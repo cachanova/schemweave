@@ -10,4 +10,8 @@ The engine is under active development. Its first production consumer will be
 meets that application's routing-quality gates, Synth Explorer continues to use
 its existing layout engine.
 
+The repository contains the native `schematic-layout` core and the
+`schematic-layout-wasm` browser binding. See [the architecture](docs/ARCHITECTURE.md)
+for the current pipeline and production-routing direction.
+
 Licensed under Apache-2.0.
