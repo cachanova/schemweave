@@ -111,6 +111,71 @@ fn detects_a_route_through_a_node_interior() {
 }
 
 #[test]
+fn boundary_rounding_does_not_count_as_a_node_intersection() {
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: 1,
+                width: 0.2,
+                height: 1.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 0.5,
+                }],
+            },
+            Node {
+                id: 2,
+                width: 0.2,
+                height: 1.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 0.5,
+                }],
+            },
+        ],
+        edges: vec![Edge {
+            id: 1,
+            source: Endpoint { node: 1, port: 0 },
+            target: Endpoint { node: 2, port: 0 },
+            net: 1,
+            participates_in_ranking: true,
+        }],
+    };
+    let layout = Layout {
+        nodes: vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.1,
+                y: 0.0,
+                width: 0.2,
+                height: 1.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 1.0,
+                y: 0.0,
+                width: 0.2,
+                height: 1.0,
+            },
+        ],
+        edges: vec![EdgeGeometry {
+            id: 1,
+            points: vec![Point { x: 0.3, y: 0.5 }, Point { x: 1.0, y: 0.5 }],
+        }],
+        width: 1.2,
+        height: 1.0,
+    };
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.node_intersections, 0, "{report:#?}");
+}
+
+#[test]
 fn caps_examples_without_hiding_violation_counts() {
     let graph = graph();
     let mut layout = layout(&graph, LayoutOptions::default()).unwrap();
