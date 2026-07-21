@@ -19,6 +19,11 @@ stages.
 to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
 and rendering remain responsibilities of the consuming application.
 
+`schemweave-eval` is a development-only quality scorer. It validates the public
+geometry contract and measures node overlap, route/node intersections,
+unrelated segment overlap and contact, crossings, bends, route length, and area.
+It is not a dependency of either runtime crate.
+
 ## Invariants
 
 - Stable identifiers determine output order and tie-breaking.
