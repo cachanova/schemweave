@@ -66,6 +66,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "schemweave-eval"
+version = "0.1.0"
+dependencies = [
+ "schemweave",
+ "serde",
+]
+
+[[package]]
 name = "schemweave-wasm"
 version = "0.1.0"
 dependencies = [

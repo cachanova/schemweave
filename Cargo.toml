@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/schemweave", "crates/schemweave-wasm"]
+members = ["crates/schemweave", "crates/schemweave-eval", "crates/schemweave-wasm"]
 resolver = "3"
 
 [workspace.package]

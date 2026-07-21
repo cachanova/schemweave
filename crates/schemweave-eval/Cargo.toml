@@ -1,0 +1,13 @@
+[package]
+name = "schemweave-eval"
+description = "Development-only geometry quality scorer for SchemWeave"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+schemweave.workspace = true
+serde.workspace = true
