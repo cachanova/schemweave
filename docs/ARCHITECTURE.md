@@ -1,6 +1,6 @@
 # Architecture
 
-Schematic Layout is a reusable engine, not a Synth Explorer subsystem. The core
+SchemWeave is a reusable engine, not a Synth Explorer subsystem. The core
 crate accepts a directed graph of sized nodes, fixed boundary ports, electrical
 net identities, and cycle-break hints. It returns positioned node rectangles and
 orthogonal edge polylines. It has no DOM, JavaScript, HDL, Yosys, or application
@@ -15,7 +15,7 @@ the production router will replace that stage with sparse obstacle-aware routing
 and negotiated congestion while retaining the public contract and topology
 stages.
 
-`schematic-layout-wasm` exposes the same engine through a JSON function designed
+`schemweave-wasm` exposes the same engine through a JSON function designed
 to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
 and rendering remain responsibilities of the consuming application.
 

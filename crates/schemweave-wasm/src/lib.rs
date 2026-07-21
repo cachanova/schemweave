@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use schematic_layout::{Graph, LayoutOptions};
+use schemweave::{Graph, LayoutOptions};
 use wasm_bindgen::prelude::*;
 
 /// Lay out a graph through a compact JSON boundary suitable for Web Workers.
@@ -15,7 +15,7 @@ pub fn layout_json(graph_json: &str, options_json: &str) -> Result<String, JsVal
             .map_err(|error| js_error(format!("invalid options JSON: {error}")))?
     };
     let result =
-        schematic_layout::layout(&graph, options).map_err(|error| js_error(error.to_string()))?;
+        schemweave::layout(&graph, options).map_err(|error| js_error(error.to_string()))?;
     serde_json::to_string(&result)
         .map_err(|error| js_error(format!("failed to encode layout: {error}")))
 }

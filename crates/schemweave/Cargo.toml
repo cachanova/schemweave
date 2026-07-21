@@ -1,5 +1,5 @@
 [package]
-name = "schematic-layout"
+name = "schemweave"
 description = "Deterministic layout and orthogonal routing for circuit schematics"
 version.workspace = true
 edition.workspace = true
