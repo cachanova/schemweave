@@ -21,4 +21,4 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
-      - run: cargo check --locked --package schematic-layout-wasm --target wasm32-unknown-unknown
+      - run: cargo check --locked --package schemweave-wasm --target wasm32-unknown-unknown

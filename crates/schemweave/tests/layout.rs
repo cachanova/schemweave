@@ -1,4 +1,4 @@
-use schematic_layout::{
+use schemweave::{
     Edge, Endpoint, Graph, Layout, LayoutError, LayoutOptions, Node, Port, PortSide, layout,
 };
 

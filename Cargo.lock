@@ -57,7 +57,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
-name = "schematic-layout"
+name = "schemweave"
 version = "0.1.0"
 dependencies = [
  "serde",
@@ -66,10 +66,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "schematic-layout-wasm"
+name = "schemweave-wasm"
 version = "0.1.0"
 dependencies = [
- "schematic-layout",
+ "schemweave",
  "serde_json",
  "wasm-bindgen",
 ]

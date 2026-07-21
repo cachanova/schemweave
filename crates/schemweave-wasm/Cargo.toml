@@ -1,6 +1,6 @@
 [package]
-name = "schematic-layout-wasm"
-description = "WebAssembly bindings for schematic-layout"
+name = "schemweave-wasm"
+description = "WebAssembly bindings for SchemWeave"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,6 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-schematic-layout.workspace = true
+schemweave.workspace = true
 serde_json.workspace = true
 wasm-bindgen.workspace = true
