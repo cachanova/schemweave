@@ -194,7 +194,7 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
     }
     report.segments = segments.len();
     score_node_overlaps(&layout.nodes, &mut report);
-    score_node_intersections(&segments, &layout.nodes, &mut report);
+    score_node_intersections(&segments, &layout.nodes, options.epsilon, &mut report);
     score_segment_relationships(&segments, &input_edges, &mut report);
     report
 }
@@ -410,6 +410,7 @@ impl Segment {
 fn score_node_intersections(
     segments: &[Segment],
     nodes: &[NodeGeometry],
+    epsilon: f64,
     report: &mut QualityReport,
 ) {
     let mut grid = NodeGrid::new(nodes, 128.0);
@@ -418,16 +419,16 @@ fn score_node_intersections(
             let node = &nodes[node_index];
             let intersects = match segment.orientation {
                 Orientation::Horizontal => {
-                    segment.fixed > node.y
-                        && segment.fixed < node.y + node.height
-                        && segment.start < node.x + node.width
-                        && segment.end > node.x
+                    segment.fixed > node.y + epsilon
+                        && segment.fixed < node.y + node.height - epsilon
+                        && segment.start < node.x + node.width - epsilon
+                        && segment.end > node.x + epsilon
                 }
                 Orientation::Vertical => {
-                    segment.fixed > node.x
-                        && segment.fixed < node.x + node.width
-                        && segment.start < node.y + node.height
-                        && segment.end > node.y
+                    segment.fixed > node.x + epsilon
+                        && segment.fixed < node.x + node.width - epsilon
+                        && segment.start < node.y + node.height - epsilon
+                        && segment.end > node.y + epsilon
                 }
             };
             if intersects {

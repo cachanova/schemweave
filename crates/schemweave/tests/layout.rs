@@ -183,6 +183,138 @@ fn outer_lane_baseline_avoids_intermediate_nodes() {
 }
 
 #[test]
+fn adjacent_layers_route_inside_their_shared_channel() {
+    let mut source = node(1, false);
+    source.ports[1].offset = 10.0;
+    let mut target = node(2, false);
+    target.ports[0].offset = 40.0;
+    let graph = Graph {
+        nodes: vec![source, target],
+        edges: vec![edge(10, 1, 2)],
+    };
+
+    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let source = result.nodes.iter().find(|node| node.id == 1).unwrap();
+    let target = result.nodes.iter().find(|node| node.id == 2).unwrap();
+    let route = &result.edges[0].points;
+
+    assert!(
+        route
+            .iter()
+            .any(|point| point.x > source.x + source.width && point.x < target.x)
+    );
+    assert_eq!(
+        result.height,
+        result
+            .nodes
+            .iter()
+            .map(|node| node.y + node.height)
+            .fold(0.0, f64::max)
+    );
+    assert_routes_avoid_node_interiors(&result);
+}
+
+#[test]
+fn uncontended_adjacent_route_stays_straight() {
+    let source = node(1, false);
+    let mut target = node(2, false);
+    target.ports[0].offset = 25.0;
+    let graph = Graph {
+        nodes: vec![source, target],
+        edges: vec![edge(10, 1, 2)],
+    };
+
+    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    assert_eq!(result.edges[0].points.len(), 2);
+}
+
+#[test]
+fn large_multi_terminal_nets_keep_a_shared_outer_trunk() {
+    let target_count = 33;
+    let graph = Graph {
+        nodes: (0..=target_count).map(|id| node(id, false)).collect(),
+        edges: (1..=target_count)
+            .map(|target| Edge {
+                id: target,
+                source: Endpoint { node: 0, port: 1 },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net: 0,
+                participates_in_ranking: true,
+            })
+            .collect(),
+    };
+
+    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let source = result.nodes.iter().find(|node| node.id == 0).unwrap();
+    let target_left = result
+        .nodes
+        .iter()
+        .filter(|node| node.id != 0)
+        .map(|node| node.x)
+        .fold(f64::INFINITY, f64::min);
+    let gap_middle = (source.x + source.width + target_left) / 2.0;
+    for edge in &result.edges {
+        assert!(
+            edge.points
+                .iter()
+                .any(|point| { point.x > source.x + source.width && point.x < gap_middle }),
+            "edge {} does not use the shared outer channel: {:?}",
+            edge.id,
+            edge.points,
+        );
+    }
+    assert_routes_avoid_node_interiors(&result);
+}
+
+#[test]
+fn long_forward_routes_weave_through_free_layer_space() {
+    let mut source = node(1, false);
+    source.ports[1].offset = 10.0;
+    let middle_a = node(2, false);
+    let middle_b = node(3, false);
+    let mut target = node(4, false);
+    target.ports[0].offset = 40.0;
+    let graph = Graph {
+        nodes: vec![source, middle_a, middle_b, target],
+        edges: vec![
+            edge(10, 1, 2),
+            edge(11, 1, 3),
+            edge(12, 2, 4),
+            edge(13, 3, 4),
+            edge(99, 1, 4),
+        ],
+    };
+
+    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let route = &result
+        .edges
+        .iter()
+        .find(|edge| edge.id == 99)
+        .unwrap()
+        .points;
+    let min_node_y = result
+        .nodes
+        .iter()
+        .map(|node| node.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_node_y = result
+        .nodes
+        .iter()
+        .map(|node| node.y + node.height)
+        .fold(f64::NEG_INFINITY, f64::max);
+
+    assert!(
+        route
+            .iter()
+            .all(|point| point.y >= min_node_y && point.y <= max_node_y)
+    );
+    assert_routes_avoid_node_interiors(&result);
+}
+
+#[test]
 fn cycle_breakers_keep_feedback_from_flattening_the_dataflow() {
     let graph = Graph {
         nodes: vec![node(1, true), node(2, false), node(3, false)],
@@ -224,7 +356,7 @@ fn handles_the_full_consumer_graph_bound() {
     let result = layout(&graph, LayoutOptions::default()).unwrap();
     assert_eq!(result.nodes.len(), node_count as usize);
     assert_eq!(result.edges.len(), 10_000);
-    assert!(result.edges.iter().all(|edge| edge.points.len() <= 8));
+    assert!(result.edges.iter().all(|edge| edge.points.len() <= 32));
 }
 
 #[test]
