@@ -173,13 +173,10 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         &forward.layers
     };
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
+    let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
     let mut evaluate = |mut nodes: Vec<NodeGeometry>, supplemental: bool| {
-        let mut edges = if supplemental {
-            routing::route_supplemental_edges(&indexed, &nodes, &ranks, options)
-        } else {
-            routing::route_edges(&indexed, &nodes, &ranks, options)
-        };
+        let mut edges = routing::route_planned_edges(&routing_plan, &nodes, options, supplemental);
         let quality = routing::route_quality(&indexed, &edges);
         let candidate = placement::normalize(&mut nodes, &mut edges);
         retain_better_candidate(&mut best, quality, candidate);
@@ -226,7 +223,8 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
                 >= baseline_order_crossings.div_ceil(100)
         {
             let mut nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
-            let mut edges = routing::route_edges(&indexed, &nodes, &alternative_ranks, options);
+            let alternative_plan = routing::RoutingPlan::new(&indexed, &alternative_ranks);
+            let mut edges = routing::route_planned_edges(&alternative_plan, &nodes, options, false);
             let quality = routing::route_quality(&indexed, &edges);
             let candidate = placement::normalize(&mut nodes, &mut edges);
             retain_better_candidate(&mut best, quality, candidate);

@@ -4,8 +4,8 @@ use std::{
 };
 
 use crate::{
-    EdgeGeometry, EdgeId, Endpoint, LayoutOptions, NetId, NodeGeometry, Point, Port, PortSide,
-    validation::IndexedGraph,
+    Edge, EdgeGeometry, EdgeId, Endpoint, LayoutOptions, NetId, NodeGeometry, Point, Port,
+    PortSide, validation::IndexedGraph,
 };
 
 const MAX_SPARSE_NET_EDGES: usize = 300;
@@ -52,16 +52,67 @@ impl PartialOrd for FloatKey {
     }
 }
 
+#[derive(Clone, Copy)]
+struct RouteEdge<'a> {
+    edge: &'a Edge,
+    source_index: usize,
+    target_index: usize,
+    source_port: &'a Port,
+    target_port: &'a Port,
+}
+
+pub(crate) struct RoutingPlan<'a> {
+    edges: Vec<RouteEdge<'a>>,
+    net_edge_counts: BTreeMap<NetId, usize>,
+    nodes_by_rank: Vec<Vec<usize>>,
+    ranks: Vec<usize>,
+}
+
+impl<'a> RoutingPlan<'a> {
+    pub(crate) fn new(graph: &IndexedGraph<'a>, ranks: &[usize]) -> Self {
+        let edges = graph
+            .edges
+            .iter()
+            .map(|&edge| {
+                let source_index = graph.node_index[&edge.source.node];
+                let target_index = graph.node_index[&edge.target.node];
+                RouteEdge {
+                    edge,
+                    source_index,
+                    target_index,
+                    source_port: graph.ports[source_index][&edge.source.port],
+                    target_port: graph.ports[target_index][&edge.target.port],
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut net_edge_counts = BTreeMap::new();
+        for resolved in &edges {
+            *net_edge_counts.entry(resolved.edge.net).or_insert(0) += 1;
+        }
+        let mut nodes_by_rank = vec![Vec::new(); ranks.iter().copied().max().unwrap_or(0) + 1];
+        for (node, &rank) in ranks.iter().enumerate() {
+            nodes_by_rank[rank].push(node);
+        }
+        Self {
+            edges,
+            net_edge_counts,
+            nodes_by_rank,
+            ranks: ranks.to_vec(),
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn route_edges(
     graph: &IndexedGraph<'_>,
     nodes: &[NodeGeometry],
     ranks: &[usize],
     options: LayoutOptions,
 ) -> Vec<EdgeGeometry> {
+    let plan = RoutingPlan::new(graph, ranks);
     route_edges_with_lane_rounds(
-        graph,
+        &plan,
         nodes,
-        ranks,
         options,
         FULL_OUTER_LANE_ROUNDS,
         FULL_GAP_LANE_ROUNDS,
@@ -73,38 +124,54 @@ pub(crate) fn route_edges(
 /// The same deterministic router and validity-preserving construction are used; only the
 /// adjacent-transposition search for a better lane order stops earlier. The canonical full-effort
 /// candidate remains available to the exact layout comparator.
+#[cfg(test)]
 pub(crate) fn route_supplemental_edges(
     graph: &IndexedGraph<'_>,
     nodes: &[NodeGeometry],
     ranks: &[usize],
     options: LayoutOptions,
 ) -> Vec<EdgeGeometry> {
+    let plan = RoutingPlan::new(graph, ranks);
     route_edges_with_lane_rounds(
-        graph,
+        &plan,
         nodes,
-        ranks,
         options,
         SUPPLEMENTAL_OUTER_LANE_ROUNDS,
         SUPPLEMENTAL_GAP_LANE_ROUNDS,
     )
 }
 
+pub(crate) fn route_planned_edges(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    options: LayoutOptions,
+    supplemental: bool,
+) -> Vec<EdgeGeometry> {
+    let (outer_rounds, gap_rounds) = if supplemental {
+        (SUPPLEMENTAL_OUTER_LANE_ROUNDS, SUPPLEMENTAL_GAP_LANE_ROUNDS)
+    } else {
+        (FULL_OUTER_LANE_ROUNDS, FULL_GAP_LANE_ROUNDS)
+    };
+    route_edges_with_lane_rounds(plan, nodes, options, outer_rounds, gap_rounds)
+}
+
 // Keep one WASM copy of the shared routing loop for full and supplemental effort.
 #[inline(never)]
 fn route_edges_with_lane_rounds(
-    graph: &IndexedGraph<'_>,
+    plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
-    ranks: &[usize],
     options: LayoutOptions,
     outer_lane_rounds: usize,
     gap_lane_rounds: usize,
 ) -> Vec<EdgeGeometry> {
+    let ranks = &plan.ranks;
+    debug_assert_eq!(nodes.len(), ranks.len());
     let top = nodes.iter().map(|node| node.y).fold(0.0, f64::min);
     let bottom = nodes
         .iter()
         .map(|node| node.y + node.height)
         .fold(0.0, f64::max);
-    let max_rank = ranks.iter().copied().max().unwrap_or(0);
+    let max_rank = plan.nodes_by_rank.len().saturating_sub(1);
     let mut layer_left = vec![f64::INFINITY; max_rank + 1];
     let mut layer_right = vec![f64::NEG_INFINITY; max_rank + 1];
     for (node, &rank) in nodes.iter().zip(ranks) {
@@ -112,31 +179,28 @@ fn route_edges_with_lane_rounds(
         layer_right[rank] = layer_right[rank].max(node.x + node.width);
     }
 
-    let mut nodes_by_rank = vec![Vec::new(); max_rank + 1];
-    for (node, &rank) in nodes.iter().zip(ranks) {
-        nodes_by_rank[rank].push(node);
-    }
-    let free_by_rank: Vec<_> = nodes_by_rank
-        .iter_mut()
-        .map(|layer| {
+    let free_by_rank: Vec<_> = plan
+        .nodes_by_rank
+        .iter()
+        .map(|indices| {
+            let mut layer = indices
+                .iter()
+                .map(|&index| &nodes[index])
+                .collect::<Vec<_>>();
             layer.sort_by(|left, right| left.y.total_cmp(&right.y).then(left.id.cmp(&right.id)));
-            free_intervals(layer, top, bottom)
+            free_intervals(&layer, top, bottom)
         })
         .collect();
 
-    let mut net_edge_counts = BTreeMap::new();
-    for edge in &graph.edges {
-        *net_edge_counts.entry(edge.net).or_insert(0usize) += 1;
-    }
-
-    let sparse_spans: Vec<_> = graph
+    let sparse_spans: Vec<_> = plan
         .edges
         .iter()
-        .map(|edge| {
-            let source_index = graph.node_index[&edge.source.node];
-            let target_index = graph.node_index[&edge.target.node];
-            let source_port = graph.ports[source_index][&edge.source.port];
-            let target_port = graph.ports[target_index][&edge.target.port];
+        .map(|resolved| {
+            let edge = resolved.edge;
+            let source_index = resolved.source_index;
+            let target_index = resolved.target_index;
+            let source_port = resolved.source_port;
+            let target_port = resolved.target_port;
             let source_rank = ranks[source_index];
             let target_rank = ranks[target_index];
             (source_port.side == PortSide::East
@@ -144,7 +208,7 @@ fn route_edges_with_lane_rounds(
                 && source_rank < target_rank
                 // Extremely large nets are cheaper as one outer trunk; their sparse tree does
                 // not improve quality enough to pay for per-layer corridor construction.
-                && net_edge_counts[&edge.net] <= MAX_SPARSE_NET_EDGES
+                && plan.net_edge_counts[&edge.net] <= MAX_SPARSE_NET_EDGES
                 && (source_rank + 1..target_rank).all(|rank| !free_by_rank[rank].is_empty()))
             .then_some((source_rank, target_rank))
         })
@@ -154,18 +218,13 @@ fn route_edges_with_lane_rounds(
     let mut crossing_preferences = vec![BTreeMap::<u32, Vec<f64>>::new(); max_rank + 1];
     let mut crossing_pairs = BTreeSet::new();
     let mut outer_nets = BTreeSet::new();
-    for (edge, span) in graph.edges.iter().zip(&sparse_spans) {
+    for (resolved, span) in plan.edges.iter().zip(&sparse_spans) {
+        let edge = resolved.edge;
         if let Some((source_rank, target_rank)) = span {
-            let source_index = graph.node_index[&edge.source.node];
-            let target_index = graph.node_index[&edge.target.node];
-            let source = port_point(
-                &nodes[source_index],
-                graph.ports[source_index][&edge.source.port],
-            );
-            let target = port_point(
-                &nodes[target_index],
-                graph.ports[target_index][&edge.target.port],
-            );
+            let source_index = resolved.source_index;
+            let target_index = resolved.target_index;
+            let source = port_point(&nodes[source_index], resolved.source_port);
+            let target = port_point(&nodes[target_index], resolved.target_port);
             let span = (*target_rank - *source_rank) as f64;
             for (gap, preferences) in gap_preferences
                 .iter_mut()
@@ -211,7 +270,7 @@ fn route_edges_with_lane_rounds(
         .collect();
     let crossing_tie_lane_count = crossing_tie_lanes.len();
     let outer_lanes = outer_lane_assignments(
-        graph,
+        plan,
         nodes,
         ranks,
         &sparse_spans,
@@ -224,7 +283,7 @@ fn route_edges_with_lane_rounds(
         outer_lane_rounds,
     );
     let mut endpoint_tracks = build_endpoint_tracks(
-        graph,
+        plan,
         nodes,
         ranks,
         &sparse_spans,
@@ -235,10 +294,9 @@ fn route_edges_with_lane_rounds(
         options,
     );
     let crossing_paths = sparse_crossing_paths(
-        graph,
+        plan,
         nodes,
         &sparse_spans,
-        &net_edge_counts,
         &crossing_lanes,
         &crossing_tie_lanes,
         crossing_tie_lane_count,
@@ -247,7 +305,7 @@ fn route_edges_with_lane_rounds(
         options.port_stub,
     );
     gap_lanes = crossing_aware_gap_lanes(
-        graph,
+        plan,
         nodes,
         &sparse_spans,
         &crossing_paths,
@@ -257,7 +315,7 @@ fn route_edges_with_lane_rounds(
         gap_lane_rounds,
     );
     endpoint_tracks = build_endpoint_tracks(
-        graph,
+        plan,
         nodes,
         ranks,
         &sparse_spans,
@@ -267,18 +325,18 @@ fn route_edges_with_lane_rounds(
         &outer_lanes,
         options,
     );
-    graph
-        .edges
+    plan.edges
         .iter()
         .zip(sparse_spans)
         .zip(crossing_paths)
-        .map(|((edge, sparse_span), crossing_path)| {
-            let source_index = graph.node_index[&edge.source.node];
-            let target_index = graph.node_index[&edge.target.node];
+        .map(|((resolved, sparse_span), crossing_path)| {
+            let edge = resolved.edge;
+            let source_index = resolved.source_index;
+            let target_index = resolved.target_index;
             let source_node = &nodes[source_index];
             let target_node = &nodes[target_index];
-            let source_port = graph.ports[source_index][&edge.source.port];
-            let target_port = graph.ports[target_index][&edge.target.port];
+            let source_port = resolved.source_port;
+            let target_port = resolved.target_port;
             let source = port_point(source_node, source_port);
             let target = port_point(target_node, target_port);
             if let (Some((source_rank, target_rank)), Some(crossing_path)) =
@@ -678,7 +736,7 @@ struct OuterNetAccess {
 
 #[allow(clippy::too_many_arguments)]
 fn outer_lane_assignments(
-    graph: &IndexedGraph<'_>,
+    plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     ranks: &[usize],
     sparse_spans: &[Option<(usize, usize)>],
@@ -693,14 +751,17 @@ fn outer_lane_assignments(
     let mut top_nets = BTreeSet::new();
     let mut bottom_nets = BTreeSet::new();
     let mut edge_sides = BTreeMap::new();
-    for (edge, span) in graph.edges.iter().zip(sparse_spans) {
+    for (resolved, span) in plan.edges.iter().zip(sparse_spans) {
+        let edge = resolved.edge;
         if span.is_some() {
             continue;
         }
         let mut cost = (0.0, 0.0);
-        for endpoint in [edge.source, edge.target] {
-            let node_index = graph.node_index[&endpoint.node];
-            let point = port_point(&nodes[node_index], graph.ports[node_index][&endpoint.port]);
+        for (node_index, port) in [
+            (resolved.source_index, resolved.source_port),
+            (resolved.target_index, resolved.target_port),
+        ] {
+            let point = port_point(&nodes[node_index], port);
             cost.0 += point.y - top;
             cost.1 += bottom - point.y;
         }
@@ -719,16 +780,17 @@ fn outer_lane_assignments(
     let channel_count = channel_lanes.len();
     let mut top_access = BTreeMap::<u32, OuterNetAccess>::new();
     let mut bottom_access = BTreeMap::<u32, OuterNetAccess>::new();
-    for (edge, span) in graph.edges.iter().zip(sparse_spans) {
+    for (resolved, span) in plan.edges.iter().zip(sparse_spans) {
+        let edge = resolved.edge;
         if span.is_some() {
             continue;
         }
-        let source_index = graph.node_index[&edge.source.node];
-        let target_index = graph.node_index[&edge.target.node];
+        let source_index = resolved.source_index;
+        let target_index = resolved.target_index;
         let source_node = &nodes[source_index];
         let target_node = &nodes[target_index];
-        let source_port = graph.ports[source_index][&edge.source.port];
-        let target_port = graph.ports[target_index][&edge.target.port];
+        let source_port = resolved.source_port;
+        let target_port = resolved.target_port;
         let source_stub = stub_point(
             port_point(source_node, source_port),
             source_port.side,
@@ -781,7 +843,8 @@ fn outer_lane_assignments(
         crossing_aware_outer_lane_indices_with_rounds(&top_nets, &top_access, lane_rounds);
     let bottom_lanes =
         crossing_aware_outer_lane_indices_with_rounds(&bottom_nets, &bottom_access, lane_rounds);
-    for (edge, span) in graph.edges.iter().zip(sparse_spans) {
+    for (resolved, span) in plan.edges.iter().zip(sparse_spans) {
+        let edge = resolved.edge;
         if span.is_some() {
             continue;
         }
@@ -899,7 +962,7 @@ struct EndpointAccess {
 
 #[allow(clippy::too_many_arguments)]
 fn build_endpoint_tracks(
-    graph: &IndexedGraph<'_>,
+    plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     ranks: &[usize],
     sparse_spans: &[Option<(usize, usize)>],
@@ -910,13 +973,14 @@ fn build_endpoint_tracks(
     options: LayoutOptions,
 ) -> BTreeMap<(u32, u32, u8), (usize, usize)> {
     let mut accesses = BTreeMap::<(u32, u32, u8), EndpointAccess>::new();
-    for (edge, sparse_span) in graph.edges.iter().zip(sparse_spans) {
-        let source_index = graph.node_index[&edge.source.node];
-        let target_index = graph.node_index[&edge.target.node];
+    for (resolved, sparse_span) in plan.edges.iter().zip(sparse_spans) {
+        let edge = resolved.edge;
+        let source_index = resolved.source_index;
+        let target_index = resolved.target_index;
         let source_node = &nodes[source_index];
         let target_node = &nodes[target_index];
-        let source_port = graph.ports[source_index][&edge.source.port];
-        let target_port = graph.ports[target_index][&edge.target.port];
+        let source_port = resolved.source_port;
+        let target_port = resolved.target_port;
         let source = port_point(source_node, source_port);
         let target = port_point(target_node, target_port);
         let source_stub = stub_point(source, source_port.side, options.port_stub);
@@ -1069,10 +1133,9 @@ fn free_intervals(nodes: &[&NodeGeometry], top: f64, bottom: f64) -> Vec<(f64, f
 
 #[allow(clippy::too_many_arguments)]
 fn sparse_crossing_paths(
-    graph: &IndexedGraph<'_>,
+    plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     sparse_spans: &[Option<(usize, usize)>],
-    net_edge_counts: &BTreeMap<u32, usize>,
     crossing_lanes: &[BTreeMap<u32, usize>],
     crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
     crossing_tie_lane_count: usize,
@@ -1083,8 +1146,9 @@ fn sparse_crossing_paths(
     // A single-driver net uses one obstacle-safe backbone; each sink route receives the prefix
     // that reaches its rank and branches only in the final gap.
     let mut edges_by_net = HashMap::<u32, Vec<usize>>::new();
-    for (edge_index, edge) in graph.edges.iter().enumerate() {
-        if net_edge_counts[&edge.net] > 1 {
+    for (edge_index, resolved) in plan.edges.iter().enumerate() {
+        if plan.net_edge_counts[&resolved.edge.net] > 1 {
+            let edge = resolved.edge;
             edges_by_net.entry(edge.net).or_default().push(edge_index);
         }
     }
@@ -1097,10 +1161,11 @@ fn sparse_crossing_paths(
         {
             continue;
         }
-        let first_edge = graph.edges[edge_indices[0]];
+        let first = plan.edges[edge_indices[0]];
+        let first_edge = first.edge;
         if edge_indices
             .iter()
-            .any(|&edge_index| graph.edges[edge_index].source != first_edge.source)
+            .any(|&edge_index| plan.edges[edge_index].edge.source != first_edge.source)
         {
             continue;
         }
@@ -1116,21 +1181,14 @@ fn sparse_crossing_paths(
         if max_target_rank <= source_rank + 1 {
             continue;
         }
-        let source_index = graph.node_index[&first_edge.source.node];
-        let source = port_point(
-            &nodes[source_index],
-            graph.ports[source_index][&first_edge.source.port],
-        );
+        let source = port_point(&nodes[first.source_index], first.source_port);
         let source_y = endpoint_escape_y(source, first_edge.source, 0, endpoint_tracks, port_stub);
         let mut target_ys = edge_indices
             .iter()
             .map(|&edge_index| {
-                let edge = graph.edges[edge_index];
-                let target_index = graph.node_index[&edge.target.node];
-                let target = port_point(
-                    &nodes[target_index],
-                    graph.ports[target_index][&edge.target.port],
-                );
+                let resolved = plan.edges[edge_index];
+                let edge = resolved.edge;
+                let target = port_point(&nodes[resolved.target_index], resolved.target_port);
                 endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub)
             })
             .collect::<Vec<_>>();
@@ -1154,26 +1212,18 @@ fn sparse_crossing_paths(
         shared_paths.insert(net, (source_rank, path));
     }
 
-    graph
-        .edges
+    plan.edges
         .iter()
         .zip(sparse_spans)
-        .map(|(edge, span)| {
+        .map(|(resolved, span)| {
+            let edge = resolved.edge;
             let &(source_rank, target_rank) = span.as_ref()?;
             if let Some(&(shared_source_rank, ref shared_path)) = shared_paths.get(&edge.net) {
                 debug_assert_eq!(shared_source_rank, source_rank);
                 return Some(shared_path[..target_rank - source_rank - 1].to_vec());
             }
-            let source_index = graph.node_index[&edge.source.node];
-            let target_index = graph.node_index[&edge.target.node];
-            let source = port_point(
-                &nodes[source_index],
-                graph.ports[source_index][&edge.source.port],
-            );
-            let target = port_point(
-                &nodes[target_index],
-                graph.ports[target_index][&edge.target.port],
-            );
+            let source = port_point(&nodes[resolved.source_index], resolved.source_port);
+            let target = port_point(&nodes[resolved.target_index], resolved.target_port);
             let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
             let target_y = endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub);
             Some(shortest_crossing_path(
@@ -1204,7 +1254,7 @@ struct GapNetAccess {
 
 #[allow(clippy::too_many_arguments)]
 fn crossing_aware_gap_lanes(
-    graph: &IndexedGraph<'_>,
+    plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     sparse_spans: &[Option<(usize, usize)>],
     crossing_paths: &[Option<Vec<f64>>],
@@ -1216,20 +1266,13 @@ fn crossing_aware_gap_lanes(
     let mut accesses = (0..current_lanes.len())
         .map(|_| BTreeMap::<u32, GapNetAccess>::new())
         .collect::<Vec<_>>();
-    for ((edge, span), path) in graph.edges.iter().zip(sparse_spans).zip(crossing_paths) {
+    for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(crossing_paths) {
+        let edge = resolved.edge;
         let (Some(&(source_rank, target_rank)), Some(path)) = (span.as_ref(), path) else {
             continue;
         };
-        let source_index = graph.node_index[&edge.source.node];
-        let target_index = graph.node_index[&edge.target.node];
-        let source = port_point(
-            &nodes[source_index],
-            graph.ports[source_index][&edge.source.port],
-        );
-        let target = port_point(
-            &nodes[target_index],
-            graph.ports[target_index][&edge.target.port],
-        );
+        let source = port_point(&nodes[resolved.source_index], resolved.source_port);
+        let target = port_point(&nodes[resolved.target_index], resolved.target_port);
         let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
         let target_y = endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub);
         for gap in source_rank..target_rank {
@@ -1677,10 +1720,11 @@ mod tests {
     };
 
     use super::{
-        FULL_OUTER_LANE_ROUNDS, GapNetAccess, OuterNetAccess, OuterSide,
+        FULL_OUTER_LANE_ROUNDS, GapNetAccess, OuterNetAccess, OuterSide, RoutingPlan,
         crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices, crossing_track_y,
-        distance_transform, outer_lane_assignments, route_quality, shortest_crossing_path,
-        sparse_channel_route, vertical_horizontal_crossings,
+        distance_transform, outer_lane_assignments, route_edges, route_planned_edges,
+        route_quality, route_supplemental_edges, shortest_crossing_path, sparse_channel_route,
+        vertical_horizontal_crossings,
     };
 
     #[test]
@@ -1835,8 +1879,9 @@ mod tests {
             },
         ];
 
+        let plan = RoutingPlan::new(&indexed, &[0, 1, 1]);
         let lanes = outer_lane_assignments(
-            &indexed,
+            &plan,
             &geometry,
             &[0, 1, 1],
             &[None, None],
@@ -1852,6 +1897,88 @@ mod tests {
         assert_eq!(lanes[&10].side, OuterSide::Top);
         assert_eq!(lanes[&11].side, OuterSide::Bottom);
         assert_eq!(lanes[&10].channel_index, lanes[&11].channel_index);
+    }
+
+    #[test]
+    fn routing_plan_matches_fresh_preparation_and_does_not_retain_candidate_state() {
+        let node = |id, side| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 10.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let ranks = [0, 1, 1];
+        let candidate_a = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 50.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 100.0,
+                y: 100.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        let mut candidate_b = candidate_a.clone();
+        candidate_b[0].y = 140.0;
+        candidate_b[1].y = 120.0;
+        candidate_b[2].y = 10.0;
+        let plan = RoutingPlan::new(&indexed, &ranks);
+
+        let full_a = route_planned_edges(&plan, &candidate_a, options, false);
+        assert_eq!(full_a, route_edges(&indexed, &candidate_a, &ranks, options));
+        assert_eq!(
+            route_planned_edges(&plan, &candidate_a, options, true),
+            route_supplemental_edges(&indexed, &candidate_a, &ranks, options)
+        );
+
+        let _full_b = route_planned_edges(&plan, &candidate_b, options, false);
+        assert_eq!(
+            route_planned_edges(&plan, &candidate_a, options, false),
+            full_a
+        );
     }
 
     #[test]
