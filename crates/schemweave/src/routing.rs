@@ -23,6 +23,14 @@ const MAX_CROSSING_REPAIR_NODES: usize = 2_000;
 const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
 const MAX_CROSSING_REPAIR_PATH_STATES: usize = 500_000;
+// Small nets keep the historical stable-ID order. For a single-source outer fanout, higher channel
+// indices usually shorten the many sink escapes at the cost of one shared source arm; the exact
+// route scorer below still rejects the heuristic whenever that trade is not beneficial.
+const MIN_FANOUT_AWARE_CHANNEL_EDGES: usize = 16;
+// A channel-order candidate emits and exactly scores a second complete route set. Require enough
+// actual outer sink work to amortize that cost; smaller clusters keep the historical fast path.
+const MIN_FANOUT_AWARE_OUTER_BRANCHES: usize = 512;
+const MIN_FANOUT_AWARE_NODES: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RouteQuality {
@@ -35,8 +43,11 @@ pub(crate) struct RoutedEdges {
     pub(crate) primary: Vec<EdgeGeometry>,
     pub(crate) primary_quality: Option<RouteQuality>,
     pub(crate) repair: Option<(RouteQuality, Vec<EdgeGeometry>)>,
+    pub(crate) alternatives: Vec<(RouteQuality, Vec<EdgeGeometry>)>,
     #[cfg(test)]
     pub(crate) feedback_trace: FeedbackCandidateTrace,
+    #[cfg(test)]
+    pub(crate) fanout_trace: FanoutCandidateTrace,
 }
 
 #[cfg(test)]
@@ -49,10 +60,27 @@ pub(crate) struct FeedbackCandidateTrace {
     pub(crate) candidate_quality: Option<RouteQuality>,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FanoutCandidateTrace {
+    pub(crate) evaluated: bool,
+    pub(crate) selected: bool,
+    pub(crate) baseline_quality: Option<RouteQuality>,
+    pub(crate) candidate_quality: Option<RouteQuality>,
+}
+
 struct RoutedLaneState {
     routes: Vec<EdgeGeometry>,
     gap_lanes: Vec<BTreeMap<u32, usize>>,
     crossing_paths: Vec<Option<Vec<f64>>>,
+}
+
+struct RouteFamily {
+    primary: Vec<EdgeGeometry>,
+    primary_quality: RouteQuality,
+    repair: Option<(RouteQuality, Vec<EdgeGeometry>)>,
+    #[cfg(test)]
+    feedback_trace: FeedbackCandidateTrace,
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +181,7 @@ pub(crate) fn route_edges(
         FULL_OUTER_LANE_ROUNDS,
         FULL_GAP_LANE_ROUNDS,
         false,
+        false,
     )
     .primary
 }
@@ -177,6 +206,7 @@ pub(crate) fn route_supplemental_edges(
         SUPPLEMENTAL_OUTER_LANE_ROUNDS,
         SUPPLEMENTAL_GAP_LANE_ROUNDS,
         true,
+        true,
     )
     .primary
 }
@@ -192,8 +222,15 @@ pub(crate) fn route_planned_candidates(
     } else {
         (FULL_OUTER_LANE_ROUNDS, FULL_GAP_LANE_ROUNDS)
     };
-    let mut routed =
-        route_edges_with_lane_rounds(plan, nodes, options, outer_rounds, gap_rounds, supplemental);
+    let mut routed = route_edges_with_lane_rounds(
+        plan,
+        nodes,
+        options,
+        outer_rounds,
+        gap_rounds,
+        supplemental,
+        supplemental,
+    );
     if routed.primary_quality.is_none() {
         routed.primary_quality = Some(route_quality_for_plan(plan, &routed.primary));
     }
@@ -219,6 +256,7 @@ fn route_edges_with_lane_rounds(
     outer_lane_rounds: usize,
     gap_lane_rounds: usize,
     repair_crossings: bool,
+    fanout_candidates: bool,
 ) -> RoutedEdges {
     let ranks = &plan.ranks;
     debug_assert_eq!(nodes.len(), ranks.len());
@@ -325,12 +363,13 @@ fn route_edges_with_lane_rounds(
         .map(|(lane, pair)| (pair, lane))
         .collect();
     let crossing_tie_lane_count = crossing_tie_lanes.len();
+    let stable_channel_lanes = lane_indices(&outer_nets);
     let baseline_outer_lanes = outer_lane_assignments(
         plan,
         nodes,
         ranks,
         &sparse_spans,
-        &outer_nets,
+        &stable_channel_lanes,
         &layer_left,
         &layer_right,
         top,
@@ -360,14 +399,46 @@ fn route_edges_with_lane_rounds(
         options,
         gap_lane_rounds,
     );
-    let mut outer_lanes = baseline_outer_lanes;
-    let mut primary_quality = None;
     let node_count = plan
         .nodes_by_rank
         .iter()
         .map(Vec::len)
         .try_fold(0usize, usize::checked_add)
         .unwrap_or(usize::MAX);
+    let fanout_within_budget = fanout_candidates
+        && repair_crossings
+        && node_count >= MIN_FANOUT_AWARE_NODES
+        && fanout_candidate_within_budget(node_count, plan.edges.len(), &routes);
+    if fanout_within_budget
+        && let Some(adaptive_channel_lanes) =
+            fanout_outer_channel_lane_indices(plan, &sparse_spans, &outer_nets)
+    {
+        return finish_fanout_route_families(
+            plan,
+            nodes,
+            ranks,
+            &sparse_spans,
+            &crossing_lanes,
+            &crossing_tie_lanes,
+            crossing_tie_lane_count,
+            &free_by_rank,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            &crossing_paths,
+            &stable_channel_lanes,
+            adaptive_channel_lanes,
+            baseline_outer_lanes,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            repair_crossings,
+            routes,
+        );
+    }
+    let mut outer_lanes = baseline_outer_lanes;
+    let mut primary_quality = None;
     let split_feedback = has_split_feedback_net(plan, &sparse_spans, &outer_lanes);
     let feedback_within_budget = split_feedback
         && crossing_repair_within_budget(
@@ -386,15 +457,13 @@ fn route_edges_with_lane_rounds(
         baseline: None,
         candidate_quality: None,
     };
-    // Only spend on the alternative when the baseline visibly fragments a feedback net. The
-    // shared optional-candidate budget keeps the extra exact score bounded on large inputs.
     if feedback_within_budget {
         let coherent_outer_lanes = outer_lane_assignments(
             plan,
             nodes,
             ranks,
             &sparse_spans,
-            &outer_nets,
+            &stable_channel_lanes,
             &layer_left,
             &layer_right,
             top,
@@ -404,8 +473,6 @@ fn route_edges_with_lane_rounds(
             true,
         );
         let baseline_quality = route_quality_for_plan(plan, &routes);
-        // Coherence changes outer side and side-local lane indices, but not the stable per-net
-        // channel index. The baseline sparse paths and gap lanes therefore remain valid.
         let candidate_endpoint_tracks = build_endpoint_tracks(
             plan,
             nodes,
@@ -438,8 +505,6 @@ fn route_edges_with_lane_rounds(
             feedback_trace.baseline = Some((baseline_quality, routes.clone()));
             feedback_trace.candidate_quality = Some(candidate_quality);
         }
-        // Preserve the canonical physical-quality ordering; coherence is never accepted merely
-        // for looking tidier when it would increase crossings, bends, or route length.
         if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
             routes = candidate_routes;
             outer_lanes = coherent_outer_lanes;
@@ -469,12 +534,353 @@ fn route_edges_with_lane_rounds(
             bottom,
             options,
             &routes,
+            None,
         );
         (Some(quality), repair)
     } else {
         (primary_quality, None)
     };
     RoutedEdges {
+        primary: routes,
+        primary_quality,
+        repair,
+        alternatives: Vec::new(),
+        #[cfg(test)]
+        feedback_trace,
+        #[cfg(test)]
+        fanout_trace: FanoutCandidateTrace {
+            evaluated: false,
+            selected: false,
+            baseline_quality: None,
+            candidate_quality: None,
+        },
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn finish_fanout_route_families(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    ranks: &[usize],
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_lanes: &[BTreeMap<NetId, usize>],
+    crossing_tie_lanes: &BTreeMap<(usize, NetId), usize>,
+    crossing_tie_lane_count: usize,
+    free_by_rank: &[Vec<(f64, f64)>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    crossing_paths: &[Option<Vec<f64>>],
+    stable_channel_lanes: &BTreeMap<NetId, usize>,
+    adaptive_channel_lanes: BTreeMap<NetId, usize>,
+    stable_outer_lanes: BTreeMap<NetId, OuterLane>,
+    top: f64,
+    bottom: f64,
+    options: LayoutOptions,
+    outer_lane_rounds: usize,
+    repair_crossings: bool,
+    stable_routes: Vec<EdgeGeometry>,
+) -> RoutedEdges {
+    let adaptive_outer_lanes = outer_lane_assignments(
+        plan,
+        nodes,
+        ranks,
+        sparse_spans,
+        &adaptive_channel_lanes,
+        layer_left,
+        layer_right,
+        top,
+        bottom,
+        options,
+        outer_lane_rounds,
+        false,
+    );
+    // Channel order changes only outer accesses. Preserve the already-refined sparse corridors
+    // and rebuild the endpoint escapes plus complete route geometry affected by those accesses.
+    let adaptive_endpoint_tracks = build_endpoint_tracks(
+        plan,
+        nodes,
+        ranks,
+        sparse_spans,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        &adaptive_outer_lanes,
+        options,
+    );
+    let adaptive_routes = emit_routes(
+        plan,
+        nodes,
+        sparse_spans,
+        crossing_paths,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        &adaptive_endpoint_tracks,
+        &adaptive_outer_lanes,
+        top,
+        bottom,
+        options,
+    );
+    let baseline_score = horizontal_crossing_counts_by_net(plan, &stable_routes);
+    let candidate_score = horizontal_crossing_counts_by_net(plan, &adaptive_routes);
+    let baseline_quality = baseline_score.1;
+    let candidate_quality = candidate_score.1;
+    let adaptive_is_better = route_quality_cmp(candidate_quality, baseline_quality).is_lt();
+
+    let (selected, alternatives) = if adaptive_is_better {
+        let adaptive = finish_route_family(
+            plan,
+            nodes,
+            ranks,
+            sparse_spans,
+            crossing_lanes,
+            crossing_tie_lanes,
+            crossing_tie_lane_count,
+            free_by_rank,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            crossing_paths,
+            &adaptive_channel_lanes,
+            adaptive_outer_lanes,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            repair_crossings,
+            Some(candidate_score),
+            adaptive_routes,
+        );
+        let stable = finish_route_family(
+            plan,
+            nodes,
+            ranks,
+            sparse_spans,
+            crossing_lanes,
+            crossing_tie_lanes,
+            crossing_tie_lane_count,
+            free_by_rank,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            crossing_paths,
+            stable_channel_lanes,
+            stable_outer_lanes,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            repair_crossings,
+            Some(baseline_score),
+            stable_routes,
+        );
+        let mut alternatives = vec![(stable.primary_quality, stable.primary)];
+        if let Some(repair) = stable.repair {
+            alternatives.push(repair);
+        }
+        (adaptive, alternatives)
+    } else {
+        (
+            finish_route_family(
+                plan,
+                nodes,
+                ranks,
+                sparse_spans,
+                crossing_lanes,
+                crossing_tie_lanes,
+                crossing_tie_lane_count,
+                free_by_rank,
+                layer_left,
+                layer_right,
+                gap_lanes,
+                crossing_paths,
+                stable_channel_lanes,
+                stable_outer_lanes,
+                top,
+                bottom,
+                options,
+                outer_lane_rounds,
+                repair_crossings,
+                Some(baseline_score),
+                stable_routes,
+            ),
+            Vec::new(),
+        )
+    };
+    RoutedEdges {
+        primary: selected.primary,
+        primary_quality: Some(selected.primary_quality),
+        repair: selected.repair,
+        alternatives,
+        #[cfg(test)]
+        feedback_trace: selected.feedback_trace,
+        #[cfg(test)]
+        fanout_trace: FanoutCandidateTrace {
+            evaluated: true,
+            selected: adaptive_is_better,
+            baseline_quality: Some(baseline_quality),
+            candidate_quality: Some(candidate_quality),
+        },
+    }
+}
+
+fn fanout_candidate_within_budget(
+    node_count: usize,
+    edge_count: usize,
+    routes: &[EdgeGeometry],
+) -> bool {
+    node_count <= MAX_CROSSING_REPAIR_NODES
+        && edge_count <= MAX_CROSSING_REPAIR_EDGES
+        && sum_within_limit(
+            routes.iter().map(|route| route.points.len()),
+            MAX_CROSSING_REPAIR_ROUTE_POINTS,
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_route_family(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    ranks: &[usize],
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_lanes: &[BTreeMap<u32, usize>],
+    crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
+    crossing_tie_lane_count: usize,
+    free_by_rank: &[Vec<(f64, f64)>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<u32, usize>],
+    crossing_paths: &[Option<Vec<f64>>],
+    channel_lanes: &BTreeMap<NetId, usize>,
+    mut outer_lanes: BTreeMap<u32, OuterLane>,
+    top: f64,
+    bottom: f64,
+    options: LayoutOptions,
+    outer_lane_rounds: usize,
+    repair_crossings: bool,
+    mut precomputed_score: Option<(BTreeMap<NetId, usize>, RouteQuality)>,
+    mut routes: Vec<EdgeGeometry>,
+) -> RouteFamily {
+    let node_count = plan
+        .nodes_by_rank
+        .iter()
+        .map(Vec::len)
+        .try_fold(0usize, usize::checked_add)
+        .unwrap_or(usize::MAX);
+    let split_feedback = has_split_feedback_net(plan, sparse_spans, &outer_lanes);
+    let feedback_within_budget = split_feedback
+        && crossing_repair_within_budget(
+            node_count,
+            plan.edges.len(),
+            &routes,
+            gap_lanes,
+            sparse_spans,
+            free_by_rank,
+        );
+    #[cfg(test)]
+    let mut feedback_trace = FeedbackCandidateTrace {
+        split: split_feedback,
+        evaluated: false,
+        selected: false,
+        baseline: None,
+        candidate_quality: None,
+    };
+    // Only spend on the alternative when the baseline visibly fragments a feedback net. The
+    // shared optional-candidate budget keeps the extra exact score bounded on large inputs.
+    if feedback_within_budget {
+        let coherent_outer_lanes = outer_lane_assignments(
+            plan,
+            nodes,
+            ranks,
+            sparse_spans,
+            channel_lanes,
+            layer_left,
+            layer_right,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            true,
+        );
+        let baseline_score = precomputed_score
+            .take()
+            .unwrap_or_else(|| horizontal_crossing_counts_by_net(plan, &routes));
+        let baseline_quality = baseline_score.1;
+        // Coherence changes outer side and side-local lane indices, but not the stable per-net
+        // channel index. The baseline sparse paths and gap lanes therefore remain valid.
+        let candidate_endpoint_tracks = build_endpoint_tracks(
+            plan,
+            nodes,
+            ranks,
+            sparse_spans,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            &coherent_outer_lanes,
+            options,
+        );
+        let candidate_routes = emit_routes(
+            plan,
+            nodes,
+            sparse_spans,
+            crossing_paths,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            &candidate_endpoint_tracks,
+            &coherent_outer_lanes,
+            top,
+            bottom,
+            options,
+        );
+        let candidate_score = horizontal_crossing_counts_by_net(plan, &candidate_routes);
+        let candidate_quality = candidate_score.1;
+        #[cfg(test)]
+        {
+            feedback_trace.evaluated = true;
+            feedback_trace.baseline = Some((baseline_quality, routes.clone()));
+            feedback_trace.candidate_quality = Some(candidate_quality);
+        }
+        // Preserve the canonical physical-quality ordering; coherence is never accepted merely
+        // for looking tidier when it would increase crossings, bends, or route length.
+        if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
+            routes = candidate_routes;
+            outer_lanes = coherent_outer_lanes;
+            precomputed_score = Some(candidate_score);
+            #[cfg(test)]
+            {
+                feedback_trace.selected = true;
+            }
+        } else {
+            precomputed_score = Some(baseline_score);
+        }
+    }
+    let (primary_quality, repair) = if repair_crossings {
+        repair_crossing_heavy_net(
+            plan,
+            nodes,
+            sparse_spans,
+            crossing_lanes,
+            crossing_tie_lanes,
+            crossing_tie_lane_count,
+            free_by_rank,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            &outer_lanes,
+            top,
+            bottom,
+            options,
+            &routes,
+            precomputed_score,
+        )
+    } else {
+        (route_quality_for_plan(plan, &routes), None)
+    };
+    RouteFamily {
         primary: routes,
         primary_quality,
         repair,
@@ -758,6 +1164,7 @@ fn repair_crossing_heavy_net(
     bottom: f64,
     options: LayoutOptions,
     routes: &[EdgeGeometry],
+    precomputed: Option<(BTreeMap<NetId, usize>, RouteQuality)>,
 ) -> (RouteQuality, Option<(RouteQuality, Vec<EdgeGeometry>)>) {
     let node_count = plan
         .nodes_by_rank
@@ -775,7 +1182,8 @@ fn repair_crossing_heavy_net(
     ) {
         return (route_quality_for_plan(plan, routes), None);
     }
-    let (crossing_counts, quality) = horizontal_crossing_counts_by_net(plan, routes);
+    let (crossing_counts, quality) =
+        precomputed.unwrap_or_else(|| horizontal_crossing_counts_by_net(plan, routes));
     let repair = (|| {
         let net = select_crossing_repair_net(quality.crossings, &crossing_counts, gap_lanes)?;
         let candidate_lanes = move_net_to_outer_lane(gap_lanes, net)?;
@@ -1230,12 +1638,75 @@ impl CrossingFenwick {
     }
 }
 
-fn lane_indices(nets: &BTreeSet<u32>) -> BTreeMap<u32, usize> {
+fn lane_indices(nets: &BTreeSet<NetId>) -> BTreeMap<NetId, usize> {
     nets.iter()
         .copied()
         .enumerate()
         .map(|(index, net)| (net, index))
         .collect()
+}
+
+#[derive(Clone, Copy)]
+struct OuterFanout {
+    source: Endpoint,
+    branches: usize,
+    eligible: bool,
+}
+
+fn fanout_outer_channel_lane_indices(
+    plan: &RoutingPlan<'_>,
+    sparse_spans: &[Option<(usize, usize)>],
+    outer_nets: &BTreeSet<NetId>,
+) -> Option<BTreeMap<NetId, usize>> {
+    let mut fanout = BTreeMap::<NetId, OuterFanout>::new();
+    for (resolved, span) in plan.edges.iter().zip(sparse_spans) {
+        if span.is_some() {
+            continue;
+        }
+        let edge = resolved.edge;
+        if let Some(access) = fanout.get_mut(&edge.net) {
+            access.branches = access.branches.saturating_add(1);
+            access.eligible &= edge.source == access.source;
+        } else {
+            fanout.insert(
+                edge.net,
+                OuterFanout {
+                    source: edge.source,
+                    branches: 1,
+                    eligible: true,
+                },
+            );
+        }
+    }
+    if fanout
+        .values()
+        .filter(|access| access.eligible && access.branches >= MIN_FANOUT_AWARE_CHANNEL_EDGES)
+        .map(|access| access.branches)
+        .sum::<usize>()
+        < MIN_FANOUT_AWARE_OUTER_BRANCHES
+    {
+        return None;
+    }
+    let mut ordered = outer_nets
+        .iter()
+        .map(|&net| {
+            let priority = fanout
+                .get(&net)
+                .filter(|access| {
+                    access.eligible && access.branches >= MIN_FANOUT_AWARE_CHANNEL_EDGES
+                })
+                .map_or(0, |access| access.branches);
+            (priority, net)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    Some(
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, net))| (net, index))
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1264,7 +1735,7 @@ fn outer_lane_assignments(
     nodes: &[NodeGeometry],
     ranks: &[usize],
     sparse_spans: &[Option<(usize, usize)>],
-    outer_nets: &BTreeSet<u32>,
+    channel_lanes: &BTreeMap<NetId, usize>,
     layer_left: &[f64],
     layer_right: &[f64],
     top: f64,
@@ -1344,7 +1815,6 @@ fn outer_lane_assignments(
         .collect::<BTreeMap<_, _>>();
 
     let mut assignments = BTreeMap::new();
-    let channel_lanes = lane_indices(outer_nets);
     let channel_count = channel_lanes.len();
     let mut top_access = BTreeMap::<u32, OuterNetAccess>::new();
     let mut bottom_access = BTreeMap::<u32, OuterNetAccess>::new();
@@ -2293,11 +2763,13 @@ mod tests {
         MIN_CROSSING_REPAIR_TOTAL, OuterNetAccess, OuterSide, RoutingPlan,
         crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices,
         crossing_repair_within_budget, crossing_track_y, distance_transform,
-        has_split_feedback_net, horizontal_crossing_counts_by_net, move_net_to_outer_lane,
-        outer_lane_assignments, port_point, route_edges, route_planned_candidates,
-        route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
-        route_supplemental_edges, select_crossing_repair_net, shortest_crossing_path,
-        sparse_channel_route, sum_within_limit, vertical_horizontal_crossings,
+        fanout_outer_channel_lane_indices, has_split_feedback_net,
+        horizontal_crossing_counts_by_net, lane_indices, move_net_to_outer_lane,
+        outer_lane_assignments, port_point, route_edges, route_edges_with_lane_rounds,
+        route_planned_candidates, route_planned_edges, route_quality, route_quality_cmp,
+        route_quality_for_plan, route_supplemental_edges, select_crossing_repair_net,
+        shortest_crossing_path, sparse_channel_route, sum_within_limit,
+        vertical_horizontal_crossings,
     };
 
     #[test]
@@ -2555,6 +3027,514 @@ mod tests {
         assert_eq!(permuted_repair, repair);
     }
 
+    fn fanout_candidate_fixture(
+        fanout_branches: u32,
+        other_nets: u32,
+    ) -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
+        let mut nodes = Vec::new();
+        let mut geometry = Vec::new();
+        let mut ranks = Vec::new();
+        let mut add_node =
+            |id: u32, x: f64, y: f64, height: f64, rank: usize, side: Option<PortSide>| {
+                nodes.push(Node {
+                    id,
+                    width: 20.0,
+                    height,
+                    cycle_breaker: false,
+                    ports: side
+                        .map(|side| {
+                            vec![Port {
+                                id: 0,
+                                side,
+                                offset: if matches!(side, PortSide::East | PortSide::West) {
+                                    10.0
+                                } else {
+                                    5.0
+                                },
+                            }]
+                        })
+                        .unwrap_or_default(),
+                });
+                geometry.push(NodeGeometry {
+                    id,
+                    x,
+                    y,
+                    width: 20.0,
+                    height,
+                });
+                ranks.push(rank);
+            };
+
+        add_node(0, 0.0, 30.0, 20.0, 0, Some(PortSide::East));
+        for branch in 0..fanout_branches {
+            add_node(
+                1 + branch,
+                240.0,
+                20.0 + f64::from(branch) * 18.0,
+                12.0,
+                2,
+                Some(PortSide::West),
+            );
+        }
+        let blocker = 1 + fanout_branches;
+        add_node(
+            blocker,
+            110.0,
+            0.0,
+            (f64::from(fanout_branches) * 18.0 + 100.0).max(900.0),
+            1,
+            None,
+        );
+        for branch in 0..other_nets {
+            add_node(
+                blocker + 1 + branch,
+                0.0,
+                320.0 + f64::from(branch) * 14.0,
+                12.0,
+                0,
+                Some(PortSide::East),
+            );
+        }
+        for branch in 0..other_nets {
+            add_node(
+                blocker + 1 + other_nets + branch,
+                240.0,
+                340.0 - f64::from(branch) * 14.0,
+                12.0,
+                2,
+                Some(PortSide::West),
+            );
+        }
+
+        let mut edges = (0..fanout_branches)
+            .map(|branch| Edge {
+                id: branch,
+                source: Endpoint { node: 0, port: 0 },
+                target: Endpoint {
+                    node: 1 + branch,
+                    port: 0,
+                },
+                net: 1,
+                participates_in_ranking: true,
+            })
+            .collect::<Vec<_>>();
+        edges.extend((0..other_nets).map(|branch| Edge {
+            id: fanout_branches + branch,
+            source: Endpoint {
+                node: blocker + 1 + branch,
+                port: 0,
+            },
+            target: Endpoint {
+                node: blocker + 1 + other_nets + branch,
+                port: 0,
+            },
+            net: 100 + branch,
+            participates_in_ranking: true,
+        }));
+
+        (Graph { nodes, edges }, geometry, ranks)
+    }
+
+    fn add_crossing_repair_fixture(
+        graph: &mut Graph,
+        geometry: &mut Vec<NodeGeometry>,
+        ranks: &mut Vec<usize>,
+    ) {
+        const SIDE: u32 = 70;
+        let first = graph.nodes.len() as u32;
+        graph.nodes.extend((0..SIDE * 2).map(|offset| Node {
+            id: first + offset,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: if offset < SIDE {
+                    PortSide::East
+                } else {
+                    PortSide::West
+                },
+                offset: 5.0,
+            }],
+        }));
+        geometry.extend((0..SIDE * 2).map(|offset| NodeGeometry {
+            id: first + offset,
+            x: if offset < SIDE { -400.0 } else { -200.0 },
+            y: f64::from(offset % SIDE) * 30.0,
+            width: 10.0,
+            height: 10.0,
+        }));
+        ranks.extend((0..SIDE * 2).map(|offset| usize::from(offset >= SIDE)));
+        let first_edge = graph.edges.len() as u32;
+        graph.edges.extend((0..SIDE).map(|offset| Edge {
+            id: first_edge + offset,
+            source: Endpoint {
+                node: first + offset,
+                port: 0,
+            },
+            target: Endpoint {
+                node: first + SIDE * 2 - 1 - offset,
+                port: 0,
+            },
+            net: 20_000 + offset,
+            participates_in_ranking: true,
+        }));
+    }
+
+    fn add_feedback_fixture(
+        graph: &mut Graph,
+        geometry: &mut Vec<NodeGeometry>,
+        ranks: &mut Vec<usize>,
+    ) {
+        let first = graph.nodes.len() as u32;
+        let node = |id, cycle_breaker, source| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker,
+            ports: if source {
+                vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    },
+                ]
+            } else {
+                vec![Port {
+                    id: 0,
+                    side: if id == first {
+                        PortSide::East
+                    } else {
+                        PortSide::West
+                    },
+                    offset: 10.0,
+                }]
+            },
+        };
+        graph.nodes.extend([
+            node(first, false, false),
+            node(first + 1, false, true),
+            node(first + 2, false, true),
+            node(first + 3, true, false),
+            node(first + 4, true, false),
+            node(first + 5, true, false),
+            node(first + 6, true, false),
+        ]);
+        for (offset, (x, y)) in [
+            (-800.0, 4_500.0),
+            (-700.0, 0.0),
+            (-700.0, 3_000.0),
+            (-800.0, 0.0),
+            (-800.0, 9_000.0),
+            (-800.0, 1_500.0),
+            (-800.0, 7_500.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            geometry.push(NodeGeometry {
+                id: first + offset as u32,
+                x,
+                y,
+                width: 20.0,
+                height: 20.0,
+            });
+        }
+        ranks.extend([0, 1, 1, 0, 0, 0, 0]);
+        let edge = graph.edges.len() as u32;
+        graph.edges.extend([
+            Edge {
+                id: edge,
+                source: Endpoint {
+                    node: first,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: first + 1,
+                    port: 0,
+                },
+                net: 30_100,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 1,
+                source: Endpoint {
+                    node: first,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: first + 2,
+                    port: 0,
+                },
+                net: 30_101,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 2,
+                source: Endpoint {
+                    node: first + 1,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: first + 3,
+                    port: 0,
+                },
+                net: 30_007,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 3,
+                source: Endpoint {
+                    node: first + 1,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: first + 4,
+                    port: 0,
+                },
+                net: 30_007,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 4,
+                source: Endpoint {
+                    node: first + 2,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: first + 5,
+                    port: 0,
+                },
+                net: 30_008,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 5,
+                source: Endpoint {
+                    node: first + 2,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: first + 6,
+                    port: 0,
+                },
+                net: 30_008,
+                participates_in_ranking: true,
+            },
+        ]);
+    }
+
+    fn pad_fixture_to_node_count(
+        graph: &mut Graph,
+        geometry: &mut Vec<NodeGeometry>,
+        ranks: &mut Vec<usize>,
+        node_count: usize,
+    ) {
+        while graph.nodes.len() < node_count {
+            let id = graph.nodes.len() as u32;
+            graph.nodes.push(Node {
+                id,
+                width: 20.0,
+                height: 20.0,
+                cycle_breaker: false,
+                ports: Vec::new(),
+            });
+            geometry.push(NodeGeometry {
+                id,
+                x: 400.0,
+                y: f64::from(id % 20) * 30.0,
+                width: 20.0,
+                height: 20.0,
+            });
+            ranks.push(3);
+        }
+    }
+
+    #[test]
+    fn fanout_channel_candidate_counts_only_outer_branches_and_is_total() {
+        let (graph, _, ranks) = fanout_candidate_fixture(512, 1);
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let outer_nets = BTreeSet::from([1, 100, 999]);
+
+        assert!(
+            fanout_outer_channel_lane_indices(&plan, &vec![Some((0, 2)); 513], &outer_nets)
+                .is_none()
+        );
+        let mut mixed_spans = vec![Some((0, 2)); 513];
+        mixed_spans[..511].fill(None);
+        assert!(
+            fanout_outer_channel_lane_indices(&plan, &mixed_spans, &outer_nets).is_none(),
+            "electrical fanout does not substitute for the actual outer-branch threshold"
+        );
+        mixed_spans[511] = None;
+        let lanes = fanout_outer_channel_lane_indices(&plan, &mixed_spans, &outer_nets)
+            .expect("enough actual outer branches activate the candidate");
+        assert_eq!(lanes, BTreeMap::from([(100, 0), (999, 1), (1, 2)]));
+    }
+
+    #[test]
+    fn production_fanout_candidate_is_exactly_scored_and_deterministic() {
+        let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
+        add_crossing_repair_fixture(&mut graph, &mut geometry, &mut ranks);
+        add_feedback_fixture(&mut graph, &mut geometry, &mut ranks);
+        pad_fixture_to_node_count(
+            &mut graph,
+            &mut geometry,
+            &mut ranks,
+            super::MIN_FANOUT_AWARE_NODES,
+        );
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+
+        assert!(routed.fanout_trace.evaluated);
+        assert!(routed.fanout_trace.selected);
+        assert!(routed.feedback_trace.selected);
+        let baseline = routed.fanout_trace.baseline_quality.unwrap();
+        let candidate = routed.fanout_trace.candidate_quality.unwrap();
+        assert!(candidate.crossings < baseline.crossings);
+        assert!(route_quality_cmp(candidate, baseline).is_lt());
+        let selected = routed.primary_quality.unwrap();
+        assert!(!route_quality_cmp(selected, candidate).is_gt());
+        assert_eq!(route_quality(&indexed, &routed.primary), selected);
+        let adaptive_repair = routed
+            .repair
+            .as_ref()
+            .expect("fixture must cover the selected adaptive repair path");
+        assert_eq!(
+            route_quality(&indexed, &adaptive_repair.1),
+            adaptive_repair.0
+        );
+        let stable = route_edges_with_lane_rounds(
+            &plan,
+            &geometry,
+            LayoutOptions::default(),
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            true,
+            false,
+        );
+        assert!(stable.feedback_trace.selected);
+        assert!(
+            stable.repair.is_some(),
+            "fixture must cover the repair family"
+        );
+        let mut stable_family = vec![(stable.primary_quality.unwrap(), stable.primary)];
+        if let Some(repair) = stable.repair {
+            stable_family.push(repair);
+        }
+        assert_eq!(routed.alternatives, stable_family);
+
+        let mut permuted = graph.clone();
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        let indexed = validate_and_index(&permuted, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let permuted = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        assert!(permuted.fanout_trace.selected);
+        assert_eq!(permuted.primary_quality, routed.primary_quality);
+        assert_eq!(permuted.primary, routed.primary);
+        assert_eq!(permuted.repair, routed.repair);
+        assert_eq!(permuted.alternatives, routed.alternatives);
+    }
+
+    #[test]
+    fn production_fanout_candidate_retains_exact_baseline_when_not_better() {
+        let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
+        pad_fixture_to_node_count(
+            &mut graph,
+            &mut geometry,
+            &mut ranks,
+            super::MIN_FANOUT_AWARE_NODES,
+        );
+        for edge in graph.edges.iter_mut().take(512) {
+            edge.net = 1_000;
+        }
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        let stable = route_edges_with_lane_rounds(
+            &plan,
+            &geometry,
+            LayoutOptions::default(),
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            true,
+            false,
+        );
+
+        assert!(routed.fanout_trace.evaluated);
+        assert!(!routed.fanout_trace.selected);
+        assert!(
+            !route_quality_cmp(
+                routed.fanout_trace.candidate_quality.unwrap(),
+                routed.fanout_trace.baseline_quality.unwrap(),
+            )
+            .is_lt()
+        );
+        assert_eq!(routed.primary, stable.primary);
+        assert_eq!(routed.primary_quality, stable.primary_quality);
+    }
+
+    #[test]
+    fn production_fanout_candidate_preserves_subthreshold_routes() {
+        let (graph, geometry, ranks) = fanout_candidate_fixture(15, 16);
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let supplemental =
+            route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        let stable = route_edges_with_lane_rounds(
+            &plan,
+            &geometry,
+            LayoutOptions::default(),
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            true,
+            false,
+        );
+
+        assert!(!supplemental.fanout_trace.evaluated);
+        assert!(!supplemental.fanout_trace.selected);
+        assert_eq!(supplemental.primary, stable.primary);
+    }
+
+    #[test]
+    fn production_fanout_candidate_preserves_routes_below_node_threshold() {
+        let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
+        pad_fixture_to_node_count(
+            &mut graph,
+            &mut geometry,
+            &mut ranks,
+            super::MIN_FANOUT_AWARE_NODES - 1,
+        );
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let supplemental =
+            route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        let stable = route_edges_with_lane_rounds(
+            &plan,
+            &geometry,
+            LayoutOptions::default(),
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            true,
+            false,
+        );
+
+        assert_eq!(graph.nodes.len(), super::MIN_FANOUT_AWARE_NODES - 1);
+        assert!(!supplemental.fanout_trace.evaluated);
+        assert_eq!(supplemental.primary, stable.primary);
+        assert_eq!(supplemental.primary_quality, stable.primary_quality);
+        assert_eq!(supplemental.repair, stable.repair);
+    }
+
     #[test]
     fn gap_lane_transpose_can_move_a_net_across_more_than_sixteen_lanes() {
         let current = (0..18).map(|net| (net, net as usize)).collect();
@@ -2672,12 +3652,13 @@ mod tests {
         ];
 
         let plan = RoutingPlan::new(&indexed, &[0, 1, 1]);
+        let channels = lane_indices(&BTreeSet::from([7]));
         let lanes = outer_lane_assignments(
             &plan,
             &geometry,
             &[0, 1, 1],
             &[None, None],
-            &BTreeSet::from([7]),
+            &channels,
             &[0.0, 100.0],
             &[20.0, 120.0],
             0.0,
@@ -2754,12 +3735,13 @@ mod tests {
         ];
 
         let plan = RoutingPlan::new(&indexed, &[0, 1, 1]);
+        let channels = lane_indices(&BTreeSet::from([7]));
         let split_lanes = outer_lane_assignments(
             &plan,
             &geometry,
             &[0, 1, 1],
             &[None, None],
-            &BTreeSet::from([7]),
+            &channels,
             &[0.0, 100.0],
             &[20.0, 120.0],
             0.0,
@@ -2774,7 +3756,7 @@ mod tests {
             &geometry,
             &[0, 1, 1],
             &[None, None],
-            &BTreeSet::from([7]),
+            &channels,
             &[0.0, 100.0],
             &[20.0, 120.0],
             0.0,

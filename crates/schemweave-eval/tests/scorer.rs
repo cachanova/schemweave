@@ -4,6 +4,13 @@ use schemweave::{
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
+mod active_fanout_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../schemweave/tests/support/active_fanout.rs"
+    ));
+}
+
 fn graph() -> Graph {
     Graph {
         nodes: vec![
@@ -72,6 +79,21 @@ fn accepts_the_current_exact_port_baseline() {
     );
     assert!(report.segments > 0);
     assert!(report.route_length > 0.0);
+}
+
+#[test]
+fn fanout_candidate_layout_preserves_all_hard_gates() {
+    let graph = active_fanout_fixture::graph();
+    let options = LayoutOptions {
+        ordering_sweeps: 0,
+        ..LayoutOptions::default()
+    };
+    let layout = layout(&graph, options).unwrap();
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert!(report.passes_hard_gates(), "{report:#?}");
+    assert_eq!(report.semantic_violations, 0);
+    assert_eq!(report.ranking_direction_violations, 0);
 }
 
 #[test]
