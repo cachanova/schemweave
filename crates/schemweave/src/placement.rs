@@ -334,7 +334,31 @@ fn isotonic_projection(targets: &[f64], weights: &[f64]) -> Vec<f64> {
     projected
 }
 
+#[allow(dead_code)]
 pub(crate) fn normalize(nodes: &mut [NodeGeometry], edges: &mut [EdgeGeometry]) -> Layout {
+    let (width, height) = normalize_in_place(nodes, edges);
+    Layout {
+        nodes: nodes.to_vec(),
+        edges: edges.to_vec(),
+        width,
+        height,
+    }
+}
+
+pub(crate) fn normalize_owned(
+    mut nodes: Vec<NodeGeometry>,
+    mut edges: Vec<EdgeGeometry>,
+) -> Layout {
+    let (width, height) = normalize_in_place(&mut nodes, &mut edges);
+    Layout {
+        nodes,
+        edges,
+        width,
+        height,
+    }
+}
+
+fn normalize_in_place(nodes: &mut [NodeGeometry], edges: &mut [EdgeGeometry]) -> (f64, f64) {
     let mut min_x = nodes.iter().map(|node| node.x).fold(0.0, f64::min);
     let mut min_y = nodes.iter().map(|node| node.y).fold(0.0, f64::min);
     for point in edges.iter().flat_map(|edge| &edge.points) {
@@ -369,12 +393,7 @@ pub(crate) fn normalize(nodes: &mut [NodeGeometry], edges: &mut [EdgeGeometry]) 
                 .flat_map(|edge| edge.points.iter().map(|point| point.y)),
         )
         .fold(0.0, f64::max);
-    Layout {
-        nodes: nodes.to_vec(),
-        edges: edges.to_vec(),
-        width,
-        height,
-    }
+    (width, height)
 }
 
 /// Place nodes without routing edges for consumers that provide a custom routing stage.
@@ -391,13 +410,36 @@ pub fn place(
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, align_layer, isotonic_projection, preferred_alignment_can_be_significant,
-        preferred_alignment_is_significant, preferred_edges,
+        Alignment, align_layer, isotonic_projection, normalize, normalize_owned,
+        preferred_alignment_can_be_significant, preferred_alignment_is_significant,
+        preferred_edges,
     };
     use crate::{
-        Edge, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Port, PortSide, place,
-        topology::assign_ranks, validation::validate_and_index,
+        Edge, EdgeGeometry, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Point, Port,
+        PortSide, place, topology::assign_ranks, validation::validate_and_index,
     };
+
+    #[test]
+    fn owned_normalization_matches_the_borrowed_api_exactly() {
+        let nodes = vec![NodeGeometry {
+            id: 7,
+            x: -4.0,
+            y: 3.0,
+            width: 20.0,
+            height: 10.0,
+        }];
+        let edges = vec![EdgeGeometry {
+            id: 11,
+            points: vec![Point { x: -8.0, y: -6.0 }, Point { x: 5.0, y: -6.0 }],
+        }];
+        let mut borrowed_nodes = nodes.clone();
+        let mut borrowed_edges = edges.clone();
+
+        assert_eq!(
+            normalize_owned(nodes, edges),
+            normalize(&mut borrowed_nodes, &mut borrowed_edges)
+        );
+    }
 
     #[test]
     fn preferred_alignment_gate_requires_absolute_and_relative_value() {

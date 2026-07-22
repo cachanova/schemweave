@@ -194,12 +194,11 @@ pub fn layout_with_quality_effort(
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    let mut retain = |mut nodes: Vec<NodeGeometry>,
-                      mut edges: Vec<EdgeGeometry>,
+    let mut retain = |nodes: Vec<NodeGeometry>,
+                      edges: Vec<EdgeGeometry>,
                       quality: Option<routing::RouteQuality>| {
         let quality = quality.unwrap_or_else(|| routing::route_quality(&indexed, &edges));
-        let candidate = placement::normalize(&mut nodes, &mut edges);
-        retain_better_candidate(&mut best, quality, candidate);
+        retain_owned_candidate(&mut best, quality, nodes, edges);
     };
     let mut evaluate = |nodes: Vec<NodeGeometry>,
                         supplemental: bool,
@@ -289,16 +288,15 @@ pub fn layout_with_quality_effort(
             && baseline_order_crossings - alternative_crossings
                 >= baseline_order_crossings.div_ceil(100)
         {
-            let mut nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
+            let nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
             let alternative_plan = routing::RoutingPlan::new(&indexed, &alternative_ranks);
             let routed =
                 routing::route_planned_candidates(&alternative_plan, &nodes, options, false);
-            let mut edges = routed.primary;
+            let edges = routed.primary;
             let quality = routed
                 .primary_quality
                 .expect("planned candidates include exact primary quality");
-            let candidate = placement::normalize(&mut nodes, &mut edges);
-            retain_better_candidate(&mut best, quality, candidate);
+            retain_owned_candidate(&mut best, quality, nodes, edges);
         }
     }
     Ok(best.expect("layout has deterministic candidates").1)
@@ -330,28 +328,49 @@ fn retain_better_candidate(
     }
 }
 
+fn retain_owned_candidate(
+    best: &mut Option<(routing::RouteQuality, Layout)>,
+    quality: routing::RouteQuality,
+    nodes: Vec<NodeGeometry>,
+    edges: Vec<EdgeGeometry>,
+) {
+    if best
+        .as_ref()
+        .is_some_and(|(current_quality, _)| route_quality_cmp(quality, *current_quality).is_gt())
+    {
+        return;
+    }
+    retain_better_candidate(best, quality, placement::normalize_owned(nodes, edges));
+}
+
+fn route_quality_cmp(
+    left: routing::RouteQuality,
+    right: routing::RouteQuality,
+) -> std::cmp::Ordering {
+    left.crossings
+        .cmp(&right.crossings)
+        .then(left.bends.cmp(&right.bends))
+        .then(left.route_length.total_cmp(&right.route_length))
+}
+
 fn candidate_quality_cmp(
     left: routing::RouteQuality,
     left_layout: &Layout,
     right: routing::RouteQuality,
     right_layout: &Layout,
 ) -> std::cmp::Ordering {
-    left.crossings
-        .cmp(&right.crossings)
-        .then(left.bends.cmp(&right.bends))
-        .then(left.route_length.total_cmp(&right.route_length))
-        .then(
-            (left_layout.width * left_layout.height)
-                .total_cmp(&(right_layout.width * right_layout.height)),
-        )
+    route_quality_cmp(left, right).then(
+        (left_layout.width * left_layout.height)
+            .total_cmp(&(right_layout.width * right_layout.height)),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Edge, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Port, PortSide,
-        QualityEffort, candidate_quality_cmp, layout, placement, retain_better_candidate, routing,
-        routing::RouteQuality, topology, validation,
+        QualityEffort, candidate_quality_cmp, layout, placement, retain_better_candidate,
+        retain_owned_candidate, routing, routing::RouteQuality, topology, validation,
     };
 
     mod active_fanout_fixture {
@@ -382,6 +401,67 @@ mod tests {
                 height: 1.0,
             },
         )
+    }
+
+    fn browser_max_effort_graph() -> Graph {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..600)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 25.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 25.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut state = 10;
+        let mut endpoints = Vec::new();
+        for layer in 0..3u32 {
+            let source_start = layer * 50;
+            let target_start = (layer + 1) * 50;
+            for source in source_start..source_start + 50 {
+                for target in target_start..target_start + 50 {
+                    if next(&mut state) % 100 < 16 {
+                        endpoints.push((source, target, source));
+                    }
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target, net))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect();
+        Graph { nodes, edges }
     }
 
     #[test]
@@ -1064,6 +1144,42 @@ mod tests {
     }
 
     #[test]
+    fn owned_candidate_selection_keeps_the_exact_quality_and_area_ordering() {
+        let baseline = candidate(1, 3, 20.0, 100.0);
+        let mut best = Some(baseline.clone());
+        retain_owned_candidate(
+            &mut best,
+            candidate(2, 0, 1.0, 1.0).0,
+            vec![NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(best, Some(baseline.clone()));
+
+        retain_owned_candidate(
+            &mut best,
+            baseline.0,
+            vec![NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 5.0,
+                height: 4.0,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            best.as_ref().unwrap().1.width * best.as_ref().unwrap().1.height,
+            20.0
+        );
+    }
+
+    #[test]
     fn selects_a_distinct_net_representative_candidate_deterministically() {
         let graph = net_representative_graph();
         let options = LayoutOptions::default();
@@ -1162,6 +1278,57 @@ mod tests {
             super::layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
             quality
         );
+        assert_eq!(
+            super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
+            max
+        );
+    }
+
+    #[test]
+    fn max_preserves_the_browser_corpus_refined_fallback() {
+        let graph = browser_max_effort_graph();
+        let options = LayoutOptions::default();
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let (ranks, _) = topology::rank_candidates(&indexed);
+        let (_, _, representative) =
+            topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
+        let nodes = placement::place_nodes(
+            &indexed,
+            &ranks,
+            &representative
+                .expect("browser fixture has a representative candidate")
+                .layers,
+            options,
+        );
+        let plan = routing::RoutingPlan::new(&indexed, &ranks);
+        let routed = routing::route_planned_candidates_with_refined_sparse_global(
+            &plan, &nodes, options, false, true, true, true,
+        );
+        assert_eq!(routed.primary_quality.unwrap().crossings, 22_065);
+        assert_eq!(
+            routed
+                .alternatives
+                .iter()
+                .map(|item| item.0.crossings)
+                .collect::<Vec<_>>(),
+            [22_315, 21_959, 22_044]
+        );
+        let quality =
+            super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+        let max = super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+
+        assert_eq!(
+            routing::route_quality(&indexed, &quality.edges).crossings,
+            22_065
+        );
+        assert_eq!(
+            routing::route_quality(&indexed, &max.edges).crossings,
+            21_959
+        );
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
         assert_eq!(
             super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
             max

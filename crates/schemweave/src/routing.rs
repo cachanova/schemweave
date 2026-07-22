@@ -24,10 +24,12 @@ const SUPPLEMENTAL_GAP_LANE_ROUNDS: usize = 32;
 const MAX_GLOBAL_GAP_LANES: usize = 32;
 const MAX_LARGE_GLOBAL_GAP_LANES: usize = 705;
 const MAX_LARGE_GLOBAL_GAP_HOT_NETS: usize = 32;
-// Keep the production one-pass candidate as an exact fallback, then admit one deeper family.
-// The public comparator exact-scores both, so proxy improvement cannot regress canonical quality.
-const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS: usize = 64;
-const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS: usize = 2;
+// Preserve the first Max family exactly, then admit one deeper family. The public comparator
+// exact-scores every complete route set, so proxy improvement cannot regress canonical quality.
+const MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_NETS: usize = 64;
+const MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS: usize = 2;
+const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS: usize = 256;
+const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS: usize = 5;
 const MIN_GLOBAL_GAP_ORDER_GAIN: usize = 256;
 // Aggregate caps bound the pair table and vertical-access comparisons across every eligible gap;
 // both measured 2,000-node winners remain below these limits.
@@ -36,10 +38,11 @@ const MAX_GLOBAL_GAP_ACCESS_WORK: usize = 500_000;
 const MAX_LARGE_GLOBAL_GAP_PAIRS: usize = 262_144;
 const MAX_LARGE_GLOBAL_GAP_ACCESS_WORK: usize = 2_000_000;
 // Admit exactly two maximum-size refined gaps after charging directional precompute plus every
-// linear locate/remove/gather/fold/walk/insert pass in both rounds.
+// linear locate/remove/gather/fold/walk/insert pass in every configured round.
 const MAX_REFINED_LARGE_GLOBAL_GAP_LANE_WORK: usize = MAX_LARGE_GLOBAL_GAP_LANES
-    * MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS
-    * (2 + MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS * 6)
+    * (MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS * (2 + MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS * 6)
+        + MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_NETS * 6
+        + 2)
     * 2;
 const MIN_CROSSING_REPAIR_TOTAL: usize = 500;
 const MIN_CROSSING_REPAIR_NET: usize = 64;
@@ -110,6 +113,7 @@ struct RoutedLaneState {
     routes: Vec<EdgeGeometry>,
     gap_lanes: Vec<BTreeMap<u32, usize>>,
     global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
+    preserved_refined_global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
     refined_global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
     crossing_paths: Vec<Option<Vec<f64>>>,
 }
@@ -536,6 +540,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         mut routes,
         gap_lanes,
         global_gap_lanes,
+        preserved_refined_global_gap_lanes,
         refined_global_gap_lanes,
         crossing_paths,
     } = emit_routes_with_outer_lanes(
@@ -633,6 +638,8 @@ fn route_edges_with_lane_rounds_and_refined_global(
         Some((candidate_quality, candidate_routes))
     };
     let sparse_alternative = global_gap_lanes.and_then(&build_sparse_alternative);
+    let preserved_refined_sparse_alternative =
+        preserved_refined_global_gap_lanes.and_then(&build_sparse_alternative);
     let refined_sparse_alternative = refined_global_gap_lanes.and_then(build_sparse_alternative);
     let fanout_within_budget = fanout_candidates
         && repair_crossings
@@ -666,6 +673,9 @@ fn route_edges_with_lane_rounds_and_refined_global(
             routes,
             sparse_alternative,
         );
+        routed
+            .alternatives
+            .extend(preserved_refined_sparse_alternative);
         routed.alternatives.extend(refined_sparse_alternative);
         return routed;
     }
@@ -785,6 +795,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         repair: repair.as_mut().and_then(|repair| repair.candidate.take()),
         alternatives: sparse_alternative
             .into_iter()
+            .chain(preserved_refined_sparse_alternative)
             .chain(refined_sparse_alternative)
             .collect(),
         #[cfg(test)]
@@ -1238,6 +1249,7 @@ fn emit_routes_with_outer_lanes(
     let GapLaneCandidates {
         baseline: gap_lanes,
         global: global_gap_lanes,
+        preserved_refined: preserved_refined_global_gap_lanes,
         refined: refined_global_gap_lanes,
     } = crossing_aware_gap_lanes(
         plan,
@@ -1281,6 +1293,7 @@ fn emit_routes_with_outer_lanes(
         routes,
         gap_lanes,
         global_gap_lanes,
+        preserved_refined_global_gap_lanes,
         refined_global_gap_lanes,
         crossing_paths,
     }
@@ -2059,6 +2072,97 @@ fn route_quality_cmp(left: RouteQuality, right: RouteQuality) -> Ordering {
 }
 
 fn physical_route_segments<'a>(
+    edges: impl Iterator<Item = &'a Edge>,
+    routes: &[EdgeGeometry],
+) -> (Vec<PhysicalSegment>, usize, f64) {
+    struct RawSegment {
+        net: u32,
+        source: Endpoint,
+        target: Endpoint,
+        horizontal: bool,
+        fixed: f64,
+        start: f64,
+        end: f64,
+        edge: EdgeId,
+    }
+
+    let mut segments = Vec::<RawSegment>::new();
+    let mut bends = Vec::new();
+    for (edge, route) in edges.zip(routes) {
+        for points in route.points.windows(3) {
+            let first_horizontal = points[0].y == points[1].y;
+            let second_horizontal = points[1].y == points[2].y;
+            if first_horizontal != second_horizontal {
+                bends.push((edge.net, FloatKey(points[1].x), FloatKey(points[1].y)));
+            }
+        }
+        for points in route.points.windows(2) {
+            let horizontal = points[0].y == points[1].y;
+            let fixed = if horizontal { points[0].y } else { points[0].x };
+            let (first, second) = if horizontal {
+                (points[0].x, points[1].x)
+            } else {
+                (points[0].y, points[1].y)
+            };
+            let start = first.min(second);
+            let end = first.max(second);
+            if start == end {
+                continue;
+            }
+            segments.push(RawSegment {
+                net: edge.net,
+                source: edge.source,
+                target: edge.target,
+                horizontal,
+                fixed,
+                start,
+                end,
+                edge: edge.id,
+            });
+        }
+    }
+
+    bends.sort_unstable();
+    bends.dedup();
+    segments.sort_unstable_by(|left, right| {
+        left.net
+            .cmp(&right.net)
+            .then(left.horizontal.cmp(&right.horizontal))
+            .then(left.fixed.total_cmp(&right.fixed))
+            .then(left.start.total_cmp(&right.start))
+            .then(left.end.total_cmp(&right.end))
+            .then(left.edge.cmp(&right.edge))
+    });
+    let mut merged = Vec::<PhysicalSegment>::new();
+    for segment in segments {
+        if let Some(prior) = merged.last_mut()
+            && prior.net == segment.net
+            && prior.horizontal == segment.horizontal
+            && prior.fixed == segment.fixed
+            && segment.start <= prior.end
+        {
+            prior.end = prior.end.max(segment.end);
+        } else {
+            merged.push(PhysicalSegment {
+                net: segment.net,
+                source: segment.source,
+                target: segment.target,
+                horizontal: segment.horizontal,
+                fixed: segment.fixed,
+                start: segment.start,
+                end: segment.end,
+            });
+        }
+    }
+    let route_length = merged
+        .iter()
+        .map(|segment| segment.end - segment.start)
+        .sum();
+    (merged, bends.len(), route_length)
+}
+
+#[cfg(test)]
+fn physical_route_segments_btree_reference<'a>(
     edges: impl Iterator<Item = &'a Edge>,
     routes: &[EdgeGeometry],
 ) -> (Vec<PhysicalSegment>, usize, f64) {
@@ -3062,12 +3166,18 @@ struct GapNetAccess {
 struct GapLaneCandidates {
     baseline: Vec<BTreeMap<u32, usize>>,
     global: Option<Vec<BTreeMap<u32, usize>>>,
+    preserved_refined: Option<Vec<BTreeMap<u32, usize>>>,
     refined: Option<Vec<BTreeMap<u32, usize>>>,
 }
 
 type GapPairCosts = BTreeMap<(u32, u32), usize>;
 type GapLaneOrder = (BTreeMap<u32, usize>, usize);
-type GapLaneOrderCandidates = (Option<GapLaneOrder>, Option<GapLaneOrder>);
+
+struct GapLaneOrderCandidates {
+    global: Option<GapLaneOrder>,
+    preserved_refined: Option<GapLaneOrder>,
+    refined: Option<GapLaneOrder>,
+}
 
 #[allow(clippy::too_many_arguments)]
 fn crossing_aware_gap_lanes(
@@ -3131,17 +3241,28 @@ fn crossing_aware_gap_lanes(
         && refined_large_global_candidates
         && refined_large_gap_candidate_work_within_budget(current_lanes, &accesses);
     let mut refined = refined_candidates.then(|| Vec::with_capacity(current_lanes.len()));
+    let mut preserved_refined = refined_candidates.then(|| Vec::with_capacity(current_lanes.len()));
     let mut changed = false;
+    let mut preserved_refined_changed = false;
     let mut refined_changed = false;
     let mut total_gain = 0usize;
+    let mut preserved_refined_total_gain = 0usize;
     let mut refined_total_gain = 0usize;
     for (lanes, access) in current_lanes.iter().zip(&accesses) {
         let local = crossing_aware_gap_lane_indices_with_rounds(lanes, access, lane_rounds);
         let fused_large_gap = refined.is_some() && lanes.len() > MAX_GLOBAL_GAP_LANES;
-        let (mut fused_global, mut fused_refined) = if fused_large_gap {
+        let GapLaneOrderCandidates {
+            global: mut fused_global,
+            preserved_refined: mut fused_preserved_refined,
+            refined: mut fused_refined,
+        } = if fused_large_gap {
             refined_large_gap_hot_insertion_orders(access, &local)
         } else {
-            (None, None)
+            GapLaneOrderCandidates {
+                global: None,
+                preserved_refined: None,
+                refined: None,
+            }
         };
         let mut global_lane = local.clone();
         if let Some(global) = &mut global {
@@ -3163,27 +3284,48 @@ fn crossing_aware_gap_lanes(
             }
             global.push(global_lane.clone());
         }
+        let mut preserved_refined_lane = global_lane.clone();
+        if let Some(preserved_refined) = &mut preserved_refined {
+            let (candidate, gain) = if lanes.len() > MAX_GLOBAL_GAP_LANES {
+                fused_preserved_refined
+                    .take()
+                    .unwrap_or_else(|| (local.clone(), 0))
+            } else {
+                (global_lane.clone(), 0)
+            };
+            preserved_refined_changed |= candidate != global_lane;
+            preserved_refined_total_gain = preserved_refined_total_gain.saturating_add(gain);
+            preserved_refined_lane = candidate;
+            preserved_refined.push(preserved_refined_lane.clone());
+        }
         if let Some(refined) = &mut refined {
             let (refined_lane, gain) = if lanes.len() > MAX_GLOBAL_GAP_LANES {
                 fused_refined.take().unwrap_or_else(|| (local.clone(), 0))
             } else {
-                (global_lane.clone(), 0)
+                (preserved_refined_lane.clone(), 0)
             };
-            refined_changed |= refined_lane != global_lane;
+            refined_changed |= refined_lane != preserved_refined_lane;
             refined_total_gain = refined_total_gain.saturating_add(gain);
             refined.push(refined_lane);
         }
         baseline.push(local);
     }
     let global = global.filter(|_| changed && total_gain >= MIN_GLOBAL_GAP_ORDER_GAIN);
+    let preserved_refined = preserved_refined.filter(|candidate| {
+        preserved_refined_changed
+            && preserved_refined_total_gain >= MIN_GLOBAL_GAP_ORDER_GAIN
+            && global.as_ref() != Some(candidate)
+    });
     let refined = refined.filter(|candidate| {
         refined_changed
             && refined_total_gain >= MIN_GLOBAL_GAP_ORDER_GAIN
             && global.as_ref() != Some(candidate)
+            && preserved_refined.as_ref() != Some(candidate)
     });
     GapLaneCandidates {
         baseline,
         global,
+        preserved_refined,
         refined,
     }
 }
@@ -3401,21 +3543,98 @@ fn refined_large_gap_hot_insertion_orders(
     accesses: &BTreeMap<u32, GapNetAccess>,
     baseline: &BTreeMap<u32, usize>,
 ) -> GapLaneOrderCandidates {
-    let standard_hot =
-        large_gap_hot_nets_with_limit(accesses, baseline, MAX_LARGE_GLOBAL_GAP_HOT_NETS);
+    if !(MAX_GLOBAL_GAP_LANES + 1..=MAX_LARGE_GLOBAL_GAP_LANES).contains(&baseline.len()) {
+        return GapLaneOrderCandidates {
+            global: None,
+            preserved_refined: None,
+            refined: None,
+        };
+    }
+    let ordered = initial_large_gap_order(baseline);
     let refined_hot =
         large_gap_hot_nets_with_limit(accesses, baseline, MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS);
+    let pair_cost_table = large_gap_pair_cost_table(accesses, &ordered, &refined_hot);
+    let row_width = ordered.len();
+    let mut refined_order = ordered;
+    let mut refined_gain = 0usize;
+    let global_count = MAX_LARGE_GLOBAL_GAP_HOT_NETS.min(refined_hot.len());
+    let preserved_count = MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_NETS.min(refined_hot.len());
+    let mut first_round_changed = run_large_gap_hot_insertion_range(
+        accesses,
+        &mut refined_order,
+        &refined_hot,
+        Some(&pair_cost_table),
+        row_width,
+        0,
+        global_count,
+        &mut refined_gain,
+    );
+    let global = gap_lane_order_candidate(&refined_order, refined_gain);
+    first_round_changed |= run_large_gap_hot_insertion_range(
+        accesses,
+        &mut refined_order,
+        &refined_hot,
+        Some(&pair_cost_table),
+        row_width,
+        global_count,
+        preserved_count,
+        &mut refined_gain,
+    );
+    let mut preserved_order = refined_order.clone();
+    let mut preserved_gain = refined_gain;
+    for _ in 1..MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS {
+        if !run_large_gap_hot_insertion_range(
+            accesses,
+            &mut preserved_order,
+            &refined_hot,
+            Some(&pair_cost_table),
+            row_width,
+            0,
+            preserved_count,
+            &mut preserved_gain,
+        ) {
+            break;
+        }
+    }
+    let preserved_refined = gap_lane_order_candidate(&preserved_order, preserved_gain);
+    first_round_changed |= run_large_gap_hot_insertion_range(
+        accesses,
+        &mut refined_order,
+        &refined_hot,
+        Some(&pair_cost_table),
+        row_width,
+        preserved_count,
+        refined_hot.len(),
+        &mut refined_gain,
+    );
+    if first_round_changed {
+        for _ in 1..MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS {
+            if !run_large_gap_hot_insertion_range(
+                accesses,
+                &mut refined_order,
+                &refined_hot,
+                Some(&pair_cost_table),
+                row_width,
+                0,
+                refined_hot.len(),
+                &mut refined_gain,
+            ) {
+                break;
+            }
+        }
+    }
+    let refined = gap_lane_order_candidate(&refined_order, refined_gain);
+    let standard_hot =
+        large_gap_hot_nets_with_limit(accesses, baseline, MAX_LARGE_GLOBAL_GAP_HOT_NETS);
     debug_assert_eq!(
         standard_hot,
         refined_hot[..MAX_LARGE_GLOBAL_GAP_HOT_NETS.min(refined_hot.len())]
     );
-    large_gap_hot_insertion_orders_with_rounds(
-        accesses,
-        baseline,
-        MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS,
-        MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS,
-        Some(MAX_LARGE_GLOBAL_GAP_HOT_NETS.min(refined_hot.len())),
-    )
+    GapLaneOrderCandidates {
+        global,
+        preserved_refined,
+        refined,
+    }
 }
 
 fn large_gap_hot_insertion_order_with_rounds(
@@ -3433,123 +3652,185 @@ fn large_gap_hot_insertion_orders_with_rounds(
     hot_limit: usize,
     rounds: usize,
     snapshot_hot_limit: Option<usize>,
-) -> GapLaneOrderCandidates {
+) -> (Option<GapLaneOrder>, Option<GapLaneOrder>) {
     if !(MAX_GLOBAL_GAP_LANES + 1..=MAX_LARGE_GLOBAL_GAP_LANES).contains(&baseline.len()) {
         return (None, None);
     }
+    let ordered = initial_large_gap_order(baseline);
+    let hot = large_gap_hot_nets_with_limit(accesses, baseline, hot_limit);
+    let pair_cost_table = (rounds > 1).then(|| large_gap_pair_cost_table(accesses, &ordered, &hot));
+    let row_width = ordered.len();
+    run_large_gap_hot_insertion_rounds(
+        accesses,
+        ordered,
+        &hot,
+        pair_cost_table.as_deref(),
+        row_width,
+        rounds,
+        snapshot_hot_limit,
+    )
+}
+
+fn initial_large_gap_order(baseline: &BTreeMap<u32, usize>) -> Vec<(u32, usize)> {
     let mut ordered = baseline
         .iter()
         .map(|(&net, &lane)| (lane, net))
         .collect::<Vec<_>>();
     ordered.sort_unstable();
-    let mut ordered = ordered
+    ordered
         .into_iter()
         .enumerate()
         .map(|(original_lane, (_, net))| (net, original_lane))
-        .collect::<Vec<_>>();
-    let hot = large_gap_hot_nets_with_limit(accesses, baseline, hot_limit);
-    // A deeper pass revisits each hot net, so materialize its pair costs once in compact lane
-    // order. Keeping the original lane beside each net makes lookups dense and avoids a tree
-    // lookup for every candidate insertion position.
-    let pair_cost_rows = (rounds > 1).then(|| {
-        hot.iter()
-            .map(|&hot_net| {
-                ordered
-                    .iter()
-                    .map(|&(other, _)| {
-                        (
-                            gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
-                            gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    });
+        .collect()
+}
 
+fn large_gap_pair_cost_table(
+    accesses: &BTreeMap<u32, GapNetAccess>,
+    ordered: &[(u32, usize)],
+    hot: &[u32],
+) -> Vec<(usize, usize)> {
+    hot.iter()
+        .flat_map(|&hot_net| {
+            ordered.iter().map(move |&(other, _)| {
+                (
+                    gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
+                    gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
+                )
+            })
+        })
+        .collect()
+}
+
+fn run_large_gap_hot_insertion_rounds(
+    accesses: &BTreeMap<u32, GapNetAccess>,
+    mut ordered: Vec<(u32, usize)>,
+    hot: &[u32],
+    pair_cost_table: Option<&[(usize, usize)]>,
+    row_width: usize,
+    rounds: usize,
+    snapshot_hot_limit: Option<usize>,
+) -> (Option<GapLaneOrder>, Option<GapLaneOrder>) {
     let mut total_gain = 0usize;
     let mut snapshot = None;
     for round in 0..rounds {
-        let mut changed = false;
-        for (hot_index, &hot_net) in hot.iter().enumerate() {
-            let Some(current_index) = ordered.iter().position(|&(net, _)| net == hot_net) else {
-                continue;
-            };
-            let hot_entry = ordered.remove(current_index);
-            // The one-round production candidate materializes costs without a pair table, as in
-            // PR #42. The deeper candidate reuses its dense row on the second round.
-            let pair_costs = ordered
-                .iter()
-                .map(|&(other, original_lane)| {
-                    pair_cost_rows.as_ref().map_or_else(
-                        || {
-                            (
-                                gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
-                                gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
-                            )
-                        },
-                        |rows| rows[hot_index][original_lane],
-                    )
-                })
-                .collect::<Vec<_>>();
-            let mut insertion_cost = pair_costs
-                .iter()
-                .map(|&(hot_before, _)| hot_before)
-                .fold(0usize, usize::saturating_add);
-            let mut best_index = 0usize;
-            let mut best_cost = insertion_cost;
-            let mut current_cost = if current_index == 0 {
-                insertion_cost
+        let snapshot_index = (round == 0)
+            .then_some(snapshot_hot_limit)
+            .flatten()
+            .unwrap_or(0)
+            .min(hot.len());
+        let mut changed = run_large_gap_hot_insertion_range(
+            accesses,
+            &mut ordered,
+            hot,
+            pair_cost_table,
+            row_width,
+            0,
+            if snapshot_index == 0 {
+                hot.len()
             } else {
-                0
-            };
-            for (index, &(hot_before, other_before)) in pair_costs.iter().enumerate() {
-                insertion_cost = insertion_cost
-                    .saturating_sub(hot_before)
-                    .saturating_add(other_before);
-                if index + 1 == current_index {
-                    current_cost = insertion_cost;
-                }
-                if insertion_cost < best_cost {
-                    best_cost = insertion_cost;
-                    best_index = index + 1;
-                }
-            }
-            if current_cost > best_cost {
-                total_gain = total_gain.saturating_add(current_cost - best_cost);
-                ordered.insert(best_index, hot_entry);
-                changed = true;
-            } else {
-                ordered.insert(current_index, hot_entry);
-            }
-            if round == 0 && snapshot_hot_limit == Some(hot_index + 1) {
-                snapshot = (total_gain > 0).then(|| {
-                    (
-                        ordered
-                            .iter()
-                            .enumerate()
-                            .map(|(lane, &(net, _))| (net, lane))
-                            .collect(),
-                        total_gain,
-                    )
-                });
-            }
+                snapshot_index
+            },
+            &mut total_gain,
+        );
+        if snapshot_index > 0 {
+            snapshot = gap_lane_order_candidate(&ordered, total_gain);
+            changed |= run_large_gap_hot_insertion_range(
+                accesses,
+                &mut ordered,
+                hot,
+                pair_cost_table,
+                row_width,
+                snapshot_index,
+                hot.len(),
+                &mut total_gain,
+            );
         }
         if !changed {
             break;
         }
     }
-    let refined = (total_gain > 0).then(|| {
+    (snapshot, gap_lane_order_candidate(&ordered, total_gain))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_large_gap_hot_insertion_range(
+    accesses: &BTreeMap<u32, GapNetAccess>,
+    ordered: &mut Vec<(u32, usize)>,
+    hot: &[u32],
+    pair_cost_table: Option<&[(usize, usize)]>,
+    row_width: usize,
+    start: usize,
+    end: usize,
+    total_gain: &mut usize,
+) -> bool {
+    let mut changed = false;
+    for hot_index in start..end {
+        let hot_net = hot[hot_index];
+        let Some(current_index) = ordered.iter().position(|&(net, _)| net == hot_net) else {
+            continue;
+        };
+        let hot_entry = ordered.remove(current_index);
+        // The one-round production candidate materializes costs without a pair table, as in
+        // PR #42. The deeper candidate reuses its dense row on the second round.
+        let pair_costs = ordered
+            .iter()
+            .map(|&(other, original_lane)| {
+                pair_cost_table.map_or_else(
+                    || {
+                        (
+                            gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
+                            gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
+                        )
+                    },
+                    |table| table[hot_index * row_width + original_lane],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut insertion_cost = pair_costs
+            .iter()
+            .map(|&(hot_before, _)| hot_before)
+            .fold(0usize, usize::saturating_add);
+        let mut best_index = 0usize;
+        let mut best_cost = insertion_cost;
+        let mut current_cost = if current_index == 0 {
+            insertion_cost
+        } else {
+            0
+        };
+        for (index, &(hot_before, other_before)) in pair_costs.iter().enumerate() {
+            insertion_cost = insertion_cost
+                .saturating_sub(hot_before)
+                .saturating_add(other_before);
+            if index + 1 == current_index {
+                current_cost = insertion_cost;
+            }
+            if insertion_cost < best_cost {
+                best_cost = insertion_cost;
+                best_index = index + 1;
+            }
+        }
+        if current_cost > best_cost {
+            *total_gain = total_gain.saturating_add(current_cost - best_cost);
+            ordered.insert(best_index, hot_entry);
+            changed = true;
+        } else {
+            ordered.insert(current_index, hot_entry);
+        }
+    }
+    changed
+}
+
+fn gap_lane_order_candidate(ordered: &[(u32, usize)], total_gain: usize) -> Option<GapLaneOrder> {
+    (total_gain > 0).then(|| {
         (
             ordered
-                .into_iter()
+                .iter()
                 .enumerate()
-                .map(|(lane, (net, _))| (net, lane))
+                .map(|(lane, &(net, _))| (net, lane))
                 .collect(),
             total_gain,
         )
-    });
-    (snapshot, refined)
+    })
 }
 
 #[cfg(test)]
@@ -4145,7 +4426,8 @@ mod tests {
         lane_indices, large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
         large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
         large_gap_hot_nets, large_gap_hot_nets_with_limit, move_nets_to_outer_lanes,
-        outer_lane_assignments, physical_crossing_sweep, physical_crossing_sweep_lines, port_point,
+        outer_lane_assignments, physical_crossing_sweep, physical_crossing_sweep_lines,
+        physical_route_segments, physical_route_segments_btree_reference, port_point,
         refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
         repair_crossing_heavy_net, route_edges, route_edges_with_lane_rounds,
         route_edges_with_lane_rounds_and_global, route_planned_candidates,
@@ -4957,7 +5239,11 @@ mod tests {
         assert_eq!(super::MAX_LARGE_GLOBAL_GAP_LANES, 705);
         assert_eq!(super::MAX_LARGE_GLOBAL_GAP_PAIRS, 262_144);
         assert_eq!(super::MAX_LARGE_GLOBAL_GAP_ACCESS_WORK, 2_000_000);
-        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_LANE_WORK, 1_263_360);
+        assert_eq!(super::MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_NETS, 64);
+        assert_eq!(super::MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS, 2);
+        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS, 256);
+        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS, 5);
+        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_LANE_WORK, 12_094_980);
         let lanes = |count: u32| {
             (0..count)
                 .enumerate()
@@ -5177,6 +5463,13 @@ mod tests {
             1,
         )
         .unwrap();
+        let preserved_refined = large_gap_hot_insertion_order_with_rounds(
+            &accesses,
+            &current,
+            super::MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_NETS,
+            super::MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS,
+        )
+        .expect("preserved refined search should improve the standard candidate");
         let refined = large_gap_hot_insertion_order_with_rounds(
             &accesses,
             &current,
@@ -5184,12 +5477,31 @@ mod tests {
             super::MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS,
         )
         .expect("expanded hot set should move the remaining hot nets");
-        let (fused_baseline, fused_refined) =
-            refined_large_gap_hot_insertion_orders(&accesses, &current);
-        assert_eq!(fused_baseline, Some((baseline.clone(), baseline_gain)));
-        assert_eq!(fused_refined, Some(refined.clone()));
+        let fused = refined_large_gap_hot_insertion_orders(&accesses, &current);
+        let expected_global = Some((baseline.clone(), baseline_gain));
+        assert_eq!(fused.global, expected_global);
         assert_eq!(
-            fused_refined,
+            fused.global,
+            large_gap_hot_insertion_order_btree_reference(
+                &accesses,
+                &current,
+                super::MAX_LARGE_GLOBAL_GAP_HOT_NETS,
+                1,
+            )
+        );
+        assert_eq!(fused.preserved_refined, Some(preserved_refined.clone()));
+        assert_eq!(
+            fused.preserved_refined,
+            large_gap_hot_insertion_order_btree_reference(
+                &accesses,
+                &current,
+                super::MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_NETS,
+                super::MAX_PRESERVED_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS,
+            )
+        );
+        assert_eq!(fused.refined, Some(refined.clone()));
+        assert_eq!(
+            fused.refined,
             large_gap_hot_insertion_order_btree_reference(
                 &accesses,
                 &current,
@@ -7003,6 +7315,72 @@ mod tests {
             }
         }
         assert_eq!(actual_profiles, expected_profiles);
+    }
+
+    #[test]
+    fn flat_physical_segments_match_btree_reference() {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let mut state = 0x5eed_u64;
+        let mut edges = Vec::new();
+        let mut routes = Vec::new();
+        for id in 0..256u32 {
+            let x0 = (next(&mut state) % 32) as f64;
+            let y0 = (next(&mut state) % 24) as f64;
+            let x1 = (next(&mut state) % 32) as f64;
+            let y1 = (next(&mut state) % 24) as f64;
+            let x2 = (next(&mut state) % 32) as f64;
+            edges.push(Edge {
+                id,
+                source: Endpoint {
+                    node: id * 2,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: id * 2 + 1,
+                    port: 0,
+                },
+                net: (next(&mut state) % 23) as u32,
+                participates_in_ranking: true,
+            });
+            routes.push(EdgeGeometry {
+                id,
+                points: vec![
+                    Point { x: x0, y: y0 },
+                    Point { x: x1, y: y0 },
+                    Point { x: x1, y: y1 },
+                    Point { x: x2, y: y1 },
+                ],
+            });
+        }
+
+        let signature = |segments: &[PhysicalSegment]| {
+            segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.net,
+                        segment.source,
+                        segment.target,
+                        segment.horizontal,
+                        segment.fixed.to_bits(),
+                        segment.start.to_bits(),
+                        segment.end.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let actual = physical_route_segments(edges.iter(), &routes);
+        let expected = physical_route_segments_btree_reference(edges.iter(), &routes);
+
+        assert_eq!(signature(&actual.0), signature(&expected.0));
+        assert_eq!(actual.1, expected.1);
+        assert_eq!(actual.2.to_bits(), expected.2.to_bits());
     }
 
     #[test]
