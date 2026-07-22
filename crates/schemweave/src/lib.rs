@@ -235,10 +235,12 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         {
             let mut nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
             let alternative_plan = routing::RoutingPlan::new(&indexed, &alternative_ranks);
-            let mut edges =
-                routing::route_planned_candidates(&alternative_plan, &nodes, options, false)
-                    .primary;
-            let quality = routing::route_quality(&indexed, &edges);
+            let routed =
+                routing::route_planned_candidates(&alternative_plan, &nodes, options, false);
+            let mut edges = routed.primary;
+            let quality = routed
+                .primary_quality
+                .expect("planned candidates include exact primary quality");
             let candidate = placement::normalize(&mut nodes, &mut edges);
             retain_better_candidate(&mut best, quality, candidate);
         }
