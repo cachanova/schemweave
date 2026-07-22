@@ -1,0 +1,19 @@
+[package]
+name = "schemweave-review-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+schemweave.workspace = true
+schemweave-eval = { path = "../../../crates/schemweave-eval" }
+schemweave-wasm = { path = "../../../crates/schemweave-wasm" }
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true

@@ -75,6 +75,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "schemweave-review-wasm"
+version = "0.1.0"
+dependencies = [
+ "schemweave",
+ "schemweave-eval",
+ "schemweave-wasm",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "schemweave-wasm"
 version = "0.1.0"
 dependencies = [
