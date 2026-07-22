@@ -12,10 +12,11 @@ connected components, assigns left-to-right ranks, applies deterministic
 barycentric ordering over real and net-scoped virtual items, refines adjacent
 crossings, places node layers, and routes ordinary forward nets through sparse
 inter-layer channels and obstacle-free vertical corridors. Unsupported port
-directions, feedback, and very large multi-terminal nets retain a shared outer
-trunk as a correctness backstop. Negotiated congestion and native multi-terminal
-trees will replace that backstop while retaining the public contract and
-topology stages.
+directions, feedback, and very large multi-terminal nets retain globally unique
+channel tracks and may branch onto deterministic top and bottom outer trunks as
+a correctness backstop. Negotiated congestion and native multi-terminal trees
+will replace that backstop while retaining the public contract and topology
+stages.
 
 `schemweave-wasm` exposes the same engine through a JSON function designed
 to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
