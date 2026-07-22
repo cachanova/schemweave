@@ -12,6 +12,10 @@ const MAX_SPARSE_NET_EDGES: usize = 300;
 const CROSSING_TRACK_NUDGE: f64 = 1e-4;
 const CROSSING_ALIGNMENT_WEIGHT: f64 = 4.0;
 const MIN_ROUTE_SEGMENT: f64 = 1e-7;
+const FULL_OUTER_LANE_ROUNDS: usize = 16;
+const FULL_GAP_LANE_ROUNDS: usize = 32;
+const SUPPLEMENTAL_OUTER_LANE_ROUNDS: usize = 4;
+const SUPPLEMENTAL_GAP_LANE_ROUNDS: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RouteQuality {
@@ -53,6 +57,47 @@ pub(crate) fn route_edges(
     nodes: &[NodeGeometry],
     ranks: &[usize],
     options: LayoutOptions,
+) -> Vec<EdgeGeometry> {
+    route_edges_with_lane_rounds(
+        graph,
+        nodes,
+        ranks,
+        options,
+        FULL_OUTER_LANE_ROUNDS,
+        FULL_GAP_LANE_ROUNDS,
+    )
+}
+
+/// Route an optional layout candidate with bounded lane-refinement work.
+///
+/// The same deterministic router and validity-preserving construction are used; only the
+/// adjacent-transposition search for a better lane order stops earlier. The canonical full-effort
+/// candidate remains available to the exact layout comparator.
+pub(crate) fn route_supplemental_edges(
+    graph: &IndexedGraph<'_>,
+    nodes: &[NodeGeometry],
+    ranks: &[usize],
+    options: LayoutOptions,
+) -> Vec<EdgeGeometry> {
+    route_edges_with_lane_rounds(
+        graph,
+        nodes,
+        ranks,
+        options,
+        SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+        SUPPLEMENTAL_GAP_LANE_ROUNDS,
+    )
+}
+
+// Keep one WASM copy of the shared routing loop for full and supplemental effort.
+#[inline(never)]
+fn route_edges_with_lane_rounds(
+    graph: &IndexedGraph<'_>,
+    nodes: &[NodeGeometry],
+    ranks: &[usize],
+    options: LayoutOptions,
+    outer_lane_rounds: usize,
+    gap_lane_rounds: usize,
 ) -> Vec<EdgeGeometry> {
     let top = nodes.iter().map(|node| node.y).fold(0.0, f64::min);
     let bottom = nodes
@@ -176,6 +221,7 @@ pub(crate) fn route_edges(
         top,
         bottom,
         options,
+        outer_lane_rounds,
     );
     let mut endpoint_tracks = build_endpoint_tracks(
         graph,
@@ -208,6 +254,7 @@ pub(crate) fn route_edges(
         &gap_lanes,
         &endpoint_tracks,
         options.port_stub,
+        gap_lane_rounds,
     );
     endpoint_tracks = build_endpoint_tracks(
         graph,
@@ -641,6 +688,7 @@ fn outer_lane_assignments(
     top: f64,
     bottom: f64,
     options: LayoutOptions,
+    lane_rounds: usize,
 ) -> BTreeMap<u32, OuterLane> {
     let mut top_nets = BTreeSet::new();
     let mut bottom_nets = BTreeSet::new();
@@ -729,8 +777,10 @@ fn outer_lane_assignments(
     for access in top_access.values_mut().chain(bottom_access.values_mut()) {
         access.vertical_x.sort_by(f64::total_cmp);
     }
-    let top_lanes = crossing_aware_outer_lane_indices(&top_nets, &top_access);
-    let bottom_lanes = crossing_aware_outer_lane_indices(&bottom_nets, &bottom_access);
+    let top_lanes =
+        crossing_aware_outer_lane_indices_with_rounds(&top_nets, &top_access, lane_rounds);
+    let bottom_lanes =
+        crossing_aware_outer_lane_indices_with_rounds(&bottom_nets, &bottom_access, lane_rounds);
     for (edge, span) in graph.edges.iter().zip(sparse_spans) {
         if span.is_some() {
             continue;
@@ -753,13 +803,22 @@ fn outer_lane_assignments(
     assignments
 }
 
+#[cfg(test)]
 fn crossing_aware_outer_lane_indices(
     nets: &BTreeSet<u32>,
     accesses: &BTreeMap<u32, OuterNetAccess>,
 ) -> BTreeMap<u32, usize> {
+    crossing_aware_outer_lane_indices_with_rounds(nets, accesses, FULL_OUTER_LANE_ROUNDS)
+}
+
+fn crossing_aware_outer_lane_indices_with_rounds(
+    nets: &BTreeSet<u32>,
+    accesses: &BTreeMap<u32, OuterNetAccess>,
+    lane_rounds: usize,
+) -> BTreeMap<u32, usize> {
     let mut ordered: Vec<_> = nets.iter().copied().collect();
     let mut costs = BTreeMap::new();
-    for _ in 0..16 {
+    for _ in 0..lane_rounds {
         let mut changed = false;
         for index in 0..ordered.len().saturating_sub(1) {
             let inner = ordered[index];
@@ -1152,6 +1211,7 @@ fn crossing_aware_gap_lanes(
     current_lanes: &[BTreeMap<u32, usize>],
     endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
     port_stub: f64,
+    lane_rounds: usize,
 ) -> Vec<BTreeMap<u32, usize>> {
     let mut accesses = (0..current_lanes.len())
         .map(|_| BTreeMap::<u32, GapNetAccess>::new())
@@ -1198,19 +1258,30 @@ fn crossing_aware_gap_lanes(
     current_lanes
         .iter()
         .zip(&accesses)
-        .map(|(lanes, access)| crossing_aware_gap_lane_indices(lanes, access))
+        .map(|(lanes, access)| {
+            crossing_aware_gap_lane_indices_with_rounds(lanes, access, lane_rounds)
+        })
         .collect()
 }
 
+#[cfg(test)]
 fn crossing_aware_gap_lane_indices(
     current: &BTreeMap<u32, usize>,
     accesses: &BTreeMap<u32, GapNetAccess>,
+) -> BTreeMap<u32, usize> {
+    crossing_aware_gap_lane_indices_with_rounds(current, accesses, FULL_GAP_LANE_ROUNDS)
+}
+
+fn crossing_aware_gap_lane_indices_with_rounds(
+    current: &BTreeMap<u32, usize>,
+    accesses: &BTreeMap<u32, GapNetAccess>,
+    lane_rounds: usize,
 ) -> BTreeMap<u32, usize> {
     let mut ordered: Vec<_> = current.iter().map(|(&net, &lane)| (lane, net)).collect();
     ordered.sort_unstable();
     let mut ordered: Vec<_> = ordered.into_iter().map(|(_, net)| net).collect();
     let mut costs = BTreeMap::new();
-    for _ in 0..32 {
+    for _ in 0..lane_rounds {
         let mut changed = false;
         for index in 0..ordered.len().saturating_sub(1) {
             let left = ordered[index];
@@ -1606,10 +1677,10 @@ mod tests {
     };
 
     use super::{
-        GapNetAccess, OuterNetAccess, OuterSide, crossing_aware_gap_lane_indices,
-        crossing_aware_outer_lane_indices, crossing_track_y, distance_transform,
-        outer_lane_assignments, route_quality, shortest_crossing_path, sparse_channel_route,
-        vertical_horizontal_crossings,
+        FULL_OUTER_LANE_ROUNDS, GapNetAccess, OuterNetAccess, OuterSide,
+        crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices, crossing_track_y,
+        distance_transform, outer_lane_assignments, route_quality, shortest_crossing_path,
+        sparse_channel_route, vertical_horizontal_crossings,
     };
 
     #[test]
@@ -1775,6 +1846,7 @@ mod tests {
             0.0,
             120.0,
             LayoutOptions::default(),
+            FULL_OUTER_LANE_ROUNDS,
         );
 
         assert_eq!(lanes[&10].side, OuterSide::Top);
