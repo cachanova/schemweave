@@ -2075,6 +2075,97 @@ fn physical_route_segments<'a>(
     edges: impl Iterator<Item = &'a Edge>,
     routes: &[EdgeGeometry],
 ) -> (Vec<PhysicalSegment>, usize, f64) {
+    struct RawSegment {
+        net: u32,
+        source: Endpoint,
+        target: Endpoint,
+        horizontal: bool,
+        fixed: f64,
+        start: f64,
+        end: f64,
+        edge: EdgeId,
+    }
+
+    let mut segments = Vec::<RawSegment>::new();
+    let mut bends = Vec::new();
+    for (edge, route) in edges.zip(routes) {
+        for points in route.points.windows(3) {
+            let first_horizontal = points[0].y == points[1].y;
+            let second_horizontal = points[1].y == points[2].y;
+            if first_horizontal != second_horizontal {
+                bends.push((edge.net, FloatKey(points[1].x), FloatKey(points[1].y)));
+            }
+        }
+        for points in route.points.windows(2) {
+            let horizontal = points[0].y == points[1].y;
+            let fixed = if horizontal { points[0].y } else { points[0].x };
+            let (first, second) = if horizontal {
+                (points[0].x, points[1].x)
+            } else {
+                (points[0].y, points[1].y)
+            };
+            let start = first.min(second);
+            let end = first.max(second);
+            if start == end {
+                continue;
+            }
+            segments.push(RawSegment {
+                net: edge.net,
+                source: edge.source,
+                target: edge.target,
+                horizontal,
+                fixed,
+                start,
+                end,
+                edge: edge.id,
+            });
+        }
+    }
+
+    bends.sort_unstable();
+    bends.dedup();
+    segments.sort_unstable_by(|left, right| {
+        left.net
+            .cmp(&right.net)
+            .then(left.horizontal.cmp(&right.horizontal))
+            .then(left.fixed.total_cmp(&right.fixed))
+            .then(left.start.total_cmp(&right.start))
+            .then(left.end.total_cmp(&right.end))
+            .then(left.edge.cmp(&right.edge))
+    });
+    let mut merged = Vec::<PhysicalSegment>::new();
+    for segment in segments {
+        if let Some(prior) = merged.last_mut()
+            && prior.net == segment.net
+            && prior.horizontal == segment.horizontal
+            && prior.fixed == segment.fixed
+            && segment.start <= prior.end
+        {
+            prior.end = prior.end.max(segment.end);
+        } else {
+            merged.push(PhysicalSegment {
+                net: segment.net,
+                source: segment.source,
+                target: segment.target,
+                horizontal: segment.horizontal,
+                fixed: segment.fixed,
+                start: segment.start,
+                end: segment.end,
+            });
+        }
+    }
+    let route_length = merged
+        .iter()
+        .map(|segment| segment.end - segment.start)
+        .sum();
+    (merged, bends.len(), route_length)
+}
+
+#[cfg(test)]
+fn physical_route_segments_btree_reference<'a>(
+    edges: impl Iterator<Item = &'a Edge>,
+    routes: &[EdgeGeometry],
+) -> (Vec<PhysicalSegment>, usize, f64) {
     let mut groups =
         BTreeMap::<(u32, bool, FloatKey), Vec<(f64, f64, EdgeId, Endpoint, Endpoint)>>::new();
     let mut bends = BTreeSet::new();
@@ -4335,7 +4426,8 @@ mod tests {
         lane_indices, large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
         large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
         large_gap_hot_nets, large_gap_hot_nets_with_limit, move_nets_to_outer_lanes,
-        outer_lane_assignments, physical_crossing_sweep, physical_crossing_sweep_lines, port_point,
+        outer_lane_assignments, physical_crossing_sweep, physical_crossing_sweep_lines,
+        physical_route_segments, physical_route_segments_btree_reference, port_point,
         refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
         repair_crossing_heavy_net, route_edges, route_edges_with_lane_rounds,
         route_edges_with_lane_rounds_and_global, route_planned_candidates,
@@ -7223,6 +7315,72 @@ mod tests {
             }
         }
         assert_eq!(actual_profiles, expected_profiles);
+    }
+
+    #[test]
+    fn flat_physical_segments_match_btree_reference() {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let mut state = 0x5eed_u64;
+        let mut edges = Vec::new();
+        let mut routes = Vec::new();
+        for id in 0..256u32 {
+            let x0 = (next(&mut state) % 32) as f64;
+            let y0 = (next(&mut state) % 24) as f64;
+            let x1 = (next(&mut state) % 32) as f64;
+            let y1 = (next(&mut state) % 24) as f64;
+            let x2 = (next(&mut state) % 32) as f64;
+            edges.push(Edge {
+                id,
+                source: Endpoint {
+                    node: id * 2,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: id * 2 + 1,
+                    port: 0,
+                },
+                net: (next(&mut state) % 23) as u32,
+                participates_in_ranking: true,
+            });
+            routes.push(EdgeGeometry {
+                id,
+                points: vec![
+                    Point { x: x0, y: y0 },
+                    Point { x: x1, y: y0 },
+                    Point { x: x1, y: y1 },
+                    Point { x: x2, y: y1 },
+                ],
+            });
+        }
+
+        let signature = |segments: &[PhysicalSegment]| {
+            segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.net,
+                        segment.source,
+                        segment.target,
+                        segment.horizontal,
+                        segment.fixed.to_bits(),
+                        segment.start.to_bits(),
+                        segment.end.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let actual = physical_route_segments(edges.iter(), &routes);
+        let expected = physical_route_segments_btree_reference(edges.iter(), &routes);
+
+        assert_eq!(signature(&actual.0), signature(&expected.0));
+        assert_eq!(actual.1, expected.1);
+        assert_eq!(actual.2.to_bits(), expected.2.to_bits());
     }
 
     #[test]
