@@ -24,7 +24,7 @@ const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
 const MAX_CROSSING_REPAIR_PATH_STATES: usize = 500_000;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RouteQuality {
     pub(crate) crossings: usize,
     pub(crate) bends: usize,
@@ -35,6 +35,18 @@ pub(crate) struct RoutedEdges {
     pub(crate) primary: Vec<EdgeGeometry>,
     pub(crate) primary_quality: Option<RouteQuality>,
     pub(crate) repair: Option<(RouteQuality, Vec<EdgeGeometry>)>,
+    #[cfg(test)]
+    pub(crate) feedback_trace: FeedbackCandidateTrace,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FeedbackCandidateTrace {
+    pub(crate) split: bool,
+    pub(crate) evaluated: bool,
+    pub(crate) selected: bool,
+    pub(crate) baseline: Option<(RouteQuality, Vec<EdgeGeometry>)>,
+    pub(crate) candidate_quality: Option<RouteQuality>,
 }
 
 struct RoutedLaneState {
@@ -356,9 +368,8 @@ fn route_edges_with_lane_rounds(
         .map(Vec::len)
         .try_fold(0usize, usize::checked_add)
         .unwrap_or(usize::MAX);
-    // Only spend on the alternative when the baseline visibly fragments a feedback net. The
-    // shared optional-candidate budget keeps the extra exact score bounded on large inputs.
-    if has_split_feedback_net(plan, &sparse_spans, &outer_lanes)
+    let split_feedback = has_split_feedback_net(plan, &sparse_spans, &outer_lanes);
+    let feedback_within_budget = split_feedback
         && crossing_repair_within_budget(
             node_count,
             plan.edges.len(),
@@ -366,8 +377,18 @@ fn route_edges_with_lane_rounds(
             &gap_lanes,
             &sparse_spans,
             &free_by_rank,
-        )
-    {
+        );
+    #[cfg(test)]
+    let mut feedback_trace = FeedbackCandidateTrace {
+        split: split_feedback,
+        evaluated: false,
+        selected: false,
+        baseline: None,
+        candidate_quality: None,
+    };
+    // Only spend on the alternative when the baseline visibly fragments a feedback net. The
+    // shared optional-candidate budget keeps the extra exact score bounded on large inputs.
+    if feedback_within_budget {
         let coherent_outer_lanes = outer_lane_assignments(
             plan,
             nodes,
@@ -411,12 +432,22 @@ fn route_edges_with_lane_rounds(
             options,
         );
         let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
+        #[cfg(test)]
+        {
+            feedback_trace.evaluated = true;
+            feedback_trace.baseline = Some((baseline_quality, routes.clone()));
+            feedback_trace.candidate_quality = Some(candidate_quality);
+        }
         // Preserve the canonical physical-quality ordering; coherence is never accepted merely
         // for looking tidier when it would increase crossings, bends, or route length.
         if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
             routes = candidate_routes;
             outer_lanes = coherent_outer_lanes;
             primary_quality = Some(candidate_quality);
+            #[cfg(test)]
+            {
+                feedback_trace.selected = true;
+            }
         } else {
             primary_quality = Some(baseline_quality);
         }
@@ -447,6 +478,8 @@ fn route_edges_with_lane_rounds(
         primary: routes,
         primary_quality,
         repair,
+        #[cfg(test)]
+        feedback_trace,
     }
 }
 
@@ -2262,9 +2295,9 @@ mod tests {
         crossing_repair_within_budget, crossing_track_y, distance_transform,
         has_split_feedback_net, horizontal_crossing_counts_by_net, move_net_to_outer_lane,
         outer_lane_assignments, port_point, route_edges, route_planned_candidates,
-        route_planned_edges, route_quality, route_quality_for_plan, route_supplemental_edges,
-        select_crossing_repair_net, shortest_crossing_path, sparse_channel_route, sum_within_limit,
-        vertical_horizontal_crossings,
+        route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
+        route_supplemental_edges, select_crossing_repair_net, shortest_crossing_path,
+        sparse_channel_route, sum_within_limit, vertical_horizontal_crossings,
     };
 
     #[test]
@@ -2755,6 +2788,236 @@ mod tests {
         assert_eq!(lanes[&11].side, OuterSide::Top);
         assert_eq!(lanes[&10].side_index, lanes[&11].side_index);
         assert!(!has_split_feedback_net(&plan, &[None, None], &lanes));
+    }
+
+    fn feedback_candidate_fixture(
+        source_a: f64,
+        source_b: f64,
+        targets: [f64; 4],
+        extra_nodes: usize,
+    ) -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
+        let make_node = |id, cycle_breaker, source| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker,
+            ports: if source {
+                vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    },
+                ]
+            } else {
+                vec![Port {
+                    id: 0,
+                    side: if id == 0 {
+                        PortSide::East
+                    } else {
+                        PortSide::West
+                    },
+                    offset: 10.0,
+                }]
+            },
+        };
+        let mut nodes = vec![
+            make_node(0, false, false),
+            make_node(1, false, true),
+            make_node(2, false, true),
+            make_node(3, true, false),
+            make_node(4, true, false),
+            make_node(5, true, false),
+            make_node(6, true, false),
+        ];
+        nodes.extend((0..extra_nodes).map(|offset| Node {
+            id: 7 + offset as u32,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: Vec::new(),
+        }));
+        let graph = Graph {
+            nodes,
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 1, port: 0 },
+                    net: 100,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 101,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 1 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 1 },
+                    target: Endpoint { node: 4, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 12,
+                    source: Endpoint { node: 2, port: 1 },
+                    target: Endpoint { node: 5, port: 0 },
+                    net: 8,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 13,
+                    source: Endpoint { node: 2, port: 1 },
+                    target: Endpoint { node: 6, port: 0 },
+                    net: 8,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let mut geometry = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 60.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 100.0,
+                y: source_a,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: source_b,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        geometry.extend(
+            targets
+                .into_iter()
+                .enumerate()
+                .map(|(offset, y)| NodeGeometry {
+                    id: 3 + offset as u32,
+                    x: 0.0,
+                    y,
+                    width: 20.0,
+                    height: 20.0,
+                }),
+        );
+        geometry.extend((0..extra_nodes).map(|offset| NodeGeometry {
+            id: 7 + offset as u32,
+            x: 200.0,
+            y: (offset % 7) as f64 * 20.0,
+            width: 20.0,
+            height: 20.0,
+        }));
+        let mut ranks = vec![0, 1, 1, 0, 0, 0, 0];
+        ranks.extend(std::iter::repeat_n(2, extra_nodes));
+        (graph, geometry, ranks)
+    }
+
+    fn route_feedback_fixture(
+        graph: &Graph,
+        geometry: &[NodeGeometry],
+        ranks: &[usize],
+    ) -> super::RoutedEdges {
+        let indexed = validate_and_index(graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, ranks);
+        route_planned_candidates(&plan, geometry, LayoutOptions::default(), false)
+    }
+
+    #[test]
+    fn production_feedback_candidate_uses_inferred_cycle_cuts_and_is_deterministic() {
+        let (graph, geometry, ranks) =
+            feedback_candidate_fixture(0.0, 40.0, [0.0, 120.0, 20.0, 100.0], 0);
+        assert!(graph.edges.iter().all(|edge| edge.participates_in_ranking));
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        assert!(
+            plan.edges
+                .iter()
+                .filter(|resolved| resolved.edge.id >= 10)
+                .all(|resolved| !resolved.participates_in_ranking)
+        );
+
+        let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), false);
+        let (baseline_quality, baseline) = routed
+            .feedback_trace
+            .baseline
+            .as_ref()
+            .expect("split feedback evaluates a bounded alternative");
+        let candidate_quality = routed.feedback_trace.candidate_quality.unwrap();
+        assert!(routed.feedback_trace.split);
+        assert!(routed.feedback_trace.evaluated);
+        assert!(routed.feedback_trace.selected);
+        assert!(route_quality_cmp(candidate_quality, *baseline_quality).is_lt());
+        assert_eq!(routed.primary_quality, Some(candidate_quality));
+        assert_ne!(&routed.primary, baseline);
+
+        let mut permuted = graph.clone();
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        let permuted = route_feedback_fixture(&permuted, &geometry, &ranks);
+        assert!(permuted.feedback_trace.selected);
+        assert_eq!(routed.primary, permuted.primary);
+        assert_eq!(routed.primary_quality, permuted.primary_quality);
+    }
+
+    #[test]
+    fn production_feedback_candidate_retains_exact_baseline_when_not_better() {
+        let (graph, geometry, ranks) =
+            feedback_candidate_fixture(0.0, 20.0, [0.0, 100.0, 40.0, 120.0], 0);
+        let routed = route_feedback_fixture(&graph, &geometry, &ranks);
+        let (baseline_quality, baseline) = routed
+            .feedback_trace
+            .baseline
+            .as_ref()
+            .expect("split feedback evaluates a bounded alternative");
+        let candidate_quality = routed.feedback_trace.candidate_quality.unwrap();
+
+        assert!(routed.feedback_trace.split);
+        assert!(routed.feedback_trace.evaluated);
+        assert!(!routed.feedback_trace.selected);
+        assert!(!route_quality_cmp(candidate_quality, *baseline_quality).is_lt());
+        assert_eq!(routed.primary_quality, Some(*baseline_quality));
+        assert_eq!(&routed.primary, baseline);
+    }
+
+    #[test]
+    fn production_feedback_candidate_skips_over_budget_graph() {
+        let (graph, geometry, ranks) = feedback_candidate_fixture(
+            0.0,
+            40.0,
+            [0.0, 120.0, 20.0, 100.0],
+            MAX_CROSSING_REPAIR_NODES + 1 - 7,
+        );
+        let routed = route_feedback_fixture(&graph, &geometry, &ranks);
+
+        assert!(routed.feedback_trace.split);
+        assert!(!routed.feedback_trace.evaluated);
+        assert!(!routed.feedback_trace.selected);
+        assert!(routed.feedback_trace.baseline.is_none());
+        assert!(routed.feedback_trace.candidate_quality.is_none());
     }
 
     #[test]
