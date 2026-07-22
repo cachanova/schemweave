@@ -213,9 +213,20 @@ fn optimize_ordering_seed(
         edge_crossings,
     });
     refresh_positions(&layers, &mut positions);
+    let mut ordering_scores = if sweeps == 0 {
+        Vec::new()
+    } else {
+        vec![0.0; ordering.stable_keys.len()]
+    };
     for _ in 0..sweeps {
         for layer in layers.iter_mut().skip(1) {
-            sort_layer(layer, &ordering.stable_keys, &positions, &ordering.incoming);
+            sort_layer(
+                layer,
+                &ordering.stable_keys,
+                &positions,
+                &ordering.incoming,
+                &mut ordering_scores,
+            );
             refresh_layer(layer, &mut positions);
         }
         transpose_layers(
@@ -242,7 +253,13 @@ fn optimize_ordering_seed(
         }
         let reverse_count = layers.len().saturating_sub(1);
         for layer in layers.iter_mut().take(reverse_count).rev() {
-            sort_layer(layer, &ordering.stable_keys, &positions, &ordering.outgoing);
+            sort_layer(
+                layer,
+                &ordering.stable_keys,
+                &positions,
+                &ordering.outgoing,
+                &mut ordering_scores,
+            );
             refresh_layer(layer, &mut positions);
         }
         transpose_layers(
@@ -322,10 +339,17 @@ fn sort_layer(
     stable_keys: &[(u8, u32, u32)],
     positions: &[usize],
     neighbors: &[Vec<usize>],
+    scores: &mut [f64],
 ) {
+    if layer.len() < 2 {
+        return;
+    }
+    for &item in layer.iter() {
+        scores[item] = barycenter(item, positions, neighbors);
+    }
     layer.sort_by(|&left, &right| {
-        barycenter(left, positions, neighbors)
-            .total_cmp(&barycenter(right, positions, neighbors))
+        scores[left]
+            .total_cmp(&scores[right])
             .then_with(|| stable_keys[left].cmp(&stable_keys[right]))
     });
 }
