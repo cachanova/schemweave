@@ -112,7 +112,7 @@ pub(crate) fn order_layers(
     ranks: &[usize],
     sweeps: usize,
 ) -> Vec<Vec<usize>> {
-    let (forward, reverse, _) = order_layer_candidates(graph, ranks, sweeps);
+    let (forward, reverse, _) = order_layer_candidates(graph, ranks, sweeps, false);
     if reverse.crossings < forward.crossings {
         reverse.layers
     } else {
@@ -141,9 +141,11 @@ pub(crate) fn order_layer_candidates(
     graph: &IndexedGraph<'_>,
     ranks: &[usize],
     sweeps: usize,
+    include_net_representative: bool,
 ) -> (LayerOrdering, LayerOrdering, Option<LayerOrdering>) {
     let real_count = graph.nodes.len();
-    let track_net_representative = should_score_net_representative_candidate(graph);
+    let track_net_representative =
+        include_net_representative && should_score_net_representative_candidate(graph);
     let ordering = expanded_ordering_graph(graph, ranks, track_net_representative);
     let forward = optimize_ordering_seed(&ordering, sweeps, false, track_net_representative);
     let reverse = optimize_ordering_seed(&ordering, sweeps, true, false);
@@ -222,16 +224,21 @@ fn optimize_ordering_seed(
             &ordering.outgoing,
             &mut positions,
         );
-        retain_best(
+        let current_edge_crossings = retain_best_edge(
             &layers,
             ordering,
             &mut positions,
             &mut edge_layers,
             &mut edge_crossings,
-            CrossingScore::Edge,
         );
         if let Some(best) = &mut net_representative {
-            retain_best_net_representative(&layers, ordering, &mut positions, best);
+            retain_best_net_representative(
+                &layers,
+                ordering,
+                &mut positions,
+                current_edge_crossings,
+                best,
+            );
         }
         let reverse_count = layers.len().saturating_sub(1);
         for layer in layers.iter_mut().take(reverse_count).rev() {
@@ -244,16 +251,21 @@ fn optimize_ordering_seed(
             &ordering.outgoing,
             &mut positions,
         );
-        retain_best(
+        let current_edge_crossings = retain_best_edge(
             &layers,
             ordering,
             &mut positions,
             &mut edge_layers,
             &mut edge_crossings,
-            CrossingScore::Edge,
         );
         if let Some(best) = &mut net_representative {
-            retain_best_net_representative(&layers, ordering, &mut positions, best);
+            retain_best_net_representative(
+                &layers,
+                ordering,
+                &mut positions,
+                current_edge_crossings,
+                best,
+            );
         }
     }
     OptimizedSeed {
@@ -410,25 +422,26 @@ fn expanded_ordering_graph(
     }
 }
 
-fn retain_best(
+fn retain_best_edge(
     layers: &[Vec<usize>],
     ordering: &OrderingGraph,
     positions: &mut [usize],
     best_layers: &mut [Vec<usize>],
     best_crossings: &mut usize,
-    score: CrossingScore,
-) {
-    let crossings = crossing_score(layers, ordering, positions, score);
+) -> usize {
+    let crossings = crossing_score(layers, ordering, positions, CrossingScore::Edge);
     if crossings < *best_crossings {
         *best_crossings = crossings;
         best_layers.clone_from_slice(layers);
     }
+    crossings
 }
 
 fn retain_best_net_representative(
     layers: &[Vec<usize>],
     ordering: &OrderingGraph,
     positions: &mut [usize],
+    edge_crossings: usize,
     best: &mut ScoredOrdering,
 ) {
     let score = (
@@ -438,7 +451,7 @@ fn retain_best_net_representative(
             positions,
             CrossingScore::NetRepresentative,
         ),
-        crossing_score(layers, ordering, positions, CrossingScore::Edge),
+        edge_crossings,
     );
     if score < (best.crossings, best.edge_crossings) {
         best.crossings = score.0;
@@ -699,6 +712,21 @@ mod tests {
         assert!(enabled(64, true));
         assert!(!enabled(65, true));
         assert!(!enabled(16, false));
+
+        let mixed = Graph {
+            nodes: vec![node(0), node(1)],
+            edges: (0..16)
+                .map(|id| Edge {
+                    id,
+                    source: Endpoint { node: 0, port: 1 },
+                    target: Endpoint { node: 1, port: 0 },
+                    net: 7,
+                    participates_in_ranking: id < 15,
+                })
+                .collect(),
+        };
+        let indexed = validate_and_index(&mixed, LayoutOptions::default()).unwrap();
+        assert!(!should_score_net_representative_candidate(&indexed));
     }
 
     #[test]
@@ -748,7 +776,7 @@ mod tests {
 
     #[test]
     fn net_representative_score_does_not_multiply_shared_branch_crossings() {
-        let graph = Graph {
+        let mut graph = Graph {
             nodes: (0..10).map(node).collect(),
             edges: vec![
                 (0, 0, 4, 100),
@@ -774,6 +802,13 @@ mod tests {
             })
             .collect(),
         };
+        graph.edges.extend((6..19).map(|id| Edge {
+            id,
+            source: Endpoint { node: 0, port: 1 },
+            target: Endpoint { node: 4, port: 0 },
+            net: 100,
+            participates_in_ranking: true,
+        }));
         let ranks = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
         let ordering = expanded_ordering_graph(&indexed, &ranks, true);
