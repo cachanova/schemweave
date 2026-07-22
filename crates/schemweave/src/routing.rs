@@ -399,9 +399,6 @@ fn route_edges_with_lane_rounds(
         options,
         gap_lane_rounds,
     );
-    let mut outer_lanes = baseline_outer_lanes;
-    let mut selected_channel_lanes = &stable_channel_lanes;
-    let mut stable_fallback = None;
     let node_count = plan
         .nodes_by_rank
         .iter()
@@ -412,109 +409,11 @@ fn route_edges_with_lane_rounds(
         && repair_crossings
         && node_count >= MIN_FANOUT_AWARE_NODES
         && fanout_candidate_within_budget(node_count, plan.edges.len(), &routes);
-    let adaptive_channel_lanes = fanout_within_budget
-        .then(|| fanout_outer_channel_lane_indices(plan, &sparse_spans, &outer_nets))
-        .flatten();
-    #[cfg(test)]
-    let mut fanout_trace = FanoutCandidateTrace {
-        evaluated: false,
-        selected: false,
-        baseline_quality: None,
-        candidate_quality: None,
-    };
-    if let Some(adaptive_channel_lanes) = adaptive_channel_lanes.as_ref() {
-        let candidate_outer_lanes = outer_lane_assignments(
-            plan,
-            nodes,
-            ranks,
-            &sparse_spans,
-            adaptive_channel_lanes,
-            &layer_left,
-            &layer_right,
-            top,
-            bottom,
-            options,
-            outer_lane_rounds,
-            false,
-        );
-        // Channel order changes only outer accesses. Preserve the already-refined sparse
-        // corridors and rebuild the endpoint escapes plus complete route geometry that can be
-        // affected by those accesses; the complete result is still scored exactly below.
-        let candidate_endpoint_tracks = build_endpoint_tracks(
-            plan,
-            nodes,
-            ranks,
-            &sparse_spans,
-            &layer_left,
-            &layer_right,
-            &gap_lanes,
-            &candidate_outer_lanes,
-            options,
-        );
-        let candidate_routes = emit_routes(
-            plan,
-            nodes,
-            &sparse_spans,
-            &crossing_paths,
-            &layer_left,
-            &layer_right,
-            &gap_lanes,
-            &candidate_endpoint_tracks,
-            &candidate_outer_lanes,
-            top,
-            bottom,
-            options,
-        );
-        let (baseline_crossing_counts, baseline_quality) =
-            horizontal_crossing_counts_by_net(plan, &routes);
-        let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
-        #[cfg(test)]
-        {
-            fanout_trace.evaluated = true;
-            fanout_trace.baseline_quality = Some(baseline_quality);
-            fanout_trace.candidate_quality = Some(candidate_quality);
-        }
-        if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
-            stable_fallback = Some((
-                routes,
-                outer_lanes,
-                (baseline_crossing_counts, baseline_quality),
-            ));
-            routes = candidate_routes;
-            outer_lanes = candidate_outer_lanes;
-            selected_channel_lanes = adaptive_channel_lanes;
-            #[cfg(test)]
-            {
-                fanout_trace.selected = true;
-            }
-        }
-    }
-    let selected = finish_route_family(
-        plan,
-        nodes,
-        ranks,
-        &sparse_spans,
-        &crossing_lanes,
-        &crossing_tie_lanes,
-        crossing_tie_lane_count,
-        &free_by_rank,
-        &layer_left,
-        &layer_right,
-        &gap_lanes,
-        &crossing_paths,
-        selected_channel_lanes,
-        outer_lanes,
-        top,
-        bottom,
-        options,
-        outer_lane_rounds,
-        repair_crossings,
-        None,
-        routes,
-    );
-    let mut alternatives = Vec::new();
-    if let Some((stable_routes, stable_outer_lanes, stable_repair_score)) = stable_fallback {
-        let stable = finish_route_family(
+    if fanout_within_budget
+        && let Some(adaptive_channel_lanes) =
+            fanout_outer_channel_lane_indices(plan, &sparse_spans, &outer_nets)
+    {
+        return finish_fanout_route_families(
             plan,
             nodes,
             ranks,
@@ -528,20 +427,289 @@ fn route_edges_with_lane_rounds(
             &gap_lanes,
             &crossing_paths,
             &stable_channel_lanes,
+            adaptive_channel_lanes,
+            baseline_outer_lanes,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            repair_crossings,
+            routes,
+        );
+    }
+    let mut outer_lanes = baseline_outer_lanes;
+    let mut primary_quality = None;
+    let split_feedback = has_split_feedback_net(plan, &sparse_spans, &outer_lanes);
+    let feedback_within_budget = split_feedback
+        && crossing_repair_within_budget(
+            node_count,
+            plan.edges.len(),
+            &routes,
+            &gap_lanes,
+            &sparse_spans,
+            &free_by_rank,
+        );
+    #[cfg(test)]
+    let mut feedback_trace = FeedbackCandidateTrace {
+        split: split_feedback,
+        evaluated: false,
+        selected: false,
+        baseline: None,
+        candidate_quality: None,
+    };
+    if feedback_within_budget {
+        let coherent_outer_lanes = outer_lane_assignments(
+            plan,
+            nodes,
+            ranks,
+            &sparse_spans,
+            &stable_channel_lanes,
+            &layer_left,
+            &layer_right,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            true,
+        );
+        let baseline_quality = route_quality_for_plan(plan, &routes);
+        let candidate_endpoint_tracks = build_endpoint_tracks(
+            plan,
+            nodes,
+            ranks,
+            &sparse_spans,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            &coherent_outer_lanes,
+            options,
+        );
+        let candidate_routes = emit_routes(
+            plan,
+            nodes,
+            &sparse_spans,
+            &crossing_paths,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            &candidate_endpoint_tracks,
+            &coherent_outer_lanes,
+            top,
+            bottom,
+            options,
+        );
+        let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
+        #[cfg(test)]
+        {
+            feedback_trace.evaluated = true;
+            feedback_trace.baseline = Some((baseline_quality, routes.clone()));
+            feedback_trace.candidate_quality = Some(candidate_quality);
+        }
+        if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
+            routes = candidate_routes;
+            outer_lanes = coherent_outer_lanes;
+            primary_quality = Some(candidate_quality);
+            #[cfg(test)]
+            {
+                feedback_trace.selected = true;
+            }
+        } else {
+            primary_quality = Some(baseline_quality);
+        }
+    }
+    let (primary_quality, repair) = if repair_crossings {
+        let (quality, repair) = repair_crossing_heavy_net(
+            plan,
+            nodes,
+            &sparse_spans,
+            &crossing_lanes,
+            &crossing_tie_lanes,
+            crossing_tie_lane_count,
+            &free_by_rank,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            &outer_lanes,
+            top,
+            bottom,
+            options,
+            &routes,
+            None,
+        );
+        (Some(quality), repair)
+    } else {
+        (primary_quality, None)
+    };
+    RoutedEdges {
+        primary: routes,
+        primary_quality,
+        repair,
+        alternatives: Vec::new(),
+        #[cfg(test)]
+        feedback_trace,
+        #[cfg(test)]
+        fanout_trace: FanoutCandidateTrace {
+            evaluated: false,
+            selected: false,
+            baseline_quality: None,
+            candidate_quality: None,
+        },
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn finish_fanout_route_families(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    ranks: &[usize],
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_lanes: &[BTreeMap<NetId, usize>],
+    crossing_tie_lanes: &BTreeMap<(usize, NetId), usize>,
+    crossing_tie_lane_count: usize,
+    free_by_rank: &[Vec<(f64, f64)>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    crossing_paths: &[Option<Vec<f64>>],
+    stable_channel_lanes: &BTreeMap<NetId, usize>,
+    adaptive_channel_lanes: BTreeMap<NetId, usize>,
+    stable_outer_lanes: BTreeMap<NetId, OuterLane>,
+    top: f64,
+    bottom: f64,
+    options: LayoutOptions,
+    outer_lane_rounds: usize,
+    repair_crossings: bool,
+    stable_routes: Vec<EdgeGeometry>,
+) -> RoutedEdges {
+    let adaptive_outer_lanes = outer_lane_assignments(
+        plan,
+        nodes,
+        ranks,
+        sparse_spans,
+        &adaptive_channel_lanes,
+        layer_left,
+        layer_right,
+        top,
+        bottom,
+        options,
+        outer_lane_rounds,
+        false,
+    );
+    // Channel order changes only outer accesses. Preserve the already-refined sparse corridors
+    // and rebuild the endpoint escapes plus complete route geometry affected by those accesses.
+    let adaptive_endpoint_tracks = build_endpoint_tracks(
+        plan,
+        nodes,
+        ranks,
+        sparse_spans,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        &adaptive_outer_lanes,
+        options,
+    );
+    let adaptive_routes = emit_routes(
+        plan,
+        nodes,
+        sparse_spans,
+        crossing_paths,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        &adaptive_endpoint_tracks,
+        &adaptive_outer_lanes,
+        top,
+        bottom,
+        options,
+    );
+    let baseline_score = horizontal_crossing_counts_by_net(plan, &stable_routes);
+    let candidate_score = horizontal_crossing_counts_by_net(plan, &adaptive_routes);
+    let baseline_quality = baseline_score.1;
+    let candidate_quality = candidate_score.1;
+    let adaptive_is_better = route_quality_cmp(candidate_quality, baseline_quality).is_lt();
+
+    let (selected, alternatives) = if adaptive_is_better {
+        let adaptive = finish_route_family(
+            plan,
+            nodes,
+            ranks,
+            sparse_spans,
+            crossing_lanes,
+            crossing_tie_lanes,
+            crossing_tie_lane_count,
+            free_by_rank,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            crossing_paths,
+            &adaptive_channel_lanes,
+            adaptive_outer_lanes,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            repair_crossings,
+            Some(candidate_score),
+            adaptive_routes,
+        );
+        let stable = finish_route_family(
+            plan,
+            nodes,
+            ranks,
+            sparse_spans,
+            crossing_lanes,
+            crossing_tie_lanes,
+            crossing_tie_lane_count,
+            free_by_rank,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            crossing_paths,
+            stable_channel_lanes,
             stable_outer_lanes,
             top,
             bottom,
             options,
             outer_lane_rounds,
             repair_crossings,
-            Some(stable_repair_score),
+            Some(baseline_score),
             stable_routes,
         );
-        alternatives.push((stable.primary_quality, stable.primary));
+        let mut alternatives = vec![(stable.primary_quality, stable.primary)];
         if let Some(repair) = stable.repair {
             alternatives.push(repair);
         }
-    }
+        (adaptive, alternatives)
+    } else {
+        (
+            finish_route_family(
+                plan,
+                nodes,
+                ranks,
+                sparse_spans,
+                crossing_lanes,
+                crossing_tie_lanes,
+                crossing_tie_lane_count,
+                free_by_rank,
+                layer_left,
+                layer_right,
+                gap_lanes,
+                crossing_paths,
+                stable_channel_lanes,
+                stable_outer_lanes,
+                top,
+                bottom,
+                options,
+                outer_lane_rounds,
+                repair_crossings,
+                Some(baseline_score),
+                stable_routes,
+            ),
+            Vec::new(),
+        )
+    };
     RoutedEdges {
         primary: selected.primary,
         primary_quality: Some(selected.primary_quality),
@@ -550,7 +718,12 @@ fn route_edges_with_lane_rounds(
         #[cfg(test)]
         feedback_trace: selected.feedback_trace,
         #[cfg(test)]
-        fanout_trace,
+        fanout_trace: FanoutCandidateTrace {
+            evaluated: true,
+            selected: adaptive_is_better,
+            baseline_quality: Some(baseline_quality),
+            candidate_quality: Some(candidate_quality),
+        },
     }
 }
 
@@ -588,7 +761,7 @@ fn finish_route_family(
     options: LayoutOptions,
     outer_lane_rounds: usize,
     repair_crossings: bool,
-    mut precomputed_repair_score: Option<(BTreeMap<NetId, usize>, RouteQuality)>,
+    mut precomputed_score: Option<(BTreeMap<NetId, usize>, RouteQuality)>,
     mut routes: Vec<EdgeGeometry>,
 ) -> RouteFamily {
     let node_count = plan
@@ -632,7 +805,10 @@ fn finish_route_family(
             outer_lane_rounds,
             true,
         );
-        let baseline_quality = route_quality_for_plan(plan, &routes);
+        let baseline_score = precomputed_score
+            .take()
+            .unwrap_or_else(|| horizontal_crossing_counts_by_net(plan, &routes));
+        let baseline_quality = baseline_score.1;
         // Coherence changes outer side and side-local lane indices, but not the stable per-net
         // channel index. The baseline sparse paths and gap lanes therefore remain valid.
         let candidate_endpoint_tracks = build_endpoint_tracks(
@@ -660,7 +836,8 @@ fn finish_route_family(
             bottom,
             options,
         );
-        let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
+        let candidate_score = horizontal_crossing_counts_by_net(plan, &candidate_routes);
+        let candidate_quality = candidate_score.1;
         #[cfg(test)]
         {
             feedback_trace.evaluated = true;
@@ -672,11 +849,13 @@ fn finish_route_family(
         if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
             routes = candidate_routes;
             outer_lanes = coherent_outer_lanes;
-            precomputed_repair_score = None;
+            precomputed_score = Some(candidate_score);
             #[cfg(test)]
             {
                 feedback_trace.selected = true;
             }
+        } else {
+            precomputed_score = Some(baseline_score);
         }
     }
     let (primary_quality, repair) = if repair_crossings {
@@ -696,7 +875,7 @@ fn finish_route_family(
             bottom,
             options,
             &routes,
-            precomputed_repair_score,
+            precomputed_score,
         )
     } else {
         (route_quality_for_plan(plan, &routes), None)
