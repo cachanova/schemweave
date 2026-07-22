@@ -2604,33 +2604,36 @@ fn global_gap_lane_indices_with_rounds(
         return None;
     }
 
-    // Each ordered pair is a weighted tournament edge. Sorting by weighted out-minus-in score
-    // provides a deterministic non-local seed that can escape strict adjacent-swap plateaus; the
-    // existing bounded adjacent descent then refines it under the same proxy objective.
+    // Each ordered pair is a weighted tournament edge. A single saturating signed out-minus-in
+    // balance gives every net a total-order key even at numeric limits. The resulting deterministic
+    // non-local seed can escape strict adjacent-swap plateaus; the existing bounded adjacent descent
+    // then refines it under the same proxy objective.
     let mut costs = BTreeMap::new();
-    let mut scores = BTreeMap::<u32, (u64, u64)>::new();
+    let mut scores = BTreeMap::<u32, i64>::new();
     for (index, &left) in seed.iter().enumerate() {
         for &right in &seed[index + 1..] {
             let left_before_right = gap_pair_crossings(&accesses[&left], &accesses[&right]);
             let right_before_left = gap_pair_crossings(&accesses[&right], &accesses[&left]);
             costs.insert((left, right), left_before_right);
             costs.insert((right, left), right_before_left);
-            let left_score = scores.entry(left).or_default();
-            left_score.0 = left_score.0.saturating_add(left_before_right as u64);
-            left_score.1 = left_score.1.saturating_add(right_before_left as u64);
-            let right_score = scores.entry(right).or_default();
-            right_score.0 = right_score.0.saturating_add(right_before_left as u64);
-            right_score.1 = right_score.1.saturating_add(left_before_right as u64);
+            let pair_balance = i64::try_from(left_before_right)
+                .unwrap_or(i64::MAX)
+                .saturating_sub(i64::try_from(right_before_left).unwrap_or(i64::MAX));
+            scores
+                .entry(left)
+                .and_modify(|score| *score = score.saturating_add(pair_balance))
+                .or_insert(pair_balance);
+            scores
+                .entry(right)
+                .and_modify(|score| *score = score.saturating_sub(pair_balance))
+                .or_insert_with(|| 0i64.saturating_sub(pair_balance));
         }
     }
     let seed_lanes = current;
     let mut global = seed;
     global.sort_by(|left, right| {
-        let (left_out, left_in) = scores[left];
-        let (right_out, right_in) = scores[right];
-        left_out
-            .saturating_add(right_in)
-            .cmp(&right_out.saturating_add(left_in))
+        scores[left]
+            .cmp(&scores[right])
             .then(seed_lanes[left].cmp(&seed_lanes[right]))
             .then(left.cmp(right))
     });
