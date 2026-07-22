@@ -64,6 +64,77 @@ fn detects_overlapping_nodes() {
     assert!(!report.passes_hard_gates());
 }
 
+fn quality_regression_graph(seed: u64) -> Graph {
+    fn next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+
+    let mut state = seed + 1;
+    let nodes = (0u32..15)
+        .map(|id| {
+            let height = 36.0 + (next(&mut state) % 5) as f64 * 7.0;
+            Node {
+                id,
+                width: 64.0 + (id % 3) as f64 * 9.0,
+                height,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 6.0 + (next(&mut state) % (height as u64 - 11)) as f64,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 6.0 + (next(&mut state) % (height as u64 - 11)) as f64,
+                    },
+                ],
+            }
+        })
+        .collect();
+
+    let mut edges = Vec::new();
+    for &(lo, hi, target_lo, target_hi, threshold) in &[
+        (0u32, 5u32, 5u32, 10u32, 38u64),
+        (5, 10, 10, 15, 38),
+        (0, 5, 10, 15, 18),
+    ] {
+        for from in lo..hi {
+            for to in target_lo..target_hi {
+                if next(&mut state) % 100 < threshold {
+                    let id = edges.len() as u32;
+                    edges.push(Edge {
+                        id,
+                        source: Endpoint {
+                            node: from,
+                            port: 1,
+                        },
+                        target: Endpoint { node: to, port: 0 },
+                        net: id,
+                        participates_in_ranking: true,
+                    });
+                }
+            }
+        }
+    }
+
+    Graph { nodes, edges }
+}
+
+#[test]
+fn candidate_selection_never_increases_canonical_crossings_over_baseline() {
+    let graph = quality_regression_graph(172);
+    let selected = layout(&graph, LayoutOptions::default()).unwrap();
+    let report = score(&graph, &selected, ScoreOptions::default());
+
+    assert!(report.passes_hard_gates(), "{report:#?}");
+    assert!(report.crossings <= 13, "{report:#?}");
+}
+
 #[test]
 fn rejects_a_diagonal_and_wrong_fixed_endpoint() {
     let graph = graph();

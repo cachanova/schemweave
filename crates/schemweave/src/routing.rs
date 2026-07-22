@@ -1,10 +1,11 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
 };
 
 use crate::{
-    EdgeGeometry, LayoutOptions, NodeGeometry, Point, Port, PortSide, validation::IndexedGraph,
+    EdgeGeometry, EdgeId, Endpoint, LayoutOptions, NetId, NodeGeometry, Point, Port, PortSide,
+    validation::IndexedGraph,
 };
 
 const MAX_SPARSE_NET_EDGES: usize = 300;
@@ -22,6 +23,8 @@ pub(crate) struct RouteQuality {
 #[derive(Clone, Copy)]
 struct PhysicalSegment {
     net: u32,
+    source: Endpoint,
+    target: Endpoint,
     horizontal: bool,
     fixed: f64,
     start: f64,
@@ -351,7 +354,8 @@ pub(crate) fn route_edges(
 }
 
 pub(crate) fn route_quality(graph: &IndexedGraph<'_>, routes: &[EdgeGeometry]) -> RouteQuality {
-    let mut groups = BTreeMap::<(u32, bool, FloatKey), Vec<(f64, f64)>>::new();
+    let mut groups =
+        BTreeMap::<(u32, bool, FloatKey), Vec<(f64, f64, EdgeId, Endpoint, Endpoint)>>::new();
     let mut bends = BTreeSet::new();
     for (edge, route) in graph.edges.iter().zip(routes) {
         for points in route.points.windows(3) {
@@ -377,15 +381,19 @@ pub(crate) fn route_quality(graph: &IndexedGraph<'_>, routes: &[EdgeGeometry]) -
             groups
                 .entry((edge.net, horizontal, FloatKey(fixed)))
                 .or_default()
-                .push((start, end));
+                .push((start, end, edge.id, edge.source, edge.target));
         }
     }
 
     let mut segments = Vec::<PhysicalSegment>::new();
     for ((net, horizontal, FloatKey(fixed)), intervals) in &mut groups {
-        intervals
-            .sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
-        for &(start, end) in intervals.iter() {
+        intervals.sort_by(|left, right| {
+            left.0
+                .total_cmp(&right.0)
+                .then(left.1.total_cmp(&right.1))
+                .then(left.2.cmp(&right.2))
+        });
+        for &(start, end, _, source, target) in intervals.iter() {
             if let Some(prior) = segments.last_mut()
                 && prior.net == *net
                 && prior.horizontal == *horizontal
@@ -396,6 +404,8 @@ pub(crate) fn route_quality(graph: &IndexedGraph<'_>, routes: &[EdgeGeometry]) -
             } else {
                 segments.push(PhysicalSegment {
                     net: *net,
+                    source,
+                    target,
                     horizontal: *horizontal,
                     fixed: *fixed,
                     start,
@@ -408,7 +418,7 @@ pub(crate) fn route_quality(graph: &IndexedGraph<'_>, routes: &[EdgeGeometry]) -
         .iter()
         .map(|segment| segment.end - segment.start)
         .sum();
-    let crossings = physical_crossings(&segments);
+    let crossings = physical_crossings(graph, &segments);
     RouteQuality {
         crossings,
         bends: bends.len(),
@@ -416,65 +426,138 @@ pub(crate) fn route_quality(graph: &IndexedGraph<'_>, routes: &[EdgeGeometry]) -
     }
 }
 
-fn physical_crossings(segments: &[PhysicalSegment]) -> usize {
-    let total = crossing_sweep(segments);
-    let mut by_net = BTreeMap::<u32, Vec<PhysicalSegment>>::new();
-    for &segment in segments {
-        by_net.entry(segment.net).or_default().push(segment);
-    }
-    total
-        - by_net
-            .values()
-            .map(|segments| crossing_sweep(segments))
-            .sum::<usize>()
-}
-
 #[derive(Clone, Copy)]
 enum CrossingEvent {
-    Remove { y: usize },
-    Query { low: f64, high: f64 },
-    Add { y: usize },
+    Remove { segment: usize, y: usize },
+    Query { segment: usize },
+    Add { segment: usize, y: usize },
 }
 
-fn crossing_sweep(segments: &[PhysicalSegment]) -> usize {
-    let mut horizontal_y = segments
+fn physical_crossings(graph: &IndexedGraph<'_>, segments: &[PhysicalSegment]) -> usize {
+    let horizontal = segments
         .iter()
         .filter(|segment| segment.horizontal)
+        .collect::<Vec<_>>();
+    let vertical = segments
+        .iter()
+        .filter(|segment| !segment.horizontal)
+        .collect::<Vec<_>>();
+    let mut horizontal_y = horizontal
+        .iter()
         .map(|segment| segment.fixed)
         .collect::<Vec<_>>();
     horizontal_y.sort_by(f64::total_cmp);
     horizontal_y.dedup_by(|left, right| left.total_cmp(right).is_eq());
-    let mut events = Vec::with_capacity(segments.len() * 2);
-    for segment in segments {
-        if segment.horizontal {
-            let y = horizontal_y
-                .binary_search_by(|candidate| candidate.total_cmp(&segment.fixed))
-                .expect("horizontal coordinate exists");
-            events.push((FloatKey(segment.start), 2u8, CrossingEvent::Add { y }));
-            events.push((FloatKey(segment.end), 0u8, CrossingEvent::Remove { y }));
-        } else {
-            events.push((
-                FloatKey(segment.fixed),
-                1u8,
-                CrossingEvent::Query {
-                    low: segment.start,
-                    high: segment.end,
-                },
-            ));
+
+    let mut endpoint_nets = HashMap::<Endpoint, NetId>::new();
+    let mut shared_endpoints = HashSet::<Endpoint>::new();
+    for edge in &graph.edges {
+        for endpoint in [edge.source, edge.target] {
+            match endpoint_nets.entry(endpoint) {
+                Entry::Vacant(entry) => {
+                    entry.insert(edge.net);
+                }
+                Entry::Occupied(entry) if *entry.get() != edge.net => {
+                    shared_endpoints.insert(endpoint);
+                }
+                Entry::Occupied(_) => {}
+            }
         }
+    }
+    let mut by_net = HashMap::<NetId, Vec<usize>>::new();
+    let mut by_endpoint = HashMap::<Endpoint, Vec<usize>>::new();
+    for (index, segment) in horizontal.iter().enumerate() {
+        // Same-edge relationships are already covered because one edge has exactly one net.
+        by_net.entry(segment.net).or_default().push(index);
+        for endpoint in [segment.source, segment.target] {
+            if shared_endpoints.contains(&endpoint) {
+                by_endpoint.entry(endpoint).or_default().push(index);
+            }
+        }
+    }
+
+    let mut events = Vec::with_capacity(segments.len() * 2);
+    for (segment_index, segment) in horizontal.iter().enumerate() {
+        let y = horizontal_y
+            .binary_search_by(|candidate| candidate.total_cmp(&segment.fixed))
+            .expect("horizontal coordinate exists");
+        events.push((
+            FloatKey(segment.start),
+            2u8,
+            CrossingEvent::Add {
+                segment: segment_index,
+                y,
+            },
+        ));
+        events.push((
+            FloatKey(segment.end),
+            0u8,
+            CrossingEvent::Remove {
+                segment: segment_index,
+                y,
+            },
+        ));
+    }
+    for (segment_index, segment) in vertical.iter().enumerate() {
+        events.push((
+            FloatKey(segment.fixed),
+            1u8,
+            CrossingEvent::Query {
+                segment: segment_index,
+            },
+        ));
     }
     events.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
     let mut active = CrossingFenwick::new(horizontal_y.len());
+    let mut active_segments = vec![false; horizontal.len()];
+    let mut relation_stamps = vec![0u32; horizontal.len()];
+    let mut relation_generation = 0u32;
     let mut crossings = 0usize;
     for (_, _, event) in events {
         match event {
-            CrossingEvent::Remove { y } => active.remove(y),
-            CrossingEvent::Query { low, high } => {
-                let start = horizontal_y.partition_point(|&y| y <= low);
-                let end = horizontal_y.partition_point(|&y| y < high);
-                crossings += active.prefix(end) - active.prefix(start);
+            CrossingEvent::Remove { segment, y } => {
+                active_segments[segment] = false;
+                active.remove(y);
             }
-            CrossingEvent::Add { y } => active.add(y),
+            CrossingEvent::Query { segment } => {
+                let line = vertical[segment];
+                let start = horizontal_y.partition_point(|&y| y <= line.start);
+                let end = horizontal_y.partition_point(|&y| y < line.end);
+                let mut count = active.prefix(end) - active.prefix(start);
+                if count == 0 {
+                    continue;
+                }
+                relation_generation = relation_generation.wrapping_add(1);
+                if relation_generation == 0 {
+                    relation_stamps.fill(0);
+                    relation_generation = 1;
+                }
+                let mut related_count = 0usize;
+                let mut visit = |candidates: Option<&Vec<usize>>| {
+                    for &candidate in candidates.into_iter().flatten() {
+                        if relation_stamps[candidate] == relation_generation {
+                            continue;
+                        }
+                        relation_stamps[candidate] = relation_generation;
+                        if active_segments[candidate]
+                            && horizontal[candidate].fixed > line.start
+                            && horizontal[candidate].fixed < line.end
+                        {
+                            related_count += 1;
+                        }
+                    }
+                };
+                visit(by_net.get(&line.net));
+                for endpoint in [line.source, line.target] {
+                    visit(by_endpoint.get(&endpoint));
+                }
+                count -= related_count;
+                crossings += count;
+            }
+            CrossingEvent::Add { segment, y } => {
+                active_segments[segment] = true;
+                active.add(y);
+            }
         }
     }
     crossings
@@ -1163,6 +1246,9 @@ fn vertical_horizontal_crossings(vertical: &[(f64, f64)], horizontal_y: &[f64]) 
     vertical
         .iter()
         .map(|&(low, high)| {
+            if low >= high {
+                return 0;
+            }
             let start = horizontal_y.partition_point(|&y| y <= low);
             let end = horizontal_y.partition_point(|&y| y < high);
             end - start
@@ -1523,7 +1609,16 @@ mod tests {
         GapNetAccess, OuterNetAccess, OuterSide, crossing_aware_gap_lane_indices,
         crossing_aware_outer_lane_indices, crossing_track_y, distance_transform,
         outer_lane_assignments, route_quality, shortest_crossing_path, sparse_channel_route,
+        vertical_horizontal_crossings,
     };
+
+    #[test]
+    fn zero_length_vertical_access_has_no_crossings() {
+        assert_eq!(
+            vertical_horizontal_crossings(&[(20.0, 20.0)], &[10.0, 20.0, 30.0]),
+            0
+        );
+    }
 
     #[test]
     fn gap_lane_transpose_uses_predicted_crossing_cost() {
@@ -1747,7 +1842,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_quality_merges_shared_net_geometry_before_scoring() {
+    fn physical_quality_merges_shared_net_geometry_and_excludes_related_crossings() {
         let graph = Graph {
             nodes: vec![
                 Node {
@@ -1809,8 +1904,60 @@ mod tests {
 
         let quality = route_quality(&indexed, &routes);
 
-        assert_eq!(quality.crossings, 1);
+        assert_eq!(quality.crossings, 0);
         assert_eq!(quality.bends, 1);
         assert_eq!(quality.route_length, 30.0);
+    }
+
+    #[test]
+    fn physical_quality_counts_crossings_between_unrelated_edges() {
+        let graph = Graph {
+            nodes: (1..=4)
+                .map(|id| Node {
+                    id,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 5.0,
+                    }],
+                })
+                .collect(),
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 4, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let routes = vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![Point { x: 0.0, y: 5.0 }, Point { x: 10.0, y: 5.0 }],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 5.0, y: 0.0 }, Point { x: 5.0, y: 10.0 }],
+            },
+        ];
+
+        let quality = route_quality(&indexed, &routes);
+
+        assert_eq!(quality.crossings, 1);
+        assert_eq!(quality.bends, 0);
+        assert_eq!(quality.route_length, 20.0);
     }
 }
