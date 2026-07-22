@@ -258,7 +258,8 @@ pub(crate) fn preferred_alignment_is_significant(ordinary: f64, preferred: f64) 
 }
 
 pub(crate) fn preferred_alignment_can_be_significant(ordinary: f64) -> bool {
-    ordinary * 3.0 >= MIN_PREFERRED_ALIGNMENT_IMPROVEMENT * 50.0
+    // Alignment error is nonnegative, so no candidate can reduce it by more than `ordinary`.
+    ordinary >= MIN_PREFERRED_ALIGNMENT_IMPROVEMENT
 }
 
 fn align_layer(
@@ -400,8 +401,8 @@ mod tests {
 
     #[test]
     fn preferred_alignment_gate_requires_absolute_and_relative_value() {
-        assert!(!preferred_alignment_can_be_significant(1_666_666.0));
-        assert!(preferred_alignment_can_be_significant(1_666_667.0));
+        assert!(!preferred_alignment_can_be_significant(99_999.0));
+        assert!(preferred_alignment_can_be_significant(100_000.0));
         assert!(!preferred_alignment_is_significant(1_000_000.0, 900_001.0));
         assert!(preferred_alignment_is_significant(1_000_000.0, 900_000.0));
         assert!(!preferred_alignment_is_significant(
@@ -414,6 +415,14 @@ mod tests {
             2_900_000.0
         ));
         assert!(!preferred_alignment_is_significant(100_000.0, 110_000.0));
+
+        for ordinary in [0.0, 99_999.0, 100_000.0, 1_000_000.0, 2_000_000.0] {
+            for preferred in [0.0, 50_000.0, 90_000.0, 900_000.0, 1_880_000.0] {
+                if preferred_alignment_is_significant(ordinary, preferred) {
+                    assert!(preferred_alignment_can_be_significant(ordinary));
+                }
+            }
+        }
     }
 
     #[test]
