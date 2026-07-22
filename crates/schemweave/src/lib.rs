@@ -83,10 +83,12 @@ pub struct LayoutOptions {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum QualityEffort {
     Fast,
     #[default]
     Quality,
+    Max,
 }
 
 impl Default for LayoutOptions {
@@ -242,12 +244,33 @@ pub fn layout_with_quality_effort(
     {
         let (sparse_global, large_sparse_global) =
             net_representative_sparse_global_flags(graph.nodes.len(), quality_effort);
-        evaluate(
-            placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
-            false,
-            sparse_global,
-            large_sparse_global,
-        );
+        if quality_effort == QualityEffort::Max && large_sparse_global {
+            let nodes =
+                placement::place_nodes(&indexed, &ranks, &net_representative.layers, options);
+            let routed = routing::route_planned_candidates_with_refined_sparse_global(
+                &routing_plan,
+                &nodes,
+                options,
+                false,
+                sparse_global,
+                large_sparse_global,
+                true,
+            );
+            retain(nodes.clone(), routed.primary, routed.primary_quality);
+            if let Some((repair_quality, repair)) = routed.repair {
+                retain(nodes.clone(), repair, Some(repair_quality));
+            }
+            for (quality, alternative) in routed.alternatives {
+                retain(nodes.clone(), alternative, Some(quality));
+            }
+        } else {
+            evaluate(
+                placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
+                false,
+                sparse_global,
+                large_sparse_global,
+            );
+        }
     }
     if let Some(alternative_ranks) = latest_ranks {
         let (forward, reverse, _) = topology::order_layer_candidates(
@@ -287,7 +310,7 @@ fn net_representative_sparse_global_flags(
 ) -> (bool, bool) {
     match quality_effort {
         QualityEffort::Fast => (false, false),
-        QualityEffort::Quality => {
+        QualityEffort::Quality | QualityEffort::Max => {
             let admitted = (600..=1_000).contains(&node_count);
             (admitted, admitted)
         }
@@ -382,6 +405,10 @@ mod tests {
         assert_eq!(
             super::net_representative_sparse_global_flags(855, QualityEffort::Fast),
             (false, false)
+        );
+        assert_eq!(
+            super::net_representative_sparse_global_flags(855, QualityEffort::Max),
+            (true, true)
         );
     }
 
@@ -1113,13 +1140,16 @@ mod tests {
         let fast = super::layout_with_quality_effort(&graph, options, QualityEffort::Fast).unwrap();
         let quality =
             super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+        let max = super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
         assert_eq!(layout(&graph, options).unwrap(), quality);
         let indexed = validation::validate_and_index(&graph, options).unwrap();
         let fast_quality = routing::route_quality(&indexed, &fast.edges);
         let quality_quality = routing::route_quality(&indexed, &quality.edges);
+        let max_quality = routing::route_quality(&indexed, &max.edges);
         assert_eq!(fast_quality.crossings, 552);
         assert_eq!(quality_quality.crossings, 405);
         assert!(candidate_quality_cmp(quality_quality, &quality, fast_quality, &fast).is_lt());
+        assert!(!candidate_quality_cmp(max_quality, &max, quality_quality, &quality).is_gt());
 
         let mut permuted = graph;
         permuted.nodes.reverse();
@@ -1131,6 +1161,10 @@ mod tests {
         assert_eq!(
             super::layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
             quality
+        );
+        assert_eq!(
+            super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
+            max
         );
     }
 }

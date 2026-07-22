@@ -64,6 +64,36 @@ for (let source = 8; source < 24; source += 1) {
     }
   }
 }
+const maxEffortFixtureName = 'max-effort-600'
+const maxEffortEdges = []
+const maxEffortInputEdges = []
+let maxEffortState = 10n
+const nextMaxEffortState = () => {
+  maxEffortState = BigInt.asUintN(
+    64,
+    maxEffortState * 6_364_136_223_846_793_005n + 1_442_695_040_888_963_407n,
+  )
+  return maxEffortState
+}
+for (let layer = 0; layer < 3; layer += 1) {
+  const sourceStart = layer * 50
+  const targetStart = (layer + 1) * 50
+  for (let from = sourceStart; from < sourceStart + 50; from += 1) {
+    for (let to = targetStart; to < targetStart + 50; to += 1) {
+      if (nextMaxEffortState() % 100n < 16n) {
+        maxEffortEdges.push({
+          inputIndex: maxEffortEdges.length,
+          from,
+          to,
+          sourceY: 25,
+          targetY: 25,
+          control: false,
+        })
+        maxEffortInputEdges.push({ fromPort: `net_${from}`, toPort: 'A', control: false })
+      }
+    }
+  }
+}
 const corpus = {
   exactBaseSha: '0123456789abcdef0123456789abcdef01234567',
   fixtures: [
@@ -84,6 +114,14 @@ const corpus = {
       edgeCount: effortEdges.length,
       layoutInput: { edges: effortInputEdges },
       resolvedInput: { nodes: effortNodes, edges: effortEdges },
+    },
+    {
+      name: maxEffortFixtureName,
+      kind: 'max-effort-smoke',
+      nodeCount: effortNodeCount,
+      edgeCount: maxEffortEdges.length,
+      layoutInput: { edges: maxEffortInputEdges },
+      resolvedInput: { nodes: effortNodes, edges: maxEffortEdges },
     },
   ],
 }
@@ -152,6 +190,37 @@ const elk = {
         height: 3_160,
       },
     },
+    {
+      name: maxEffortFixtureName,
+      samplesMs: [],
+      geometry: {
+        nodes: effortNodes.map((node) => ({
+          id: node.id,
+          x: node.id < 200 ? Math.floor(node.id / 50) * 146 : ((node.id - 200) % 20) * 100,
+          y: node.id < 200 ? (node.id % 50) * 80 : 4_100 + Math.floor((node.id - 200) / 20) * 80,
+          width: node.width,
+          height: node.height,
+        })),
+        edges: maxEffortEdges.map((edge) => {
+          const sourceX = Math.floor(edge.from / 50) * 146 + 80
+          const sourceY = (edge.from % 50) * 80 + 25
+          const targetX = Math.floor(edge.to / 50) * 146
+          const targetY = (edge.to % 50) * 80 + 25
+          const middleX = (sourceX + targetX) / 2
+          return {
+            inputIndex: edge.inputIndex,
+            points: [
+              { x: sourceX, y: sourceY },
+              { x: middleX, y: sourceY },
+              { x: middleX, y: targetY },
+              { x: targetX, y: targetY },
+            ],
+          }
+        }),
+        width: 1_980,
+        height: 5_700,
+      },
+    },
   ],
 }
 
@@ -200,6 +269,27 @@ try {
   await page.locator('#fixture').selectOption(effortFixtureName)
   await waitForCompletedLayout(page, effortNodeCount)
   const qualityCrossings = await schemweaveCrossings(page)
+  await page.locator('#fixture').selectOption(maxEffortFixtureName)
+  await waitForCompletedLayout(page, effortNodeCount)
+  const maxFixtureQualityCrossings = await schemweaveCrossings(page)
+  await page.locator('#quality-effort').fill('2')
+  await waitForCompletedLayout(page, effortNodeCount)
+  const maxCrossings = await schemweaveCrossings(page)
+  if (maxCrossings >= maxFixtureQualityCrossings) {
+    throw new Error(
+      `Max did not change Rust-selected output: ${maxCrossings} >= ${maxFixtureQualityCrossings}`,
+    )
+  }
+  if (await page.locator('#quality-effort-value').textContent() !== 'Max') {
+    throw new Error('routing quality slider did not display Max')
+  }
+  await page.locator('#quality-effort').fill('1')
+  await waitForCompletedLayout(page, effortNodeCount)
+  await page.locator('#fixture').selectOption(effortFixtureName)
+  await waitForCompletedLayout(page, effortNodeCount)
+  if ((await schemweaveCrossings(page)) !== qualityCrossings) {
+    throw new Error('Quality output changed after exercising Max')
+  }
   await page.locator('#quality-effort').fill('0')
   await waitForCompletedLayout(page, effortNodeCount)
   const fastCrossings = await schemweaveCrossings(page)
@@ -266,7 +356,7 @@ try {
   await waitForCompletedLayout(fallback)
 
   process.stdout.write(
-    `PASS: ${nodeCount} nodes, latest-only presets, ${mainThreadResponseMs.toFixed(1)} ms control response, synchronized worker scoring, file fallback\n`,
+    `PASS: ${nodeCount} nodes, Max ${maxFixtureQualityCrossings}->${maxCrossings} crossings, latest-only presets, ${mainThreadResponseMs.toFixed(1)} ms control response, synchronized worker scoring, file fallback\n`,
   )
 } finally {
   await browser?.close()
