@@ -4,8 +4,9 @@ use crate::{
     EdgeGeometry, LayoutOptions, NodeGeometry, Point, Port, PortSide, validation::IndexedGraph,
 };
 
-const MAX_SPARSE_NET_EDGES: usize = 32;
+const MAX_SPARSE_NET_EDGES: usize = 300;
 const CROSSING_TRACK_NUDGE: f64 = 1e-4;
+const CROSSING_ALIGNMENT_WEIGHT: f64 = 4.0;
 
 pub(crate) fn route_edges(
     graph: &IndexedGraph<'_>,
@@ -64,29 +65,66 @@ pub(crate) fn route_edges(
         })
         .collect();
 
-    let mut gap_nets = vec![BTreeSet::new(); max_rank];
+    let mut gap_preferences = vec![BTreeMap::<u32, Vec<f64>>::new(); max_rank];
+    let mut crossing_preferences = vec![BTreeMap::<u32, Vec<f64>>::new(); max_rank + 1];
     let mut crossing_pairs = BTreeSet::new();
     let mut outer_nets = BTreeSet::new();
     for (edge, span) in graph.edges.iter().zip(&sparse_spans) {
         if let Some((source_rank, target_rank)) = span {
-            for nets in &mut gap_nets[*source_rank..*target_rank] {
-                nets.insert(edge.net);
+            let source_index = graph.node_index[&edge.source.node];
+            let target_index = graph.node_index[&edge.target.node];
+            let source = port_point(
+                &nodes[source_index],
+                graph.ports[source_index][&edge.source.port],
+            );
+            let target = port_point(
+                &nodes[target_index],
+                graph.ports[target_index][&edge.target.port],
+            );
+            let span = (*target_rank - *source_rank) as f64;
+            for (gap, preferences) in gap_preferences
+                .iter_mut()
+                .enumerate()
+                .take(*target_rank)
+                .skip(*source_rank)
+            {
+                let progress = (gap - *source_rank) as f64 / span;
+                preferences
+                    .entry(edge.net)
+                    .or_default()
+                    .push(source.y + (target.y - source.y) * progress);
             }
-            for rank in source_rank + 1..*target_rank {
+            for (rank, preferences) in crossing_preferences
+                .iter_mut()
+                .enumerate()
+                .take(*target_rank)
+                .skip(source_rank + 1)
+            {
                 crossing_pairs.insert((rank, edge.net));
+                let progress = (rank - *source_rank) as f64 / span;
+                preferences
+                    .entry(edge.net)
+                    .or_default()
+                    .push(source.y + (target.y - source.y) * progress);
             }
         } else {
             outer_nets.insert(edge.net);
         }
     }
-    let gap_lanes: Vec<_> = gap_nets.iter().map(lane_indices).collect();
-    let crossing_lanes: BTreeMap<_, _> = crossing_pairs
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(index, pair)| (pair, index))
+    let gap_lanes: Vec<_> = gap_preferences
+        .into_iter()
+        .map(preferred_lane_indices)
         .collect();
-    let crossing_lane_count = crossing_lanes.len();
+    let crossing_lanes: Vec<_> = crossing_preferences
+        .into_iter()
+        .map(preferred_lane_indices)
+        .collect();
+    let crossing_tie_lanes: BTreeMap<_, _> = crossing_pairs
+        .into_iter()
+        .enumerate()
+        .map(|(lane, pair)| (pair, lane))
+        .collect();
+    let crossing_tie_lane_count = crossing_tie_lanes.len();
     let outer_lanes = lane_indices(&outer_nets);
     let outer_lane_count = outer_lanes.len();
     let endpoint_tracks = endpoint_tracks(
@@ -130,7 +168,8 @@ pub(crate) fn route_edges(
                         &layer_right,
                         &gap_lanes,
                         &crossing_lanes,
-                        crossing_lane_count,
+                        &crossing_tie_lanes,
+                        crossing_tie_lane_count,
                         &free_by_rank,
                         &endpoint_tracks,
                         options.port_stub,
@@ -234,6 +273,22 @@ fn lane_indices(nets: &BTreeSet<u32>) -> BTreeMap<u32, usize> {
         .copied()
         .enumerate()
         .map(|(index, net)| (net, index))
+        .collect()
+}
+
+fn preferred_lane_indices(mut preferences: BTreeMap<u32, Vec<f64>>) -> BTreeMap<u32, usize> {
+    let mut ordered = Vec::with_capacity(preferences.len());
+    for (net, values) in &mut preferences {
+        values.sort_by(f64::total_cmp);
+        ordered.push((*net, values[values.len() / 2]));
+    }
+    ordered.sort_by(|(left_net, left), (right_net, right)| {
+        left.total_cmp(right).then(left_net.cmp(right_net))
+    });
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(lane, (net, _))| (net, lane))
         .collect()
 }
 
@@ -444,8 +499,9 @@ fn sparse_channel_route(
     layer_left: &[f64],
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<u32, usize>],
-    crossing_lanes: &BTreeMap<(usize, u32), usize>,
-    crossing_lane_count: usize,
+    crossing_lanes: &[BTreeMap<u32, usize>],
+    crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
+    crossing_tie_lane_count: usize,
     free_by_rank: &[Vec<(f64, f64)>],
     endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
     port_stub: f64,
@@ -473,15 +529,22 @@ fn sparse_channel_route(
         },
     );
 
-    for rank in source_rank + 1..target_rank {
-        let progress = (rank - source_rank) as f64 / (target_rank - source_rank) as f64;
-        let preferred = source.y + (target.y - source.y) * progress;
-        let y = choose_crossing_y(
-            &free_by_rank[rank],
-            preferred,
-            crossing_lanes[&(rank, net)],
-            crossing_lane_count,
-        );
+    let crossing_path = shortest_crossing_path(
+        &free_by_rank[source_rank + 1..target_rank],
+        source_escape_y,
+        target_escape_y,
+        &(source_rank + 1..target_rank)
+            .map(|rank| crossing_lanes[rank][&net])
+            .collect::<Vec<_>>(),
+        &(source_rank + 1..target_rank)
+            .map(|rank| crossing_lanes[rank].len())
+            .collect::<Vec<_>>(),
+        &(source_rank + 1..target_rank)
+            .map(|rank| crossing_tie_lanes[&(rank, net)])
+            .collect::<Vec<_>>(),
+        crossing_tie_lane_count,
+    );
+    for (rank, y) in (source_rank + 1..target_rank).zip(crossing_path) {
         push_point(&mut points, Point { x, y });
         x = sparse_gap_x(net, rank, layer_left, layer_right, gap_lanes);
         push_point(&mut points, Point { x, y });
@@ -519,34 +582,143 @@ fn sparse_gap_x(
     layer_right[gap] + (layer_left[gap + 1] - layer_right[gap]) * fraction
 }
 
-fn choose_crossing_y(
-    intervals: &[(f64, f64)],
-    preferred: f64,
+fn crossing_track_y(
+    interval: (f64, f64),
     lane: usize,
     lane_count: usize,
+    tie_lane: usize,
+    tie_lane_count: usize,
 ) -> f64 {
-    let &(low, high) = intervals
-        .iter()
-        .min_by(|(left_low, left_high), (right_low, right_high)| {
-            interval_distance(preferred, *left_low, *left_high)
-                .total_cmp(&interval_distance(preferred, *right_low, *right_high))
-                .then(left_low.total_cmp(right_low))
-        })
-        .expect("sparse routes require a free crossing interval");
+    let (low, high) = interval;
     let lane_fraction = (lane + 1) as f64 / (lane_count + 1) as f64;
     let y = low + (high - low) * lane_fraction;
     let margin = (y - low).min(high - y);
-    y + (CROSSING_TRACK_NUDGE * lane_fraction).min(margin / 2.0)
+    let tie_fraction = (tie_lane + 1) as f64 / (tie_lane_count + 1) as f64;
+    y + (CROSSING_TRACK_NUDGE * tie_fraction).min(margin / 2.0)
 }
 
-fn interval_distance(value: f64, low: f64, high: f64) -> f64 {
-    if value < low {
-        low - value
-    } else if value > high {
-        value - high
-    } else {
-        0.0
+fn shortest_crossing_path(
+    layers: &[Vec<(f64, f64)>],
+    source_y: f64,
+    target_y: f64,
+    lanes: &[usize],
+    lane_counts: &[usize],
+    tie_lanes: &[usize],
+    tie_lane_count: usize,
+) -> Vec<f64> {
+    if layers.is_empty() {
+        return Vec::new();
     }
+    let candidates: Vec<Vec<f64>> = layers
+        .iter()
+        .zip(lanes)
+        .zip(lane_counts)
+        .zip(tie_lanes)
+        .map(|(((intervals, &lane), &lane_count), &tie_lane)| {
+            intervals
+                .iter()
+                .copied()
+                .map(|interval| {
+                    crossing_track_y(interval, lane, lane_count, tie_lane, tie_lane_count)
+                })
+                .collect()
+        })
+        .collect();
+    let mut costs: Vec<f64> = candidates[0]
+        .iter()
+        .map(|&y| {
+            (source_y - y).abs()
+                + CROSSING_ALIGNMENT_WEIGHT
+                    * (y - preferred_crossing_y(source_y, target_y, 0, candidates.len())).abs()
+        })
+        .collect();
+    let mut predecessors = Vec::with_capacity(candidates.len().saturating_sub(1));
+    for (layer_index, layer) in candidates.iter().enumerate().skip(1) {
+        let previous = &candidates[predecessors.len()];
+        let (mut next_costs, layer_predecessors) = distance_transform(previous, &costs, layer);
+        let preferred = preferred_crossing_y(source_y, target_y, layer_index, candidates.len());
+        for (cost, &y) in next_costs.iter_mut().zip(layer) {
+            *cost += CROSSING_ALIGNMENT_WEIGHT * (y - preferred).abs();
+        }
+        costs = next_costs;
+        predecessors.push(layer_predecessors);
+    }
+    let last = candidates.last().expect("crossing path has a layer");
+    let mut selected = last
+        .iter()
+        .enumerate()
+        .map(|(index, &y)| (index, costs[index] + (y - target_y).abs()))
+        .min_by(|(left_index, left), (right_index, right)| {
+            left.total_cmp(right).then(left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
+        .expect("crossing layers contain free intervals");
+    let mut result = vec![0.0; candidates.len()];
+    for layer in (0..candidates.len()).rev() {
+        result[layer] = candidates[layer][selected];
+        if layer > 0 {
+            selected = predecessors[layer - 1][selected];
+        }
+    }
+    result
+}
+
+fn preferred_crossing_y(source: f64, target: f64, index: usize, count: usize) -> f64 {
+    let progress = (index + 1) as f64 / (count + 1) as f64;
+    source + (target - source) * progress
+}
+
+fn distance_transform(previous: &[f64], costs: &[f64], current: &[f64]) -> (Vec<f64>, Vec<usize>) {
+    let mut prefix = Vec::with_capacity(previous.len());
+    let mut best = 0usize;
+    for index in 0..previous.len() {
+        let candidate = costs[index] - previous[index];
+        let current_best = costs[best] - previous[best];
+        if candidate.total_cmp(&current_best).is_lt() {
+            best = index;
+        }
+        prefix.push(best);
+    }
+    let mut suffix = vec![0usize; previous.len()];
+    best = previous.len() - 1;
+    for index in (0..previous.len()).rev() {
+        let candidate = costs[index] + previous[index];
+        let current_best = costs[best] + previous[best];
+        if candidate.total_cmp(&current_best).is_lt() || (candidate == current_best && index < best)
+        {
+            best = index;
+        }
+        suffix[index] = best;
+    }
+
+    let mut next_costs = Vec::with_capacity(current.len());
+    let mut predecessors = Vec::with_capacity(current.len());
+    for &y in current {
+        let split = previous.partition_point(|&previous_y| previous_y <= y);
+        let left = (split > 0).then(|| {
+            let index = prefix[split - 1];
+            (index, costs[index] + y - previous[index])
+        });
+        let right = (split < previous.len()).then(|| {
+            let index = suffix[split];
+            (index, costs[index] + previous[index] - y)
+        });
+        let (predecessor, cost) = match (left, right) {
+            (Some(left), Some(right)) => {
+                if left.1.total_cmp(&right.1).is_lt() || (left.1 == right.1 && left.0 < right.0) {
+                    left
+                } else {
+                    right
+                }
+            }
+            (Some(left), None) => left,
+            (None, Some(right)) => right,
+            (None, None) => unreachable!("crossing layers contain free intervals"),
+        };
+        next_costs.push(cost);
+        predecessors.push(predecessor);
+    }
+    (next_costs, predecessors)
 }
 
 fn stub_point(point: Point, side: PortSide, distance: f64) -> Point {
@@ -662,15 +834,62 @@ fn push_point(points: &mut Vec<Point>, point: Point) {
 
 #[cfg(test)]
 mod tests {
-    use super::choose_crossing_y;
+    use super::{crossing_track_y, distance_transform, shortest_crossing_path};
 
     #[test]
     fn crossing_tie_breaker_separates_coincident_tracks() {
-        let first = choose_crossing_y(&[(0.0, 4.0)], 1.0, 0, 3);
-        let second = choose_crossing_y(&[(0.0, 2.0)], 1.0, 1, 3);
+        let first = crossing_track_y((0.0, 4.0), 0, 3, 0, 2);
+        let second = crossing_track_y((0.0, 2.0), 1, 3, 1, 2);
 
         assert_ne!(first, second);
         assert!(first > 0.0 && first < 4.0);
         assert!(second > 0.0 && second < 2.0);
+    }
+
+    #[test]
+    fn shortest_path_keeps_a_consistent_free_corridor() {
+        let path = shortest_crossing_path(
+            &[
+                vec![(0.0, 10.0), (90.0, 100.0)],
+                vec![(0.0, 10.0), (90.0, 100.0)],
+                vec![(0.0, 10.0), (90.0, 100.0)],
+            ],
+            5.0,
+            5.0,
+            &[0, 0, 0],
+            &[1, 1, 1],
+            &[0, 1, 2],
+            3,
+        );
+
+        assert!(path.iter().all(|&y| y < 10.0));
+    }
+
+    #[test]
+    fn linear_distance_transform_matches_exhaustive_costs() {
+        let previous = [0.0, 10.0, 30.0];
+        let costs = [4.0, 0.0, 2.0];
+        let current = [5.0, 20.0, 40.0];
+        let (actual_costs, actual_predecessors) = distance_transform(&previous, &costs, &current);
+
+        let expected: Vec<_> = current
+            .iter()
+            .map(|&y| {
+                previous
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &before)| (index, costs[index] + f64::abs(before - y)))
+                    .min_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            actual_costs,
+            expected.iter().map(|item| item.1).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual_predecessors,
+            expected.iter().map(|item| item.0).collect::<Vec<_>>()
+        );
     }
 }

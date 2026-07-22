@@ -230,7 +230,7 @@ fn uncontended_adjacent_route_stays_straight() {
 
 #[test]
 fn large_multi_terminal_nets_keep_a_shared_outer_trunk() {
-    let target_count = 33;
+    let target_count = 301;
     let graph = Graph {
         nodes: (0..=target_count).map(|id| node(id, false)).collect(),
         edges: (1..=target_count)
