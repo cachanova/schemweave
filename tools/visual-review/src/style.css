@@ -51,7 +51,7 @@ button:hover, select:hover, .file-loader:hover { background: #202836; }
 main { padding: 12px; }
 .controls {
   display: grid;
-  grid-template-columns: 130px repeat(4, minmax(145px, 1fr)) minmax(210px, 1.25fr);
+  grid-template-columns: 130px repeat(5, minmax(135px, 1fr)) minmax(210px, 1.25fr);
   gap: 9px;
   align-items: stretch;
   margin-bottom: 10px;
