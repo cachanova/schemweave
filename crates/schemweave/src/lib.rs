@@ -194,12 +194,11 @@ pub fn layout_with_quality_effort(
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    let mut retain = |mut nodes: Vec<NodeGeometry>,
-                      mut edges: Vec<EdgeGeometry>,
+    let mut retain = |nodes: Vec<NodeGeometry>,
+                      edges: Vec<EdgeGeometry>,
                       quality: Option<routing::RouteQuality>| {
         let quality = quality.unwrap_or_else(|| routing::route_quality(&indexed, &edges));
-        let candidate = placement::normalize(&mut nodes, &mut edges);
-        retain_better_candidate(&mut best, quality, candidate);
+        retain_owned_candidate(&mut best, quality, nodes, edges);
     };
     let mut evaluate = |nodes: Vec<NodeGeometry>,
                         supplemental: bool,
@@ -289,16 +288,15 @@ pub fn layout_with_quality_effort(
             && baseline_order_crossings - alternative_crossings
                 >= baseline_order_crossings.div_ceil(100)
         {
-            let mut nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
+            let nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
             let alternative_plan = routing::RoutingPlan::new(&indexed, &alternative_ranks);
             let routed =
                 routing::route_planned_candidates(&alternative_plan, &nodes, options, false);
-            let mut edges = routed.primary;
+            let edges = routed.primary;
             let quality = routed
                 .primary_quality
                 .expect("planned candidates include exact primary quality");
-            let candidate = placement::normalize(&mut nodes, &mut edges);
-            retain_better_candidate(&mut best, quality, candidate);
+            retain_owned_candidate(&mut best, quality, nodes, edges);
         }
     }
     Ok(best.expect("layout has deterministic candidates").1)
@@ -330,28 +328,49 @@ fn retain_better_candidate(
     }
 }
 
+fn retain_owned_candidate(
+    best: &mut Option<(routing::RouteQuality, Layout)>,
+    quality: routing::RouteQuality,
+    nodes: Vec<NodeGeometry>,
+    edges: Vec<EdgeGeometry>,
+) {
+    if best
+        .as_ref()
+        .is_some_and(|(current_quality, _)| route_quality_cmp(quality, *current_quality).is_gt())
+    {
+        return;
+    }
+    retain_better_candidate(best, quality, placement::normalize_owned(nodes, edges));
+}
+
+fn route_quality_cmp(
+    left: routing::RouteQuality,
+    right: routing::RouteQuality,
+) -> std::cmp::Ordering {
+    left.crossings
+        .cmp(&right.crossings)
+        .then(left.bends.cmp(&right.bends))
+        .then(left.route_length.total_cmp(&right.route_length))
+}
+
 fn candidate_quality_cmp(
     left: routing::RouteQuality,
     left_layout: &Layout,
     right: routing::RouteQuality,
     right_layout: &Layout,
 ) -> std::cmp::Ordering {
-    left.crossings
-        .cmp(&right.crossings)
-        .then(left.bends.cmp(&right.bends))
-        .then(left.route_length.total_cmp(&right.route_length))
-        .then(
-            (left_layout.width * left_layout.height)
-                .total_cmp(&(right_layout.width * right_layout.height)),
-        )
+    route_quality_cmp(left, right).then(
+        (left_layout.width * left_layout.height)
+            .total_cmp(&(right_layout.width * right_layout.height)),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         Edge, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Port, PortSide,
-        QualityEffort, candidate_quality_cmp, layout, placement, retain_better_candidate, routing,
-        routing::RouteQuality, topology, validation,
+        QualityEffort, candidate_quality_cmp, layout, placement, retain_better_candidate,
+        retain_owned_candidate, routing, routing::RouteQuality, topology, validation,
     };
 
     mod active_fanout_fixture {
@@ -1122,6 +1141,42 @@ mod tests {
         assert_ne!(exact_tie.1, smaller.1);
         retain_better_candidate(&mut best, exact_tie.0, exact_tie.1);
         assert_eq!(best.as_ref().unwrap().1, smaller.1);
+    }
+
+    #[test]
+    fn owned_candidate_selection_keeps_the_exact_quality_and_area_ordering() {
+        let baseline = candidate(1, 3, 20.0, 100.0);
+        let mut best = Some(baseline.clone());
+        retain_owned_candidate(
+            &mut best,
+            candidate(2, 0, 1.0, 1.0).0,
+            vec![NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(best, Some(baseline.clone()));
+
+        retain_owned_candidate(
+            &mut best,
+            baseline.0,
+            vec![NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 5.0,
+                height: 4.0,
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            best.as_ref().unwrap().1.width * best.as_ref().unwrap().1.height,
+            20.0
+        );
     }
 
     #[test]
