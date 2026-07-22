@@ -62,6 +62,12 @@ pub(crate) fn validate_and_index(
         validate_endpoint(edge.id, "target", edge.target, &node_index, &ports)?;
     }
 
+    let mut raw_incoming = vec![0usize; nodes.len()];
+    for edge in &edges {
+        if edge.participates_in_ranking {
+            raw_incoming[node_index[&edge.target.node]] += 1;
+        }
+    }
     let mut outgoing = vec![Vec::new(); nodes.len()];
     let mut incoming = vec![Vec::new(); nodes.len()];
     for edge in &edges {
@@ -70,7 +76,9 @@ pub(crate) fn validate_and_index(
         }
         let source = node_index[&edge.source.node];
         let target = node_index[&edge.target.node];
-        if nodes[target].cycle_breaker {
+        // A root source cannot close a cycle, so its constraint can place a register after
+        // primary inputs. Other incoming register edges remain cut as feedback boundaries.
+        if nodes[target].cycle_breaker && raw_incoming[source] != 0 {
             continue;
         }
         outgoing[source].push(target);
