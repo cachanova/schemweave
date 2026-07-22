@@ -276,7 +276,7 @@ fn retain_best(
     layers: &[Vec<usize>],
     outgoing: &[Vec<usize>],
     positions: &mut [usize],
-    best_layers: &mut Vec<Vec<usize>>,
+    best_layers: &mut [Vec<usize>],
     best_crossings: &mut usize,
 ) {
     let crossings = crossing_count(layers, outgoing, positions);
