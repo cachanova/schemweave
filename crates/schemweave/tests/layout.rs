@@ -245,7 +245,7 @@ fn outer_lane_baseline_avoids_intermediate_nodes() {
 }
 
 #[test]
-fn adjacent_layers_route_inside_their_shared_channel() {
+fn adjacent_layers_align_ports_and_route_straight_through_their_channel() {
     let mut source = node(1, false);
     source.ports[1].offset = 10.0;
     let mut target = node(2, false);
@@ -260,11 +260,8 @@ fn adjacent_layers_route_inside_their_shared_channel() {
     let target = result.nodes.iter().find(|node| node.id == 2).unwrap();
     let route = &result.edges[0].points;
 
-    assert!(
-        route
-            .iter()
-            .any(|point| point.x > source.x + source.width && point.x < target.x)
-    );
+    assert_eq!(source.y + 10.0, target.y + 40.0);
+    assert_eq!(route.len(), 2);
     assert_eq!(
         result.height,
         result

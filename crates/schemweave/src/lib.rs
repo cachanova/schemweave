@@ -165,8 +165,44 @@ pub enum LayoutError {
 pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
     let ranks = topology::assign_ranks(&indexed);
-    let ordering = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
-    let mut nodes = placement::place_nodes(&indexed, &ranks, &ordering, options);
-    let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
-    Ok(placement::normalize(&mut nodes, &mut edges))
+    let [forward, reverse] =
+        topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps);
+    let quality_layers = if reverse.crossings < forward.crossings {
+        &reverse.layers
+    } else {
+        &forward.layers
+    };
+    let candidates = [
+        placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
+        placement::place_nodes(&indexed, &ranks, quality_layers, options),
+    ];
+    let mut best: Option<(routing::RouteQuality, Layout)> = None;
+    for mut nodes in candidates {
+        let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
+        let quality = routing::route_quality(&indexed, &edges);
+        let candidate = placement::normalize(&mut nodes, &mut edges);
+        let replace = best.as_ref().is_none_or(|(current_quality, current)| {
+            candidate_quality_cmp(quality, &candidate, *current_quality, current).is_lt()
+        });
+        if replace {
+            best = Some((quality, candidate));
+        }
+    }
+    Ok(best.expect("layout has deterministic candidates").1)
+}
+
+fn candidate_quality_cmp(
+    left: routing::RouteQuality,
+    left_layout: &Layout,
+    right: routing::RouteQuality,
+    right_layout: &Layout,
+) -> std::cmp::Ordering {
+    left.crossings
+        .cmp(&right.crossings)
+        .then(left.bends.cmp(&right.bends))
+        .then(left.route_length.total_cmp(&right.route_length))
+        .then(
+            (left_layout.width * left_layout.height)
+                .total_cmp(&(right_layout.width * right_layout.height)),
+        )
 }

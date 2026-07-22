@@ -2,14 +2,51 @@ use crate::{
     EdgeGeometry, Layout, LayoutOptions, NodeGeometry, PortSide, validation::IndexedGraph,
 };
 
-const ALIGNMENT_ROUNDS: usize = 4;
-const STABILITY_WEIGHT: f64 = 4.0;
+const BASELINE_ALIGNMENT_ROUNDS: usize = 4;
+const BASELINE_STABILITY_WEIGHT: f64 = 4.0;
+const QUALITY_ALIGNMENT_ROUNDS: usize = 16;
+const QUALITY_STABILITY_WEIGHT: f64 = 0.25;
 
 pub(crate) fn place_nodes(
     graph: &IndexedGraph<'_>,
     ranks: &[usize],
     layers: &[Vec<usize>],
     options: LayoutOptions,
+) -> Vec<NodeGeometry> {
+    place_nodes_with_alignment(
+        graph,
+        ranks,
+        layers,
+        options,
+        QUALITY_ALIGNMENT_ROUNDS,
+        QUALITY_STABILITY_WEIGHT,
+    )
+}
+
+pub(crate) fn place_baseline_nodes(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    layers: &[Vec<usize>],
+    options: LayoutOptions,
+) -> Vec<NodeGeometry> {
+    place_nodes_with_alignment(
+        graph,
+        ranks,
+        layers,
+        options,
+        BASELINE_ALIGNMENT_ROUNDS,
+        BASELINE_STABILITY_WEIGHT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_nodes_with_alignment(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    layers: &[Vec<usize>],
+    options: LayoutOptions,
+    alignment_rounds: usize,
+    stability_weight: f64,
 ) -> Vec<NodeGeometry> {
     let widths: Vec<f64> = layers
         .iter()
@@ -52,7 +89,15 @@ pub(crate) fn place_nodes(
         }
     }
     let mut positioned: Vec<_> = positioned.into_iter().map(Option::unwrap).collect();
-    align_connected_ports(graph, ranks, layers, &mut positioned, options.node_gap);
+    align_connected_ports(
+        graph,
+        ranks,
+        layers,
+        &mut positioned,
+        options.node_gap,
+        alignment_rounds,
+        stability_weight,
+    );
     positioned
 }
 
@@ -69,6 +114,8 @@ fn align_connected_ports(
     layers: &[Vec<usize>],
     nodes: &mut [NodeGeometry],
     node_gap: f64,
+    alignment_rounds: usize,
+    stability_weight: f64,
 ) {
     let mut alignments = vec![Vec::<Alignment>::new(); graph.nodes.len()];
     for edge in &graph.edges {
@@ -94,12 +141,12 @@ fn align_connected_ports(
         });
     }
 
-    for _ in 0..ALIGNMENT_ROUNDS {
+    for _ in 0..alignment_rounds {
         for layer in layers.iter().skip(1) {
-            align_layer(layer, &alignments, nodes, node_gap);
+            align_layer(layer, &alignments, nodes, node_gap, stability_weight);
         }
         for layer in layers.iter().take(layers.len().saturating_sub(1)).rev() {
-            align_layer(layer, &alignments, nodes, node_gap);
+            align_layer(layer, &alignments, nodes, node_gap, stability_weight);
         }
     }
 }
@@ -109,6 +156,7 @@ fn align_layer(
     alignments: &[Vec<Alignment>],
     nodes: &mut [NodeGeometry],
     node_gap: f64,
+    stability_weight: f64,
 ) {
     if layer.is_empty() {
         return;
@@ -119,8 +167,8 @@ fn align_layer(
     let mut weights = Vec::with_capacity(layer.len());
     for &node in layer {
         offsets.push(offset);
-        let mut weighted_y = STABILITY_WEIGHT * nodes[node].y;
-        let mut weight = STABILITY_WEIGHT;
+        let mut weighted_y = stability_weight * nodes[node].y;
+        let mut weight = stability_weight;
         for alignment in &alignments[node] {
             weighted_y +=
                 nodes[alignment.neighbor].y + alignment.neighbor_offset - alignment.own_offset;
@@ -264,14 +312,14 @@ mod tests {
             });
         }
 
-        align_layer(&[0, 1, 2], &alignments, &mut nodes, 10.0);
+        align_layer(&[0, 1, 2], &alignments, &mut nodes, 10.0, 1.0);
 
         assert!(nodes[1].y >= nodes[0].y + nodes[0].height + 10.0);
         assert!(nodes[2].y >= nodes[1].y + nodes[1].height + 10.0);
     }
 
     #[test]
-    fn placement_moves_connected_ports_toward_alignment() {
+    fn placement_converges_connected_ports_to_alignment() {
         let graph = Graph {
             nodes: vec![
                 Node {
@@ -309,9 +357,8 @@ mod tests {
         let nodes = place(&graph, LayoutOptions::default()).unwrap();
         let source = nodes.iter().find(|node| node.id == 1).unwrap();
         let target = nodes.iter().find(|node| node.id == 2).unwrap();
-        let initial_port_delta = 40.0;
         let aligned_port_delta = (source.y + 5.0 - target.y - 45.0).abs();
 
-        assert!(aligned_port_delta < initial_port_delta);
+        assert!(aligned_port_delta < 1.0, "{aligned_port_delta}");
     }
 }
