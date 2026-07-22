@@ -22,3 +22,4 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: cargo check --locked --package schemweave-wasm --target wasm32-unknown-unknown
+      - run: cargo build --locked --release --package schemweave-wasm --target wasm32-unknown-unknown

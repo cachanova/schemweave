@@ -7,17 +7,20 @@ orthogonal edge polylines. It has no DOM, JavaScript, HDL, Yosys, or application
 model dependency.
 
 The current pipeline validates and compacts stable caller identifiers, cuts
-ranking dependencies at explicit cycle breakers, condenses remaining strongly
-connected components, assigns left-to-right ranks, applies deterministic
-barycentric ordering over real and net-scoped virtual items, refines adjacent
-crossings, places node layers, and routes ordinary forward nets through sparse
-inter-layer channels and obstacle-free vertical corridors. Inter-layer and
-outer-trunk lane nesting use bounded crossing-cost transposition. Unsupported port
-directions, feedback, and very large multi-terminal nets retain globally unique
+feedback dependencies at explicit cycle breakers while retaining acyclic root
+constraints, condenses remaining strongly connected components, and assigns
+left-to-right ranks. Deterministic barycentric ordering operates over real and
+net-scoped virtual items. Placement then aligns connected fixed ports with
+bounded bidirectional sweeps and weighted isotonic projection, preserving node
+order and minimum gaps.
+
+Ordinary forward nets route through sparse inter-layer channels and
+obstacle-free vertical corridors. Eligible single-driver multi-terminal nets
+share one median-guided corridor backbone and branch only in their final gap.
+Inter-layer and outer-trunk lanes use bounded crossing-cost transposition.
+Unsupported port directions, feedback, and extremely large nets retain unique
 channel tracks and may branch onto deterministic top and bottom outer trunks as
-a correctness backstop. Negotiated congestion and native multi-terminal trees
-will replace that backstop while retaining the public contract and topology
-stages.
+a correctness backstop.
 
 `schemweave-wasm` exposes the same engine through a JSON function designed
 to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
@@ -25,8 +28,10 @@ and rendering remain responsibilities of the consuming application.
 
 `schemweave-eval` is a development-only quality scorer. It validates the public
 geometry contract and measures node overlap, route/node intersections,
-unrelated segment overlap and contact, physical net crossings, edge-level bends
-and route length, and area. It is not a dependency of either runtime crate.
+unrelated segment overlap and contact, physical net crossings, unique physical
+net bends, union wire length, and area. Hard gates operate on the original edge
+routes; same-net merging affects only physical quality measurements. The scorer
+is not a dependency of either runtime crate.
 
 ## Invariants
 
@@ -41,14 +46,13 @@ and route length, and area. It is not a dependency of either runtime crate.
 - The implementation uses compact numeric indices internally and avoids graph
   cloning between phases.
 
-## Routing direction
+## Routing resources
 
-The target router uses a sparse rectilinear visibility graph around placed node
-obstacles. Initial routes use A* with length, bend, crossing, and congestion
-costs. Deterministic Pathfinder-style rip-up and reroute raises historical costs
-on contested resources until unrelated segment sharing and node intersections
-are eliminated. A final lane-assignment and compaction pass reduces area without
-changing connectivity or endpoint direction.
+The router constructs only layer gaps, free vertical intervals, endpoint escape
+tracks, and the lanes actually used by the graph. Dynamic programming chooses a
+consistent free interval across each forward span. Net-aware ordering and
+bounded adjacent transposition minimize predicted crossings without allocating
+a dense visibility grid or performing order-dependent global reroute rounds.
 
 Electrical `net` identities are explicit in the API. Shared trunks are legal
 within one net; multiple nets may also share the minimum escape segment when
