@@ -30,6 +30,7 @@ const MIN_FANOUT_AWARE_CHANNEL_EDGES: usize = 16;
 // A channel-order candidate emits and exactly scores a second complete route set. Require enough
 // actual outer sink work to amortize that cost; smaller clusters keep the historical fast path.
 const MIN_FANOUT_AWARE_OUTER_BRANCHES: usize = 512;
+const MIN_FANOUT_AWARE_NODES: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RouteQuality {
@@ -409,6 +410,7 @@ fn route_edges_with_lane_rounds(
         .unwrap_or(usize::MAX);
     let fanout_within_budget = fanout_candidates
         && repair_crossings
+        && node_count >= MIN_FANOUT_AWARE_NODES
         && fanout_candidate_within_budget(node_count, plan.edges.len(), &routes);
     let adaptive_channel_lanes = fanout_within_budget
         .then(|| fanout_outer_channel_lane_indices(plan, &sparse_spans, &outer_nets))
@@ -3149,6 +3151,31 @@ mod tests {
         ]);
     }
 
+    fn pad_fixture_to_fanout_node_threshold(
+        graph: &mut Graph,
+        geometry: &mut Vec<NodeGeometry>,
+        ranks: &mut Vec<usize>,
+    ) {
+        while graph.nodes.len() < super::MIN_FANOUT_AWARE_NODES {
+            let id = graph.nodes.len() as u32;
+            graph.nodes.push(Node {
+                id,
+                width: 20.0,
+                height: 20.0,
+                cycle_breaker: false,
+                ports: Vec::new(),
+            });
+            geometry.push(NodeGeometry {
+                id,
+                x: 400.0,
+                y: f64::from(id % 20) * 30.0,
+                width: 20.0,
+                height: 20.0,
+            });
+            ranks.push(3);
+        }
+    }
+
     #[test]
     fn fanout_channel_candidate_counts_only_outer_branches_and_is_total() {
         let (graph, _, ranks) = fanout_candidate_fixture(512, 1);
@@ -3177,6 +3204,7 @@ mod tests {
         let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
         add_crossing_repair_fixture(&mut graph, &mut geometry, &mut ranks);
         add_feedback_fixture(&mut graph, &mut geometry, &mut ranks);
+        pad_fixture_to_fanout_node_threshold(&mut graph, &mut geometry, &mut ranks);
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
         let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
@@ -3225,7 +3253,8 @@ mod tests {
 
     #[test]
     fn production_fanout_candidate_retains_exact_baseline_when_not_better() {
-        let (mut graph, geometry, ranks) = fanout_candidate_fixture(512, 16);
+        let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
+        pad_fixture_to_fanout_node_threshold(&mut graph, &mut geometry, &mut ranks);
         for edge in graph.edges.iter_mut().take(512) {
             edge.net = 1_000;
         }

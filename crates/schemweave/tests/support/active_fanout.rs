@@ -64,7 +64,7 @@ pub fn graph() -> Graph {
             offset: 10.0,
         }],
     });
-    for branch in 0..512u32 {
+    for branch in 0..950u32 {
         graph.nodes.push(Node {
             id: first + 1 + branch,
             width: 20.0,
@@ -91,8 +91,8 @@ pub fn graph() -> Graph {
         });
     }
     for branch in 0..16u32 {
-        let source = first + 513 + branch;
-        let target = first + 529 + (15 - branch);
+        let source = first + 951 + branch;
+        let target = first + 967 + (15 - branch);
         graph.nodes.extend([
             Node {
                 id: source,
