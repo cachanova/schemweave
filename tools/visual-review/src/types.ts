@@ -116,6 +116,7 @@ export interface ElkGeometry {
 
 export interface WorkerRequest {
   id: number
+  datasetId: number
   fixtureName: string
   graph: SchemWeaveGraph
   elk: ElkGeometry
@@ -125,10 +126,11 @@ export interface WorkerRequest {
 export type WorkerResponse =
   | {
       id: number
+      datasetId: number
       fixtureName: string
       elapsedMs: number
       layout: Layout
       quality: QualityReport
       elkQuality: QualityReport
     }
-  | { id: number; fixtureName: string; error: string }
+  | { id: number; datasetId: number; fixtureName: string; error: string }

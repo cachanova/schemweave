@@ -18,6 +18,10 @@ export class CanvasView {
   private view: ViewState = { scale: 1, x: 0, y: 0 }
   private dragging: { x: number; y: number } | null = null
   private fittedScale = 1
+  private frame: number | null = null
+  private controlEdges = new Set<number>()
+  private registers = new Set<number>()
+  private labels = new Map<number, string>()
   onViewChanged: (() => void) | null = null
 
   constructor(private readonly canvas: HTMLCanvasElement) {
@@ -31,12 +35,24 @@ export class CanvasView {
   setGeometry(geometry: Layout, fixture: Fixture): void {
     this.geometry = geometry
     this.fixture = fixture
+    this.controlEdges = new Set(
+      fixture.resolvedInput.edges.filter((edge) => edge.control).map((edge) => edge.inputIndex),
+    )
+    this.registers = new Set(
+      fixture.resolvedInput.nodes.filter((node) => node.register).map((node) => node.id),
+    )
+    this.labels = new Map(
+      fixture.subgraph?.nodes.map((node) => [node.id, node.name || node.cell_type || `${node.id}`]),
+    )
     this.fit()
   }
 
   clear(): void {
     this.geometry = null
     this.fixture = null
+    this.controlEdges.clear()
+    this.registers.clear()
+    this.labels.clear()
     this.draw()
   }
 
@@ -58,7 +74,7 @@ export class CanvasView {
       x: (this.canvas.width - width * this.fittedScale) / 2,
       y: (this.canvas.height - height * this.fittedScale) / 2,
     }
-    this.draw()
+    this.scheduleDraw()
   }
 
   normalizedView(): NormalizedView | null {
@@ -82,7 +98,7 @@ export class CanvasView {
       this.canvas.width / 2 - view.centerX * this.geometry.width * this.view.scale
     this.view.y =
       this.canvas.height / 2 - view.centerY * this.geometry.height * this.view.scale
-    this.draw()
+    this.scheduleDraw()
   }
 
   draw(): void {
@@ -91,16 +107,6 @@ export class CanvasView {
     if (!context) return
     context.clearRect(0, 0, this.canvas.width, this.canvas.height)
     if (!this.geometry || !this.fixture) return
-
-    const controlEdges = new Set(
-      this.fixture.resolvedInput.edges.filter((edge) => edge.control).map((edge) => edge.inputIndex),
-    )
-    const registers = new Set(
-      this.fixture.resolvedInput.nodes.filter((node) => node.register).map((node) => node.id),
-    )
-    const labels = new Map(
-      this.fixture.subgraph?.nodes.map((node) => [node.id, node.name || node.cell_type || `${node.id}`]),
-    )
 
     context.save()
     context.translate(this.view.x, this.view.y)
@@ -115,21 +121,21 @@ export class CanvasView {
       for (let index = 1; index < edge.points.length; index += 1) {
         context.lineTo(edge.points[index].x, edge.points[index].y)
       }
-      context.strokeStyle = controlEdges.has(edge.id) ? '#f2a83b' : '#78879a'
+      context.strokeStyle = this.controlEdges.has(edge.id) ? '#f2a83b' : '#78879a'
       context.lineWidth = Math.max(0.7 / this.view.scale, 1.25)
       context.stroke()
     }
 
     context.globalAlpha = 0.96
     for (const node of this.geometry.nodes) {
-      const register = registers.has(node.id)
+      const register = this.registers.has(node.id)
       context.fillStyle = register ? '#6153d8' : '#243143'
       context.strokeStyle = register ? '#b5aaff' : '#8292a8'
       context.lineWidth = Math.max(0.65 / this.view.scale, 1)
       context.fillRect(node.x, node.y, node.width, node.height)
       context.strokeRect(node.x, node.y, node.width, node.height)
       if (node.width * this.view.scale > 52 * devicePixelRatio) {
-        const label = labels.get(node.id) ?? `${node.id}`
+        const label = this.labels.get(node.id) ?? `${node.id}`
         context.save()
         context.beginPath()
         context.rect(node.x + 2, node.y + 2, node.width - 4, node.height - 4)
@@ -166,7 +172,7 @@ export class CanvasView {
     this.view.scale = next
     this.view.x = mouseX - (mouseX - this.view.x) * (next / previous)
     this.view.y = mouseY - (mouseY - this.view.y) * (next / previous)
-    this.draw()
+    this.scheduleDraw()
     this.onViewChanged?.()
   }
 
@@ -181,12 +187,20 @@ export class CanvasView {
     this.view.x += (event.clientX - this.dragging.x) * devicePixelRatio
     this.view.y += (event.clientY - this.dragging.y) * devicePixelRatio
     this.dragging = { x: event.clientX, y: event.clientY }
-    this.draw()
+    this.scheduleDraw()
     this.onViewChanged?.()
   }
 
   private endPan(): void {
     this.dragging = null
     this.canvas.classList.remove('dragging')
+  }
+
+  private scheduleDraw(): void {
+    if (this.frame != null) return
+    this.frame = requestAnimationFrame(() => {
+      this.frame = null
+      this.draw()
+    })
   }
 }

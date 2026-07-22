@@ -35,3 +35,7 @@ jobs:
         working-directory: tools/visual-review
       - run: npm run build
         working-directory: tools/visual-review
+      - run: npx playwright install --with-deps chromium
+        working-directory: tools/visual-review
+      - run: npm run test:browser
+        working-directory: tools/visual-review

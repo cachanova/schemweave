@@ -1,7 +1,9 @@
 import './style.css'
 
 import { CanvasView } from './canvasView'
-import { buildGraph, elkAsLayout } from './graph'
+import { prepareDataset, type PreparedDataset } from './dataset'
+import { elkAsLayout } from './graph'
+import { LatestRequest } from './latestRequest'
 import type {
   Corpus,
   ElkRows,
@@ -51,24 +53,28 @@ schemweaveView.onViewChanged = () => {
   if (syncView.checked && view) elkView.applyNormalizedView(view)
 }
 
-let corpus: Corpus | null = null
-let fixtures: Fixture[] = []
-let elkRows: ElkRows['rows'] = []
+let dataset: PreparedDataset | null = null
+let datasetId = 0
 let currentIndex = 0
-let workerBusy = false
-let requestPending = false
+let layoutDirty = false
 let requestSequence = 0
 let debounce: number | null = null
 let lastFixtureName: string | null = null
 
 const worker = new Worker(new URL('./layout.worker.ts', import.meta.url), { type: 'module' })
+const requests = new LatestRequest<WorkerRequest>((request) => {
+  status.textContent = `Laying out ${request.fixtureName}…`
+  worker.postMessage(request)
+})
 worker.addEventListener('message', (event: MessageEvent<WorkerResponse>) => {
-  workerBusy = false
   const response = event.data
-  if (requestPending || response.fixtureName !== currentFixture()?.name) {
-    dispatchLayout()
-    return
-  }
+  const superseded =
+    layoutDirty ||
+    requests.hasPending ||
+    response.datasetId !== datasetId ||
+    response.fixtureName !== currentFixture()?.name
+  requests.complete()
+  if (superseded) return
   if ('error' in response) {
     status.textContent = `Layout failed: ${response.error}`
     return
@@ -84,22 +90,25 @@ worker.addEventListener('message', (event: MessageEvent<WorkerResponse>) => {
   }
   schemweaveSize.textContent = dimensions(response.layout.width, response.layout.height)
   updateMetrics(response.elkQuality, response.quality)
-  status.textContent = `${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${response.elapsedMs.toFixed(1)} ms`
+  const elkInvalid = contractViolations(response.elkQuality)
+  const schemweaveInvalid = contractViolations(response.quality)
+  const invalid = elkInvalid + schemweaveInvalid
+  status.textContent = `${invalid > 0 ? `INVALID: ELK ${elkInvalid}, SchemWeave ${schemweaveInvalid} · ` : ''}${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${response.elapsedMs.toFixed(1)} ms`
   lastFixtureName = fixture.name
 })
 
 worker.addEventListener('error', (event) => {
-  workerBusy = false
+  if (requests.busy) requests.complete()
   status.textContent = `Worker failed: ${event.message}`
 })
 
 function currentFixture(): Fixture | null {
-  return fixtures[currentIndex] ?? null
+  return dataset?.fixtures[currentIndex] ?? null
 }
 
 function currentElk(): ElkRows['rows'][number] | null {
   const name = currentFixture()?.name
-  return elkRows.find((row) => row.name === name) ?? null
+  return name ? (dataset?.elkByName.get(name) ?? null) : null
 }
 
 function layoutOptions(): LayoutOptions {
@@ -113,8 +122,10 @@ function layoutOptions(): LayoutOptions {
 }
 
 function scheduleLayout(delay = 100): void {
-  requestPending = true
-  status.textContent = workerBusy ? 'Finishing current layout; newest settings queued…' : 'Layout queued…'
+  layoutDirty = true
+  status.textContent = requests.busy
+    ? 'Finishing current layout; newest settings queued…'
+    : 'Layout queued…'
   if (debounce != null) window.clearTimeout(debounce)
   debounce = window.setTimeout(() => {
     debounce = null
@@ -123,26 +134,26 @@ function scheduleLayout(delay = 100): void {
 }
 
 function dispatchLayout(): void {
-  if (workerBusy || !requestPending) return
+  if (!layoutDirty) return
   const fixture = currentFixture()
   const elk = currentElk()
-  if (!fixture || !elk) return
-  requestPending = false
-  workerBusy = true
-  status.textContent = `Laying out ${fixture.name}…`
+  const graph = fixture ? dataset?.graphByName.get(fixture.name) : null
+  if (!fixture || !elk || !graph) return
+  layoutDirty = false
   const request: WorkerRequest = {
     id: ++requestSequence,
+    datasetId,
     fixtureName: fixture.name,
-    graph: buildGraph(fixture),
+    graph,
     elk: elk.geometry,
     options: layoutOptions(),
   }
-  worker.postMessage(request)
+  requests.submit(request)
 }
 
 function showFixture(index: number): void {
-  if (fixtures.length === 0) return
-  currentIndex = (index + fixtures.length) % fixtures.length
+  if (!dataset || dataset.fixtures.length === 0) return
+  currentIndex = (index + dataset.fixtures.length) % dataset.fixtures.length
   const fixture = currentFixture()
   const elk = currentElk()
   if (!fixture || !elk) return
@@ -158,17 +169,17 @@ function showFixture(index: number): void {
 }
 
 function initializeData(nextCorpus: Corpus, nextElk: ElkRows): void {
-  const elkNames = new Set(nextElk.rows.map((row) => row.name))
-  fixtures = nextCorpus.fixtures.filter((fixture) => elkNames.has(fixture.name))
-  if (fixtures.length === 0) throw new Error('corpus and ELK data have no matching fixtures')
-  corpus = nextCorpus
-  elkRows = nextElk.rows
+  const prepared = prepareDataset(nextCorpus, nextElk)
+  dataset = prepared
+  datasetId += 1
   fixtureSelect.replaceChildren(
-    ...fixtures.map((fixture) => new Option(`${fixture.name} (${fixture.nodeCount})`, fixture.name)),
+    ...prepared.fixtures.map(
+      (fixture) => new Option(`${fixture.name} (${fixture.nodeCount})`, fixture.name),
+    ),
   )
   corpusRevision.textContent = `SynthExplorer corpus ${nextCorpus.exactBaseSha.slice(0, 10)}`
   const requested = decodeURIComponent(location.hash.slice(1))
-  const requestedIndex = fixtures.findIndex((fixture) => fixture.name === requested)
+  const requestedIndex = prepared.fixtures.findIndex((fixture) => fixture.name === requested)
   showFixture(requestedIndex >= 0 ? requestedIndex : 0)
 }
 
@@ -180,8 +191,11 @@ async function loadDefaultData(): Promise<void> {
     ])
     if (!corpusResponse.ok || !elkResponse.ok) throw new Error('review data endpoint unavailable')
     initializeData((await corpusResponse.json()) as Corpus, (await elkResponse.json()) as ElkRows)
-  } catch {
-    status.textContent = 'Select corpus.json and elk.json with “Load data”'
+  } catch (error) {
+    status.textContent =
+      error instanceof Error && error.message !== 'review data endpoint unavailable'
+        ? error.message
+        : 'Select corpus.json and elk.json with “Load data”'
   }
 }
 
@@ -236,7 +250,9 @@ for (const control of [layerGap, nodeGap, laneGap, sweeps]) {
   })
 }
 fixtureSelect.addEventListener('change', () => {
-  showFixture(fixtures.findIndex((fixture) => fixture.name === fixtureSelect.value))
+  showFixture(
+    dataset?.fixtures.findIndex((fixture) => fixture.name === fixtureSelect.value) ?? -1,
+  )
 })
 query<HTMLButtonElement>('#previous').addEventListener('click', () => showFixture(currentIndex - 1))
 query<HTMLButtonElement>('#next').addEventListener('click', () => showFixture(currentIndex + 1))
@@ -287,7 +303,7 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       higherIsBetter: true,
     },
     { label: 'Viewport fit', elk: (q) => q.viewport_fit, format: decimal },
-    { label: 'Area', elk: (q) => q.area, format: integer },
+    { label: 'Contract violations', elk: contractViolations, format: integer },
   ]
 
   metrics.replaceChildren(
@@ -342,6 +358,16 @@ function decimal(value: number): string {
 
 function percentage(value: number): string {
   return `${(value * 100).toFixed(1)}%`
+}
+
+function contractViolations(quality: QualityReport): number {
+  return (
+    quality.semantic_violations +
+    quality.node_overlaps +
+    quality.node_intersections +
+    quality.unrelated_overlaps +
+    quality.unrelated_contacts
+  )
 }
 
 updateControlLabels()

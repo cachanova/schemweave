@@ -7,9 +7,11 @@
     "dev": "npm run build:wasm && vite",
     "build": "npm run build:wasm && tsc --noEmit && vite build",
     "test": "vitest run",
+    "test:browser": "node scripts/browser-smoke.mjs",
     "lint": "tsc --noEmit"
   },
   "devDependencies": {
+    "@playwright/test": "1.61.1",
     "@types/node": "^24.0.0",
     "typescript": "~6.0.2",
     "vite": "^8.1.5",
