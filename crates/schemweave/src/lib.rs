@@ -197,6 +197,7 @@ pub fn layout_with_quality_effort(
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
     let candidate_routing = CandidateRouting {
         adaptive_gap_spacing,
+        deeper_crossing_repair: quality_effort == QualityEffort::Max,
         ..CandidateRouting::default()
     };
     evaluate_candidate(
@@ -259,7 +260,7 @@ pub fn layout_with_quality_effort(
         if quality_effort == QualityEffort::Max && large_sparse_global {
             let nodes =
                 placement::place_nodes(&indexed, &ranks, &net_representative.layers, options);
-            let routed = routing::route_planned_candidates_with_adaptive_gap_spacing(
+            let routed = routing::route_planned_candidates_with_quality_options(
                 &routing_plan,
                 &nodes,
                 options,
@@ -268,6 +269,7 @@ pub fn layout_with_quality_effort(
                 large_sparse_global,
                 true,
                 adaptive_gap_spacing,
+                true,
             );
             retain_routed_candidates(&indexed, &mut best, nodes, routed);
         } else {
@@ -304,7 +306,7 @@ pub fn layout_with_quality_effort(
         {
             let nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
             let alternative_plan = routing::RoutingPlan::new(&indexed, &alternative_ranks);
-            let routed = routing::route_planned_candidates_with_adaptive_gap_spacing(
+            let routed = routing::route_planned_candidates_with_quality_options(
                 &alternative_plan,
                 &nodes,
                 options,
@@ -313,6 +315,7 @@ pub fn layout_with_quality_effort(
                 false,
                 false,
                 adaptive_gap_spacing,
+                false,
             );
             let edges = routed.primary;
             let quality = routed
@@ -365,6 +368,7 @@ struct CandidateRouting {
     sparse_global: bool,
     large_sparse_global: bool,
     adaptive_gap_spacing: bool,
+    deeper_crossing_repair: bool,
 }
 
 fn evaluate_candidate(
@@ -375,7 +379,7 @@ fn evaluate_candidate(
     options: LayoutOptions,
     routing: CandidateRouting,
 ) {
-    let routed = routing::route_planned_candidates_with_adaptive_gap_spacing(
+    let routed = routing::route_planned_candidates_with_quality_options(
         routing_plan,
         &nodes,
         options,
@@ -384,6 +388,7 @@ fn evaluate_candidate(
         routing.large_sparse_global,
         false,
         routing.adaptive_gap_spacing,
+        routing.deeper_crossing_repair,
     );
     retain_routed_candidates(indexed, best, nodes, routed);
 }
@@ -660,8 +665,8 @@ mod tests {
         };
         let ordinary = placement::place_nodes(&indexed, &ranks, layers, options);
         let plan = routing::RoutingPlan::new(&indexed, &ranks);
-        let routed = routing::route_planned_candidates_with_adaptive_gap_spacing(
-            &plan, &ordinary, options, false, true, false, false, true,
+        let routed = routing::route_planned_candidates_with_quality_options(
+            &plan, &ordinary, options, false, true, false, false, true, false,
         );
         (ordinary, routed)
     }
@@ -1173,8 +1178,8 @@ mod tests {
                 placement::place_nodes(&indexed, ranks, layers, options)
             };
             let plan = routing::RoutingPlan::new(&indexed, ranks);
-            let mut edges = routing::route_planned_candidates_with_adaptive_gap_spacing(
-                &plan, &nodes, options, false, false, false, false, true,
+            let mut edges = routing::route_planned_candidates_with_quality_options(
+                &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
             let quality = routing::route_quality(&indexed, &edges);
@@ -1253,8 +1258,8 @@ mod tests {
 
         let evaluate = |mut nodes: Vec<NodeGeometry>| {
             let plan = routing::RoutingPlan::new(&indexed, &ranks);
-            let mut edges = routing::route_planned_candidates_with_adaptive_gap_spacing(
-                &plan, &nodes, options, false, false, false, false, true,
+            let mut edges = routing::route_planned_candidates_with_quality_options(
+                &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
             let quality = routing::route_quality(&indexed, &edges);
@@ -1393,8 +1398,8 @@ mod tests {
 
         let evaluate = |mut nodes: Vec<NodeGeometry>| {
             let plan = routing::RoutingPlan::new(&indexed, &ranks);
-            let mut edges = routing::route_planned_candidates_with_adaptive_gap_spacing(
-                &plan, &nodes, options, false, false, false, false, true,
+            let mut edges = routing::route_planned_candidates_with_quality_options(
+                &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
             let quality = routing::route_quality(&indexed, &edges);
