@@ -181,14 +181,22 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
         let quality = routing::route_quality(&indexed, &edges);
         let candidate = placement::normalize(&mut nodes, &mut edges);
-        let replace = best.as_ref().is_none_or(|(current_quality, current)| {
-            candidate_quality_cmp(quality, &candidate, *current_quality, current).is_lt()
-        });
-        if replace {
-            best = Some((quality, candidate));
-        }
+        retain_better_candidate(&mut best, quality, candidate);
     }
     Ok(best.expect("layout has deterministic candidates").1)
+}
+
+fn retain_better_candidate(
+    best: &mut Option<(routing::RouteQuality, Layout)>,
+    quality: routing::RouteQuality,
+    candidate: Layout,
+) {
+    let replace = best.as_ref().is_none_or(|(current_quality, current)| {
+        candidate_quality_cmp(quality, &candidate, *current_quality, current).is_lt()
+    });
+    if replace {
+        *best = Some((quality, candidate));
+    }
 }
 
 fn candidate_quality_cmp(
@@ -205,4 +213,57 @@ fn candidate_quality_cmp(
             (left_layout.width * left_layout.height)
                 .total_cmp(&(right_layout.width * right_layout.height)),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Layout, retain_better_candidate, routing::RouteQuality};
+
+    fn candidate(
+        crossings: usize,
+        bends: usize,
+        route_length: f64,
+        area: f64,
+    ) -> (RouteQuality, Layout) {
+        (
+            RouteQuality {
+                crossings,
+                bends,
+                route_length,
+            },
+            Layout {
+                nodes: Vec::new(),
+                edges: Vec::new(),
+                width: area,
+                height: 1.0,
+            },
+        )
+    }
+
+    #[test]
+    fn candidate_selection_preserves_baseline_and_uses_quality_priority() {
+        let baseline = candidate(1, 4, 30.0, 40.0);
+        let mut best = None;
+        retain_better_candidate(&mut best, baseline.0, baseline.1.clone());
+
+        let worse_crossings = candidate(2, 0, 1.0, 1.0);
+        retain_better_candidate(&mut best, worse_crossings.0, worse_crossings.1);
+        assert_eq!(best.as_ref().unwrap().1, baseline.1);
+
+        let fewer_bends = candidate(1, 3, 100.0, 100.0);
+        retain_better_candidate(&mut best, fewer_bends.0, fewer_bends.1.clone());
+        assert_eq!(best.as_ref().unwrap().1, fewer_bends.1);
+
+        let shorter = candidate(1, 3, 20.0, 100.0);
+        retain_better_candidate(&mut best, shorter.0, shorter.1.clone());
+        assert_eq!(best.as_ref().unwrap().1, shorter.1);
+
+        let smaller = candidate(1, 3, 20.0, 20.0);
+        retain_better_candidate(&mut best, smaller.0, smaller.1.clone());
+        assert_eq!(best.as_ref().unwrap().1, smaller.1);
+
+        let exact_tie = candidate(1, 3, 20.0, 20.0);
+        retain_better_candidate(&mut best, exact_tie.0, exact_tie.1);
+        assert_eq!(best.as_ref().unwrap().1, smaller.1);
+    }
 }

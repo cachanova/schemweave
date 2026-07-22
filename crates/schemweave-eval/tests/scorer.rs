@@ -240,6 +240,9 @@ fn scores_the_full_consumer_bound() {
     assert_eq!(report.semantic_violations, 0);
     assert_eq!(report.node_overlaps, 0);
     assert_eq!(report.node_intersections, 0);
+    assert_eq!(report.unrelated_overlaps, 0);
+    assert_eq!(report.unrelated_contacts, 0);
+    assert!(report.passes_hard_gates(), "{report:#?}");
     assert_eq!(
         report.segments,
         layout.edges.iter().map(|edge| edge.points.len() - 1).sum()
