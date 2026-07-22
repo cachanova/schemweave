@@ -7,6 +7,7 @@ use crate::{
 pub(crate) struct IndexedGraph<'a> {
     pub(crate) nodes: Vec<&'a Node>,
     pub(crate) edges: Vec<&'a Edge>,
+    pub(crate) rank_edges: Vec<bool>,
     pub(crate) node_index: HashMap<NodeId, usize>,
     pub(crate) ports: Vec<HashMap<PortId, &'a Port>>,
     pub(crate) outgoing: Vec<Vec<usize>>,
@@ -70,8 +71,10 @@ pub(crate) fn validate_and_index(
     }
     let mut outgoing = vec![Vec::new(); nodes.len()];
     let mut incoming = vec![Vec::new(); nodes.len()];
+    let mut rank_edges = Vec::with_capacity(edges.len());
     for edge in &edges {
         if !edge.participates_in_ranking {
+            rank_edges.push(false);
             continue;
         }
         let source = node_index[&edge.source.node];
@@ -79,14 +82,17 @@ pub(crate) fn validate_and_index(
         // A root source cannot close a cycle, so its constraint can place a register after
         // primary inputs. Other incoming register edges remain cut as feedback boundaries.
         if nodes[target].cycle_breaker && raw_incoming[source] != 0 {
+            rank_edges.push(false);
             continue;
         }
+        rank_edges.push(true);
         outgoing[source].push(target);
         incoming[target].push(source);
     }
     Ok(IndexedGraph {
         nodes,
         edges,
+        rank_edges,
         node_index,
         ports,
         outgoing,
