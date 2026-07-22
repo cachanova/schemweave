@@ -3151,12 +3151,13 @@ mod tests {
         ]);
     }
 
-    fn pad_fixture_to_fanout_node_threshold(
+    fn pad_fixture_to_node_count(
         graph: &mut Graph,
         geometry: &mut Vec<NodeGeometry>,
         ranks: &mut Vec<usize>,
+        node_count: usize,
     ) {
-        while graph.nodes.len() < super::MIN_FANOUT_AWARE_NODES {
+        while graph.nodes.len() < node_count {
             let id = graph.nodes.len() as u32;
             graph.nodes.push(Node {
                 id,
@@ -3204,7 +3205,12 @@ mod tests {
         let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
         add_crossing_repair_fixture(&mut graph, &mut geometry, &mut ranks);
         add_feedback_fixture(&mut graph, &mut geometry, &mut ranks);
-        pad_fixture_to_fanout_node_threshold(&mut graph, &mut geometry, &mut ranks);
+        pad_fixture_to_node_count(
+            &mut graph,
+            &mut geometry,
+            &mut ranks,
+            super::MIN_FANOUT_AWARE_NODES,
+        );
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
         let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
@@ -3254,7 +3260,12 @@ mod tests {
     #[test]
     fn production_fanout_candidate_retains_exact_baseline_when_not_better() {
         let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
-        pad_fixture_to_fanout_node_threshold(&mut graph, &mut geometry, &mut ranks);
+        pad_fixture_to_node_count(
+            &mut graph,
+            &mut geometry,
+            &mut ranks,
+            super::MIN_FANOUT_AWARE_NODES,
+        );
         for edge in graph.edges.iter_mut().take(512) {
             edge.net = 1_000;
         }
@@ -3304,6 +3315,36 @@ mod tests {
         assert!(!supplemental.fanout_trace.evaluated);
         assert!(!supplemental.fanout_trace.selected);
         assert_eq!(supplemental.primary, stable.primary);
+    }
+
+    #[test]
+    fn production_fanout_candidate_preserves_routes_below_node_threshold() {
+        let (mut graph, mut geometry, mut ranks) = fanout_candidate_fixture(512, 16);
+        pad_fixture_to_node_count(
+            &mut graph,
+            &mut geometry,
+            &mut ranks,
+            super::MIN_FANOUT_AWARE_NODES - 1,
+        );
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let supplemental =
+            route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        let stable = route_edges_with_lane_rounds(
+            &plan,
+            &geometry,
+            LayoutOptions::default(),
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            true,
+            false,
+        );
+
+        assert_eq!(graph.nodes.len(), super::MIN_FANOUT_AWARE_NODES - 1);
+        assert!(!supplemental.fanout_trace.evaluated);
+        assert_eq!(supplemental.primary, stable.primary);
+        assert_eq!(supplemental.primary_quality, stable.primary_quality);
+        assert_eq!(supplemental.repair, stable.repair);
     }
 
     #[test]
