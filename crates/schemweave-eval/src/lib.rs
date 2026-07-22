@@ -526,11 +526,12 @@ fn score_segment_relationships(
         }
     }
 
-    let horizontal: Vec<_> = segments
+    let crossing_segments = merged_net_segments(segments);
+    let horizontal: Vec<_> = crossing_segments
         .iter()
         .filter(|segment| segment.orientation == Orientation::Horizontal)
         .collect();
-    let vertical: Vec<_> = segments
+    let vertical: Vec<_> = crossing_segments
         .iter()
         .filter(|segment| segment.orientation == Orientation::Vertical)
         .collect();
@@ -591,7 +592,48 @@ fn score_segment_relationships(
             tree.add(y, 1);
         }
     }
-    report.unrelated_contacts += perpendicular_contacts(&horizontal, &vertical, edges);
+    let contact_horizontal: Vec<_> = segments
+        .iter()
+        .filter(|segment| segment.orientation == Orientation::Horizontal)
+        .collect();
+    let contact_vertical: Vec<_> = segments
+        .iter()
+        .filter(|segment| segment.orientation == Orientation::Vertical)
+        .collect();
+    report.unrelated_contacts +=
+        perpendicular_contacts(&contact_horizontal, &contact_vertical, edges);
+}
+
+fn merged_net_segments(segments: &[Segment]) -> Vec<Segment> {
+    let mut groups: BTreeMap<(NetId, u8, FloatKey), Vec<Segment>> = BTreeMap::new();
+    for &segment in segments {
+        let axis = u8::from(segment.orientation == Orientation::Vertical);
+        groups
+            .entry((segment.net, axis, FloatKey(segment.fixed)))
+            .or_default()
+            .push(segment);
+    }
+
+    let mut merged = Vec::with_capacity(segments.len());
+    for group in groups.values_mut() {
+        group.sort_by(|left, right| {
+            left.start
+                .total_cmp(&right.start)
+                .then(left.end.total_cmp(&right.end))
+                .then(left.edge.cmp(&right.edge))
+        });
+        let mut current = group[0];
+        for &segment in group.iter().skip(1) {
+            if segment.start <= current.end {
+                current.end = current.end.max(segment.end);
+            } else {
+                merged.push(current);
+                current = segment;
+            }
+        }
+        merged.push(current);
+    }
+    merged
 }
 
 #[derive(Default)]
