@@ -2,7 +2,7 @@
 
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 };
 
 use schemweave::{Edge, EdgeId, Endpoint, Graph, Layout, NetId, NodeGeometry, Point, PortSide};
@@ -52,8 +52,11 @@ pub struct QualityReport {
     pub unrelated_overlaps: usize,
     pub unrelated_contacts: usize,
     pub crossings: usize,
+    /// Unique direction changes in the physical same-net geometry.
     pub bends: usize,
+    /// Raw route segments, before overlapping same-net geometry is merged.
     pub segments: usize,
+    /// Union length of the physical same-net geometry.
     pub route_length: f64,
     pub area: f64,
     pub examples: Vec<Violation>,
@@ -152,6 +155,7 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
     }
 
     let mut segments = Vec::new();
+    let mut bend_points = BTreeSet::new();
     let mut seen_edges = HashSet::with_capacity(layout.edges.len());
     for route in &layout.edges {
         if !seen_edges.insert(route.id) {
@@ -179,6 +183,7 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             options,
             &mut report,
             &mut segments,
+            &mut bend_points,
         );
     }
     if layout.edges.len() != graph.edges.len() {
@@ -195,7 +200,13 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
     report.segments = segments.len();
     score_node_overlaps(&layout.nodes, &mut report);
     score_node_intersections(&segments, &layout.nodes, options.epsilon, &mut report);
-    score_segment_relationships(&segments, &input_edges, &mut report);
+    let physical_segments = merged_net_segments(&segments);
+    report.route_length = physical_segments
+        .iter()
+        .map(|segment| segment.end - segment.start)
+        .sum();
+    report.bends = bend_points.len();
+    score_segment_relationships(&segments, &physical_segments, &input_edges, &mut report);
     report
 }
 
@@ -223,6 +234,7 @@ fn validate_route(
     options: ScoreOptions,
     report: &mut QualityReport,
     segments: &mut Vec<Segment>,
+    bend_points: &mut BTreeSet<(NetId, FloatKey, FloatKey)>,
 ) {
     if points.len() < 2 {
         report.violation(
@@ -297,7 +309,6 @@ fn validate_route(
             );
             continue;
         };
-        report.route_length += dx + dy;
         segments.push(Segment::new(
             edge.id,
             edge.net,
@@ -306,7 +317,25 @@ fn validate_route(
             orientation,
         ));
     }
-    report.bends += segments.len().saturating_sub(before + 1);
+    for pair in segments[before..].windows(2) {
+        if pair[0].orientation != pair[1].orientation {
+            let horizontal = if pair[0].orientation == Orientation::Horizontal {
+                pair[0]
+            } else {
+                pair[1]
+            };
+            let vertical = if pair[0].orientation == Orientation::Vertical {
+                pair[0]
+            } else {
+                pair[1]
+            };
+            bend_points.insert((
+                edge.net,
+                FloatKey(vertical.fixed),
+                FloatKey(horizontal.fixed),
+            ));
+        }
+    }
 }
 
 fn endpoint_point(
@@ -496,6 +525,7 @@ fn grid_coord(value: f64, cell: f64) -> i64 {
 
 fn score_segment_relationships(
     segments: &[Segment],
+    physical_segments: &[Segment],
     edges: &HashMap<EdgeId, &Edge>,
     report: &mut QualityReport,
 ) {
@@ -526,12 +556,11 @@ fn score_segment_relationships(
         }
     }
 
-    let crossing_segments = merged_net_segments(segments);
-    let horizontal: Vec<_> = crossing_segments
+    let horizontal: Vec<_> = physical_segments
         .iter()
         .filter(|segment| segment.orientation == Orientation::Horizontal)
         .collect();
-    let vertical: Vec<_> = crossing_segments
+    let vertical: Vec<_> = physical_segments
         .iter()
         .filter(|segment| segment.orientation == Orientation::Vertical)
         .collect();
