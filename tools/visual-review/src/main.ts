@@ -113,7 +113,7 @@ function currentElk(): ElkRows['rows'][number] | null {
 }
 
 function layoutOptions(): LayoutOptions {
-  const effort = ['fast', 'quality'] as const
+  const effort = ['fast', 'quality', 'max'] as const
   return {
     layer_gap: Number(layerGap.value),
     node_gap: Number(nodeGap.value),
@@ -233,7 +233,7 @@ function updateControlLabels(): void {
   query<HTMLOutputElement>('#lane-gap-value').value = laneGap.value
   query<HTMLOutputElement>('#sweeps-value').value = sweeps.value
   query<HTMLOutputElement>('#quality-effort-value').value =
-    ['Fast', 'Quality'][Number(qualityEffort.value)] ?? 'Quality'
+    ['Fast', 'Quality', 'Max'][Number(qualityEffort.value)] ?? 'Quality'
   const options = layoutOptions()
   const matching = Object.entries(presets).find(
     ([, preset]) =>

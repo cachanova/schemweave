@@ -116,6 +116,67 @@ mod tests {
         serde_json::to_string(&Graph { nodes, edges }).unwrap()
     }
 
+    fn max_activating_graph_json() -> String {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..600)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 25.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 25.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut state = 10;
+        let mut endpoints = Vec::new();
+        for layer in 0..3u32 {
+            let source_start = layer * 50;
+            let target_start = (layer + 1) * 50;
+            for source in source_start..source_start + 50 {
+                for target in target_start..target_start + 50 {
+                    if next(&mut state) % 100 < 16 {
+                        endpoints.push((source, target, source));
+                    }
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target, net))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect();
+        serde_json::to_string(&Graph { nodes, edges }).unwrap()
+    }
+
     #[test]
     fn uses_default_options_for_an_empty_options_object() {
         let graph = r#"{"nodes":[],"edges":[]}"#;
@@ -129,7 +190,7 @@ mod tests {
     #[test]
     fn accepts_each_quality_effort_over_the_json_boundary() {
         let graph = r#"{"nodes":[],"edges":[]}"#;
-        for effort in ["fast", "quality"] {
+        for effort in ["fast", "quality", "max"] {
             let options = format!(r#"{{"quality_effort":"{effort}"}}"#);
             assert_eq!(
                 layout_serialized(graph, &options).unwrap(),
@@ -146,6 +207,14 @@ mod tests {
         let fast = layout_serialized(&graph, r#"{"quality_effort":"fast"}"#).unwrap();
         assert_eq!(omitted, quality);
         assert_ne!(omitted, fast);
+    }
+
+    #[test]
+    fn max_effort_changes_rust_selected_output_over_the_json_boundary() {
+        let graph = max_activating_graph_json();
+        let quality = layout_serialized(&graph, r#"{"quality_effort":"quality"}"#).unwrap();
+        let max = layout_serialized(&graph, r#"{"quality_effort":"max"}"#).unwrap();
+        assert_ne!(quality, max);
     }
 
     #[test]
