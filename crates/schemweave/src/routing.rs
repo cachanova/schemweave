@@ -23,6 +23,9 @@ const MAX_CROSSING_REPAIR_NODES: usize = 2_000;
 const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
 const MAX_CROSSING_REPAIR_PATH_STATES: usize = 500_000;
+// Small nets keep the historical stable-ID order; at this fanout the many target branches make
+// target-proximal channel placement materially more important than the single shared source arm.
+const MIN_FANOUT_AWARE_CHANNEL_EDGES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RouteQuality {
@@ -1230,9 +1233,19 @@ impl CrossingFenwick {
     }
 }
 
-fn lane_indices(nets: &BTreeSet<u32>) -> BTreeMap<u32, usize> {
-    nets.iter()
-        .copied()
+fn outer_channel_lane_indices(
+    nets: &BTreeSet<NetId>,
+    edge_counts: &BTreeMap<NetId, usize>,
+) -> BTreeMap<NetId, usize> {
+    let mut ordered = nets.iter().copied().collect::<Vec<_>>();
+    if ordered
+        .iter()
+        .any(|net| edge_counts[net] >= MIN_FANOUT_AWARE_CHANNEL_EDGES)
+    {
+        ordered.sort_unstable_by_key(|net| (edge_counts[net], *net));
+    }
+    ordered
+        .into_iter()
         .enumerate()
         .map(|(index, net)| (net, index))
         .collect()
@@ -1344,7 +1357,7 @@ fn outer_lane_assignments(
         .collect::<BTreeMap<_, _>>();
 
     let mut assignments = BTreeMap::new();
-    let channel_lanes = lane_indices(outer_nets);
+    let channel_lanes = outer_channel_lane_indices(outer_nets, &plan.net_edge_counts);
     let channel_count = channel_lanes.len();
     let mut top_access = BTreeMap::<u32, OuterNetAccess>::new();
     let mut bottom_access = BTreeMap::<u32, OuterNetAccess>::new();
@@ -2294,10 +2307,11 @@ mod tests {
         crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices,
         crossing_repair_within_budget, crossing_track_y, distance_transform,
         has_split_feedback_net, horizontal_crossing_counts_by_net, move_net_to_outer_lane,
-        outer_lane_assignments, port_point, route_edges, route_planned_candidates,
-        route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
-        route_supplemental_edges, select_crossing_repair_net, shortest_crossing_path,
-        sparse_channel_route, sum_within_limit, vertical_horizontal_crossings,
+        outer_channel_lane_indices, outer_lane_assignments, port_point, route_edges,
+        route_planned_candidates, route_planned_edges, route_quality, route_quality_cmp,
+        route_quality_for_plan, route_supplemental_edges, select_crossing_repair_net,
+        shortest_crossing_path, sparse_channel_route, sum_within_limit,
+        vertical_horizontal_crossings,
     };
 
     #[test]
@@ -2305,6 +2319,20 @@ mod tests {
         assert_eq!(
             vertical_horizontal_crossings(&[(20.0, 20.0)], &[10.0, 20.0, 30.0]),
             0
+        );
+    }
+
+    #[test]
+    fn outer_channels_put_dominant_fanout_nearest_its_targets() {
+        let nets = BTreeSet::from([1, 2, 3]);
+
+        assert_eq!(
+            outer_channel_lane_indices(&nets, &BTreeMap::from([(1, 15), (2, 1), (3, 2)])),
+            BTreeMap::from([(1, 0), (2, 1), (3, 2)]),
+        );
+        assert_eq!(
+            outer_channel_lane_indices(&nets, &BTreeMap::from([(1, 16), (2, 1), (3, 16)])),
+            BTreeMap::from([(1, 1), (2, 0), (3, 2)]),
         );
     }
 
