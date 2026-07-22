@@ -30,18 +30,13 @@ struct OrderingArc {
 }
 
 pub(crate) fn assign_ranks(graph: &IndexedGraph<'_>) -> Vec<usize> {
-    rank_candidates(graph).0
+    let (component, component_out, topological) = component_graph(graph);
+    earliest_ranks(&component, &component_out, &topological)
 }
 
 pub(crate) fn rank_candidates(graph: &IndexedGraph<'_>) -> (Vec<usize>, Option<Vec<usize>>) {
     let (component, component_out, topological) = component_graph(graph);
-    let mut component_rank = vec![0usize; component_out.len()];
-    for &current in &topological {
-        for &next in &component_out[current] {
-            component_rank[next] = component_rank[next].max(component_rank[current] + 1);
-        }
-    }
-    let earliest: Vec<_> = component.iter().map(|&id| component_rank[id]).collect();
+    let earliest = earliest_ranks(&component, &component_out, &topological);
     let component_count = component_out.len();
     let mut distance_to_sink = vec![0usize; component_count];
     for &current in topological.iter().rev() {
@@ -76,29 +71,79 @@ pub(crate) fn rank_candidates(graph: &IndexedGraph<'_>) -> (Vec<usize>, Option<V
     };
     let baseline_span = total_span(&earliest);
     let candidate_span = total_span(&candidate);
+    if candidate_span > baseline_span {
+        return (earliest, None);
+    }
     let moved_nodes = candidate
         .iter()
         .zip(&earliest)
         .filter(|(late, early)| late != early)
         .count();
-    let localized_slack =
-        moved_nodes <= graph.nodes.len().div_ceil(100) && candidate_span < baseline_span;
-    let global_span_reduction = moved_nodes >= graph.nodes.len().saturating_mul(2).div_ceil(5)
-        && candidate_span <= baseline_span - baseline_span / 10;
+    if accept_latest_rank_candidate(
+        graph.nodes.len(),
+        moved_nodes,
+        baseline_span,
+        candidate_span,
+        0,
+    ) {
+        return (earliest, Some(candidate));
+    }
+    if graph.nodes.len() >= 1_000 {
+        return (earliest, None);
+    }
     let mut fanout_by_net = BTreeMap::<NetId, usize>::new();
+    let mut max_net_fanout = 0usize;
     for (edge, &participates_in_ranking) in graph.edges.iter().zip(&graph.rank_edges) {
         if participates_in_ranking {
             let fanout = fanout_by_net.entry(edge.net).or_default();
             *fanout = fanout.saturating_add(1);
+            max_net_fanout = max_net_fanout.max(*fanout);
+            if max_net_fanout >= 100 {
+                break;
+            }
         }
     }
-    let dominant_fanout = fanout_by_net.values().any(|&fanout| fanout >= 100);
     (
         earliest,
-        (candidate_span <= baseline_span
-            && (localized_slack || global_span_reduction || dominant_fanout))
-            .then_some(candidate),
+        accept_latest_rank_candidate(
+            graph.nodes.len(),
+            moved_nodes,
+            baseline_span,
+            candidate_span,
+            max_net_fanout,
+        )
+        .then_some(candidate),
     )
+}
+
+fn earliest_ranks(
+    component: &[usize],
+    component_out: &[Vec<usize>],
+    topological: &[usize],
+) -> Vec<usize> {
+    let mut component_rank = vec![0usize; component_out.len()];
+    for &current in topological {
+        for &next in &component_out[current] {
+            component_rank[next] = component_rank[next].max(component_rank[current] + 1);
+        }
+    }
+    component.iter().map(|&id| component_rank[id]).collect()
+}
+
+fn accept_latest_rank_candidate(
+    node_count: usize,
+    moved_nodes: usize,
+    baseline_span: usize,
+    candidate_span: usize,
+    max_net_fanout: usize,
+) -> bool {
+    let localized_slack = moved_nodes <= node_count.div_ceil(100) && candidate_span < baseline_span;
+    let global_span_reduction = moved_nodes >= node_count.saturating_mul(2).div_ceil(5)
+        && candidate_span <= baseline_span.saturating_sub(baseline_span.div_ceil(10));
+    candidate_span <= baseline_span
+        && (localized_slack
+            || global_span_reduction
+            || (node_count < 1_000 && max_net_fanout >= 100))
 }
 
 fn component_graph(graph: &IndexedGraph<'_>) -> (Vec<usize>, Vec<Vec<usize>>, Vec<usize>) {
@@ -806,9 +851,10 @@ mod tests {
     };
 
     use super::{
-        AlternativeOrdering, NeighborMeasure, alternative_ordering_candidate, assign_ranks,
-        crossing_count, expanded_ordering_graph, median, net_representative_crossing_count,
-        optimize_ordering_seed, order_layers, rank_candidates,
+        AlternativeOrdering, NeighborMeasure, accept_latest_rank_candidate,
+        alternative_ordering_candidate, assign_ranks, crossing_count, expanded_ordering_graph,
+        median, net_representative_crossing_count, optimize_ordering_seed, order_layers,
+        rank_candidates,
     };
 
     fn node(id: u32) -> Node {
@@ -912,6 +958,43 @@ mod tests {
         assert_eq!(
             rank_candidates(&indexed),
             (vec![0, 0, 1, 2, 3], Some(vec![0, 2, 1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn latest_rank_candidate_gate_enforces_quality_boundaries() {
+        assert!(accept_latest_rank_candidate(100, 1, 100, 99, 0));
+        assert!(!accept_latest_rank_candidate(100, 1, 100, 100, 0));
+
+        assert!(!accept_latest_rank_candidate(100, 39, 100, 90, 0));
+        assert!(accept_latest_rank_candidate(100, 40, 100, 90, 0));
+        assert!(!accept_latest_rank_candidate(100, 40, 100, 91, 0));
+        assert!(!accept_latest_rank_candidate(100, 40, 19, 18, 0));
+        assert!(accept_latest_rank_candidate(100, 40, 19, 17, 0));
+
+        assert!(!accept_latest_rank_candidate(100, 20, 100, 100, 99));
+        assert!(accept_latest_rank_candidate(100, 20, 100, 100, 100));
+        assert!(!accept_latest_rank_candidate(1_000, 20, 100, 100, 100));
+        assert!(!accept_latest_rank_candidate(100, 20, 100, 101, 100));
+    }
+
+    #[test]
+    fn latest_rank_candidate_rejects_equal_span_isolated_node_shift() {
+        let graph = Graph {
+            nodes: (0..10).map(node).collect(),
+            edges: vec![Edge {
+                id: 0,
+                source: Endpoint { node: 0, port: 1 },
+                target: Endpoint { node: 1, port: 0 },
+                net: 0,
+                participates_in_ranking: true,
+            }],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+
+        assert_eq!(
+            rank_candidates(&indexed),
+            (vec![0, 1, 0, 0, 0, 0, 0, 0, 0, 0], None)
         );
     }
 

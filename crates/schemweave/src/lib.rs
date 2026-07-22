@@ -543,10 +543,18 @@ mod tests {
         let selected = layout(&graph, options).unwrap();
         assert_eq!(selected, alternative.1);
 
+        let zero_sweeps = LayoutOptions {
+            ordering_sweeps: 0,
+            ..options
+        };
+        let zero_sweep_selected = layout(&graph, zero_sweeps).unwrap();
+        assert_eq!(layout(&graph, zero_sweeps).unwrap(), zero_sweep_selected);
+
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
         assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout(&permuted, zero_sweeps).unwrap(), zero_sweep_selected);
     }
 
     #[test]
