@@ -341,6 +341,9 @@ fn sort_layer(
     neighbors: &[Vec<usize>],
     scores: &mut [f64],
 ) {
+    if layer.len() < 2 {
+        return;
+    }
     for &item in layer.iter() {
         scores[item] = barycenter(item, positions, neighbors);
     }
