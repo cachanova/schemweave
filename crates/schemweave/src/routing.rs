@@ -3322,8 +3322,8 @@ fn large_gap_hot_access_work_from_counts(
 ) -> Option<usize> {
     let hot_to_all = lane_count.checked_sub(1)?.checked_mul(hot_verticals)?;
     let nonhot_to_hot = hot_count.checked_mul(nonhot_verticals)?;
-    // Pair vectors deliberately avoid a cross-hot cache. Each hot-hot pair is therefore scored
-    // once from each hot net's insertion walk, adding one repeat of both directional costs.
+    // Keep charging the original uncached work. The refined table avoids these repeated hot-hot
+    // comparisons, but retaining the conservative admission preserves the checked budget boundary.
     let repeated_hot_to_hot = hot_count.saturating_sub(1).checked_mul(hot_verticals)?;
     hot_to_all
         .checked_add(nonhot_to_hot)?
@@ -3448,27 +3448,46 @@ fn large_gap_hot_insertion_orders_with_rounds(
         .map(|(original_lane, (_, net))| (net, original_lane))
         .collect::<Vec<_>>();
     let hot = large_gap_hot_nets_with_limit(accesses, baseline, hot_limit);
-    // A deeper pass revisits each hot net, so materialize its pair costs once in compact lane
-    // order. Keeping the original lane beside each net makes lookups dense and avoids a tree
-    // lookup for every candidate insertion position.
-    let pair_cost_rows = (rounds > 1).then(|| {
-        hot.iter()
-            .map(|&hot_net| {
-                ordered
-                    .iter()
-                    .map(|&(other, _)| {
+    let lane_count = ordered.len();
+    // A deeper pass revisits each hot net, so materialize its pair costs once in one compact table.
+    // Original lane indices remain stable as `ordered` moves, and the reverse row of an earlier
+    // hot net supplies both directions without rescoring the same hot-hot pair.
+    let pair_cost_table = (rounds > 1).then(|| {
+        let mut table: Vec<(usize, usize)> = vec![(0usize, 0usize); hot.len() * lane_count];
+        let mut processed_hot_by_lane: Vec<Option<usize>> = vec![None; lane_count];
+        let hot_original_lanes = hot
+            .iter()
+            .map(|hot_net| baseline[hot_net])
+            .collect::<Vec<_>>();
+        for (hot_index, (&hot_net, &hot_original_lane)) in
+            hot.iter().zip(&hot_original_lanes).enumerate()
+        {
+            for &(other, original_lane) in &ordered {
+                if other == hot_net {
+                    continue;
+                }
+                let costs = processed_hot_by_lane[original_lane].map_or_else(
+                    || {
                         (
                             gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
                             gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
                         )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
+                    },
+                    |other_hot_index| {
+                        let reverse = table[other_hot_index * lane_count + hot_original_lane];
+                        (reverse.1, reverse.0)
+                    },
+                );
+                table[hot_index * lane_count + original_lane] = costs;
+            }
+            processed_hot_by_lane[hot_original_lane] = Some(hot_index);
+        }
+        table
     });
 
     let mut total_gain = 0usize;
     let mut snapshot = None;
+    let mut pair_costs = Vec::with_capacity(ordered.len().saturating_sub(1));
     for round in 0..rounds {
         let mut changed = false;
         for (hot_index, &hot_net) in hot.iter().enumerate() {
@@ -3478,20 +3497,18 @@ fn large_gap_hot_insertion_orders_with_rounds(
             let hot_entry = ordered.remove(current_index);
             // The one-round production candidate materializes costs without a pair table, as in
             // PR #42. The deeper candidate reuses its dense row on the second round.
-            let pair_costs = ordered
-                .iter()
-                .map(|&(other, original_lane)| {
-                    pair_cost_rows.as_ref().map_or_else(
-                        || {
-                            (
-                                gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
-                                gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
-                            )
-                        },
-                        |rows| rows[hot_index][original_lane],
-                    )
-                })
-                .collect::<Vec<_>>();
+            pair_costs.clear();
+            pair_costs.extend(ordered.iter().map(|&(other, original_lane)| {
+                pair_cost_table.as_ref().map_or_else(
+                    || {
+                        (
+                            gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
+                            gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
+                        )
+                    },
+                    |table| table[hot_index * lane_count + original_lane],
+                )
+            }));
             let mut insertion_cost = pair_costs
                 .iter()
                 .map(|&(hot_before, _)| hot_before)
@@ -5209,6 +5226,56 @@ mod tests {
             ),
             Some(refined)
         );
+    }
+
+    #[test]
+    fn contiguous_hot_pair_table_matches_btree_reference_across_large_gaps() {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        for count in [33u32, 64, 80, 257, 705] {
+            let lanes = (0..count)
+                .map(|net| (net, (count - 1 - net) as usize))
+                .collect::<BTreeMap<_, _>>();
+            let mut state = u64::from(count);
+            let accesses = (0..count)
+                .map(|net| {
+                    let mut access = GapNetAccess::default();
+                    for _ in 0..next(&mut state) % 4 + 1 {
+                        let low = (next(&mut state) % 200) as f64;
+                        let high = low + (next(&mut state) % 80 + 1) as f64;
+                        access.vertical.push((low, high));
+                    }
+                    for _ in 0..next(&mut state) % 3 + 1 {
+                        access.left_y.push((next(&mut state) % 300) as f64);
+                        access.right_y.push((next(&mut state) % 300) as f64);
+                    }
+                    access.left_y.sort_by(f64::total_cmp);
+                    access.right_y.sort_by(f64::total_cmp);
+                    (net, access)
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            for (hot_limit, rounds) in [
+                (super::MAX_LARGE_GLOBAL_GAP_HOT_NETS, 1),
+                (
+                    super::MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS,
+                    super::MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS,
+                ),
+            ] {
+                assert_eq!(
+                    large_gap_hot_insertion_order_with_rounds(&accesses, &lanes, hot_limit, rounds,),
+                    large_gap_hot_insertion_order_btree_reference(
+                        &accesses, &lanes, hot_limit, rounds,
+                    ),
+                    "count={count}, hot_limit={hot_limit}, rounds={rounds}",
+                );
+            }
+        }
     }
 
     #[test]
