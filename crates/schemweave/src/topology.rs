@@ -226,13 +226,13 @@ fn expanded_ordering_graph(graph: &IndexedGraph<'_>, ranks: &[usize]) -> Orderin
     let mut outgoing = vec![Vec::new(); graph.nodes.len()];
     let mut virtual_items = BTreeMap::new();
 
-    for edge in &graph.edges {
-        if !edge.participates_in_ranking {
+    for (edge, &rank_edge) in graph.edges.iter().zip(&graph.rank_edges) {
+        if !rank_edge {
             continue;
         }
         let source = graph.node_index[&edge.source.node];
         let target = graph.node_index[&edge.target.node];
-        if graph.nodes[target].cycle_breaker || ranks[source] >= ranks[target] {
+        if ranks[source] >= ranks[target] {
             continue;
         }
         let mut previous = source;
@@ -375,7 +375,7 @@ mod tests {
         Edge, Endpoint, Graph, LayoutOptions, Node, Port, PortSide, validation::validate_and_index,
     };
 
-    use super::expanded_ordering_graph;
+    use super::{assign_ranks, expanded_ordering_graph};
 
     fn node(id: u32) -> Node {
         Node {
@@ -426,5 +426,28 @@ mod tests {
         assert!(ordering.stable_keys.contains(&(1, 7, 1)));
         assert!(ordering.stable_keys.contains(&(1, 7, 2)));
         assert_eq!(ordering.outgoing[0].len(), 1);
+    }
+
+    #[test]
+    fn root_to_cycle_breaker_edge_participates_in_ordering() {
+        let mut register = node(2);
+        register.cycle_breaker = true;
+        let graph = Graph {
+            nodes: vec![node(1), register],
+            edges: vec![Edge {
+                id: 1,
+                source: Endpoint { node: 1, port: 1 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            }],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let ranks = assign_ranks(&indexed);
+        let ordering = expanded_ordering_graph(&indexed, &ranks);
+
+        assert_eq!(ranks, vec![0, 1]);
+        assert_eq!(ordering.outgoing[0], vec![1]);
+        assert_eq!(ordering.incoming[1], vec![0]);
     }
 }
