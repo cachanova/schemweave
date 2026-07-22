@@ -3404,6 +3404,14 @@ mod tests {
         let selected = routed.primary_quality.unwrap();
         assert!(!route_quality_cmp(selected, candidate).is_gt());
         assert_eq!(route_quality(&indexed, &routed.primary), selected);
+        let adaptive_repair = routed
+            .repair
+            .as_ref()
+            .expect("fixture must cover the selected adaptive repair path");
+        assert_eq!(
+            route_quality(&indexed, &adaptive_repair.1),
+            adaptive_repair.0
+        );
         let stable = route_edges_with_lane_rounds(
             &plan,
             &geometry,
@@ -3433,6 +3441,7 @@ mod tests {
         assert!(permuted.fanout_trace.selected);
         assert_eq!(permuted.primary_quality, routed.primary_quality);
         assert_eq!(permuted.primary, routed.primary);
+        assert_eq!(permuted.repair, routed.repair);
         assert_eq!(permuted.alternatives, routed.alternatives);
     }
 
