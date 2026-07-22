@@ -1050,6 +1050,7 @@ fn finish_route_family(
             precomputed_score = Some(baseline_score);
         }
     }
+    let precomputed_quality = precomputed_score.as_ref().map(|(_, quality)| *quality);
     let mut repair = if repair_crossings {
         Some(repair_crossing_heavy_net(
             plan,
@@ -1074,7 +1075,7 @@ fn finish_route_family(
         None
     };
     let primary_quality = repair.as_ref().map_or_else(
-        || route_quality_for_plan(plan, &routes),
+        || precomputed_quality.unwrap_or_else(|| route_quality_for_plan(plan, &routes)),
         |repair| repair.baseline_quality,
     );
     #[cfg(test)]
@@ -3161,7 +3162,13 @@ fn large_gap_hot_access_work_from_counts(
 ) -> Option<usize> {
     let hot_to_all = lane_count.checked_sub(1)?.checked_mul(hot_verticals)?;
     let nonhot_to_hot = hot_count.checked_mul(nonhot_verticals)?;
-    hot_to_all.checked_add(nonhot_to_hot)?.checked_mul(2)
+    // Pair vectors deliberately avoid a cross-hot cache. Each hot-hot pair is therefore scored
+    // once from each hot net's insertion walk, adding one repeat of both directional costs.
+    let repeated_hot_to_hot = hot_count.saturating_sub(1).checked_mul(hot_verticals)?;
+    hot_to_all
+        .checked_add(nonhot_to_hot)?
+        .checked_add(repeated_hot_to_hot)?
+        .checked_mul(2)
 }
 
 #[cfg(test)]
@@ -3238,20 +3245,27 @@ fn large_gap_hot_insertion_order(
     let mut ordered = ordered.into_iter().map(|(_, net)| net).collect::<Vec<_>>();
     let hot = large_gap_hot_nets(accesses, baseline);
 
-    let mut costs = GapPairCosts::new();
     let mut total_gain = 0usize;
     for hot_net in hot {
         let Some(current_index) = ordered.iter().position(|&net| net == hot_net) else {
             continue;
         };
         ordered.remove(current_index);
-        let mut insertion_cost = ordered
+        // A hot net is evaluated only once, so a tree keyed by every ordered pair adds lookup
+        // overhead without providing useful reuse. Materialize both orientations in lane order;
+        // this preserves the exact insertion walk while making the large-gap path linear-memory.
+        let pair_costs = ordered
             .iter()
             .map(|&other| {
-                *costs
-                    .entry((hot_net, other))
-                    .or_insert_with(|| gap_pair_crossings(&accesses[&hot_net], &accesses[&other]))
+                (
+                    gap_pair_crossings(&accesses[&hot_net], &accesses[&other]),
+                    gap_pair_crossings(&accesses[&other], &accesses[&hot_net]),
+                )
             })
+            .collect::<Vec<_>>();
+        let mut insertion_cost = pair_costs
+            .iter()
+            .map(|&(hot_before, _)| hot_before)
             .fold(0usize, usize::saturating_add);
         let mut best_index = 0usize;
         let mut best_cost = insertion_cost;
@@ -3260,13 +3274,7 @@ fn large_gap_hot_insertion_order(
         } else {
             0
         };
-        for (index, &other) in ordered.iter().enumerate() {
-            let hot_before = *costs
-                .entry((hot_net, other))
-                .or_insert_with(|| gap_pair_crossings(&accesses[&hot_net], &accesses[&other]));
-            let other_before = *costs
-                .entry((other, hot_net))
-                .or_insert_with(|| gap_pair_crossings(&accesses[&other], &accesses[&hot_net]));
+        for (index, &(hot_before, other_before)) in pair_costs.iter().enumerate() {
             insertion_cost = insertion_cost
                 .saturating_sub(hot_before)
                 .saturating_add(other_before);
@@ -4673,14 +4681,11 @@ mod tests {
 
         let thirty_three = lanes(33);
         let mut exact_accesses = empty_accesses(33);
-        exact_accesses.get_mut(&0).unwrap().vertical = vec![(0.0, 1.0); 31_219];
+        exact_accesses.get_mut(&0).unwrap().vertical = vec![(0.0, 1.0); 15_779];
         for net in 1..32 {
-            exact_accesses
-                .get_mut(&net)
-                .unwrap()
-                .vertical
-                .push((0.0, 1.0));
+            exact_accesses.get_mut(&net).unwrap().vertical = vec![(0.0, 1.0); 3];
         }
+        exact_accesses.get_mut(&32).unwrap().vertical = vec![(0.0, 1.0); 2];
         assert_eq!(
             large_gap_hot_access_work(&thirty_three, &exact_accesses),
             Some(super::MAX_LARGE_GLOBAL_GAP_ACCESS_WORK)
@@ -4704,6 +4709,7 @@ mod tests {
             large_gap_hot_access_work_from_counts(usize::MAX, 32, 2, 0).is_none(),
             "checked arithmetic must reject overflow"
         );
+        assert_eq!(large_gap_hot_access_work_from_counts(33, 0, 0, 0), Some(0));
     }
 
     #[test]
