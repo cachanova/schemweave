@@ -9,11 +9,13 @@ model dependency.
 The current pipeline validates and compacts stable caller identifiers, cuts
 ranking dependencies at explicit cycle breakers, condenses remaining strongly
 connected components, assigns left-to-right ranks, applies deterministic
-barycentric ordering, places node layers, and routes exact ports through
-obstacle-free outer lanes. The outer-lane router is the correctness baseline;
-the production router will replace that stage with sparse obstacle-aware routing
-and negotiated congestion while retaining the public contract and topology
-stages.
+barycentric ordering over real and net-scoped virtual items, refines adjacent
+crossings, places node layers, and routes ordinary forward nets through sparse
+inter-layer channels and obstacle-free vertical corridors. Unsupported port
+directions, feedback, and very large multi-terminal nets retain a shared outer
+trunk as a correctness backstop. Negotiated congestion and native multi-terminal
+trees will replace that backstop while retaining the public contract and
+topology stages.
 
 `schemweave-wasm` exposes the same engine through a JSON function designed
 to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
