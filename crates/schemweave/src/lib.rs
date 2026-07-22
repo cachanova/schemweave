@@ -185,11 +185,12 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     let mut evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool| {
         let routed =
             routing::route_planned_candidates(&routing_plan, &nodes, options, supplemental);
+        retain(nodes.clone(), routed.primary, routed.primary_quality);
         if let Some((repair_quality, repair)) = routed.repair {
-            retain(nodes.clone(), routed.primary, routed.primary_quality);
-            retain(nodes, repair, Some(repair_quality));
-        } else {
-            retain(nodes, routed.primary, routed.primary_quality);
+            retain(nodes.clone(), repair, Some(repair_quality));
+        }
+        for (quality, alternative) in routed.alternatives {
+            retain(nodes.clone(), alternative, Some(quality));
         }
     };
     evaluate(
@@ -284,6 +285,15 @@ mod tests {
         candidate_quality_cmp, layout, placement, retain_better_candidate, routing,
         routing::RouteQuality, topology, validation,
     };
+
+    mod active_fanout_fixture {
+        use crate as schemweave;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/active_fanout.rs"
+        ));
+    }
 
     fn candidate(
         crossings: usize,
@@ -610,6 +620,46 @@ mod tests {
         permuted.nodes.reverse();
         permuted.edges.reverse();
         assert_eq!(layout(&permuted, options).unwrap(), selected);
+    }
+
+    #[test]
+    fn public_layout_selects_an_active_fanout_candidate() {
+        let options = LayoutOptions {
+            ordering_sweeps: 0,
+            ..LayoutOptions::default()
+        };
+        let graph = active_fanout_fixture::graph();
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let ranks = topology::assign_ranks(&indexed);
+        let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
+        let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
+        let preferred = placement::place_preferred_nodes(&indexed, &ranks, &layers, options);
+        let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary);
+        let preferred_alignment = placement::port_alignment_error(&indexed, &ranks, &preferred);
+        assert!(
+            placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment),
+            "ordinary={ordinary_alignment} preferred={preferred_alignment}"
+        );
+        let plan = routing::RoutingPlan::new(&indexed, &ranks);
+        let routed = routing::route_planned_candidates(&plan, &preferred, options, true);
+        assert!(routed.fanout_trace.evaluated, "{:#?}", routed.fanout_trace);
+        assert!(routed.fanout_trace.selected, "{:#?}", routed.fanout_trace);
+        let mut adaptive_layouts = Vec::new();
+        let mut candidate_nodes = preferred.clone();
+        let mut candidate_edges = routed.primary;
+        adaptive_layouts.push(placement::normalize(
+            &mut candidate_nodes,
+            &mut candidate_edges,
+        ));
+        if let Some((_, mut repair)) = routed.repair {
+            let mut candidate_nodes = preferred.clone();
+            adaptive_layouts.push(placement::normalize(&mut candidate_nodes, &mut repair));
+        }
+        let selected = layout(&graph, options).unwrap();
+        assert!(
+            adaptive_layouts.contains(&selected),
+            "public layout did not retain the active adaptive family"
+        );
     }
 
     #[test]

@@ -4,6 +4,13 @@ use schemweave::{
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
+mod active_fanout_fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../schemweave/tests/support/active_fanout.rs"
+    ));
+}
+
 fn graph() -> Graph {
     Graph {
         nodes: vec![
@@ -76,77 +83,12 @@ fn accepts_the_current_exact_port_baseline() {
 
 #[test]
 fn fanout_candidate_layout_preserves_all_hard_gates() {
-    const FANOUT_BRANCHES: u32 = 512;
-    const OTHER_NETS: u32 = 1;
-    let port = |side| Port {
-        id: 0,
-        side,
-        offset: 10.0,
+    let graph = active_fanout_fixture::graph();
+    let options = LayoutOptions {
+        ordering_sweeps: 0,
+        ..LayoutOptions::default()
     };
-    let mut nodes = vec![Node {
-        id: 0,
-        width: 20.0,
-        height: 20.0,
-        cycle_breaker: false,
-        ports: vec![port(PortSide::East)],
-    }];
-    nodes.extend((0..FANOUT_BRANCHES).map(|branch| Node {
-        id: 1 + branch,
-        width: 20.0,
-        height: 20.0,
-        cycle_breaker: false,
-        ports: vec![port(PortSide::North)],
-    }));
-    nodes.extend((0..OTHER_NETS).flat_map(|branch| {
-        let source = 1 + FANOUT_BRANCHES + branch * 2;
-        [
-            Node {
-                id: source,
-                width: 20.0,
-                height: 20.0,
-                cycle_breaker: false,
-                ports: vec![port(PortSide::East)],
-            },
-            Node {
-                id: source + 1,
-                width: 20.0,
-                height: 20.0,
-                cycle_breaker: false,
-                ports: vec![port(PortSide::North)],
-            },
-        ]
-    }));
-    let mut edges = (0..FANOUT_BRANCHES)
-        .map(|branch| Edge {
-            id: branch,
-            source: Endpoint { node: 0, port: 0 },
-            target: Endpoint {
-                node: 1 + branch,
-                port: 0,
-            },
-            net: 1,
-            participates_in_ranking: true,
-        })
-        .collect::<Vec<_>>();
-    edges.extend((0..OTHER_NETS).map(|branch| {
-        let source = 1 + FANOUT_BRANCHES + branch * 2;
-        Edge {
-            id: FANOUT_BRANCHES + branch,
-            source: Endpoint {
-                node: source,
-                port: 0,
-            },
-            target: Endpoint {
-                node: source + 1,
-                port: 0,
-            },
-            net: 100 + branch,
-            participates_in_ranking: true,
-        }
-    }));
-    let graph = Graph { nodes, edges };
-
-    let layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let layout = layout(&graph, options).unwrap();
     let report = score(&graph, &layout, ScoreOptions::default());
 
     assert!(report.passes_hard_gates(), "{report:#?}");
