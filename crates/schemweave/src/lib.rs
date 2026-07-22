@@ -223,11 +223,13 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     if let Some(net_representative) = net_representative
         && net_representative.layers != *quality_layers
     {
+        let (sparse_global, large_sparse_global) =
+            net_representative_sparse_global_flags(graph.nodes.len());
         evaluate(
             placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
             false,
-            true,
-            enable_large_sparse_global_candidate(graph.nodes.len()),
+            sparse_global,
+            large_sparse_global,
         );
     }
     if let Some(alternative_ranks) = latest_ranks {
@@ -262,8 +264,9 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     Ok(best.expect("layout has deterministic candidates").1)
 }
 
-fn enable_large_sparse_global_candidate(node_count: usize) -> bool {
-    (600..=1_000).contains(&node_count)
+fn net_representative_sparse_global_flags(node_count: usize) -> (bool, bool) {
+    let admitted = (600..=1_000).contains(&node_count);
+    (admitted, admitted)
 }
 
 fn retain_better_candidate(
@@ -334,11 +337,23 @@ mod tests {
     }
 
     #[test]
-    fn large_sparse_global_candidate_is_admitted_only_for_medium_large_graphs() {
-        assert!(!super::enable_large_sparse_global_candidate(599));
-        assert!(super::enable_large_sparse_global_candidate(600));
-        assert!(super::enable_large_sparse_global_candidate(1_000));
-        assert!(!super::enable_large_sparse_global_candidate(1_001));
+    fn net_representative_sparse_global_is_admitted_only_for_medium_large_graphs() {
+        assert_eq!(
+            super::net_representative_sparse_global_flags(599),
+            (false, false)
+        );
+        assert_eq!(
+            super::net_representative_sparse_global_flags(600),
+            (true, true)
+        );
+        assert_eq!(
+            super::net_representative_sparse_global_flags(1_000),
+            (true, true)
+        );
+        assert_eq!(
+            super::net_representative_sparse_global_flags(1_001),
+            (false, false)
+        );
     }
 
     fn sparse_global_layered_graph(
