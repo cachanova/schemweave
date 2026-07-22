@@ -247,7 +247,7 @@ fn scores_the_full_consumer_bound() {
 }
 
 #[test]
-fn counts_one_unrelated_perpendicular_crossing() {
+fn counts_overlapping_same_net_branches_as_one_physical_crossing() {
     let small_node = |id, side| Node {
         id,
         width: 10.0,
@@ -279,6 +279,13 @@ fn counts_one_unrelated_perpendicular_crossing() {
                 source: Endpoint { node: 3, port: 0 },
                 target: Endpoint { node: 4, port: 0 },
                 net: 2,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 3,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 1,
                 participates_in_ranking: true,
             },
         ],
@@ -322,6 +329,10 @@ fn counts_one_unrelated_perpendicular_crossing() {
             EdgeGeometry {
                 id: 2,
                 points: vec![Point { x: 50.0, y: 10.0 }, Point { x: 50.0, y: 90.0 }],
+            },
+            EdgeGeometry {
+                id: 3,
+                points: vec![Point { x: 10.0, y: 45.0 }, Point { x: 90.0, y: 45.0 }],
             },
         ],
         width: 100.0,
