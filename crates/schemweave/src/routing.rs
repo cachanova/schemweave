@@ -37,6 +37,12 @@ pub(crate) struct RoutedEdges {
     pub(crate) repair: Option<(RouteQuality, Vec<EdgeGeometry>)>,
 }
 
+struct RoutedLaneState {
+    routes: Vec<EdgeGeometry>,
+    gap_lanes: Vec<BTreeMap<u32, usize>>,
+    crossing_paths: Vec<Option<Vec<f64>>>,
+}
+
 #[derive(Clone, Copy)]
 struct PhysicalSegment {
     net: u32,
@@ -68,6 +74,7 @@ impl PartialOrd for FloatKey {
 #[derive(Clone, Copy)]
 struct RouteEdge<'a> {
     edge: &'a Edge,
+    participates_in_ranking: bool,
     source_index: usize,
     target_index: usize,
     source_port: &'a Port,
@@ -87,11 +94,13 @@ impl<'a> RoutingPlan<'a> {
         let edges = graph
             .edges
             .iter()
-            .map(|&edge| {
+            .zip(&graph.rank_edges)
+            .map(|(&edge, &participates_in_ranking)| {
                 let source_index = graph.node_index[&edge.source.node];
                 let target_index = graph.node_index[&edge.target.node];
                 RouteEdge {
                     edge,
+                    participates_in_ranking,
                     source_index,
                     target_index,
                     source_port: graph.ports[source_index][&edge.source.port],
@@ -290,7 +299,7 @@ fn route_edges_with_lane_rounds(
             outer_nets.insert(edge.net);
         }
     }
-    let mut gap_lanes: Vec<_> = gap_preferences
+    let initial_gap_lanes: Vec<_> = gap_preferences
         .into_iter()
         .map(preferred_lane_indices)
         .collect();
@@ -304,7 +313,7 @@ fn route_edges_with_lane_rounds(
         .map(|(lane, pair)| (pair, lane))
         .collect();
     let crossing_tie_lane_count = crossing_tie_lanes.len();
-    let outer_lanes = outer_lane_assignments(
+    let baseline_outer_lanes = outer_lane_assignments(
         plan,
         nodes,
         ranks,
@@ -316,19 +325,13 @@ fn route_edges_with_lane_rounds(
         bottom,
         options,
         outer_lane_rounds,
+        false,
     );
-    let mut endpoint_tracks = build_endpoint_tracks(
-        plan,
-        nodes,
-        ranks,
-        &sparse_spans,
-        &layer_left,
-        &layer_right,
-        &gap_lanes,
-        &outer_lanes,
-        options,
-    );
-    let crossing_paths = sparse_crossing_paths(
+    let RoutedLaneState {
+        mut routes,
+        gap_lanes,
+        crossing_paths,
+    } = emit_routes_with_outer_lanes(
         plan,
         nodes,
         &sparse_spans,
@@ -336,44 +339,88 @@ fn route_edges_with_lane_rounds(
         &crossing_tie_lanes,
         crossing_tie_lane_count,
         &free_by_rank,
-        &endpoint_tracks,
-        options.port_stub,
-    );
-    gap_lanes = crossing_aware_gap_lanes(
-        plan,
-        nodes,
-        &sparse_spans,
-        &crossing_paths,
-        &gap_lanes,
-        &endpoint_tracks,
-        options.port_stub,
-        gap_lane_rounds,
-    );
-    endpoint_tracks = build_endpoint_tracks(
-        plan,
-        nodes,
-        ranks,
-        &sparse_spans,
         &layer_left,
         &layer_right,
-        &gap_lanes,
-        &outer_lanes,
-        options,
-    );
-    let routes = emit_routes(
-        plan,
-        nodes,
-        &sparse_spans,
-        &crossing_paths,
-        &layer_left,
-        &layer_right,
-        &gap_lanes,
-        &endpoint_tracks,
-        &outer_lanes,
+        &initial_gap_lanes,
+        &baseline_outer_lanes,
         top,
         bottom,
         options,
+        gap_lane_rounds,
     );
+    let mut outer_lanes = baseline_outer_lanes;
+    let mut primary_quality = None;
+    let node_count = plan
+        .nodes_by_rank
+        .iter()
+        .map(Vec::len)
+        .try_fold(0usize, usize::checked_add)
+        .unwrap_or(usize::MAX);
+    // Only spend on the alternative when the baseline visibly fragments a feedback net. The
+    // shared optional-candidate budget keeps the extra exact score bounded on large inputs.
+    if has_split_feedback_net(plan, &sparse_spans, &outer_lanes)
+        && crossing_repair_within_budget(
+            node_count,
+            plan.edges.len(),
+            &routes,
+            &gap_lanes,
+            &sparse_spans,
+            &free_by_rank,
+        )
+    {
+        let coherent_outer_lanes = outer_lane_assignments(
+            plan,
+            nodes,
+            ranks,
+            &sparse_spans,
+            &outer_nets,
+            &layer_left,
+            &layer_right,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            true,
+        );
+        let baseline_quality = route_quality_for_plan(plan, &routes);
+        // Coherence changes outer side and side-local lane indices, but not the stable per-net
+        // channel index. The baseline sparse paths and gap lanes therefore remain valid.
+        let candidate_endpoint_tracks = build_endpoint_tracks(
+            plan,
+            nodes,
+            ranks,
+            &sparse_spans,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            &coherent_outer_lanes,
+            options,
+        );
+        let candidate_routes = emit_routes(
+            plan,
+            nodes,
+            &sparse_spans,
+            &crossing_paths,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            &candidate_endpoint_tracks,
+            &coherent_outer_lanes,
+            top,
+            bottom,
+            options,
+        );
+        let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
+        // Preserve the canonical physical-quality ordering; coherence is never accepted merely
+        // for looking tidier when it would increase crossings, bends, or route length.
+        if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
+            routes = candidate_routes;
+            outer_lanes = coherent_outer_lanes;
+            primary_quality = Some(candidate_quality);
+        } else {
+            primary_quality = Some(baseline_quality);
+        }
+    }
     let (primary_quality, repair) = if repair_crossings {
         let (quality, repair) = repair_crossing_heavy_net(
             plan,
@@ -394,12 +441,121 @@ fn route_edges_with_lane_rounds(
         );
         (Some(quality), repair)
     } else {
-        (None, None)
+        (primary_quality, None)
     };
     RoutedEdges {
         primary: routes,
         primary_quality,
         repair,
+    }
+}
+
+fn has_split_feedback_net(
+    plan: &RoutingPlan<'_>,
+    sparse_spans: &[Option<(usize, usize)>],
+    outer_lanes: &BTreeMap<u32, OuterLane>,
+) -> bool {
+    let feedback_nets = plan
+        .edges
+        .iter()
+        .filter(|resolved| !resolved.participates_in_ranking)
+        .map(|resolved| resolved.edge.net)
+        .collect::<BTreeSet<_>>();
+    let mut sides_by_net = BTreeMap::<NetId, u8>::new();
+    plan.edges
+        .iter()
+        .zip(sparse_spans)
+        .filter(|(resolved, span)| span.is_none() && feedback_nets.contains(&resolved.edge.net))
+        .any(|(resolved, _)| {
+            let side = match outer_lanes[&resolved.edge.id].side {
+                OuterSide::Top => 1,
+                OuterSide::Bottom => 2,
+            };
+            let sides = sides_by_net.entry(resolved.edge.net).or_default();
+            *sides |= side;
+            *sides == 3
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_routes_with_outer_lanes(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_lanes: &[BTreeMap<u32, usize>],
+    crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
+    crossing_tie_lane_count: usize,
+    free_by_rank: &[Vec<(f64, f64)>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<u32, usize>],
+    outer_lanes: &BTreeMap<u32, OuterLane>,
+    top: f64,
+    bottom: f64,
+    options: LayoutOptions,
+    gap_lane_rounds: usize,
+) -> RoutedLaneState {
+    let mut endpoint_tracks = build_endpoint_tracks(
+        plan,
+        nodes,
+        &plan.ranks,
+        sparse_spans,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        outer_lanes,
+        options,
+    );
+    let crossing_paths = sparse_crossing_paths(
+        plan,
+        nodes,
+        sparse_spans,
+        crossing_lanes,
+        crossing_tie_lanes,
+        crossing_tie_lane_count,
+        free_by_rank,
+        &endpoint_tracks,
+        options.port_stub,
+    );
+    let gap_lanes = crossing_aware_gap_lanes(
+        plan,
+        nodes,
+        sparse_spans,
+        &crossing_paths,
+        gap_lanes,
+        &endpoint_tracks,
+        options.port_stub,
+        gap_lane_rounds,
+    );
+    endpoint_tracks = build_endpoint_tracks(
+        plan,
+        nodes,
+        &plan.ranks,
+        sparse_spans,
+        layer_left,
+        layer_right,
+        &gap_lanes,
+        outer_lanes,
+        options,
+    );
+    let routes = emit_routes(
+        plan,
+        nodes,
+        sparse_spans,
+        &crossing_paths,
+        layer_left,
+        layer_right,
+        &gap_lanes,
+        &endpoint_tracks,
+        outer_lanes,
+        top,
+        bottom,
+        options,
+    );
+    RoutedLaneState {
+        routes,
+        gap_lanes,
+        crossing_paths,
     }
 }
 
@@ -746,6 +902,13 @@ fn route_quality_for_plan(plan: &RoutingPlan<'_>, routes: &[EdgeGeometry]) -> Ro
     }
 }
 
+fn route_quality_cmp(left: RouteQuality, right: RouteQuality) -> Ordering {
+    left.crossings
+        .cmp(&right.crossings)
+        .then(left.bends.cmp(&right.bends))
+        .then(left.route_length.total_cmp(&right.route_length))
+}
+
 fn physical_route_segments<'a>(
     edges: impl Iterator<Item = &'a Edge>,
     routes: &[EdgeGeometry],
@@ -1048,7 +1211,7 @@ enum OuterSide {
     Bottom,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OuterLane {
     side: OuterSide,
     side_index: usize,
@@ -1075,10 +1238,19 @@ fn outer_lane_assignments(
     bottom: f64,
     options: LayoutOptions,
     lane_rounds: usize,
+    coherent_feedback: bool,
 ) -> BTreeMap<u32, OuterLane> {
     let mut top_nets = BTreeSet::new();
     let mut bottom_nets = BTreeSet::new();
     let mut edge_sides = BTreeMap::new();
+    let feedback_nets = plan
+        .edges
+        .iter()
+        .filter(|resolved| coherent_feedback && !resolved.participates_in_ranking)
+        .map(|resolved| resolved.edge.net)
+        .collect::<BTreeSet<_>>();
+    let mut feedback_endpoint_costs = BTreeMap::<u32, (f64, f64)>::new();
+    let mut counted_feedback_endpoints = HashSet::new();
     for (resolved, span) in plan.edges.iter().zip(sparse_spans) {
         let edge = resolved.edge;
         if span.is_some() {
@@ -1093,15 +1265,50 @@ fn outer_lane_assignments(
             cost.0 += point.y - top;
             cost.1 += bottom - point.y;
         }
-        let side = if cost.1 < cost.0 {
-            bottom_nets.insert(edge.net);
-            OuterSide::Bottom
-        } else {
-            top_nets.insert(edge.net);
-            OuterSide::Top
-        };
-        edge_sides.insert(edge.id, side);
+        if feedback_nets.contains(&edge.net) {
+            for (endpoint, node_index, port) in [
+                (edge.source, resolved.source_index, resolved.source_port),
+                (edge.target, resolved.target_index, resolved.target_port),
+            ] {
+                if counted_feedback_endpoints.insert((edge.net, endpoint)) {
+                    let point = port_point(&nodes[node_index], port);
+                    let net_cost = feedback_endpoint_costs.entry(edge.net).or_default();
+                    net_cost.0 += point.y - top;
+                    net_cost.1 += bottom - point.y;
+                }
+            }
+        }
+        edge_sides.insert(edge.id, (edge.net, cost));
     }
+    let feedback_sides = feedback_endpoint_costs
+        .into_iter()
+        .map(|(net, cost)| {
+            let side = if cost.1 < cost.0 {
+                OuterSide::Bottom
+            } else {
+                OuterSide::Top
+            };
+            (net, side)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let edge_sides = edge_sides
+        .into_iter()
+        .map(|(edge, (net, cost))| {
+            let side = feedback_sides.get(&net).copied().unwrap_or({
+                if cost.1 < cost.0 {
+                    OuterSide::Bottom
+                } else {
+                    OuterSide::Top
+                }
+            });
+            if side == OuterSide::Bottom {
+                bottom_nets.insert(net);
+            } else {
+                top_nets.insert(net);
+            }
+            (edge, side)
+        })
+        .collect::<BTreeMap<_, _>>();
 
     let mut assignments = BTreeMap::new();
     let channel_lanes = lane_indices(outer_nets);
@@ -2053,10 +2260,10 @@ mod tests {
         MIN_CROSSING_REPAIR_TOTAL, OuterNetAccess, OuterSide, RoutingPlan,
         crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices,
         crossing_repair_within_budget, crossing_track_y, distance_transform,
-        horizontal_crossing_counts_by_net, move_net_to_outer_lane, outer_lane_assignments,
-        port_point, route_edges, route_planned_candidates, route_planned_edges, route_quality,
-        route_quality_for_plan, route_supplemental_edges, select_crossing_repair_net,
-        shortest_crossing_path, sparse_channel_route, sum_within_limit,
+        has_split_feedback_net, horizontal_crossing_counts_by_net, move_net_to_outer_lane,
+        outer_lane_assignments, port_point, route_edges, route_planned_candidates,
+        route_planned_edges, route_quality, route_quality_for_plan, route_supplemental_edges,
+        select_crossing_repair_net, shortest_crossing_path, sparse_channel_route, sum_within_limit,
         vertical_horizontal_crossings,
     };
 
@@ -2444,11 +2651,110 @@ mod tests {
             120.0,
             LayoutOptions::default(),
             FULL_OUTER_LANE_ROUNDS,
+            false,
         );
 
         assert_eq!(lanes[&10].side, OuterSide::Top);
         assert_eq!(lanes[&11].side, OuterSide::Bottom);
         assert_eq!(lanes[&10].channel_index, lanes[&11].channel_index);
+    }
+
+    #[test]
+    fn feedback_net_uses_one_coherent_outer_side() {
+        let node = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: if id == 1 {
+                    PortSide::East
+                } else {
+                    PortSide::West
+                },
+                offset: 10.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![node(1), node(2), node(3)],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 7,
+                    participates_in_ranking: false,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let geometry = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 50.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 100.0,
+                y: 100.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+
+        let plan = RoutingPlan::new(&indexed, &[0, 1, 1]);
+        let split_lanes = outer_lane_assignments(
+            &plan,
+            &geometry,
+            &[0, 1, 1],
+            &[None, None],
+            &BTreeSet::from([7]),
+            &[0.0, 100.0],
+            &[20.0, 120.0],
+            0.0,
+            120.0,
+            LayoutOptions::default(),
+            FULL_OUTER_LANE_ROUNDS,
+            false,
+        );
+        assert!(has_split_feedback_net(&plan, &[None, None], &split_lanes));
+        let lanes = outer_lane_assignments(
+            &plan,
+            &geometry,
+            &[0, 1, 1],
+            &[None, None],
+            &BTreeSet::from([7]),
+            &[0.0, 100.0],
+            &[20.0, 120.0],
+            0.0,
+            120.0,
+            LayoutOptions::default(),
+            FULL_OUTER_LANE_ROUNDS,
+            true,
+        );
+
+        assert_eq!(lanes[&10].side, OuterSide::Top);
+        assert_eq!(lanes[&11].side, OuterSide::Top);
+        assert_eq!(lanes[&10].side_index, lanes[&11].side_index);
+        assert!(!has_split_feedback_net(&plan, &[None, None], &lanes));
     }
 
     #[test]
