@@ -165,23 +165,41 @@ pub enum LayoutError {
 pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
     let ranks = topology::assign_ranks(&indexed);
-    let [forward, reverse] =
-        topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps);
+    let (forward, reverse, net_representative) =
+        topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
     let quality_layers = if reverse.crossings < forward.crossings {
         &reverse.layers
     } else {
         &forward.layers
     };
-    let candidates = [
-        placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
-        placement::place_nodes(&indexed, &ranks, quality_layers, options),
-    ];
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    for mut nodes in candidates {
+    let mut evaluate = |mut nodes: Vec<NodeGeometry>| {
         let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
         let quality = routing::route_quality(&indexed, &edges);
         let candidate = placement::normalize(&mut nodes, &mut edges);
         retain_better_candidate(&mut best, quality, candidate);
+    };
+    evaluate(placement::place_baseline_nodes(
+        &indexed,
+        &ranks,
+        &forward.layers,
+        options,
+    ));
+    evaluate(placement::place_nodes(
+        &indexed,
+        &ranks,
+        quality_layers,
+        options,
+    ));
+    if let Some(net_representative) = net_representative
+        && net_representative.layers != *quality_layers
+    {
+        evaluate(placement::place_nodes(
+            &indexed,
+            &ranks,
+            &net_representative.layers,
+            options,
+        ));
     }
     Ok(best.expect("layout has deterministic candidates").1)
 }
@@ -217,7 +235,11 @@ fn candidate_quality_cmp(
 
 #[cfg(test)]
 mod tests {
-    use super::{Layout, retain_better_candidate, routing::RouteQuality};
+    use super::{
+        Edge, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Port, PortSide,
+        candidate_quality_cmp, layout, placement, retain_better_candidate, routing,
+        routing::RouteQuality, topology, validation,
+    };
 
     fn candidate(
         crossings: usize,
@@ -238,6 +260,75 @@ mod tests {
                 height: 1.0,
             },
         )
+    }
+
+    fn net_representative_graph() -> Graph {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..40)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 25.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 25.0,
+                    },
+                ],
+            })
+            .collect();
+        // One 16-branch net activates the guarded path; fixed sparse cross-connections
+        // make its retained ordering distinct without storing a large literal fixture.
+        let mut state = 3u64;
+        let mut endpoints = Vec::new();
+        for target in 8..24 {
+            endpoints.push((0, target, 100));
+        }
+        for source in 1..8 {
+            for target in 8..24 {
+                if next(&mut state) % 100 < 24 {
+                    endpoints.push((source, target, 1_000 + endpoints.len() as u32));
+                }
+            }
+        }
+        for source in 8..24 {
+            for target in 24..40 {
+                if next(&mut state) % 100 < 20 {
+                    endpoints.push((source, target, 1_000 + endpoints.len() as u32));
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target, net))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect();
+        Graph { nodes, edges }
     }
 
     #[test]
@@ -268,5 +359,75 @@ mod tests {
         assert_ne!(exact_tie.1, smaller.1);
         retain_better_candidate(&mut best, exact_tie.0, exact_tie.1);
         assert_eq!(best.as_ref().unwrap().1, smaller.1);
+    }
+
+    #[test]
+    fn selects_a_distinct_net_representative_candidate_deterministically() {
+        let graph = net_representative_graph();
+        let options = LayoutOptions::default();
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let ranks = topology::assign_ranks(&indexed);
+        assert!(
+            topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, false)
+                .2
+                .is_none()
+        );
+        let (forward, reverse, net_representative) =
+            topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
+        let quality_layers = if reverse.crossings < forward.crossings {
+            &reverse.layers
+        } else {
+            &forward.layers
+        };
+        let net_representative = net_representative.unwrap();
+        assert_ne!(net_representative.layers, *quality_layers);
+
+        let evaluate = |mut nodes: Vec<NodeGeometry>| {
+            let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
+            let quality = routing::route_quality(&indexed, &edges);
+            let layout = placement::normalize(&mut nodes, &mut edges);
+            (quality, layout)
+        };
+        let baseline = evaluate(placement::place_baseline_nodes(
+            &indexed,
+            &ranks,
+            &forward.layers,
+            options,
+        ));
+        let ordinary = evaluate(placement::place_nodes(
+            &indexed,
+            &ranks,
+            quality_layers,
+            options,
+        ));
+        let net_representative = evaluate(placement::place_nodes(
+            &indexed,
+            &ranks,
+            &net_representative.layers,
+            options,
+        ));
+        let best_ordinary =
+            if candidate_quality_cmp(ordinary.0, &ordinary.1, baseline.0, &baseline.1).is_lt() {
+                &ordinary
+            } else {
+                &baseline
+            };
+        assert!(
+            candidate_quality_cmp(
+                net_representative.0,
+                &net_representative.1,
+                best_ordinary.0,
+                &best_ordinary.1,
+            )
+            .is_lt()
+        );
+
+        let selected = layout(&graph, options).unwrap();
+        assert_eq!(selected, net_representative.1);
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, options).unwrap(), selected);
     }
 }

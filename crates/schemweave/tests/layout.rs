@@ -422,7 +422,11 @@ fn handles_the_full_consumer_graph_bound() {
             .map(|id| {
                 let source = id % node_count;
                 let target = (source + 1 + id / node_count) % node_count;
-                edge(id, source, target)
+                let mut edge = edge(id, source, target);
+                if id < 16 {
+                    edge.net = node_count;
+                }
+                edge
             })
             .collect(),
     };
