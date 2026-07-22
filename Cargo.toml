@@ -20,3 +20,4 @@ wasm-bindgen = "=0.2.122"
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+strip = "symbols"
