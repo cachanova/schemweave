@@ -3557,7 +3557,7 @@ fn push_point(points: &mut Vec<Point>, point: Point) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
 
     use crate::{
         Edge, EdgeGeometry, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Point, Port,
@@ -3573,11 +3573,11 @@ mod tests {
         distance_transform, fanout_outer_channel_lane_indices,
         global_gap_candidate_work_within_budget, global_gap_lane_indices_with_rounds,
         global_gap_order_seed, has_split_feedback_net, horizontal_crossing_counts_by_net,
-        lane_indices, move_nets_to_outer_lanes, outer_lane_assignments, port_point,
-        repair_crossing_heavy_net, route_edges, route_edges_with_lane_rounds,
-        route_edges_with_lane_rounds_and_global, route_planned_candidates,
-        route_planned_candidates_with_sparse_global, route_planned_edges, route_quality,
-        route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
+        lane_indices, move_nets_to_outer_lanes, outer_lane_assignments, physical_crossing_sweep,
+        physical_crossing_sweep_lines, port_point, repair_crossing_heavy_net, route_edges,
+        route_edges_with_lane_rounds, route_edges_with_lane_rounds_and_global,
+        route_planned_candidates, route_planned_candidates_with_sparse_global, route_planned_edges,
+        route_quality, route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
         select_crossing_repair_nets, select_outer_side_repairs, shortest_crossing_path,
         sparse_channel_route, sum_within_limit, vertical_horizontal_crossings,
     };
@@ -3668,6 +3668,28 @@ mod tests {
         assert!(route_quality_cmp(*candidate, baseline).is_lt());
         assert_eq!(route_quality(&indexed, &routed.primary), baseline);
         assert_eq!(route_quality(&indexed, repair), *candidate);
+        for (primary, repaired) in routed.primary.iter().zip(repair) {
+            assert_eq!(primary.id, repaired.id);
+            assert_eq!(
+                primary
+                    .points
+                    .iter()
+                    .map(|point| point.x)
+                    .collect::<Vec<_>>(),
+                repaired
+                    .points
+                    .iter()
+                    .map(|point| point.x)
+                    .collect::<Vec<_>>()
+            );
+            for route in [primary, repaired] {
+                assert!(
+                    route.points.windows(2).all(|points| {
+                        (points[0].x == points[1].x) ^ (points[0].y == points[1].y)
+                    })
+                );
+            }
+        }
 
         let mut permuted_graph = graph;
         permuted_graph.nodes.reverse();
@@ -3675,6 +3697,36 @@ mod tests {
         let permuted_indexed = validate_and_index(&permuted_graph, options).unwrap();
         let permuted_plan = RoutingPlan::new(&permuted_indexed, &ranks);
         let permuted = route_planned_candidates(&permuted_plan, &geometry, options, true);
+        assert_eq!(permuted.repair_outer_sides, routed.repair_outer_sides);
+        assert_eq!(permuted.primary_quality, routed.primary_quality);
+        assert_eq!(permuted.primary, routed.primary);
+        assert_eq!(permuted.repair, routed.repair);
+    }
+
+    #[test]
+    fn sparse_and_outer_repairs_share_one_exact_deterministic_candidate() {
+        let (mut graph, mut geometry, mut ranks) = outer_side_route_fixture(256, 70.0, 90.0);
+        add_crossing_repair_fixture(&mut graph, &mut geometry, &mut ranks);
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let routed = route_planned_candidates(&plan, &geometry, options, true);
+        let baseline = routed.primary_quality.unwrap();
+        let (candidate, repair) = routed.repair.as_ref().expect("combined repair activates");
+
+        assert!(!routed.repair_nets.is_empty());
+        assert!(!routed.repair_outer_sides.is_empty());
+        assert!(route_quality_cmp(*candidate, baseline).is_lt());
+        assert_eq!(route_quality(&indexed, &routed.primary), baseline);
+        assert_eq!(route_quality(&indexed, repair), *candidate);
+
+        let mut permuted_graph = graph;
+        permuted_graph.nodes.reverse();
+        permuted_graph.edges.reverse();
+        let permuted_indexed = validate_and_index(&permuted_graph, options).unwrap();
+        let permuted_plan = RoutingPlan::new(&permuted_indexed, &ranks);
+        let permuted = route_planned_candidates(&permuted_plan, &geometry, options, true);
+        assert_eq!(permuted.repair_nets, routed.repair_nets);
         assert_eq!(permuted.repair_outer_sides, routed.repair_outer_sides);
         assert_eq!(permuted.primary_quality, routed.primary_quality);
         assert_eq!(permuted.primary, routed.primary);
@@ -3781,6 +3833,74 @@ mod tests {
 
         assert!(select(63).is_empty());
         assert_eq!(select(64), vec![(1, OuterSide::Top)]);
+    }
+
+    #[test]
+    fn outer_side_repair_caps_equal_gain_nets_and_skips_side_ties() {
+        let (graph, nodes, ranks) = outer_side_route_fixture(2, 70.0, 70.0);
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let spans = vec![None; graph.edges.len()];
+        let outer_lanes = graph
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(channel_index, edge)| {
+                (
+                    edge.id,
+                    OuterLane {
+                        side: OuterSide::Bottom,
+                        side_index: channel_index,
+                        channel_index,
+                        channel_count: graph.edges.len(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let horizontals = |ys: &[f64]| {
+            ys.iter()
+                .enumerate()
+                .map(|(index, &fixed)| PhysicalSegment {
+                    net: 1_000 + index as u32,
+                    source: Endpoint {
+                        node: 10_000 + index as u32 * 2,
+                        port: 0,
+                    },
+                    target: Endpoint {
+                        node: 10_001 + index as u32 * 2,
+                        port: 0,
+                    },
+                    horizontal: true,
+                    fixed,
+                    start: -1_000.0,
+                    end: 1_000.0,
+                })
+                .collect::<Vec<_>>()
+        };
+        let select = |segments: &[PhysicalSegment]| {
+            select_outer_side_repairs(
+                &plan,
+                &nodes,
+                &spans,
+                &[0.0],
+                &[220.0],
+                &[],
+                &outer_lanes,
+                0.0,
+                110.0,
+                options,
+                segments,
+            )
+        };
+
+        let bottom_only = horizontals(&[100.0; 64]);
+        assert_eq!(
+            select(&bottom_only),
+            vec![(1, OuterSide::Top), (100, OuterSide::Top)]
+        );
+        let tied = horizontals(&[vec![40.0; 64], vec![100.0; 64]].concat());
+        assert!(select(&tied).is_empty());
     }
 
     #[test]
@@ -5855,6 +5975,100 @@ mod tests {
             actual_predecessors,
             expected.iter().map(|item| item.0).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn shared_crossing_sweep_matches_an_independent_pairwise_oracle() {
+        let endpoint = |node| Endpoint { node, port: 0 };
+        let shared = endpoint(50);
+        let segment = |net, source, target, horizontal, fixed, start, end| PhysicalSegment {
+            net,
+            source: endpoint(source),
+            target: endpoint(target),
+            horizontal,
+            fixed,
+            start,
+            end,
+        };
+        let segments = vec![
+            segment(1, 1, 2, true, 5.0, 0.0, 10.0),
+            segment(2, 50, 4, true, 7.0, 0.0, 10.0),
+            segment(3, 5, 6, true, 9.0, 0.0, 10.0),
+            segment(4, 7, 8, true, 5.0, 5.0, 15.0),
+            segment(10, 9, 10, false, 5.0, 0.0, 10.0),
+            segment(1, 11, 12, false, 6.0, 0.0, 10.0),
+            segment(20, 50, 13, false, 7.0, 0.0, 10.0),
+            segment(30, 14, 15, false, 10.0, 0.0, 10.0),
+            segment(31, 16, 17, false, 8.0, 5.0, 9.0),
+        ];
+        let shared_endpoints = HashSet::from([shared]);
+        let oracle = |horizontal: &[&PhysicalSegment], vertical: &[&PhysicalSegment]| {
+            let mut counts = BTreeMap::<u32, usize>::new();
+            for line in vertical {
+                for crossing in horizontal {
+                    let shares_endpoint = [line.source, line.target].into_iter().any(|endpoint| {
+                        shared_endpoints.contains(&endpoint)
+                            && (crossing.source == endpoint || crossing.target == endpoint)
+                    });
+                    if line.fixed > crossing.start
+                        && line.fixed < crossing.end
+                        && crossing.fixed > line.start
+                        && crossing.fixed < line.end
+                        && line.net != crossing.net
+                        && !shares_endpoint
+                    {
+                        *counts.entry(line.net).or_default() += 1;
+                    }
+                }
+            }
+            counts
+        };
+
+        for transpose in [false, true] {
+            let horizontal = segments
+                .iter()
+                .filter(|segment| segment.horizontal != transpose)
+                .collect::<Vec<_>>();
+            let vertical = segments
+                .iter()
+                .filter(|segment| segment.horizontal == transpose)
+                .collect::<Vec<_>>();
+            let expected = oracle(&horizontal, &vertical);
+            let mut actual = BTreeMap::new();
+            let crossings =
+                physical_crossing_sweep(&shared_endpoints, &segments, transpose, Some(&mut actual));
+            assert_eq!(crossings, expected.values().sum());
+            assert_eq!(actual, expected);
+        }
+
+        let horizontal = segments[..4].iter().collect::<Vec<_>>();
+        let vertical = &segments[4..];
+        let profile_indices: [&[usize]; 3] = [&[0, 1, 2, 3, 4], &[0, 1, 2, 3], &[0, 3]];
+        let tagged = profile_indices
+            .iter()
+            .enumerate()
+            .flat_map(|(profile, indices)| {
+                indices.iter().map(move |&index| {
+                    let line = &vertical[index];
+                    (line, ((profile as u64) << 32) | u64::from(line.net))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut actual_profiles = BTreeMap::new();
+        physical_crossing_sweep_lines(&shared_endpoints, &horizontal, &tagged, |key, crossings| {
+            *actual_profiles.entry(key).or_default() += crossings;
+        });
+        let mut expected_profiles = BTreeMap::new();
+        for (profile, indices) in profile_indices.iter().enumerate() {
+            let lines = indices
+                .iter()
+                .map(|&index| &vertical[index])
+                .collect::<Vec<_>>();
+            for (net, crossings) in oracle(&horizontal, &lines) {
+                expected_profiles.insert(((profile as u64) << 32) | u64::from(net), crossings);
+            }
+        }
+        assert_eq!(actual_profiles, expected_profiles);
     }
 
     #[test]
