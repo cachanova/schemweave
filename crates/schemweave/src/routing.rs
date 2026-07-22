@@ -22,7 +22,7 @@ const MAX_CROSSING_REPAIR_EDGES: usize = 10_000;
 const MAX_CROSSING_REPAIR_NODES: usize = 2_000;
 const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
-const MAX_CROSSING_REPAIR_PATH_STATES: usize = 100_000;
+const MAX_CROSSING_REPAIR_PATH_STATES: usize = 500_000;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RouteQuality {
@@ -570,26 +570,20 @@ fn repair_crossing_heavy_net(
     options: LayoutOptions,
     routes: &[EdgeGeometry],
 ) -> (RouteQuality, Option<(RouteQuality, Vec<EdgeGeometry>)>) {
-    if plan.edges.len() > MAX_CROSSING_REPAIR_EDGES
-        || !sum_within_limit(
-            plan.nodes_by_rank.iter().map(Vec::len),
-            MAX_CROSSING_REPAIR_NODES,
-        )
-        || !sum_within_limit(
-            routes.iter().map(|route| route.points.len()),
-            MAX_CROSSING_REPAIR_ROUTE_POINTS,
-        )
-        || !sum_within_limit(
-            gap_lanes.iter().map(BTreeMap::len),
-            MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS,
-        )
-        || !sum_within_limit(
-            sparse_spans.iter().filter_map(|span| {
-                span.map(|(source_rank, target_rank)| target_rank - source_rank - 1)
-            }),
-            MAX_CROSSING_REPAIR_PATH_STATES,
-        )
-    {
+    let node_count = plan
+        .nodes_by_rank
+        .iter()
+        .map(Vec::len)
+        .try_fold(0usize, usize::checked_add)
+        .unwrap_or(usize::MAX);
+    if !crossing_repair_within_budget(
+        node_count,
+        plan.edges.len(),
+        routes,
+        gap_lanes,
+        sparse_spans,
+        free_by_rank,
+    ) {
         return (route_quality_for_plan(plan, routes), None);
     }
     let (crossing_counts, quality) = horizontal_crossing_counts_by_net(plan, routes);
@@ -635,6 +629,37 @@ fn repair_crossing_heavy_net(
     })();
     let repair = repair.map(|routes| (route_quality_for_plan(plan, &routes), routes));
     (quality, repair)
+}
+
+fn crossing_repair_within_budget(
+    node_count: usize,
+    edge_count: usize,
+    routes: &[EdgeGeometry],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    sparse_spans: &[Option<(usize, usize)>],
+    free_by_rank: &[Vec<(f64, f64)>],
+) -> bool {
+    node_count <= MAX_CROSSING_REPAIR_NODES
+        && edge_count <= MAX_CROSSING_REPAIR_EDGES
+        && sum_within_limit(
+            routes.iter().map(|route| route.points.len()),
+            MAX_CROSSING_REPAIR_ROUTE_POINTS,
+        )
+        && sum_within_limit(
+            gap_lanes.iter().map(BTreeMap::len),
+            MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS,
+        )
+        && sum_within_limit(
+            sparse_spans
+                .iter()
+                .filter_map(|span| span.as_ref())
+                .flat_map(|&(source_rank, target_rank)| {
+                    free_by_rank[source_rank + 1..target_rank]
+                        .iter()
+                        .map(Vec::len)
+                }),
+            MAX_CROSSING_REPAIR_PATH_STATES,
+        )
 }
 
 fn sum_within_limit(mut values: impl Iterator<Item = usize>, limit: usize) -> bool {
@@ -2023,13 +2048,15 @@ mod tests {
     };
 
     use super::{
-        FULL_OUTER_LANE_ROUNDS, GapNetAccess, MAX_CROSSING_REPAIR_ROUTE_POINTS,
-        MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL, OuterNetAccess, OuterSide, RoutingPlan,
-        crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices, crossing_track_y,
-        distance_transform, horizontal_crossing_counts_by_net, move_net_to_outer_lane,
-        outer_lane_assignments, port_point, route_edges, route_planned_candidates,
-        route_planned_edges, route_quality, route_quality_for_plan, route_supplemental_edges,
-        select_crossing_repair_net, shortest_crossing_path, sparse_channel_route, sum_within_limit,
+        FULL_OUTER_LANE_ROUNDS, GapNetAccess, MAX_CROSSING_REPAIR_NODES,
+        MAX_CROSSING_REPAIR_PATH_STATES, MAX_CROSSING_REPAIR_ROUTE_POINTS, MIN_CROSSING_REPAIR_NET,
+        MIN_CROSSING_REPAIR_TOTAL, OuterNetAccess, OuterSide, RoutingPlan,
+        crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices,
+        crossing_repair_within_budget, crossing_track_y, distance_transform,
+        horizontal_crossing_counts_by_net, move_net_to_outer_lane, outer_lane_assignments,
+        port_point, route_edges, route_planned_candidates, route_planned_edges, route_quality,
+        route_quality_for_plan, route_supplemental_edges, select_crossing_repair_net,
+        shortest_crossing_path, sparse_channel_route, sum_within_limit,
         vertical_horizontal_crossings,
     };
 
@@ -2132,6 +2159,54 @@ mod tests {
             MAX_CROSSING_REPAIR_ROUTE_POINTS,
         ));
         assert!(!sum_within_limit([usize::MAX, 1].into_iter(), usize::MAX,));
+    }
+
+    #[test]
+    fn repair_budget_enforces_node_and_actual_path_state_boundaries() {
+        let empty_routes = Vec::<EdgeGeometry>::new();
+        let empty_lanes = Vec::<BTreeMap<u32, usize>>::new();
+        let empty_spans = Vec::<Option<(usize, usize)>>::new();
+        let empty_free = Vec::<Vec<(f64, f64)>>::new();
+        assert!(crossing_repair_within_budget(
+            MAX_CROSSING_REPAIR_NODES,
+            0,
+            &empty_routes,
+            &empty_lanes,
+            &empty_spans,
+            &empty_free,
+        ));
+        assert!(!crossing_repair_within_budget(
+            MAX_CROSSING_REPAIR_NODES + 1,
+            0,
+            &empty_routes,
+            &empty_lanes,
+            &empty_spans,
+            &empty_free,
+        ));
+
+        let spans = vec![Some((0, 2))];
+        let mut free_by_rank = vec![
+            Vec::new(),
+            vec![(0.0, 1.0); MAX_CROSSING_REPAIR_PATH_STATES + 1],
+            Vec::new(),
+        ];
+        assert!(!crossing_repair_within_budget(
+            0,
+            1,
+            &empty_routes,
+            &empty_lanes,
+            &spans,
+            &free_by_rank,
+        ));
+        free_by_rank[1].pop();
+        assert!(crossing_repair_within_budget(
+            0,
+            1,
+            &empty_routes,
+            &empty_lanes,
+            &spans,
+            &free_by_rank,
+        ));
     }
 
     #[test]
