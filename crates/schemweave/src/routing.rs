@@ -23,9 +23,13 @@ const MAX_CROSSING_REPAIR_NODES: usize = 2_000;
 const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
 const MAX_CROSSING_REPAIR_PATH_STATES: usize = 500_000;
-// Small nets keep the historical stable-ID order; at this fanout the many target branches make
-// target-proximal channel placement materially more important than the single shared source arm.
+// Small nets keep the historical stable-ID order. For a single-source outer fanout, higher channel
+// indices usually shorten the many sink escapes at the cost of one shared source arm; the exact
+// route scorer below still rejects the heuristic whenever that trade is not beneficial.
 const MIN_FANOUT_AWARE_CHANNEL_EDGES: usize = 16;
+// A channel-order candidate emits and exactly scores a second complete route set. Require enough
+// actual outer sink work to amortize that cost; smaller clusters keep the historical fast path.
+const MIN_FANOUT_AWARE_OUTER_BRANCHES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RouteQuality {
@@ -40,6 +44,8 @@ pub(crate) struct RoutedEdges {
     pub(crate) repair: Option<(RouteQuality, Vec<EdgeGeometry>)>,
     #[cfg(test)]
     pub(crate) feedback_trace: FeedbackCandidateTrace,
+    #[cfg(test)]
+    pub(crate) fanout_trace: FanoutCandidateTrace,
 }
 
 #[cfg(test)]
@@ -49,6 +55,15 @@ pub(crate) struct FeedbackCandidateTrace {
     pub(crate) evaluated: bool,
     pub(crate) selected: bool,
     pub(crate) baseline: Option<(RouteQuality, Vec<EdgeGeometry>)>,
+    pub(crate) candidate_quality: Option<RouteQuality>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FanoutCandidateTrace {
+    pub(crate) evaluated: bool,
+    pub(crate) selected: bool,
+    pub(crate) baseline_quality: Option<RouteQuality>,
     pub(crate) candidate_quality: Option<RouteQuality>,
 }
 
@@ -156,6 +171,7 @@ pub(crate) fn route_edges(
         FULL_OUTER_LANE_ROUNDS,
         FULL_GAP_LANE_ROUNDS,
         false,
+        false,
     )
     .primary
 }
@@ -180,6 +196,7 @@ pub(crate) fn route_supplemental_edges(
         SUPPLEMENTAL_OUTER_LANE_ROUNDS,
         SUPPLEMENTAL_GAP_LANE_ROUNDS,
         true,
+        true,
     )
     .primary
 }
@@ -195,8 +212,15 @@ pub(crate) fn route_planned_candidates(
     } else {
         (FULL_OUTER_LANE_ROUNDS, FULL_GAP_LANE_ROUNDS)
     };
-    let mut routed =
-        route_edges_with_lane_rounds(plan, nodes, options, outer_rounds, gap_rounds, supplemental);
+    let mut routed = route_edges_with_lane_rounds(
+        plan,
+        nodes,
+        options,
+        outer_rounds,
+        gap_rounds,
+        supplemental,
+        supplemental,
+    );
     if routed.primary_quality.is_none() {
         routed.primary_quality = Some(route_quality_for_plan(plan, &routed.primary));
     }
@@ -222,6 +246,7 @@ fn route_edges_with_lane_rounds(
     outer_lane_rounds: usize,
     gap_lane_rounds: usize,
     repair_crossings: bool,
+    fanout_candidates: bool,
 ) -> RoutedEdges {
     let ranks = &plan.ranks;
     debug_assert_eq!(nodes.len(), ranks.len());
@@ -328,12 +353,13 @@ fn route_edges_with_lane_rounds(
         .map(|(lane, pair)| (pair, lane))
         .collect();
     let crossing_tie_lane_count = crossing_tie_lanes.len();
+    let stable_channel_lanes = lane_indices(&outer_nets);
     let baseline_outer_lanes = outer_lane_assignments(
         plan,
         nodes,
         ranks,
         &sparse_spans,
-        &outer_nets,
+        &stable_channel_lanes,
         &layer_left,
         &layer_right,
         top,
@@ -342,11 +368,7 @@ fn route_edges_with_lane_rounds(
         outer_lane_rounds,
         false,
     );
-    let RoutedLaneState {
-        mut routes,
-        gap_lanes,
-        crossing_paths,
-    } = emit_routes_with_outer_lanes(
+    let mut routed_state = emit_routes_with_outer_lanes(
         plan,
         nodes,
         &sparse_spans,
@@ -364,6 +386,7 @@ fn route_edges_with_lane_rounds(
         gap_lane_rounds,
     );
     let mut outer_lanes = baseline_outer_lanes;
+    let mut selected_channel_lanes = &stable_channel_lanes;
     let mut primary_quality = None;
     let node_count = plan
         .nodes_by_rank
@@ -371,6 +394,95 @@ fn route_edges_with_lane_rounds(
         .map(Vec::len)
         .try_fold(0usize, usize::checked_add)
         .unwrap_or(usize::MAX);
+    let fanout_within_budget = fanout_candidates
+        && repair_crossings
+        && crossing_repair_within_budget(
+            node_count,
+            plan.edges.len(),
+            &routed_state.routes,
+            &routed_state.gap_lanes,
+            &sparse_spans,
+            &free_by_rank,
+        );
+    let adaptive_channel_lanes = fanout_within_budget
+        .then(|| fanout_outer_channel_lane_indices(plan, &sparse_spans, &outer_nets))
+        .flatten();
+    #[cfg(test)]
+    let mut fanout_trace = FanoutCandidateTrace {
+        evaluated: false,
+        selected: false,
+        baseline_quality: None,
+        candidate_quality: None,
+    };
+    if let Some(adaptive_channel_lanes) = adaptive_channel_lanes.as_ref() {
+        let candidate_outer_lanes = outer_lane_assignments(
+            plan,
+            nodes,
+            ranks,
+            &sparse_spans,
+            adaptive_channel_lanes,
+            &layer_left,
+            &layer_right,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            false,
+        );
+        // Channel order changes only outer accesses. Preserve the already-refined sparse
+        // corridors and rebuild the endpoint escapes plus complete route geometry that can be
+        // affected by those accesses; the complete result is still scored exactly below.
+        let candidate_endpoint_tracks = build_endpoint_tracks(
+            plan,
+            nodes,
+            ranks,
+            &sparse_spans,
+            &layer_left,
+            &layer_right,
+            &routed_state.gap_lanes,
+            &candidate_outer_lanes,
+            options,
+        );
+        let candidate_routes = emit_routes(
+            plan,
+            nodes,
+            &sparse_spans,
+            &routed_state.crossing_paths,
+            &layer_left,
+            &layer_right,
+            &routed_state.gap_lanes,
+            &candidate_endpoint_tracks,
+            &candidate_outer_lanes,
+            top,
+            bottom,
+            options,
+        );
+        let baseline_quality = route_quality_for_plan(plan, &routed_state.routes);
+        let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
+        #[cfg(test)]
+        {
+            fanout_trace.evaluated = true;
+            fanout_trace.baseline_quality = Some(baseline_quality);
+            fanout_trace.candidate_quality = Some(candidate_quality);
+        }
+        if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
+            routed_state.routes = candidate_routes;
+            outer_lanes = candidate_outer_lanes;
+            selected_channel_lanes = adaptive_channel_lanes;
+            primary_quality = Some(candidate_quality);
+            #[cfg(test)]
+            {
+                fanout_trace.selected = true;
+            }
+        } else {
+            primary_quality = Some(baseline_quality);
+        }
+    }
+    let RoutedLaneState {
+        mut routes,
+        gap_lanes,
+        crossing_paths,
+    } = routed_state;
     let split_feedback = has_split_feedback_net(plan, &sparse_spans, &outer_lanes);
     let feedback_within_budget = split_feedback
         && crossing_repair_within_budget(
@@ -397,7 +509,7 @@ fn route_edges_with_lane_rounds(
             nodes,
             ranks,
             &sparse_spans,
-            &outer_nets,
+            selected_channel_lanes,
             &layer_left,
             &layer_right,
             top,
@@ -483,6 +595,8 @@ fn route_edges_with_lane_rounds(
         repair,
         #[cfg(test)]
         feedback_trace,
+        #[cfg(test)]
+        fanout_trace,
     }
 }
 
@@ -1233,22 +1347,75 @@ impl CrossingFenwick {
     }
 }
 
-fn outer_channel_lane_indices(
-    nets: &BTreeSet<NetId>,
-    edge_counts: &BTreeMap<NetId, usize>,
-) -> BTreeMap<NetId, usize> {
-    let mut ordered = nets.iter().copied().collect::<Vec<_>>();
-    if ordered
-        .iter()
-        .any(|net| edge_counts[net] >= MIN_FANOUT_AWARE_CHANNEL_EDGES)
-    {
-        ordered.sort_unstable_by_key(|net| (edge_counts[net], *net));
-    }
-    ordered
-        .into_iter()
+fn lane_indices(nets: &BTreeSet<NetId>) -> BTreeMap<NetId, usize> {
+    nets.iter()
+        .copied()
         .enumerate()
         .map(|(index, net)| (net, index))
         .collect()
+}
+
+#[derive(Clone, Copy)]
+struct OuterFanout {
+    source: Endpoint,
+    branches: usize,
+    eligible: bool,
+}
+
+fn fanout_outer_channel_lane_indices(
+    plan: &RoutingPlan<'_>,
+    sparse_spans: &[Option<(usize, usize)>],
+    outer_nets: &BTreeSet<NetId>,
+) -> Option<BTreeMap<NetId, usize>> {
+    let mut fanout = BTreeMap::<NetId, OuterFanout>::new();
+    for (resolved, span) in plan.edges.iter().zip(sparse_spans) {
+        if span.is_some() {
+            continue;
+        }
+        let edge = resolved.edge;
+        if let Some(access) = fanout.get_mut(&edge.net) {
+            access.branches = access.branches.saturating_add(1);
+            access.eligible &= edge.source == access.source;
+        } else {
+            fanout.insert(
+                edge.net,
+                OuterFanout {
+                    source: edge.source,
+                    branches: 1,
+                    eligible: true,
+                },
+            );
+        }
+    }
+    if fanout
+        .values()
+        .filter(|access| access.eligible && access.branches >= MIN_FANOUT_AWARE_CHANNEL_EDGES)
+        .map(|access| access.branches)
+        .sum::<usize>()
+        < MIN_FANOUT_AWARE_OUTER_BRANCHES
+    {
+        return None;
+    }
+    let mut ordered = outer_nets
+        .iter()
+        .map(|&net| {
+            let priority = fanout
+                .get(&net)
+                .filter(|access| {
+                    access.eligible && access.branches >= MIN_FANOUT_AWARE_CHANNEL_EDGES
+                })
+                .map_or(0, |access| access.branches);
+            (priority, net)
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    Some(
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, net))| (net, index))
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1277,7 +1444,7 @@ fn outer_lane_assignments(
     nodes: &[NodeGeometry],
     ranks: &[usize],
     sparse_spans: &[Option<(usize, usize)>],
-    outer_nets: &BTreeSet<u32>,
+    channel_lanes: &BTreeMap<NetId, usize>,
     layer_left: &[f64],
     layer_right: &[f64],
     top: f64,
@@ -1357,7 +1524,6 @@ fn outer_lane_assignments(
         .collect::<BTreeMap<_, _>>();
 
     let mut assignments = BTreeMap::new();
-    let channel_lanes = outer_channel_lane_indices(outer_nets, &plan.net_edge_counts);
     let channel_count = channel_lanes.len();
     let mut top_access = BTreeMap::<u32, OuterNetAccess>::new();
     let mut bottom_access = BTreeMap::<u32, OuterNetAccess>::new();
@@ -2306,8 +2472,9 @@ mod tests {
         MIN_CROSSING_REPAIR_TOTAL, OuterNetAccess, OuterSide, RoutingPlan,
         crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices,
         crossing_repair_within_budget, crossing_track_y, distance_transform,
-        has_split_feedback_net, horizontal_crossing_counts_by_net, move_net_to_outer_lane,
-        outer_channel_lane_indices, outer_lane_assignments, port_point, route_edges,
+        fanout_outer_channel_lane_indices, has_split_feedback_net,
+        horizontal_crossing_counts_by_net, lane_indices, move_net_to_outer_lane,
+        outer_lane_assignments, port_point, route_edges, route_edges_with_lane_rounds,
         route_planned_candidates, route_planned_edges, route_quality, route_quality_cmp,
         route_quality_for_plan, route_supplemental_edges, select_crossing_repair_net,
         shortest_crossing_path, sparse_channel_route, sum_within_limit,
@@ -2319,20 +2486,6 @@ mod tests {
         assert_eq!(
             vertical_horizontal_crossings(&[(20.0, 20.0)], &[10.0, 20.0, 30.0]),
             0
-        );
-    }
-
-    #[test]
-    fn outer_channels_put_dominant_fanout_nearest_its_targets() {
-        let nets = BTreeSet::from([1, 2, 3]);
-
-        assert_eq!(
-            outer_channel_lane_indices(&nets, &BTreeMap::from([(1, 15), (2, 1), (3, 2)])),
-            BTreeMap::from([(1, 0), (2, 1), (3, 2)]),
-        );
-        assert_eq!(
-            outer_channel_lane_indices(&nets, &BTreeMap::from([(1, 16), (2, 1), (3, 16)])),
-            BTreeMap::from([(1, 1), (2, 0), (3, 2)]),
         );
     }
 
@@ -2583,6 +2736,218 @@ mod tests {
         assert_eq!(permuted_repair, repair);
     }
 
+    fn fanout_candidate_fixture(
+        fanout_branches: u32,
+        other_nets: u32,
+    ) -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
+        let mut nodes = Vec::new();
+        let mut geometry = Vec::new();
+        let mut ranks = Vec::new();
+        let mut add_node =
+            |id: u32, x: f64, y: f64, height: f64, rank: usize, side: Option<PortSide>| {
+                nodes.push(Node {
+                    id,
+                    width: 20.0,
+                    height,
+                    cycle_breaker: false,
+                    ports: side
+                        .map(|side| {
+                            vec![Port {
+                                id: 0,
+                                side,
+                                offset: if matches!(side, PortSide::East | PortSide::West) {
+                                    10.0
+                                } else {
+                                    5.0
+                                },
+                            }]
+                        })
+                        .unwrap_or_default(),
+                });
+                geometry.push(NodeGeometry {
+                    id,
+                    x,
+                    y,
+                    width: 20.0,
+                    height,
+                });
+                ranks.push(rank);
+            };
+
+        add_node(0, 0.0, 30.0, 20.0, 0, Some(PortSide::East));
+        for branch in 0..fanout_branches {
+            add_node(
+                1 + branch,
+                240.0,
+                20.0 + f64::from(branch) * 18.0,
+                12.0,
+                2,
+                Some(PortSide::West),
+            );
+        }
+        let blocker = 1 + fanout_branches;
+        add_node(
+            blocker,
+            110.0,
+            0.0,
+            (f64::from(fanout_branches) * 18.0 + 100.0).max(900.0),
+            1,
+            None,
+        );
+        for branch in 0..other_nets {
+            add_node(
+                blocker + 1 + branch,
+                0.0,
+                320.0 + f64::from(branch) * 14.0,
+                12.0,
+                0,
+                Some(PortSide::East),
+            );
+        }
+        for branch in 0..other_nets {
+            add_node(
+                blocker + 1 + other_nets + branch,
+                240.0,
+                340.0 - f64::from(branch) * 14.0,
+                12.0,
+                2,
+                Some(PortSide::West),
+            );
+        }
+
+        let mut edges = (0..fanout_branches)
+            .map(|branch| Edge {
+                id: branch,
+                source: Endpoint { node: 0, port: 0 },
+                target: Endpoint {
+                    node: 1 + branch,
+                    port: 0,
+                },
+                net: 1,
+                participates_in_ranking: true,
+            })
+            .collect::<Vec<_>>();
+        edges.extend((0..other_nets).map(|branch| Edge {
+            id: fanout_branches + branch,
+            source: Endpoint {
+                node: blocker + 1 + branch,
+                port: 0,
+            },
+            target: Endpoint {
+                node: blocker + 1 + other_nets + branch,
+                port: 0,
+            },
+            net: 100 + branch,
+            participates_in_ranking: true,
+        }));
+
+        (Graph { nodes, edges }, geometry, ranks)
+    }
+
+    #[test]
+    fn fanout_channel_candidate_counts_only_outer_branches_and_is_total() {
+        let (graph, _, ranks) = fanout_candidate_fixture(512, 1);
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let outer_nets = BTreeSet::from([1, 100, 999]);
+
+        assert!(
+            fanout_outer_channel_lane_indices(&plan, &vec![Some((0, 2)); 513], &outer_nets)
+                .is_none()
+        );
+        let mut mixed_spans = vec![Some((0, 2)); 513];
+        mixed_spans[..511].fill(None);
+        assert!(
+            fanout_outer_channel_lane_indices(&plan, &mixed_spans, &outer_nets).is_none(),
+            "electrical fanout does not substitute for the actual outer-branch threshold"
+        );
+        mixed_spans[511] = None;
+        let lanes = fanout_outer_channel_lane_indices(&plan, &mixed_spans, &outer_nets)
+            .expect("enough actual outer branches activate the candidate");
+        assert_eq!(lanes, BTreeMap::from([(100, 0), (999, 1), (1, 2)]));
+    }
+
+    #[test]
+    fn production_fanout_candidate_is_exactly_scored_and_deterministic() {
+        let (graph, geometry, ranks) = fanout_candidate_fixture(512, 16);
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+
+        assert!(routed.fanout_trace.evaluated);
+        assert!(routed.fanout_trace.selected);
+        let baseline = routed.fanout_trace.baseline_quality.unwrap();
+        let candidate = routed.fanout_trace.candidate_quality.unwrap();
+        assert!(candidate.crossings < baseline.crossings);
+        assert!(route_quality_cmp(candidate, baseline).is_lt());
+        assert_eq!(routed.primary_quality, Some(candidate));
+        assert_eq!(route_quality(&indexed, &routed.primary), candidate);
+
+        let mut permuted = graph.clone();
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        let indexed = validate_and_index(&permuted, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let permuted = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        assert!(permuted.fanout_trace.selected);
+        assert_eq!(permuted.primary_quality, routed.primary_quality);
+        assert_eq!(permuted.primary, routed.primary);
+    }
+
+    #[test]
+    fn production_fanout_candidate_retains_exact_baseline_when_not_better() {
+        let (mut graph, geometry, ranks) = fanout_candidate_fixture(512, 16);
+        for edge in graph.edges.iter_mut().take(512) {
+            edge.net = 1_000;
+        }
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        let stable = route_edges_with_lane_rounds(
+            &plan,
+            &geometry,
+            LayoutOptions::default(),
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            true,
+            false,
+        );
+
+        assert!(routed.fanout_trace.evaluated);
+        assert!(!routed.fanout_trace.selected);
+        assert!(
+            !route_quality_cmp(
+                routed.fanout_trace.candidate_quality.unwrap(),
+                routed.fanout_trace.baseline_quality.unwrap(),
+            )
+            .is_lt()
+        );
+        assert_eq!(routed.primary, stable.primary);
+        assert_eq!(routed.primary_quality, stable.primary_quality);
+    }
+
+    #[test]
+    fn production_fanout_candidate_preserves_subthreshold_routes() {
+        let (graph, geometry, ranks) = fanout_candidate_fixture(15, 16);
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let supplemental =
+            route_planned_candidates(&plan, &geometry, LayoutOptions::default(), true);
+        let stable = route_edges_with_lane_rounds(
+            &plan,
+            &geometry,
+            LayoutOptions::default(),
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            true,
+            false,
+        );
+
+        assert!(!supplemental.fanout_trace.evaluated);
+        assert!(!supplemental.fanout_trace.selected);
+        assert_eq!(supplemental.primary, stable.primary);
+    }
+
     #[test]
     fn gap_lane_transpose_can_move_a_net_across_more_than_sixteen_lanes() {
         let current = (0..18).map(|net| (net, net as usize)).collect();
@@ -2700,12 +3065,13 @@ mod tests {
         ];
 
         let plan = RoutingPlan::new(&indexed, &[0, 1, 1]);
+        let channels = lane_indices(&BTreeSet::from([7]));
         let lanes = outer_lane_assignments(
             &plan,
             &geometry,
             &[0, 1, 1],
             &[None, None],
-            &BTreeSet::from([7]),
+            &channels,
             &[0.0, 100.0],
             &[20.0, 120.0],
             0.0,
@@ -2782,12 +3148,13 @@ mod tests {
         ];
 
         let plan = RoutingPlan::new(&indexed, &[0, 1, 1]);
+        let channels = lane_indices(&BTreeSet::from([7]));
         let split_lanes = outer_lane_assignments(
             &plan,
             &geometry,
             &[0, 1, 1],
             &[None, None],
-            &BTreeSet::from([7]),
+            &channels,
             &[0.0, 100.0],
             &[20.0, 120.0],
             0.0,
@@ -2802,7 +3169,7 @@ mod tests {
             &geometry,
             &[0, 1, 1],
             &[None, None],
-            &BTreeSet::from([7]),
+            &channels,
             &[0.0, 100.0],
             &[20.0, 120.0],
             0.0,
