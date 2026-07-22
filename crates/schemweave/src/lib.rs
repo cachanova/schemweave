@@ -331,6 +331,159 @@ mod tests {
         Graph { nodes, edges }
     }
 
+    fn reverse_median_graph(seed: u64) -> Graph {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..140)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 25.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 25.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut state = seed;
+        let mut endpoints = Vec::new();
+        for target in 10..75 {
+            endpoints.push((0, target, 100));
+        }
+        for target in 15..80 {
+            endpoints.push((1, target, 101));
+        }
+        for source in 2..10 {
+            for target in 10..80 {
+                if next(&mut state) % 100 < 24 {
+                    endpoints.push((source, target, 1_000 + endpoints.len() as u32));
+                }
+            }
+        }
+        for source in 10..80 {
+            for target in 80..140 {
+                if next(&mut state) % 100 < 12 {
+                    endpoints.push((source, target, 1_000 + endpoints.len() as u32));
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target, net))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect();
+        Graph { nodes, edges }
+    }
+
+    #[test]
+    fn selects_a_reverse_median_candidate_deterministically() {
+        let options = LayoutOptions::default();
+        let graph = reverse_median_graph(1);
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let ranks = topology::assign_ranks(&indexed);
+
+        assert!(
+            topology::order_layer_candidates(&indexed, &ranks, 0, true)
+                .2
+                .is_none()
+        );
+        let one_sweep = topology::order_layer_candidates(&indexed, &ranks, 1, true)
+            .2
+            .unwrap()
+            .layers;
+        assert_eq!(
+            topology::order_layer_candidates(&indexed, &ranks, 1, true)
+                .2
+                .unwrap()
+                .layers,
+            one_sweep
+        );
+
+        let (forward, reverse, alternative) =
+            topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
+        let ordinary_layers = if reverse.crossings < forward.crossings {
+            &reverse.layers
+        } else {
+            &forward.layers
+        };
+        let alternative = alternative.unwrap();
+        assert!(alternative.crossings < forward.crossings.min(reverse.crossings));
+
+        let evaluate = |mut nodes: Vec<NodeGeometry>| {
+            let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
+            let quality = routing::route_quality(&indexed, &edges);
+            let layout = placement::normalize(&mut nodes, &mut edges);
+            (quality, layout)
+        };
+        let baseline = evaluate(placement::place_baseline_nodes(
+            &indexed,
+            &ranks,
+            &forward.layers,
+            options,
+        ));
+        let ordinary = evaluate(placement::place_nodes(
+            &indexed,
+            &ranks,
+            ordinary_layers,
+            options,
+        ));
+        let alternative = evaluate(placement::place_nodes(
+            &indexed,
+            &ranks,
+            &alternative.layers,
+            options,
+        ));
+        let best_ordinary =
+            if candidate_quality_cmp(ordinary.0, &ordinary.1, baseline.0, &baseline.1).is_lt() {
+                &ordinary
+            } else {
+                &baseline
+            };
+        assert!(
+            candidate_quality_cmp(
+                alternative.0,
+                &alternative.1,
+                best_ordinary.0,
+                &best_ordinary.1,
+            )
+            .is_lt()
+        );
+
+        let selected = layout(&graph, options).unwrap();
+        assert_eq!(selected, alternative.1);
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, options).unwrap(), selected);
+    }
+
     #[test]
     fn candidate_selection_preserves_baseline_and_uses_quality_priority() {
         let baseline = candidate(1, 4, 30.0, 40.0);

@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
 };
 
 use crate::{NetId, validation::IndexedGraph};
@@ -171,21 +171,22 @@ pub(crate) fn order_layer_candidates(
         NeighborMeasure::Mean,
     );
     let reverse = optimize_ordering_seed(&ordering, sweeps, true, None, NeighborMeasure::Mean);
-    let reverse_median =
-        matches!(alternative, Some(AlternativeOrdering::ReverseMedian)).then(|| {
-            let median = optimize_ordering_seed(
-                &ordering,
-                sweeps.min(2),
-                true,
-                None,
-                NeighborMeasure::Median,
-            );
-            ScoredOrdering {
-                layers: median.edge_layers,
-                crossings: median.edge_crossings,
-                edge_crossings: median.edge_crossings,
-            }
-        });
+    let reverse_median = (sweeps > 0
+        && matches!(alternative, Some(AlternativeOrdering::ReverseMedian)))
+    .then(|| {
+        let median = optimize_ordering_seed(
+            &ordering,
+            sweeps.min(2),
+            true,
+            None,
+            NeighborMeasure::Median,
+        );
+        ScoredOrdering {
+            layers: median.edge_layers,
+            crossings: median.edge_crossings,
+            edge_crossings: median.edge_crossings,
+        }
+    });
     let strip_virtual = |mut layers: Vec<Vec<usize>>| {
         for layer in &mut layers {
             layer.retain(|&item| item < real_count);
@@ -234,20 +235,18 @@ fn alternative_ordering_candidate(graph: &IndexedGraph<'_>) -> Option<Alternativ
     if second_largest_fanout < 65 {
         return None;
     }
-    let mut sinks_by_net = BTreeMap::<NetId, Vec<(u32, u32)>>::new();
+    let mut sinks_by_net = BTreeMap::<NetId, BTreeSet<(u32, u32)>>::new();
     for (edge, &participates_in_ranking) in graph.edges.iter().zip(&graph.rank_edges) {
         if participates_in_ranking && fanout[&edge.net] >= 65 {
-            sinks_by_net
-                .entry(edge.net)
-                .or_default()
-                .push((edge.target.node, edge.target.port));
+            let sinks = sinks_by_net.entry(edge.net).or_default();
+            if sinks.len() <= 300 {
+                sinks.insert((edge.target.node, edge.target.port));
+            }
         }
     }
     let mut largest_distinct_fanout = 0;
     let mut second_largest_distinct_fanout = 0;
-    for sinks in sinks_by_net.values_mut() {
-        sinks.sort_unstable();
-        sinks.dedup();
+    for sinks in sinks_by_net.values() {
         let distinct_fanout = sinks.len();
         if distinct_fanout > largest_distinct_fanout {
             second_largest_distinct_fanout = largest_distinct_fanout;
@@ -256,8 +255,10 @@ fn alternative_ordering_candidate(graph: &IndexedGraph<'_>) -> Option<Alternativ
             second_largest_distinct_fanout = distinct_fanout;
         }
     }
-    ((65..=100).contains(&second_largest_distinct_fanout)
-        || (graph.nodes.len() >= 1_000 && (101..=300).contains(&second_largest_distinct_fanout)))
+    (largest_distinct_fanout <= 300
+        && ((65..=100).contains(&second_largest_distinct_fanout)
+            || (graph.nodes.len() >= 1_000
+                && (101..=300).contains(&second_largest_distinct_fanout))))
     .then_some(AlternativeOrdering::ReverseMedian)
 }
 
@@ -875,15 +876,17 @@ mod tests {
         );
         assert_eq!(candidate(269, 269, 101, 101, 271, true), None);
         assert_eq!(
-            candidate(301, 301, 101, 101, 1_000, true),
+            candidate(300, 300, 101, 101, 1_000, true),
             Some(AlternativeOrdering::ReverseMedian)
         );
         assert_eq!(
-            candidate(301, 301, 300, 300, 1_000, true),
+            candidate(300, 300, 300, 300, 1_000, true),
             Some(AlternativeOrdering::ReverseMedian)
         );
+        assert_eq!(candidate(301, 301, 100, 100, 1_000, true), None);
         assert_eq!(candidate(302, 302, 301, 301, 1_000, true), None);
         assert_eq!(candidate(269, 269, 65, 65, 271, false), None);
+        assert_eq!(candidate(1_000, 1, 1_000, 1, 3, true), None);
 
         let mixed = Graph {
             nodes: vec![node(0), node(1)],
