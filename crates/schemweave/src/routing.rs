@@ -14,8 +14,10 @@ const CROSSING_ALIGNMENT_WEIGHT: f64 = 4.0;
 const MIN_ROUTE_SEGMENT: f64 = 1e-7;
 const FULL_OUTER_LANE_ROUNDS: usize = 16;
 const FULL_GAP_LANE_ROUNDS: usize = 32;
-const SUPPLEMENTAL_OUTER_LANE_ROUNDS: usize = 4;
-const SUPPLEMENTAL_GAP_LANE_ROUNDS: usize = 8;
+// Supplemental placements reuse the same bounded adjacent descent. Give them the same search
+// budgets as the baseline; both searches still stop immediately when a pass is idle.
+const SUPPLEMENTAL_OUTER_LANE_ROUNDS: usize = 16;
+const SUPPLEMENTAL_GAP_LANE_ROUNDS: usize = 32;
 const MIN_CROSSING_REPAIR_TOTAL: usize = 500;
 const MIN_CROSSING_REPAIR_NET: usize = 64;
 // Move a bounded hot-net block before the existing single rebuild and exact score. Two captures
@@ -206,9 +208,9 @@ pub(crate) fn route_edges(
 
 /// Route an optional layout candidate with bounded lane-refinement work.
 ///
-/// The same deterministic router and validity-preserving construction are used; only the
-/// adjacent-transposition search for a better lane order stops earlier. The canonical full-effort
-/// candidate remains available to the exact layout comparator.
+/// The same deterministic router and validity-preserving construction are used. Supplemental
+/// candidates share the baseline lane-refinement caps and may evaluate bounded, exact-scored
+/// repair variants. The canonical candidate remains available to the exact layout comparator.
 #[cfg(test)]
 pub(crate) fn route_supplemental_edges(
     graph: &IndexedGraph<'_>,
@@ -3815,7 +3817,7 @@ mod tests {
     }
 
     #[test]
-    fn gap_lane_transpose_can_move_a_net_across_more_than_sixteen_lanes() {
+    fn supplemental_gap_lane_transpose_can_reach_the_best_lane() {
         let current = (0..18).map(|net| (net, net as usize)).collect();
         let mut accesses = (0..17)
             .map(|net| {
@@ -3838,9 +3840,113 @@ mod tests {
             },
         );
 
-        let lanes = crossing_aware_gap_lane_indices(&current, &accesses);
+        let legacy = super::crossing_aware_gap_lane_indices_with_rounds(&current, &accesses, 8);
+        let lanes = super::crossing_aware_gap_lane_indices_with_rounds(
+            &current,
+            &accesses,
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+        );
 
+        assert_eq!(legacy[&17], 9);
         assert_eq!(lanes[&17], 0);
+        assert_eq!(
+            super::SUPPLEMENTAL_GAP_LANE_ROUNDS,
+            super::FULL_GAP_LANE_ROUNDS
+        );
+    }
+
+    fn supplemental_round_route_fixture() -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
+        let mut nodes = Vec::new();
+        let mut geometry = Vec::new();
+        let mut ranks = Vec::new();
+        let mut edges = Vec::new();
+        for net in 0..18u32 {
+            let source_id = net * 2;
+            let target_id = source_id + 1;
+            let source_y = if net == 17 { 5.0 } else { 0.0 };
+            let target_y = if net == 17 { 30.0 } else { 10.0 };
+            nodes.extend([
+                Node {
+                    id: source_id,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: target_id,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+            ]);
+            geometry.extend([
+                NodeGeometry {
+                    id: source_id,
+                    x: 0.0,
+                    y: source_y - 10.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                NodeGeometry {
+                    id: target_id,
+                    x: 100.0,
+                    y: target_y - 10.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+            ]);
+            ranks.extend([0, 1]);
+            edges.push(Edge {
+                id: net,
+                source: Endpoint {
+                    node: source_id,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: target_id,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            });
+        }
+        (Graph { nodes, edges }, geometry, ranks)
+    }
+
+    #[test]
+    fn supplemental_round_budgets_improve_emitted_routes_deterministically() {
+        let (graph, geometry, ranks) = supplemental_round_route_fixture();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let options = LayoutOptions {
+            port_stub: 1e-3,
+            ..LayoutOptions::default()
+        };
+        let legacy = route_edges_with_lane_rounds(&plan, &geometry, options, 4, 8, false, false);
+        let current = route_supplemental_edges(&indexed, &geometry, &ranks, options);
+        let legacy_quality = route_quality(&indexed, &legacy.primary);
+        let current_quality = route_quality(&indexed, &current);
+
+        assert!(route_quality_cmp(current_quality, legacy_quality).is_lt());
+        assert!(current_quality.crossings < legacy_quality.crossings);
+
+        let mut permuted = graph.clone();
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        let indexed = validate_and_index(&permuted, LayoutOptions::default()).unwrap();
+        let permuted = route_supplemental_edges(&indexed, &geometry, &ranks, options);
+        assert_eq!(permuted, current);
+        assert_eq!(route_quality(&indexed, &permuted), current_quality);
     }
 
     #[test]
@@ -3867,6 +3973,43 @@ mod tests {
 
         assert_eq!(lanes[&2], 0);
         assert_eq!(lanes[&1], 1);
+    }
+
+    #[test]
+    fn supplemental_outer_lane_transpose_can_reach_the_best_lane() {
+        let nets = (0..10).collect::<BTreeSet<_>>();
+        let mut accesses = (0..9)
+            .map(|net| {
+                (
+                    net,
+                    OuterNetAccess {
+                        horizontal: vec![(0.0, 10.0)],
+                        vertical_x: vec![20.0],
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        accesses.insert(
+            9,
+            OuterNetAccess {
+                horizontal: vec![(20.0, 30.0)],
+                vertical_x: vec![5.0],
+            },
+        );
+
+        let legacy = super::crossing_aware_outer_lane_indices_with_rounds(&nets, &accesses, 4);
+        let lanes = super::crossing_aware_outer_lane_indices_with_rounds(
+            &nets,
+            &accesses,
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+        );
+
+        assert_eq!(legacy[&9], 5);
+        assert_eq!(lanes[&9], 0);
+        assert_eq!(
+            super::SUPPLEMENTAL_OUTER_LANE_ROUNDS,
+            super::FULL_OUTER_LANE_ROUNDS
+        );
     }
 
     #[test]
