@@ -2,7 +2,7 @@ use schemweave::{
     Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Point, Port,
     PortSide, layout,
 };
-use schemweave_eval::{ScoreOptions, ViolationKind, score};
+use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
 fn graph() -> Graph {
     Graph {
@@ -41,6 +41,15 @@ fn graph() -> Graph {
 }
 
 #[test]
+fn new_quality_fields_preserve_default_json_compatibility() {
+    let options: ScoreOptions = serde_json::from_str("{}").unwrap();
+    let report: QualityReport = serde_json::from_str("{}").unwrap();
+
+    assert_eq!(options, ScoreOptions::default());
+    assert_eq!(report, QualityReport::default());
+}
+
+#[test]
 fn accepts_the_current_exact_port_baseline() {
     let graph = graph();
     let layout = layout(&graph, LayoutOptions::default()).unwrap();
@@ -49,8 +58,244 @@ fn accepts_the_current_exact_port_baseline() {
     assert_eq!(report.semantic_violations, 0);
     assert_eq!(report.node_overlaps, 0);
     assert_eq!(report.node_intersections, 0);
+    assert_eq!(report.ranking_direction_violations, 0);
+    assert_eq!(report.forward_edge_count, 1);
+    assert_eq!(report.reverse_x_length, 0.0);
+    assert_eq!(report.forward_routes_with_reverse_x, 0);
+    assert_eq!(report.p95_forward_stretch, 1.0);
+    assert_eq!(report.split_feedback_nets, 0);
+    assert_eq!(report.feedback_net_count, 0);
+    assert_eq!(report.shared_route_ratio, 0.0);
+    assert_eq!(
+        report.viewport_fit,
+        (layout.width / 1_600.0).max(layout.height / 900.0)
+    );
     assert!(report.segments > 0);
     assert!(report.route_length > 0.0);
+}
+
+#[test]
+fn measures_westward_detours_on_forward_routes() {
+    let graph = graph();
+    let mut layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let route = &mut layout.edges[0];
+    let source = route.points[0];
+    let target = route.points[route.points.len() - 1];
+    route.points = vec![
+        source,
+        Point {
+            x: source.x + 20.0,
+            y: source.y,
+        },
+        Point {
+            x: source.x + 20.0,
+            y: source.y + 10.0,
+        },
+        Point {
+            x: source.x + 10.0,
+            y: source.y + 10.0,
+        },
+        Point {
+            x: source.x + 10.0,
+            y: target.y,
+        },
+        target,
+    ];
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.ranking_direction_violations, 0);
+    assert_eq!(report.reverse_x_length, 10.0);
+    assert_eq!(report.forward_routes_with_reverse_x, 1);
+    assert!(report.p95_forward_stretch > 1.0);
+}
+
+#[test]
+fn ranking_edges_must_advance_to_a_nonoverlapping_x_range() {
+    let graph = graph();
+    let layout = Layout {
+        nodes: vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 50.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 70.0,
+                y: 100.0,
+                width: 80.0,
+                height: 50.0,
+            },
+        ],
+        edges: vec![EdgeGeometry {
+            id: 10,
+            points: vec![
+                Point { x: 80.0, y: 25.0 },
+                Point { x: 160.0, y: 25.0 },
+                Point { x: 160.0, y: 170.0 },
+                Point { x: 60.0, y: 170.0 },
+                Point { x: 60.0, y: 125.0 },
+                Point { x: 70.0, y: 125.0 },
+            ],
+        }],
+        width: 180.0,
+        height: 180.0,
+    };
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.node_overlaps, 0);
+    assert_eq!(report.node_intersections, 0);
+    assert_eq!(report.ranking_direction_violations, 1);
+    assert!(!report.passes_hard_gates());
+}
+
+#[test]
+fn detects_a_feedback_net_split_across_outer_bands() {
+    let node = |id, x, y, cycle_breaker, ports| {
+        (
+            Node {
+                id,
+                width: 20.0,
+                height: 20.0,
+                cycle_breaker,
+                ports,
+            },
+            NodeGeometry {
+                id,
+                x,
+                y,
+                width: 20.0,
+                height: 20.0,
+            },
+        )
+    };
+    let (root, root_geometry) = node(
+        0,
+        0.0,
+        70.0,
+        false,
+        vec![Port {
+            id: 0,
+            side: PortSide::East,
+            offset: 10.0,
+        }],
+    );
+    let (source, source_geometry) = node(
+        1,
+        50.0,
+        70.0,
+        false,
+        vec![
+            Port {
+                id: 0,
+                side: PortSide::West,
+                offset: 10.0,
+            },
+            Port {
+                id: 1,
+                side: PortSide::East,
+                offset: 10.0,
+            },
+        ],
+    );
+    let (top, top_geometry) = node(
+        2,
+        200.0,
+        20.0,
+        true,
+        vec![Port {
+            id: 0,
+            side: PortSide::West,
+            offset: 10.0,
+        }],
+    );
+    let (bottom, bottom_geometry) = node(
+        3,
+        200.0,
+        120.0,
+        true,
+        vec![Port {
+            id: 0,
+            side: PortSide::West,
+            offset: 10.0,
+        }],
+    );
+    let graph = Graph {
+        nodes: vec![root, source, top, bottom],
+        edges: vec![
+            Edge {
+                id: 0,
+                source: Endpoint { node: 0, port: 0 },
+                target: Endpoint { node: 1, port: 0 },
+                net: 8,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 1,
+                source: Endpoint { node: 1, port: 1 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 2,
+                source: Endpoint { node: 1, port: 1 },
+                target: Endpoint { node: 3, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+        ],
+    };
+    let layout = Layout {
+        nodes: vec![
+            root_geometry,
+            source_geometry,
+            top_geometry,
+            bottom_geometry,
+        ],
+        edges: vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![Point { x: 20.0, y: 80.0 }, Point { x: 50.0, y: 80.0 }],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![
+                    Point { x: 70.0, y: 80.0 },
+                    Point { x: 80.0, y: 80.0 },
+                    Point { x: 80.0, y: 0.0 },
+                    Point { x: 190.0, y: 0.0 },
+                    Point { x: 190.0, y: 30.0 },
+                    Point { x: 200.0, y: 30.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 2,
+                points: vec![
+                    Point { x: 70.0, y: 80.0 },
+                    Point { x: 90.0, y: 80.0 },
+                    Point { x: 90.0, y: 160.0 },
+                    Point { x: 190.0, y: 160.0 },
+                    Point { x: 190.0, y: 130.0 },
+                    Point { x: 200.0, y: 130.0 },
+                ],
+            },
+        ],
+        width: 220.0,
+        height: 160.0,
+    };
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.ranking_direction_violations, 0);
+    assert_eq!(report.split_feedback_nets, 1);
+    assert_eq!(report.feedback_net_count, 1);
 }
 
 #[test]
@@ -313,10 +558,17 @@ fn scores_the_full_consumer_bound() {
     assert_eq!(report.node_intersections, 0);
     assert_eq!(report.unrelated_overlaps, 0);
     assert_eq!(report.unrelated_contacts, 0);
+    assert_eq!(report.forward_edge_count, 0);
+    assert_eq!(report.ranking_direction_violations, 0);
+    assert_eq!(report.reverse_x_length, 0.0);
     assert!(report.passes_hard_gates(), "{report:#?}");
     assert_eq!(
         report.segments,
-        layout.edges.iter().map(|edge| edge.points.len() - 1).sum()
+        layout
+            .edges
+            .iter()
+            .map(|edge| edge.points.len() - 1)
+            .sum::<usize>()
     );
 }
 

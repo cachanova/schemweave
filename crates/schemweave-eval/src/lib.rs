@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub struct ScoreOptions {
     pub epsilon: f64,
     pub max_examples: usize,
+    pub viewport_width: f64,
+    pub viewport_height: f64,
 }
 
 impl Default for ScoreOptions {
@@ -20,6 +22,8 @@ impl Default for ScoreOptions {
         Self {
             epsilon: 1e-7,
             max_examples: 64,
+            viewport_width: 1_600.0,
+            viewport_height: 900.0,
         }
     }
 }
@@ -45,6 +49,7 @@ pub struct Violation {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
 pub struct QualityReport {
     pub semantic_violations: usize,
     pub node_overlaps: usize,
@@ -52,13 +57,31 @@ pub struct QualityReport {
     pub unrelated_overlaps: usize,
     pub unrelated_contacts: usize,
     pub crossings: usize,
+    /// Ranking edges whose target is not geometrically to the right of their source.
+    pub ranking_direction_violations: usize,
+    /// Edges between distinct ranking components, used as the directness denominator.
+    pub forward_edge_count: usize,
+    /// Total westward distance across routes that participate in forward ranking.
+    pub reverse_x_length: f64,
+    /// 95th-percentile routed length divided by endpoint Manhattan distance for forward edges.
+    pub p95_forward_stretch: f64,
+    /// Forward routes containing at least one westward segment.
+    pub forward_routes_with_reverse_x: usize,
+    /// Final non-ranking nets whose outer routes occupy both top and bottom bands.
+    pub split_feedback_nets: usize,
+    /// Nets excluded from forward ranking, used as the coherence denominator.
+    pub feedback_net_count: usize,
     /// Unique direction changes in the physical same-net geometry.
     pub bends: usize,
     /// Raw route segments, before overlapping same-net geometry is merged.
     pub segments: usize,
     /// Union length of the physical same-net geometry.
     pub route_length: f64,
+    /// Fraction of raw per-edge route length eliminated by same-net physical sharing.
+    pub shared_route_ratio: f64,
     pub area: f64,
+    /// Layout spans relative to the configured viewport; lower is easier to fit.
+    pub viewport_fit: f64,
     pub examples: Vec<Violation>,
 }
 
@@ -69,6 +92,7 @@ impl QualityReport {
             && self.node_intersections == 0
             && self.unrelated_overlaps == 0
             && self.unrelated_contacts == 0
+            && self.ranking_direction_violations == 0
     }
 
     fn violation(&mut self, options: ScoreOptions, kind: ViolationKind, message: String) {
@@ -84,11 +108,17 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         area: layout.width * layout.height,
         ..QualityReport::default()
     };
-    if !options.epsilon.is_finite() || options.epsilon < 0.0 {
+    if !options.epsilon.is_finite()
+        || options.epsilon < 0.0
+        || !options.viewport_width.is_finite()
+        || options.viewport_width <= 0.0
+        || !options.viewport_height.is_finite()
+        || options.viewport_height <= 0.0
+    {
         report.violation(
             options,
             ViolationKind::InvalidGeometry,
-            "score epsilon must be finite and nonnegative".to_owned(),
+            "score epsilon and viewport dimensions must be finite and valid".to_owned(),
         );
         return report;
     }
@@ -102,9 +132,14 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             ViolationKind::InvalidGeometry,
             "layout bounds must be finite and nonnegative".to_owned(),
         );
+    } else {
+        report.viewport_fit =
+            (layout.width / options.viewport_width).max(layout.height / options.viewport_height);
     }
     let input_nodes: HashMap<_, _> = graph.nodes.iter().map(|node| (node.id, node)).collect();
     let input_edges: HashMap<_, _> = graph.edges.iter().map(|edge| (edge.id, edge)).collect();
+    let ranking_edges = effective_ranking_edges(graph);
+    report.forward_edge_count = ranking_edges.len();
     let mut nodes = HashMap::with_capacity(layout.nodes.len());
     let mut seen_nodes = HashSet::with_capacity(layout.nodes.len());
     for node in &layout.nodes {
@@ -154,8 +189,24 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         );
     }
 
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|edge| ranking_edges.contains(&edge.id))
+    {
+        let (Some(source), Some(target)) =
+            (nodes.get(&edge.source.node), nodes.get(&edge.target.node))
+        else {
+            continue;
+        };
+        if source.x + source.width > target.x + options.epsilon {
+            report.ranking_direction_violations += 1;
+        }
+    }
+
     let mut segments = Vec::new();
     let mut bend_points = BTreeSet::new();
+    let mut forward_stretches = Vec::new();
     let mut seen_edges = HashSet::with_capacity(layout.edges.len());
     for route in &layout.edges {
         if !seen_edges.insert(route.id) {
@@ -185,6 +236,14 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             &mut segments,
             &mut bend_points,
         );
+        if ranking_edges.contains(&edge.id) {
+            score_forward_route(
+                route.points.as_slice(),
+                options.epsilon,
+                &mut report,
+                &mut forward_stretches,
+            );
+        }
     }
     if layout.edges.len() != graph.edges.len() {
         report.violation(
@@ -201,13 +260,212 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
     score_node_overlaps(&layout.nodes, &mut report);
     score_node_intersections(&segments, &layout.nodes, options.epsilon, &mut report);
     let physical_segments = merged_net_segments(&segments);
+    let raw_route_length: f64 = segments
+        .iter()
+        .map(|segment| segment.end - segment.start)
+        .sum();
     report.route_length = physical_segments
         .iter()
         .map(|segment| segment.end - segment.start)
         .sum();
+    if raw_route_length > options.epsilon {
+        report.shared_route_ratio =
+            ((raw_route_length - report.route_length) / raw_route_length).clamp(0.0, 1.0);
+    }
+    forward_stretches.sort_by(f64::total_cmp);
+    if !forward_stretches.is_empty() {
+        report.p95_forward_stretch =
+            forward_stretches[(forward_stretches.len() * 95).div_ceil(100) - 1];
+    }
+    (report.split_feedback_nets, report.feedback_net_count) =
+        split_feedback_nets(graph, layout, &input_edges, &ranking_edges, options.epsilon);
     report.bends = bend_points.len();
     score_segment_relationships(&segments, &physical_segments, &input_edges, &mut report);
     report
+}
+
+fn effective_ranking_edges(graph: &Graph) -> HashSet<EdgeId> {
+    let cycle_breakers = graph
+        .nodes
+        .iter()
+        .filter(|node| node.cycle_breaker)
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    let mut raw_incoming = HashMap::new();
+    for edge in graph
+        .edges
+        .iter()
+        .filter(|edge| edge.participates_in_ranking)
+    {
+        *raw_incoming.entry(edge.target.node).or_insert(0usize) += 1;
+    }
+    let candidates = graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.participates_in_ranking
+                && !(cycle_breakers.contains(&edge.target.node)
+                    && raw_incoming.get(&edge.source.node).copied().unwrap_or(0) != 0)
+        })
+        .collect::<Vec<_>>();
+    let node_index = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut outgoing = vec![Vec::new(); graph.nodes.len()];
+    let mut incoming = vec![Vec::new(); graph.nodes.len()];
+    for edge in &candidates {
+        let (Some(&source), Some(&target)) = (
+            node_index.get(&edge.source.node),
+            node_index.get(&edge.target.node),
+        ) else {
+            continue;
+        };
+        outgoing[source].push(target);
+        incoming[target].push(source);
+    }
+    // Strict left-to-right flow is only meaningful between ranking components. Edges inside a
+    // strongly connected component are necessarily cyclic and belong to the feedback class.
+    let components = strongly_connected_components(&outgoing, &incoming);
+    candidates
+        .into_iter()
+        .filter(|edge| {
+            let (Some(&source), Some(&target)) = (
+                node_index.get(&edge.source.node),
+                node_index.get(&edge.target.node),
+            ) else {
+                return false;
+            };
+            components[source] != components[target]
+        })
+        .map(|edge| edge.id)
+        .collect()
+}
+
+fn strongly_connected_components(outgoing: &[Vec<usize>], incoming: &[Vec<usize>]) -> Vec<usize> {
+    let mut seen = vec![false; outgoing.len()];
+    let mut finish = Vec::with_capacity(outgoing.len());
+    for start in 0..outgoing.len() {
+        if seen[start] {
+            continue;
+        }
+        seen[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((node, cursor)) = stack.last_mut() {
+            if *cursor < outgoing[*node].len() {
+                let next = outgoing[*node][*cursor];
+                *cursor += 1;
+                if !seen[next] {
+                    seen[next] = true;
+                    stack.push((next, 0));
+                }
+            } else {
+                finish.push(*node);
+                stack.pop();
+            }
+        }
+    }
+
+    let mut component = vec![usize::MAX; outgoing.len()];
+    let mut component_id = 0;
+    for &start in finish.iter().rev() {
+        if component[start] != usize::MAX {
+            continue;
+        }
+        component[start] = component_id;
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            for &next in &incoming[node] {
+                if component[next] == usize::MAX {
+                    component[next] = component_id;
+                    stack.push(next);
+                }
+            }
+        }
+        component_id += 1;
+    }
+    component
+}
+
+fn score_forward_route(
+    points: &[Point],
+    epsilon: f64,
+    report: &mut QualityReport,
+    stretches: &mut Vec<f64>,
+) {
+    if points.len() < 2
+        || points
+            .iter()
+            .any(|point| !point.x.is_finite() || !point.y.is_finite())
+    {
+        return;
+    }
+    let mut route_length = 0.0;
+    let mut reverse_x = 0.0;
+    for pair in points.windows(2) {
+        route_length += (pair[1].x - pair[0].x).abs() + (pair[1].y - pair[0].y).abs();
+        if pair[1].x < pair[0].x - epsilon {
+            reverse_x += pair[0].x - pair[1].x;
+        }
+    }
+    report.reverse_x_length += reverse_x;
+    if reverse_x > epsilon {
+        report.forward_routes_with_reverse_x += 1;
+    }
+    let first = points[0];
+    let last = points[points.len() - 1];
+    let minimum = (last.x - first.x).abs() + (last.y - first.y).abs();
+    if minimum > epsilon {
+        stretches.push(route_length / minimum);
+    }
+}
+
+fn split_feedback_nets(
+    graph: &Graph,
+    layout: &Layout,
+    edges: &HashMap<EdgeId, &Edge>,
+    ranking_edges: &HashSet<EdgeId>,
+    epsilon: f64,
+) -> (usize, usize) {
+    let Some(top) = layout.nodes.iter().map(|node| node.y).reduce(f64::min) else {
+        return (0, 0);
+    };
+    let Some(bottom) = layout
+        .nodes
+        .iter()
+        .map(|node| node.y + node.height)
+        .reduce(f64::max)
+    else {
+        return (0, 0);
+    };
+    let feedback_nets = graph
+        .edges
+        .iter()
+        .filter(|edge| !ranking_edges.contains(&edge.id))
+        .map(|edge| edge.net)
+        .collect::<HashSet<_>>();
+    let mut sides_by_net = HashMap::<NetId, u8>::new();
+    for route in &layout.edges {
+        let Some(edge) = edges.get(&route.id) else {
+            continue;
+        };
+        if !feedback_nets.contains(&edge.net) {
+            continue;
+        }
+        let sides = sides_by_net.entry(edge.net).or_default();
+        if route.points.iter().any(|point| point.y < top - epsilon) {
+            *sides |= 1;
+        }
+        if route.points.iter().any(|point| point.y > bottom + epsilon) {
+            *sides |= 2;
+        }
+    }
+    (
+        sides_by_net.values().filter(|&&sides| sides == 3).count(),
+        feedback_nets.len(),
+    )
 }
 
 fn score_node_overlaps(nodes: &[NodeGeometry], report: &mut QualityReport) {
