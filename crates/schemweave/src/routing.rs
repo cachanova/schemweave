@@ -95,6 +95,8 @@ struct CrossingRepair {
     candidate: Option<(RouteQuality, Vec<EdgeGeometry>)>,
     #[cfg(test)]
     selected_nets: Vec<NetId>,
+    #[cfg(test)]
+    candidate_emitted: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1211,6 +1213,8 @@ fn repair_crossing_heavy_net(
             candidate: None,
             #[cfg(test)]
             selected_nets: Vec::new(),
+            #[cfg(test)]
+            candidate_emitted: false,
         };
     }
     let (crossing_counts, quality) =
@@ -1218,7 +1222,12 @@ fn repair_crossing_heavy_net(
     // Baseline attribution already identifies both useful FIFO repairs. Apply them together so
     // candidate count, regeneration work, and exact scoring work remain unchanged.
     let selected_nets = select_crossing_repair_nets(quality.crossings, &crossing_counts, gap_lanes);
+    #[cfg(test)]
+    let mut candidate_emitted = false;
     let repair = (|| {
+        if !candidate_route_points_within_budget(sparse_spans) {
+            return None;
+        }
         let candidate_lanes = move_nets_to_outer_lanes(gap_lanes, &selected_nets)?;
         let endpoint_tracks = build_endpoint_tracks(
             plan,
@@ -1242,7 +1251,7 @@ fn repair_crossing_heavy_net(
             &endpoint_tracks,
             options.port_stub,
         );
-        Some(emit_routes(
+        let candidate = emit_routes(
             plan,
             nodes,
             sparse_spans,
@@ -1255,7 +1264,12 @@ fn repair_crossing_heavy_net(
             top,
             bottom,
             options,
-        ))
+        );
+        #[cfg(test)]
+        {
+            candidate_emitted = true;
+        }
+        Some(candidate)
     })();
     let repair = repair.and_then(|routes| {
         sum_within_limit(
@@ -1269,6 +1283,8 @@ fn repair_crossing_heavy_net(
         candidate: repair,
         #[cfg(test)]
         selected_nets,
+        #[cfg(test)]
+        candidate_emitted,
     }
 }
 
@@ -1301,6 +1317,20 @@ fn crossing_repair_within_budget(
                 }),
             MAX_CROSSING_REPAIR_PATH_STATES,
         )
+}
+
+fn candidate_route_points_within_budget(sparse_spans: &[Option<(usize, usize)>]) -> bool {
+    sum_within_limit(
+        sparse_spans.iter().map(|span| match *span {
+            Some((source_rank, target_rank)) => target_rank
+                .checked_sub(source_rank)
+                .and_then(|rank_span| rank_span.checked_mul(2))
+                .and_then(|points| points.checked_add(8))
+                .unwrap_or(usize::MAX),
+            None => 10,
+        }),
+        MAX_CROSSING_REPAIR_ROUTE_POINTS,
+    )
 }
 
 fn sum_within_limit(mut values: impl Iterator<Item = usize>, limit: usize) -> bool {
@@ -2822,18 +2852,18 @@ mod tests {
     };
 
     use super::{
-        FULL_OUTER_LANE_ROUNDS, GapNetAccess, MAX_CROSSING_REPAIR_NODES,
+        FULL_OUTER_LANE_ROUNDS, GapNetAccess, MAX_CROSSING_REPAIR_EDGES, MAX_CROSSING_REPAIR_NODES,
         MAX_CROSSING_REPAIR_PATH_STATES, MAX_CROSSING_REPAIR_ROUTE_POINTS, MIN_CROSSING_REPAIR_NET,
         MIN_CROSSING_REPAIR_TOTAL, OuterNetAccess, OuterSide, RoutingPlan,
-        crossing_aware_gap_lane_indices, crossing_aware_outer_lane_indices,
-        crossing_repair_within_budget, crossing_track_y, distance_transform,
-        fanout_outer_channel_lane_indices, has_split_feedback_net,
+        candidate_route_points_within_budget, crossing_aware_gap_lane_indices,
+        crossing_aware_outer_lane_indices, crossing_repair_within_budget, crossing_track_y,
+        distance_transform, fanout_outer_channel_lane_indices, has_split_feedback_net,
         horizontal_crossing_counts_by_net, lane_indices, move_nets_to_outer_lanes,
-        outer_lane_assignments, port_point, route_edges, route_edges_with_lane_rounds,
-        route_planned_candidates, route_planned_edges, route_quality, route_quality_cmp,
-        route_quality_for_plan, route_supplemental_edges, select_crossing_repair_nets,
-        shortest_crossing_path, sparse_channel_route, sum_within_limit,
-        vertical_horizontal_crossings,
+        outer_lane_assignments, port_point, repair_crossing_heavy_net, route_edges,
+        route_edges_with_lane_rounds, route_planned_candidates, route_planned_edges, route_quality,
+        route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
+        select_crossing_repair_nets, shortest_crossing_path, sparse_channel_route,
+        sum_within_limit, vertical_horizontal_crossings,
     };
 
     #[test]
@@ -2939,6 +2969,29 @@ mod tests {
             MAX_CROSSING_REPAIR_ROUTE_POINTS,
         ));
         assert!(!sum_within_limit([usize::MAX, 1].into_iter(), usize::MAX,));
+
+        assert!(candidate_route_points_within_budget(&vec![
+            None;
+            MAX_CROSSING_REPAIR_EDGES
+        ]));
+        assert!(!candidate_route_points_within_budget(&vec![
+            None;
+            MAX_CROSSING_REPAIR_EDGES
+                + 1
+        ]));
+        let exact_sparse_span = (MAX_CROSSING_REPAIR_ROUTE_POINTS - 8) / 2;
+        assert!(candidate_route_points_within_budget(&[Some((
+            0,
+            exact_sparse_span,
+        ))]));
+        assert!(!candidate_route_points_within_budget(&[Some((
+            0,
+            exact_sparse_span + 1,
+        ))]));
+        assert!(!candidate_route_points_within_budget(&[Some((
+            0,
+            usize::MAX,
+        ))]));
     }
 
     #[test]
@@ -3164,6 +3217,36 @@ mod tests {
         assert!(route_quality_cmp(*candidate, baseline).is_lt());
         assert_eq!(route_quality(&indexed, &routed.primary), baseline);
         assert_eq!(route_quality(&indexed, repair), *candidate);
+
+        let oversized_spans = vec![Some((0, 500)); SIDE as usize];
+        let oversized_free = vec![Vec::new(); 501];
+        let synthetic_lanes = vec![
+            (0..SIDE)
+                .enumerate()
+                .map(|(lane, net)| (net, lane))
+                .collect::<BTreeMap<_, _>>(),
+        ];
+        let bounded = repair_crossing_heavy_net(
+            &plan,
+            &nodes,
+            &oversized_spans,
+            &[],
+            &BTreeMap::new(),
+            0,
+            &oversized_free,
+            &[],
+            &[],
+            &synthetic_lanes,
+            &BTreeMap::new(),
+            0.0,
+            0.0,
+            LayoutOptions::default(),
+            &routed.primary,
+            None,
+        );
+        assert_eq!(bounded.selected_nets, vec![17, 12]);
+        assert!(bounded.candidate.is_none());
+        assert!(!bounded.candidate_emitted);
 
         let mut permuted_graph = graph.clone();
         permuted_graph.nodes.reverse();
