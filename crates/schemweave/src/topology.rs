@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap},
 };
 
 use crate::{NetId, validation::IndexedGraph};
@@ -9,6 +9,18 @@ use crate::{NetId, validation::IndexedGraph};
 enum CrossingScore {
     Edge,
     NetRepresentative,
+}
+
+#[derive(Clone, Copy)]
+enum NeighborMeasure {
+    Mean,
+    Median,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AlternativeOrdering {
+    NetRepresentative,
+    ReverseMedian,
 }
 
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
@@ -128,7 +140,7 @@ pub(crate) struct LayerOrdering {
 struct OptimizedSeed {
     edge_layers: Vec<Vec<usize>>,
     edge_crossings: usize,
-    net_representative: Option<ScoredOrdering>,
+    alternative: Option<ScoredOrdering>,
 }
 
 struct ScoredOrdering {
@@ -141,14 +153,40 @@ pub(crate) fn order_layer_candidates(
     graph: &IndexedGraph<'_>,
     ranks: &[usize],
     sweeps: usize,
-    include_net_representative: bool,
+    include_alternative: bool,
 ) -> (LayerOrdering, LayerOrdering, Option<LayerOrdering>) {
     let real_count = graph.nodes.len();
+    let alternative = include_alternative
+        .then(|| alternative_ordering_candidate(graph))
+        .flatten();
     let track_net_representative =
-        include_net_representative && should_score_net_representative_candidate(graph);
+        matches!(alternative, Some(AlternativeOrdering::NetRepresentative));
     let ordering = expanded_ordering_graph(graph, ranks, track_net_representative);
-    let forward = optimize_ordering_seed(&ordering, sweeps, false, track_net_representative);
-    let reverse = optimize_ordering_seed(&ordering, sweeps, true, false);
+    let forward_score = track_net_representative.then_some(CrossingScore::NetRepresentative);
+    let forward = optimize_ordering_seed(
+        &ordering,
+        sweeps,
+        false,
+        forward_score,
+        NeighborMeasure::Mean,
+    );
+    let reverse = optimize_ordering_seed(&ordering, sweeps, true, None, NeighborMeasure::Mean);
+    let reverse_median = (sweeps > 0
+        && matches!(alternative, Some(AlternativeOrdering::ReverseMedian)))
+    .then(|| {
+        let median = optimize_ordering_seed(
+            &ordering,
+            sweeps.min(2),
+            true,
+            None,
+            NeighborMeasure::Median,
+        );
+        ScoredOrdering {
+            layers: median.edge_layers,
+            crossings: median.edge_crossings,
+            edge_crossings: median.edge_crossings,
+        }
+    });
     let strip_virtual = |mut layers: Vec<Vec<usize>>| {
         for layer in &mut layers {
             layer.retain(|&item| item < real_count);
@@ -164,32 +202,72 @@ pub(crate) fn order_layer_candidates(
             layers: strip_virtual(reverse.edge_layers),
             crossings: reverse.edge_crossings,
         },
-        forward.net_representative.map(|ordering| LayerOrdering {
-            layers: strip_virtual(ordering.layers),
-            crossings: ordering.crossings,
-        }),
+        forward
+            .alternative
+            .or(reverse_median)
+            .map(|ordering| LayerOrdering {
+                layers: strip_virtual(ordering.layers),
+                crossings: ordering.crossings,
+            }),
     )
 }
 
-fn should_score_net_representative_candidate(graph: &IndexedGraph<'_>) -> bool {
+fn alternative_ordering_candidate(graph: &IndexedGraph<'_>) -> Option<AlternativeOrdering> {
     let mut fanout = BTreeMap::<NetId, usize>::new();
     for (edge, &participates_in_ranking) in graph.edges.iter().zip(&graph.rank_edges) {
         if participates_in_ranking {
             *fanout.entry(edge.net).or_default() += 1;
         }
     }
-    fanout
-        .values()
-        .copied()
-        .max()
-        .is_some_and(|max_fanout| (16..=64).contains(&max_fanout))
+    let mut largest_fanout = 0;
+    let mut second_largest_fanout = 0;
+    for &count in fanout.values() {
+        if count > largest_fanout {
+            second_largest_fanout = largest_fanout;
+            largest_fanout = count;
+        } else if count > second_largest_fanout {
+            second_largest_fanout = count;
+        }
+    }
+    if (16..=64).contains(&largest_fanout) {
+        return Some(AlternativeOrdering::NetRepresentative);
+    }
+    if second_largest_fanout < 65 {
+        return None;
+    }
+    let mut sinks_by_net = BTreeMap::<NetId, BTreeSet<(u32, u32)>>::new();
+    for (edge, &participates_in_ranking) in graph.edges.iter().zip(&graph.rank_edges) {
+        if participates_in_ranking && fanout[&edge.net] >= 65 {
+            let sinks = sinks_by_net.entry(edge.net).or_default();
+            if sinks.len() <= 300 {
+                sinks.insert((edge.target.node, edge.target.port));
+            }
+        }
+    }
+    let mut largest_distinct_fanout = 0;
+    let mut second_largest_distinct_fanout = 0;
+    for sinks in sinks_by_net.values() {
+        let distinct_fanout = sinks.len();
+        if distinct_fanout > largest_distinct_fanout {
+            second_largest_distinct_fanout = largest_distinct_fanout;
+            largest_distinct_fanout = distinct_fanout;
+        } else if distinct_fanout > second_largest_distinct_fanout {
+            second_largest_distinct_fanout = distinct_fanout;
+        }
+    }
+    (largest_distinct_fanout <= 300
+        && ((65..=100).contains(&second_largest_distinct_fanout)
+            || (graph.nodes.len() >= 1_000
+                && (101..=300).contains(&second_largest_distinct_fanout))))
+    .then_some(AlternativeOrdering::ReverseMedian)
 }
 
 fn optimize_ordering_seed(
     ordering: &OrderingGraph,
     sweeps: usize,
     reverse: bool,
-    track_net_representative: bool,
+    alternative_score: Option<CrossingScore>,
+    neighbor_measure: NeighborMeasure,
 ) -> OptimizedSeed {
     let mut positions = vec![0usize; ordering.stable_keys.len()];
     let mut layers = ordering.layers.clone();
@@ -202,14 +280,9 @@ fn optimize_ordering_seed(
     }
     let mut edge_layers = layers.clone();
     let mut edge_crossings = crossing_score(&layers, ordering, &mut positions, CrossingScore::Edge);
-    let mut net_representative = track_net_representative.then(|| ScoredOrdering {
+    let mut alternative = alternative_score.map(|score| ScoredOrdering {
         layers: layers.clone(),
-        crossings: crossing_score(
-            &layers,
-            ordering,
-            &mut positions,
-            CrossingScore::NetRepresentative,
-        ),
+        crossings: crossing_score(&layers, ordering, &mut positions, score),
         edge_crossings,
     });
     refresh_positions(&layers, &mut positions);
@@ -218,6 +291,7 @@ fn optimize_ordering_seed(
     } else {
         vec![0.0; ordering.stable_keys.len()]
     };
+    let mut median_scratch = Vec::new();
     for _ in 0..sweeps {
         for layer in layers.iter_mut().skip(1) {
             sort_layer(
@@ -226,6 +300,8 @@ fn optimize_ordering_seed(
                 &positions,
                 &ordering.incoming,
                 &mut ordering_scores,
+                neighbor_measure,
+                &mut median_scratch,
             );
             refresh_layer(layer, &mut positions);
         }
@@ -242,12 +318,13 @@ fn optimize_ordering_seed(
             &mut edge_layers,
             &mut edge_crossings,
         );
-        if let Some(best) = &mut net_representative {
-            retain_best_net_representative(
+        if let (Some(score), Some(best)) = (alternative_score, &mut alternative) {
+            retain_best_alternative(
                 &layers,
                 ordering,
                 &mut positions,
                 current_edge_crossings,
+                score,
                 best,
             );
         }
@@ -259,6 +336,8 @@ fn optimize_ordering_seed(
                 &positions,
                 &ordering.outgoing,
                 &mut ordering_scores,
+                neighbor_measure,
+                &mut median_scratch,
             );
             refresh_layer(layer, &mut positions);
         }
@@ -275,12 +354,13 @@ fn optimize_ordering_seed(
             &mut edge_layers,
             &mut edge_crossings,
         );
-        if let Some(best) = &mut net_representative {
-            retain_best_net_representative(
+        if let (Some(score), Some(best)) = (alternative_score, &mut alternative) {
+            retain_best_alternative(
                 &layers,
                 ordering,
                 &mut positions,
                 current_edge_crossings,
+                score,
                 best,
             );
         }
@@ -288,7 +368,7 @@ fn optimize_ordering_seed(
     OptimizedSeed {
         edge_layers,
         edge_crossings,
-        net_representative,
+        alternative,
     }
 }
 
@@ -340,12 +420,17 @@ fn sort_layer(
     positions: &[usize],
     neighbors: &[Vec<usize>],
     scores: &mut [f64],
+    neighbor_measure: NeighborMeasure,
+    median_scratch: &mut Vec<usize>,
 ) {
     if layer.len() < 2 {
         return;
     }
     for &item in layer.iter() {
-        scores[item] = barycenter(item, positions, neighbors);
+        scores[item] = match neighbor_measure {
+            NeighborMeasure::Mean => barycenter(item, positions, neighbors),
+            NeighborMeasure::Median => median(item, positions, neighbors, median_scratch),
+        };
     }
     layer.sort_by(|&left, &right| {
         scores[left]
@@ -461,20 +546,16 @@ fn retain_best_edge(
     crossings
 }
 
-fn retain_best_net_representative(
+fn retain_best_alternative(
     layers: &[Vec<usize>],
     ordering: &OrderingGraph,
     positions: &mut [usize],
     edge_crossings: usize,
+    score: CrossingScore,
     best: &mut ScoredOrdering,
 ) {
     let score = (
-        crossing_score(
-            layers,
-            ordering,
-            positions,
-            CrossingScore::NetRepresentative,
-        ),
+        crossing_score(layers, ordering, positions, score),
         edge_crossings,
     );
     if score < (best.crossings, best.edge_crossings) {
@@ -613,6 +694,27 @@ fn barycenter(node: usize, positions: &[usize], neighbors: &[Vec<usize>]) -> f64
         / adjacent.len() as f64
 }
 
+fn median(
+    node: usize,
+    positions: &[usize],
+    neighbors: &[Vec<usize>],
+    scratch: &mut Vec<usize>,
+) -> f64 {
+    let adjacent = &neighbors[node];
+    if adjacent.is_empty() {
+        return positions[node] as f64;
+    }
+    scratch.clear();
+    scratch.extend(adjacent.iter().map(|&item| positions[item]));
+    scratch.sort_unstable();
+    let middle = scratch.len() / 2;
+    if scratch.len().is_multiple_of(2) {
+        (scratch[middle - 1] + scratch[middle]) as f64 / 2.0
+    } else {
+        scratch[middle] as f64
+    }
+}
+
 fn refresh_positions(layers: &[Vec<usize>], positions: &mut [usize]) {
     for layer in layers {
         refresh_layer(layer, positions);
@@ -632,8 +734,9 @@ mod tests {
     };
 
     use super::{
-        assign_ranks, crossing_count, expanded_ordering_graph, net_representative_crossing_count,
-        optimize_ordering_seed, order_layers, should_score_net_representative_candidate,
+        AlternativeOrdering, NeighborMeasure, alternative_ordering_candidate, assign_ranks,
+        crossing_count, expanded_ordering_graph, median, net_representative_crossing_count,
+        optimize_ordering_seed, order_layers,
     };
 
     fn node(id: u32) -> Node {
@@ -712,30 +815,78 @@ mod tests {
     }
 
     #[test]
-    fn net_representative_candidate_is_bounded_to_measured_fanout_range() {
-        let enabled = |fanout: u32, participates_in_ranking| {
+    fn alternative_candidate_is_bounded_to_measured_fanout_ranges() {
+        let candidate = |primary_edges: u32,
+                         primary_sinks: u32,
+                         secondary_edges: u32,
+                         secondary_sinks: u32,
+                         node_count: u32,
+                         participates_in_ranking| {
+            let primary_sinks = primary_sinks.max(1);
+            let secondary_sinks = secondary_sinks.max(1);
             let graph = Graph {
-                nodes: vec![node(0), node(1)],
-                edges: (0..fanout)
+                nodes: (0..node_count.max(primary_sinks.max(secondary_sinks) + 2))
+                    .map(node)
+                    .collect(),
+                edges: (0..primary_edges)
                     .map(|id| Edge {
                         id,
                         source: Endpoint { node: 0, port: 1 },
-                        target: Endpoint { node: 1, port: 0 },
+                        target: Endpoint {
+                            node: 2 + id % primary_sinks,
+                            port: 0,
+                        },
                         net: 7,
                         participates_in_ranking,
                     })
+                    .chain((0..secondary_edges).map(|id| Edge {
+                        id: primary_edges + id,
+                        source: Endpoint { node: 1, port: 1 },
+                        target: Endpoint {
+                            node: 2 + id % secondary_sinks,
+                            port: 0,
+                        },
+                        net: 8,
+                        participates_in_ranking,
+                    }))
                     .collect(),
             };
             let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
-            should_score_net_representative_candidate(&indexed)
+            alternative_ordering_candidate(&indexed)
         };
 
-        assert!(!enabled(0, true));
-        assert!(!enabled(15, true));
-        assert!(enabled(16, true));
-        assert!(enabled(64, true));
-        assert!(!enabled(65, true));
-        assert!(!enabled(16, false));
+        assert_eq!(candidate(0, 1, 0, 1, 2, true), None);
+        assert_eq!(candidate(15, 15, 15, 15, 17, true), None);
+        assert_eq!(
+            candidate(16, 1, 1, 1, 3, true),
+            Some(AlternativeOrdering::NetRepresentative)
+        );
+        assert_eq!(
+            candidate(64, 1, 1, 1, 3, true),
+            Some(AlternativeOrdering::NetRepresentative)
+        );
+        assert_eq!(candidate(65, 1, 65, 1, 3, true), None);
+        assert_eq!(
+            candidate(269, 269, 65, 65, 271, true),
+            Some(AlternativeOrdering::ReverseMedian)
+        );
+        assert_eq!(
+            candidate(269, 269, 100, 100, 271, true),
+            Some(AlternativeOrdering::ReverseMedian)
+        );
+        assert_eq!(candidate(269, 269, 101, 101, 271, true), None);
+        assert_eq!(
+            candidate(300, 300, 101, 101, 1_000, true),
+            Some(AlternativeOrdering::ReverseMedian)
+        );
+        assert_eq!(
+            candidate(300, 300, 300, 300, 1_000, true),
+            Some(AlternativeOrdering::ReverseMedian)
+        );
+        assert_eq!(candidate(301, 301, 100, 100, 1_000, true), None);
+        assert_eq!(candidate(302, 302, 301, 301, 1_000, true), None);
+        assert_eq!(candidate(269, 269, 65, 65, 271, false), None);
+        assert_eq!(candidate(1_000, 1, 1_000, 1, 3, true), None);
 
         let mixed = Graph {
             nodes: vec![node(0), node(1)],
@@ -750,7 +901,23 @@ mod tests {
                 .collect(),
         };
         let indexed = validate_and_index(&mixed, LayoutOptions::default()).unwrap();
-        assert!(!should_score_net_representative_candidate(&indexed));
+        assert_eq!(alternative_ordering_candidate(&indexed), None);
+    }
+
+    #[test]
+    fn median_neighbor_measure_handles_odd_even_and_isolated_items() {
+        let positions = [0, 1, 9, 3, 7];
+        let mut neighbors = vec![Vec::new(); positions.len()];
+        let mut scratch = Vec::new();
+
+        neighbors[0] = vec![1, 2, 3];
+        assert_eq!(median(0, &positions, &neighbors, &mut scratch), 3.0);
+
+        neighbors[0].push(4);
+        assert_eq!(median(0, &positions, &neighbors, &mut scratch), 5.0);
+
+        neighbors[0].clear();
+        assert_eq!(median(0, &positions, &neighbors, &mut scratch), 0.0);
     }
 
     #[test]
@@ -790,8 +957,8 @@ mod tests {
         let ranks = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
         let ordering = expanded_ordering_graph(&indexed, &ranks, false);
-        let forward = optimize_ordering_seed(&ordering, 4, false, false);
-        let reverse = optimize_ordering_seed(&ordering, 4, true, false);
+        let forward = optimize_ordering_seed(&ordering, 4, false, None, NeighborMeasure::Mean);
+        let reverse = optimize_ordering_seed(&ordering, 4, true, None, NeighborMeasure::Mean);
 
         assert_eq!(forward.edge_crossings, 2);
         assert_eq!(reverse.edge_crossings, 0);

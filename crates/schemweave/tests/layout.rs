@@ -420,11 +420,13 @@ fn handles_the_full_consumer_graph_bound() {
         nodes: (0..node_count).map(|id| node(id, false)).collect(),
         edges: (0..10_000u32)
             .map(|id| {
-                let source = id % node_count;
-                let target = (source + 1 + id / node_count) % node_count;
+                let source = id % 1_000;
+                let target = 1_000 + (id * 7 + id / 1_000) % 1_000;
                 let mut edge = edge(id, source, target);
-                if id < 16 {
+                if id < 300 {
                     edge.net = node_count;
+                } else if id < 401 {
+                    edge.net = node_count + 1;
                 }
                 edge
             })
