@@ -3,7 +3,19 @@ use std::{
     collections::{BTreeMap, BinaryHeap},
 };
 
-use crate::validation::IndexedGraph;
+use crate::{NetId, validation::IndexedGraph};
+
+#[derive(Clone, Copy)]
+enum CrossingScore {
+    Edge,
+    NetRepresentative,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+struct OrderingArc {
+    neighbor: usize,
+    net: NetId,
+}
 
 pub(crate) fn assign_ranks(graph: &IndexedGraph<'_>) -> Vec<usize> {
     let (component, component_count) = strongly_connected_components(graph);
@@ -100,7 +112,7 @@ pub(crate) fn order_layers(
     ranks: &[usize],
     sweeps: usize,
 ) -> Vec<Vec<usize>> {
-    let [forward, reverse] = order_layer_candidates(graph, ranks, sweeps);
+    let (forward, reverse, _) = order_layer_candidates(graph, ranks, sweeps);
     if reverse.crossings < forward.crossings {
         reverse.layers
     } else {
@@ -113,38 +125,70 @@ pub(crate) struct LayerOrdering {
     pub(crate) crossings: usize,
 }
 
+struct OptimizedSeed {
+    edge_layers: Vec<Vec<usize>>,
+    edge_crossings: usize,
+    net_representative: Option<ScoredOrdering>,
+}
+
+struct ScoredOrdering {
+    layers: Vec<Vec<usize>>,
+    crossings: usize,
+    edge_crossings: usize,
+}
+
 pub(crate) fn order_layer_candidates(
     graph: &IndexedGraph<'_>,
     ranks: &[usize],
     sweeps: usize,
-) -> [LayerOrdering; 2] {
+) -> (LayerOrdering, LayerOrdering, Option<LayerOrdering>) {
     let real_count = graph.nodes.len();
-    let ordering = expanded_ordering_graph(graph, ranks);
-    let (forward_layers, forward_crossings) = optimize_ordering_seed(&ordering, sweeps, false);
-    let (reverse_layers, reverse_crossings) = optimize_ordering_seed(&ordering, sweeps, true);
+    let track_net_representative = should_score_net_representative_candidate(graph);
+    let ordering = expanded_ordering_graph(graph, ranks, track_net_representative);
+    let forward = optimize_ordering_seed(&ordering, sweeps, false, track_net_representative);
+    let reverse = optimize_ordering_seed(&ordering, sweeps, true, false);
     let strip_virtual = |mut layers: Vec<Vec<usize>>| {
         for layer in &mut layers {
             layer.retain(|&item| item < real_count);
         }
         layers
     };
-    [
+    (
         LayerOrdering {
-            layers: strip_virtual(forward_layers),
-            crossings: forward_crossings,
+            layers: strip_virtual(forward.edge_layers),
+            crossings: forward.edge_crossings,
         },
         LayerOrdering {
-            layers: strip_virtual(reverse_layers),
-            crossings: reverse_crossings,
+            layers: strip_virtual(reverse.edge_layers),
+            crossings: reverse.edge_crossings,
         },
-    ]
+        forward.net_representative.map(|ordering| LayerOrdering {
+            layers: strip_virtual(ordering.layers),
+            crossings: ordering.crossings,
+        }),
+    )
+}
+
+fn should_score_net_representative_candidate(graph: &IndexedGraph<'_>) -> bool {
+    let mut fanout = BTreeMap::<NetId, usize>::new();
+    for (edge, &participates_in_ranking) in graph.edges.iter().zip(&graph.rank_edges) {
+        if participates_in_ranking {
+            *fanout.entry(edge.net).or_default() += 1;
+        }
+    }
+    fanout
+        .values()
+        .copied()
+        .max()
+        .is_some_and(|max_fanout| (16..=64).contains(&max_fanout))
 }
 
 fn optimize_ordering_seed(
     ordering: &OrderingGraph,
     sweeps: usize,
     reverse: bool,
-) -> (Vec<Vec<usize>>, usize) {
+    track_net_representative: bool,
+) -> OptimizedSeed {
     let mut positions = vec![0usize; ordering.stable_keys.len()];
     let mut layers = ordering.layers.clone();
     for layer in &mut layers {
@@ -154,8 +198,18 @@ fn optimize_ordering_seed(
             layer.sort_unstable_by_key(|&item| ordering.stable_keys[item]);
         }
     }
-    let mut best_layers = layers.clone();
-    let mut best_crossings = crossing_count(&layers, &ordering.outgoing, &mut positions);
+    let mut edge_layers = layers.clone();
+    let mut edge_crossings = crossing_score(&layers, ordering, &mut positions, CrossingScore::Edge);
+    let mut net_representative = track_net_representative.then(|| ScoredOrdering {
+        layers: layers.clone(),
+        crossings: crossing_score(
+            &layers,
+            ordering,
+            &mut positions,
+            CrossingScore::NetRepresentative,
+        ),
+        edge_crossings,
+    });
     refresh_positions(&layers, &mut positions);
     for _ in 0..sweeps {
         for layer in layers.iter_mut().skip(1) {
@@ -170,11 +224,15 @@ fn optimize_ordering_seed(
         );
         retain_best(
             &layers,
-            &ordering.outgoing,
+            ordering,
             &mut positions,
-            &mut best_layers,
-            &mut best_crossings,
+            &mut edge_layers,
+            &mut edge_crossings,
+            CrossingScore::Edge,
         );
+        if let Some(best) = &mut net_representative {
+            retain_best_net_representative(&layers, ordering, &mut positions, best);
+        }
         let reverse_count = layers.len().saturating_sub(1);
         for layer in layers.iter_mut().take(reverse_count).rev() {
             sort_layer(layer, &ordering.stable_keys, &positions, &ordering.outgoing);
@@ -188,13 +246,21 @@ fn optimize_ordering_seed(
         );
         retain_best(
             &layers,
-            &ordering.outgoing,
+            ordering,
             &mut positions,
-            &mut best_layers,
-            &mut best_crossings,
+            &mut edge_layers,
+            &mut edge_crossings,
+            CrossingScore::Edge,
         );
+        if let Some(best) = &mut net_representative {
+            retain_best_net_representative(&layers, ordering, &mut positions, best);
+        }
     }
-    (best_layers, best_crossings)
+    OptimizedSeed {
+        edge_layers,
+        edge_crossings,
+        net_representative,
+    }
 }
 
 fn transpose_layers(
@@ -256,10 +322,15 @@ struct OrderingGraph {
     layers: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
     outgoing: Vec<Vec<usize>>,
+    outgoing_arcs: Option<Vec<Vec<OrderingArc>>>,
     stable_keys: Vec<(u8, u32, u32)>,
 }
 
-fn expanded_ordering_graph(graph: &IndexedGraph<'_>, ranks: &[usize]) -> OrderingGraph {
+fn expanded_ordering_graph(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    track_net_representative: bool,
+) -> OrderingGraph {
     let mut layers = vec![Vec::new(); ranks.iter().copied().max().unwrap_or(0) + 1];
     let mut stable_keys = Vec::with_capacity(graph.nodes.len());
     for (node, &rank) in ranks.iter().enumerate() {
@@ -268,6 +339,7 @@ fn expanded_ordering_graph(graph: &IndexedGraph<'_>, ranks: &[usize]) -> Orderin
     }
     let mut incoming = vec![Vec::new(); graph.nodes.len()];
     let mut outgoing = vec![Vec::new(); graph.nodes.len()];
+    let mut outgoing_arcs = track_net_representative.then(|| vec![Vec::new(); graph.nodes.len()]);
     let mut virtual_items = BTreeMap::new();
 
     for (edge, &rank_edge) in graph.edges.iter().zip(&graph.rank_edges) {
@@ -294,40 +366,143 @@ fn expanded_ordering_graph(graph: &IndexedGraph<'_>, ranks: &[usize]) -> Orderin
                 stable_keys.push((1, edge.net, rank as u32));
                 incoming.push(Vec::new());
                 outgoing.push(Vec::new());
+                if let Some(outgoing_arcs) = &mut outgoing_arcs {
+                    outgoing_arcs.push(Vec::new());
+                }
                 layer.push(item);
                 item
             };
             outgoing[previous].push(item);
+            if let Some(outgoing_arcs) = &mut outgoing_arcs {
+                outgoing_arcs[previous].push(OrderingArc {
+                    neighbor: item,
+                    net: edge.net,
+                });
+            }
             incoming[item].push(previous);
             previous = item;
         }
         outgoing[previous].push(target);
+        if let Some(outgoing_arcs) = &mut outgoing_arcs {
+            outgoing_arcs[previous].push(OrderingArc {
+                neighbor: target,
+                net: edge.net,
+            });
+        }
         incoming[target].push(previous);
     }
     for neighbors in incoming.iter_mut().chain(&mut outgoing) {
         neighbors.sort_unstable();
         neighbors.dedup();
     }
+    if let Some(outgoing_arcs) = &mut outgoing_arcs {
+        for arcs in outgoing_arcs {
+            arcs.sort_unstable();
+            arcs.dedup();
+        }
+    }
     OrderingGraph {
         layers,
         incoming,
         outgoing,
+        outgoing_arcs,
         stable_keys,
     }
 }
 
 fn retain_best(
     layers: &[Vec<usize>],
-    outgoing: &[Vec<usize>],
+    ordering: &OrderingGraph,
     positions: &mut [usize],
     best_layers: &mut [Vec<usize>],
     best_crossings: &mut usize,
+    score: CrossingScore,
 ) {
-    let crossings = crossing_count(layers, outgoing, positions);
+    let crossings = crossing_score(layers, ordering, positions, score);
     if crossings < *best_crossings {
         *best_crossings = crossings;
         best_layers.clone_from_slice(layers);
     }
+}
+
+fn retain_best_net_representative(
+    layers: &[Vec<usize>],
+    ordering: &OrderingGraph,
+    positions: &mut [usize],
+    best: &mut ScoredOrdering,
+) {
+    let score = (
+        crossing_score(
+            layers,
+            ordering,
+            positions,
+            CrossingScore::NetRepresentative,
+        ),
+        crossing_score(layers, ordering, positions, CrossingScore::Edge),
+    );
+    if score < (best.crossings, best.edge_crossings) {
+        best.crossings = score.0;
+        best.edge_crossings = score.1;
+        best.layers.clone_from_slice(layers);
+    }
+}
+
+fn crossing_score(
+    layers: &[Vec<usize>],
+    ordering: &OrderingGraph,
+    positions: &mut [usize],
+    score: CrossingScore,
+) -> usize {
+    match score {
+        CrossingScore::Edge => crossing_count(layers, &ordering.outgoing, positions),
+        CrossingScore::NetRepresentative => net_representative_crossing_count(
+            layers,
+            ordering
+                .outgoing_arcs
+                .as_deref()
+                .expect("net representative score requires net arcs"),
+            positions,
+        ),
+    }
+}
+
+fn net_representative_crossing_count(
+    layers: &[Vec<usize>],
+    outgoing: &[Vec<OrderingArc>],
+    positions: &mut [usize],
+) -> usize {
+    refresh_positions(layers, positions);
+    let mut crossings = 0usize;
+    for layer in layers.iter().take(layers.len().saturating_sub(1)) {
+        let mut by_net = BTreeMap::<NetId, (Vec<usize>, Vec<usize>)>::new();
+        for &source in layer {
+            for arc in &outgoing[source] {
+                let endpoints = by_net.entry(arc.net).or_default();
+                endpoints.0.push(positions[source]);
+                endpoints.1.push(positions[arc.neighbor]);
+            }
+        }
+        let mut connections = Vec::with_capacity(by_net.len());
+        for (net, (mut sources, mut targets)) in by_net {
+            sources.sort_unstable();
+            sources.dedup();
+            targets.sort_unstable();
+            targets.dedup();
+            connections.push((sources[sources.len() / 2], targets[targets.len() / 2], net));
+        }
+        connections.sort_unstable();
+        let target_count = connections
+            .iter()
+            .map(|&(_, target, _)| target)
+            .max()
+            .map_or(0, |target| target + 1);
+        let mut tree = Fenwick::new(target_count);
+        for (seen, (_, target, _)) in connections.into_iter().enumerate() {
+            crossings += seen - tree.prefix(target + 1);
+            tree.add(target);
+        }
+    }
+    crossings
 }
 
 fn crossing_count(
@@ -419,7 +594,10 @@ mod tests {
         Edge, Endpoint, Graph, LayoutOptions, Node, Port, PortSide, validation::validate_and_index,
     };
 
-    use super::{assign_ranks, expanded_ordering_graph, optimize_ordering_seed, order_layers};
+    use super::{
+        assign_ranks, crossing_count, expanded_ordering_graph, net_representative_crossing_count,
+        optimize_ordering_seed, order_layers, should_score_net_representative_candidate,
+    };
 
     fn node(id: u32) -> Node {
         Node {
@@ -464,12 +642,13 @@ mod tests {
             ],
         };
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
-        let ordering = expanded_ordering_graph(&indexed, &[0, 2, 3]);
+        let ordering = expanded_ordering_graph(&indexed, &[0, 2, 3], false);
 
         assert_eq!(ordering.stable_keys.len(), 5);
         assert!(ordering.stable_keys.contains(&(1, 7, 1)));
         assert!(ordering.stable_keys.contains(&(1, 7, 2)));
         assert_eq!(ordering.outgoing[0].len(), 1);
+        assert!(ordering.outgoing_arcs.is_none());
     }
 
     #[test]
@@ -488,11 +667,38 @@ mod tests {
         };
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
         let ranks = assign_ranks(&indexed);
-        let ordering = expanded_ordering_graph(&indexed, &ranks);
+        let ordering = expanded_ordering_graph(&indexed, &ranks, false);
 
         assert_eq!(ranks, vec![0, 1]);
         assert_eq!(ordering.outgoing[0], vec![1]);
         assert_eq!(ordering.incoming[1], vec![0]);
+    }
+
+    #[test]
+    fn net_representative_candidate_is_bounded_to_measured_fanout_range() {
+        let enabled = |fanout: u32, participates_in_ranking| {
+            let graph = Graph {
+                nodes: vec![node(0), node(1)],
+                edges: (0..fanout)
+                    .map(|id| Edge {
+                        id,
+                        source: Endpoint { node: 0, port: 1 },
+                        target: Endpoint { node: 1, port: 0 },
+                        net: 7,
+                        participates_in_ranking,
+                    })
+                    .collect(),
+            };
+            let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+            should_score_net_representative_candidate(&indexed)
+        };
+
+        assert!(!enabled(0, true));
+        assert!(!enabled(15, true));
+        assert!(enabled(16, true));
+        assert!(enabled(64, true));
+        assert!(!enabled(65, true));
+        assert!(!enabled(16, false));
     }
 
     #[test]
@@ -531,12 +737,77 @@ mod tests {
         };
         let ranks = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
-        let ordering = expanded_ordering_graph(&indexed, &ranks);
-        let forward = optimize_ordering_seed(&ordering, 4, false);
-        let reverse = optimize_ordering_seed(&ordering, 4, true);
+        let ordering = expanded_ordering_graph(&indexed, &ranks, false);
+        let forward = optimize_ordering_seed(&ordering, 4, false, false);
+        let reverse = optimize_ordering_seed(&ordering, 4, true, false);
 
-        assert_eq!(forward.1, 2);
-        assert_eq!(reverse.1, 0);
-        assert_eq!(order_layers(&indexed, &ranks, 4), reverse.0);
+        assert_eq!(forward.edge_crossings, 2);
+        assert_eq!(reverse.edge_crossings, 0);
+        assert_eq!(order_layers(&indexed, &ranks, 4), reverse.edge_layers);
+    }
+
+    #[test]
+    fn net_representative_score_does_not_multiply_shared_branch_crossings() {
+        let graph = Graph {
+            nodes: (0..10).map(node).collect(),
+            edges: vec![
+                (0, 0, 4, 100),
+                (1, 0, 5, 100),
+                (2, 0, 6, 100),
+                (3, 1, 7, 1),
+                (4, 2, 8, 2),
+                (5, 3, 9, 3),
+            ]
+            .into_iter()
+            .map(|(id, source, target, net)| Edge {
+                id,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect(),
+        };
+        let ranks = [0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let ordering = expanded_ordering_graph(&indexed, &ranks, true);
+        let branch_weighted = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 8, 9, 7]];
+        let net_representative_better = vec![vec![0, 1, 2, 3], vec![7, 4, 5, 6, 8, 9]];
+        let mut positions = vec![0; graph.nodes.len()];
+
+        assert_eq!(
+            crossing_count(&branch_weighted, &ordering.outgoing, &mut positions),
+            2
+        );
+        assert_eq!(
+            crossing_count(
+                &net_representative_better,
+                &ordering.outgoing,
+                &mut positions
+            ),
+            3
+        );
+        assert_eq!(
+            net_representative_crossing_count(
+                &branch_weighted,
+                ordering.outgoing_arcs.as_deref().unwrap(),
+                &mut positions
+            ),
+            2
+        );
+        assert_eq!(
+            net_representative_crossing_count(
+                &net_representative_better,
+                ordering.outgoing_arcs.as_deref().unwrap(),
+                &mut positions
+            ),
+            1
+        );
     }
 }

@@ -165,23 +165,41 @@ pub enum LayoutError {
 pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
     let ranks = topology::assign_ranks(&indexed);
-    let [forward, reverse] =
+    let (forward, reverse, net_representative) =
         topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps);
     let quality_layers = if reverse.crossings < forward.crossings {
         &reverse.layers
     } else {
         &forward.layers
     };
-    let candidates = [
-        placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
-        placement::place_nodes(&indexed, &ranks, quality_layers, options),
-    ];
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    for mut nodes in candidates {
+    let mut evaluate = |mut nodes: Vec<NodeGeometry>| {
         let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
         let quality = routing::route_quality(&indexed, &edges);
         let candidate = placement::normalize(&mut nodes, &mut edges);
         retain_better_candidate(&mut best, quality, candidate);
+    };
+    evaluate(placement::place_baseline_nodes(
+        &indexed,
+        &ranks,
+        &forward.layers,
+        options,
+    ));
+    evaluate(placement::place_nodes(
+        &indexed,
+        &ranks,
+        quality_layers,
+        options,
+    ));
+    if let Some(net_representative) = net_representative
+        && net_representative.layers != *quality_layers
+    {
+        evaluate(placement::place_nodes(
+            &indexed,
+            &ranks,
+            &net_representative.layers,
+            options,
+        ));
     }
     Ok(best.expect("layout has deterministic candidates").1)
 }
