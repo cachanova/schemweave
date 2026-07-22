@@ -341,5 +341,92 @@ fn counts_overlapping_same_net_branches_as_one_physical_crossing() {
     let report = score(&graph, &layout, ScoreOptions::default());
     assert_eq!(report.semantic_violations, 0, "{report:#?}");
     assert_eq!(report.crossings, 1);
+    assert_eq!(report.route_length, 160.0);
+    assert_eq!(report.bends, 0);
     assert_eq!(report.unrelated_contacts, 0);
+}
+
+#[test]
+fn shared_same_net_corners_count_once() {
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: 1,
+                width: 10.0,
+                height: 10.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 5.0,
+                }],
+            },
+            Node {
+                id: 2,
+                width: 10.0,
+                height: 10.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 5.0,
+                }],
+            },
+        ],
+        edges: vec![
+            Edge {
+                id: 1,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 2,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+        ],
+    };
+    let points = vec![
+        Point { x: 10.0, y: 5.0 },
+        Point { x: 50.0, y: 5.0 },
+        Point { x: 50.0, y: 45.0 },
+        Point { x: 90.0, y: 45.0 },
+    ];
+    let layout = Layout {
+        nodes: vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 90.0,
+                y: 40.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ],
+        edges: vec![
+            EdgeGeometry {
+                id: 1,
+                points: points.clone(),
+            },
+            EdgeGeometry { id: 2, points },
+        ],
+        width: 100.0,
+        height: 50.0,
+    };
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.route_length, 120.0);
+    assert_eq!(report.bends, 2);
 }
