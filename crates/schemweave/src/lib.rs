@@ -182,9 +182,14 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         let candidate = placement::normalize(&mut nodes, &mut edges);
         retain_better_candidate(&mut best, quality, candidate);
     };
-    let mut evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool| {
-        let routed =
-            routing::route_planned_candidates(&routing_plan, &nodes, options, supplemental);
+    let mut evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool, sparse_global: bool| {
+        let routed = routing::route_planned_candidates_with_sparse_global(
+            &routing_plan,
+            &nodes,
+            options,
+            supplemental,
+            sparse_global,
+        );
         retain(nodes.clone(), routed.primary, routed.primary_quality);
         if let Some((repair_quality, repair)) = routed.repair {
             retain(nodes.clone(), repair, Some(repair_quality));
@@ -196,17 +201,18 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     evaluate(
         placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
         false,
+        false,
     );
     let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
     let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
-    evaluate(ordinary_nodes, false);
+    evaluate(ordinary_nodes, false, true);
     if placement::preferred_alignment_can_be_significant(ordinary_alignment) {
         let preferred_nodes =
             placement::place_preferred_nodes(&indexed, &ranks, quality_layers, options);
         let preferred_alignment =
             placement::port_alignment_error(&indexed, &ranks, &preferred_nodes);
         if placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment) {
-            evaluate(preferred_nodes, true);
+            evaluate(preferred_nodes, true, false);
         }
     }
     if let Some(net_representative) = net_representative
@@ -214,6 +220,7 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     {
         evaluate(
             placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
+            false,
             false,
         );
     }
@@ -314,6 +321,121 @@ mod tests {
                 height: 1.0,
             },
         )
+    }
+
+    fn sparse_global_layered_graph(
+        layer_count: u32,
+        source_stride: u32,
+        branch_stride: u32,
+    ) -> Graph {
+        let mut nodes = Vec::new();
+        for id in 0..layer_count * 20 {
+            nodes.push(Node {
+                id,
+                width: 76.0,
+                height: 84.0,
+                cycle_breaker: false,
+                ports: std::iter::once(Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 42.0,
+                })
+                .chain((0..5).map(|branch| Port {
+                    id: branch + 1,
+                    side: PortSide::West,
+                    offset: 14.0 * (branch + 1) as f64,
+                }))
+                .collect(),
+            });
+        }
+        let mut edges = Vec::new();
+        for layer in 0..layer_count - 1 {
+            for source in 0..20u32 {
+                for branch in 0..5u32 {
+                    edges.push(Edge {
+                        id: edges.len() as u32,
+                        source: Endpoint {
+                            node: layer * 20 + source,
+                            port: 0,
+                        },
+                        target: Endpoint {
+                            node: (layer + 1) * 20
+                                + (source * source_stride + branch * branch_stride) % 20,
+                            port: branch + 1,
+                        },
+                        net: layer * 20 + source,
+                        participates_in_ranking: true,
+                    });
+                }
+            }
+        }
+        Graph { nodes, edges }
+    }
+
+    fn sparse_global_ordinary_routes(
+        graph: &Graph,
+        options: LayoutOptions,
+    ) -> (Vec<NodeGeometry>, routing::RoutedEdges) {
+        let indexed = validation::validate_and_index(graph, options).unwrap();
+        let ranks = topology::assign_ranks(&indexed);
+        let (forward, reverse, _) =
+            topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, false);
+        let layers = if reverse.crossings < forward.crossings {
+            &reverse.layers
+        } else {
+            &forward.layers
+        };
+        let ordinary = placement::place_nodes(&indexed, &ranks, layers, options);
+        let plan = routing::RoutingPlan::new(&indexed, &ranks);
+        let routed = routing::route_planned_candidates_with_sparse_global(
+            &plan, &ordinary, options, false, true,
+        );
+        (ordinary, routed)
+    }
+
+    #[test]
+    fn public_layout_selects_an_active_sparse_global_candidate() {
+        let options = LayoutOptions::default();
+        let graph = sparse_global_layered_graph(4, 7, 11);
+        let (ordinary, routed) = sparse_global_ordinary_routes(&graph, options);
+        assert_eq!(routed.alternatives.len(), 1);
+        let (candidate_quality, candidate_edges) = &routed.alternatives[0];
+        assert!(candidate_quality.crossings < routed.primary_quality.unwrap().crossings);
+        let mut candidate_nodes = ordinary;
+        let mut candidate_edges = candidate_edges.clone();
+        let candidate_layout = placement::normalize(&mut candidate_nodes, &mut candidate_edges);
+
+        let selected = layout(&graph, options).unwrap();
+        assert_eq!(selected, candidate_layout);
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, options).unwrap(), selected);
+    }
+
+    #[test]
+    fn public_layout_rejects_a_proxy_better_but_exact_worse_sparse_global_candidate() {
+        let options = LayoutOptions::default();
+        let graph = sparse_global_layered_graph(4, 6, 17);
+        let (ordinary, routed) = sparse_global_ordinary_routes(&graph, options);
+        assert_eq!(routed.alternatives.len(), 1);
+        let (candidate_quality, candidate_edges) = &routed.alternatives[0];
+        let primary_quality = routed.primary_quality.unwrap();
+        assert!(candidate_quality.crossings > primary_quality.crossings);
+        let mut primary_nodes = ordinary.clone();
+        let mut primary_edges = routed.primary;
+        let primary_layout = placement::normalize(&mut primary_nodes, &mut primary_edges);
+        let mut candidate_nodes = ordinary;
+        let mut candidate_edges = candidate_edges.clone();
+        let candidate_layout = placement::normalize(&mut candidate_nodes, &mut candidate_edges);
+
+        let selected = layout(&graph, options).unwrap();
+        assert_eq!(selected, primary_layout);
+        assert_ne!(selected, candidate_layout);
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, options).unwrap(), selected);
     }
 
     fn net_representative_graph() -> Graph {
