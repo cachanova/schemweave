@@ -164,7 +164,7 @@ pub enum LayoutError {
 /// Lay out a graph. Output ordering depends only on stable identifiers, not input order.
 pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
-    let ranks = topology::assign_ranks(&indexed);
+    let (ranks, latest_ranks) = topology::rank_candidates(&indexed);
     let (forward, reverse, net_representative) =
         topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
     let quality_layers = if reverse.crossings < forward.crossings {
@@ -172,6 +172,7 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     } else {
         &forward.layers
     };
+    let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
     let mut evaluate = |mut nodes: Vec<NodeGeometry>| {
         let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
@@ -200,6 +201,30 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
             &net_representative.layers,
             options,
         ));
+    }
+    if let Some(alternative_ranks) = latest_ranks {
+        let (forward, reverse, _) = topology::order_layer_candidates(
+            &indexed,
+            &alternative_ranks,
+            options.ordering_sweeps.min(3),
+            false,
+        );
+        let layers = if reverse.crossings < forward.crossings {
+            &reverse.layers
+        } else {
+            &forward.layers
+        };
+        let alternative_crossings = forward.crossings.min(reverse.crossings);
+        if alternative_crossings < baseline_order_crossings
+            && baseline_order_crossings - alternative_crossings
+                >= baseline_order_crossings.div_ceil(100)
+        {
+            let mut nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
+            let mut edges = routing::route_edges(&indexed, &nodes, &alternative_ranks, options);
+            let quality = routing::route_quality(&indexed, &edges);
+            let candidate = placement::normalize(&mut nodes, &mut edges);
+            retain_better_candidate(&mut best, quality, candidate);
+        }
     }
     Ok(best.expect("layout has deterministic candidates").1)
 }
@@ -399,6 +424,137 @@ mod tests {
             })
             .collect();
         Graph { nodes, edges }
+    }
+
+    fn slack_rank_graph(seed: u64) -> Graph {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..51)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 25.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 25.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut endpoints = vec![(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)];
+        endpoints.extend((30..51).map(|target| (4, target)));
+        let mut state = seed;
+        for source in 6..30 {
+            for target in 30..51 {
+                if next(&mut state) % 100 < 20 {
+                    endpoints.push((source, target));
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net: id as u32,
+                participates_in_ranking: true,
+            })
+            .collect();
+        Graph { nodes, edges }
+    }
+
+    #[test]
+    fn selects_a_latest_feasible_rank_candidate_deterministically() {
+        let options = LayoutOptions::default();
+        let graph = slack_rank_graph(10);
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let (ranks, alternative_ranks) = topology::rank_candidates(&indexed);
+        let alternative_ranks = alternative_ranks.unwrap();
+        let (forward, reverse, _) = topology::order_layer_candidates(&indexed, &ranks, 4, false);
+        let ordinary_layers = if reverse.crossings < forward.crossings {
+            &reverse.layers
+        } else {
+            &forward.layers
+        };
+        let baseline_crossings = forward.crossings.min(reverse.crossings);
+        let (alternative_forward, alternative_reverse, _) =
+            topology::order_layer_candidates(&indexed, &alternative_ranks, 3, false);
+        let alternative_layers = if alternative_reverse.crossings < alternative_forward.crossings {
+            &alternative_reverse.layers
+        } else {
+            &alternative_forward.layers
+        };
+        let alternative_crossings = alternative_forward
+            .crossings
+            .min(alternative_reverse.crossings);
+        assert!(baseline_crossings - alternative_crossings >= baseline_crossings.div_ceil(100));
+
+        let evaluate = |ranks: &[usize], layers: &[Vec<usize>], baseline| {
+            let mut nodes = if baseline {
+                placement::place_baseline_nodes(&indexed, ranks, layers, options)
+            } else {
+                placement::place_nodes(&indexed, ranks, layers, options)
+            };
+            let mut edges = routing::route_edges(&indexed, &nodes, ranks, options);
+            let quality = routing::route_quality(&indexed, &edges);
+            let layout = placement::normalize(&mut nodes, &mut edges);
+            (quality, layout)
+        };
+        let baseline = evaluate(&ranks, &forward.layers, true);
+        let ordinary = evaluate(&ranks, ordinary_layers, false);
+        let alternative = evaluate(&alternative_ranks, alternative_layers, false);
+        let best_ordinary =
+            if candidate_quality_cmp(ordinary.0, &ordinary.1, baseline.0, &baseline.1).is_lt() {
+                &ordinary
+            } else {
+                &baseline
+            };
+        assert!(
+            candidate_quality_cmp(
+                alternative.0,
+                &alternative.1,
+                best_ordinary.0,
+                &best_ordinary.1,
+            )
+            .is_lt()
+        );
+
+        let selected = layout(&graph, options).unwrap();
+        assert_eq!(selected, alternative.1);
+
+        let zero_sweeps = LayoutOptions {
+            ordering_sweeps: 0,
+            ..options
+        };
+        let zero_sweep_selected = layout(&graph, zero_sweeps).unwrap();
+        assert_eq!(layout(&graph, zero_sweeps).unwrap(), zero_sweep_selected);
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout(&permuted, zero_sweeps).unwrap(), zero_sweep_selected);
     }
 
     #[test]

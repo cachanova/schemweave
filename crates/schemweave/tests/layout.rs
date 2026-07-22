@@ -420,12 +420,23 @@ fn handles_the_full_consumer_graph_bound() {
         nodes: (0..node_count).map(|id| node(id, false)).collect(),
         edges: (0..10_000u32)
             .map(|id| {
-                let source = id % 1_000;
-                let target = 1_000 + (id * 7 + id / 1_000) % 1_000;
+                let (source, target) = if id == 0 {
+                    (0, 1_000)
+                } else if id == 1 {
+                    (1_000, 1_999)
+                } else if id < 2_002 {
+                    // Direct edges to the critical-path sink have span two under earliest ranks
+                    // and span one under latest ranks. This activates the value-gated large-graph
+                    // candidate without relying on the small-graph fanout exception.
+                    ((id - 2) % 1_000, 1_999)
+                } else {
+                    let offset = id - 2_002;
+                    (offset % 1_000, 1_000 + (offset * 7 + offset / 1_000) % 999)
+                };
                 let mut edge = edge(id, source, target);
-                if id < 300 {
+                if (2_002..2_302).contains(&id) {
                     edge.net = node_count;
-                } else if id < 401 {
+                } else if (2_302..2_403).contains(&id) {
                     edge.net = node_count + 1;
                 }
                 edge
