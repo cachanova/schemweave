@@ -213,7 +213,11 @@ fn optimize_ordering_seed(
         edge_crossings,
     });
     refresh_positions(&layers, &mut positions);
-    let mut ordering_scores = vec![0.0; ordering.stable_keys.len()];
+    let mut ordering_scores = if sweeps == 0 {
+        Vec::new()
+    } else {
+        vec![0.0; ordering.stable_keys.len()]
+    };
     for _ in 0..sweeps {
         for layer in layers.iter_mut().skip(1) {
             sort_layer(
