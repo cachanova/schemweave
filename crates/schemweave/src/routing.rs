@@ -22,11 +22,15 @@ const SUPPLEMENTAL_GAP_LANE_ROUNDS: usize = 32;
 // alternative. Bound both dimensions: small gaps only, and enough aggregate predicted crossings
 // removed to amortize that second route family on measured large sparse graphs.
 const MAX_GLOBAL_GAP_LANES: usize = 32;
+const MAX_LARGE_GLOBAL_GAP_LANES: usize = 705;
+const MAX_LARGE_GLOBAL_GAP_HOT_NETS: usize = 32;
 const MIN_GLOBAL_GAP_ORDER_GAIN: usize = 256;
 // Aggregate caps bound the pair table and vertical-access comparisons across every eligible gap;
 // both measured 2,000-node winners remain below these limits.
 const MAX_GLOBAL_GAP_PAIRS: usize = 32_768;
 const MAX_GLOBAL_GAP_ACCESS_WORK: usize = 500_000;
+const MAX_LARGE_GLOBAL_GAP_PAIRS: usize = 262_144;
+const MAX_LARGE_GLOBAL_GAP_ACCESS_WORK: usize = 2_000_000;
 const MIN_CROSSING_REPAIR_TOTAL: usize = 500;
 const MIN_CROSSING_REPAIR_NET: usize = 64;
 // Move a bounded hot-net block before the existing single rebuild and exact score. Two captures
@@ -258,7 +262,7 @@ pub(crate) fn route_planned_candidates(
     options: LayoutOptions,
     supplemental: bool,
 ) -> RoutedEdges {
-    route_planned_candidates_with_sparse_global(plan, nodes, options, supplemental, false)
+    route_planned_candidates_with_sparse_global(plan, nodes, options, supplemental, false, false)
 }
 
 pub(crate) fn route_planned_candidates_with_sparse_global(
@@ -267,6 +271,7 @@ pub(crate) fn route_planned_candidates_with_sparse_global(
     options: LayoutOptions,
     supplemental: bool,
     sparse_global: bool,
+    large_sparse_global: bool,
 ) -> RoutedEdges {
     let (outer_rounds, gap_rounds) = if supplemental {
         (SUPPLEMENTAL_OUTER_LANE_ROUNDS, SUPPLEMENTAL_GAP_LANE_ROUNDS)
@@ -282,6 +287,7 @@ pub(crate) fn route_planned_candidates_with_sparse_global(
         supplemental,
         supplemental,
         sparse_global,
+        large_sparse_global,
     );
     if routed.primary_quality.is_none() {
         routed.primary_quality = Some(route_quality_for_plan(plan, &routed.primary));
@@ -320,6 +326,7 @@ fn route_edges_with_lane_rounds(
         repair_crossings,
         fanout_candidates,
         false,
+        false,
     )
 }
 
@@ -334,6 +341,7 @@ fn route_edges_with_lane_rounds_and_global(
     repair_crossings: bool,
     fanout_candidates: bool,
     sparse_global: bool,
+    large_sparse_global: bool,
 ) -> RoutedEdges {
     let ranks = &plan.ranks;
     debug_assert_eq!(nodes.len(), ranks.len());
@@ -485,6 +493,7 @@ fn route_edges_with_lane_rounds_and_global(
         options,
         gap_lane_rounds,
         sparse_global,
+        large_sparse_global,
     );
     let sparse_alternative = global_gap_lanes.and_then(|candidate_lanes| {
         if !route_family_candidate_within_budget(node_count, plan.edges.len(), &routes) {
@@ -518,7 +527,46 @@ fn route_edges_with_lane_rounds_and_global(
         if !route_family_candidate_within_budget(node_count, plan.edges.len(), &candidate_routes) {
             return None;
         }
-        let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
+        let large_gap = gap_lanes
+            .iter()
+            .any(|lanes| lanes.len() > MAX_GLOBAL_GAP_LANES);
+        let (candidate_quality, candidate_routes) = if large_gap {
+            let mut candidate = finish_route_family(
+                plan,
+                nodes,
+                ranks,
+                &sparse_spans,
+                &crossing_lanes,
+                &crossing_tie_lanes,
+                crossing_tie_lane_count,
+                &free_by_rank,
+                &layer_left,
+                &layer_right,
+                &candidate_lanes,
+                &crossing_paths,
+                &stable_channel_lanes,
+                baseline_outer_lanes.clone(),
+                top,
+                bottom,
+                options,
+                outer_lane_rounds,
+                repair_crossings,
+                None,
+                candidate_routes,
+            );
+            candidate
+                .repair
+                .take()
+                .filter(|(quality, _)| {
+                    route_quality_cmp(*quality, candidate.primary_quality).is_lt()
+                })
+                .unwrap_or((candidate.primary_quality, candidate.primary))
+        } else {
+            (
+                route_quality_for_plan(plan, &candidate_routes),
+                candidate_routes,
+            )
+        };
         Some((candidate_quality, candidate_routes))
     });
     let fanout_within_budget = fanout_candidates
@@ -1091,6 +1139,7 @@ fn emit_routes_with_outer_lanes(
     options: LayoutOptions,
     gap_lane_rounds: usize,
     sparse_global: bool,
+    large_sparse_global: bool,
 ) -> RoutedLaneState {
     let mut endpoint_tracks = build_endpoint_tracks(
         plan,
@@ -1126,7 +1175,8 @@ fn emit_routes_with_outer_lanes(
         &endpoint_tracks,
         options.port_stub,
         gap_lane_rounds,
-        sparse_global && outer_lanes.is_empty(),
+        sparse_global && (outer_lanes.is_empty() || large_sparse_global),
+        large_sparse_global,
     );
     endpoint_tracks = build_endpoint_tracks(
         plan,
@@ -2952,6 +3002,7 @@ fn crossing_aware_gap_lanes(
     port_stub: f64,
     lane_rounds: usize,
     global_candidates: bool,
+    large_global_candidates: bool,
 ) -> GapLaneCandidates {
     let mut accesses = (0..current_lanes.len())
         .map(|_| BTreeMap::<u32, GapNetAccess>::new())
@@ -2988,8 +3039,12 @@ fn crossing_aware_gap_lanes(
             access.right_y.sort_by(f64::total_cmp);
         }
     }
-    let global_candidates =
-        global_candidates && global_gap_candidate_work_within_budget(current_lanes, &accesses);
+    let global_candidates = global_candidates
+        && global_gap_candidate_work_within_budget(
+            current_lanes,
+            &accesses,
+            large_global_candidates,
+        );
     let mut baseline = Vec::with_capacity(current_lanes.len());
     let mut global = global_candidates.then(|| Vec::with_capacity(current_lanes.len()));
     let mut changed = false;
@@ -2997,9 +3052,13 @@ fn crossing_aware_gap_lanes(
     for (lanes, access) in current_lanes.iter().zip(&accesses) {
         let local = crossing_aware_gap_lane_indices_with_rounds(lanes, access, lane_rounds);
         if let Some(global) = &mut global {
-            if let Some((candidate, gain)) =
-                global_gap_lane_indices_with_rounds(lanes, access, lane_rounds, &local)
-            {
+            if let Some((candidate, gain)) = global_gap_lane_indices_with_rounds(
+                lanes,
+                access,
+                lane_rounds,
+                &local,
+                large_global_candidates,
+            ) {
                 changed = true;
                 total_gain = total_gain.saturating_add(gain);
                 global.push(candidate);
@@ -3018,25 +3077,55 @@ fn crossing_aware_gap_lanes(
 fn global_gap_candidate_work_within_budget(
     current_lanes: &[BTreeMap<u32, usize>],
     accesses: &[BTreeMap<u32, GapNetAccess>],
+    large_global_candidates: bool,
 ) -> bool {
+    let max_lanes = if large_global_candidates {
+        MAX_LARGE_GLOBAL_GAP_LANES
+    } else {
+        MAX_GLOBAL_GAP_LANES
+    };
+    let pair_budget = if large_global_candidates {
+        MAX_LARGE_GLOBAL_GAP_PAIRS
+    } else {
+        MAX_GLOBAL_GAP_PAIRS
+    };
+    let access_budget = if large_global_candidates {
+        MAX_LARGE_GLOBAL_GAP_ACCESS_WORK
+    } else {
+        MAX_GLOBAL_GAP_ACCESS_WORK
+    };
     let eligible = current_lanes
         .iter()
         .zip(accesses)
-        .filter(|(lanes, _)| (2..=MAX_GLOBAL_GAP_LANES).contains(&lanes.len()));
+        .filter(|(lanes, _)| (2..=max_lanes).contains(&lanes.len()));
     let pairs_within_budget = sum_within_limit(
         eligible.clone().map(|(lanes, _)| {
-            lanes
-                .len()
-                .checked_mul(lanes.len() - 1)
-                .map(|ordered| ordered / 2)
-                .unwrap_or(usize::MAX)
+            if lanes.len() <= MAX_GLOBAL_GAP_LANES {
+                lanes
+                    .len()
+                    .checked_mul(lanes.len() - 1)
+                    .map(|ordered| ordered / 2)
+                    .unwrap_or(usize::MAX)
+            } else {
+                lanes
+                    .len()
+                    .checked_mul(MAX_LARGE_GLOBAL_GAP_HOT_NETS.min(lanes.len()))
+                    .and_then(|pairs| pairs.checked_mul(2))
+                    .unwrap_or(usize::MAX)
+            }
         }),
-        MAX_GLOBAL_GAP_PAIRS,
+        pair_budget,
     );
     pairs_within_budget
         && sum_within_limit(
             eligible.map(|(lanes, access)| {
-                let comparisons_per_access = (lanes.len() - 1).saturating_mul(2);
+                let comparisons_per_access = if lanes.len() <= MAX_GLOBAL_GAP_LANES {
+                    (lanes.len() - 1).saturating_mul(2)
+                } else {
+                    MAX_LARGE_GLOBAL_GAP_HOT_NETS
+                        .min(lanes.len())
+                        .saturating_mul(4)
+                };
                 access
                     .values()
                     .map(|net| net.vertical.len())
@@ -3047,7 +3136,7 @@ fn global_gap_candidate_work_within_budget(
                     })
                     .unwrap_or(usize::MAX)
             }),
-            MAX_GLOBAL_GAP_ACCESS_WORK,
+            access_budget,
         )
 }
 
@@ -3082,7 +3171,13 @@ fn global_gap_lane_indices_with_rounds(
     accesses: &BTreeMap<u32, GapNetAccess>,
     lane_rounds: usize,
     baseline: &BTreeMap<u32, usize>,
+    large_global_candidates: bool,
 ) -> Option<(BTreeMap<u32, usize>, usize)> {
+    if current.len() > MAX_GLOBAL_GAP_LANES {
+        return large_global_candidates
+            .then(|| large_gap_hot_insertion_order(accesses, baseline))
+            .flatten();
+    }
     let (mut global, mut costs) = global_gap_order_seed(current, accesses)?;
     refine_gap_lane_order(&mut global, accesses, lane_rounds, &mut costs);
     let mut baseline_order: Vec<_> = baseline.iter().map(|(&net, &lane)| (lane, net)).collect();
@@ -3102,6 +3197,98 @@ fn global_gap_lane_indices_with_rounds(
             .collect(),
         baseline_cost - global_cost,
     ))
+}
+
+fn large_gap_hot_insertion_order(
+    accesses: &BTreeMap<u32, GapNetAccess>,
+    baseline: &BTreeMap<u32, usize>,
+) -> Option<(BTreeMap<u32, usize>, usize)> {
+    if !(MAX_GLOBAL_GAP_LANES + 1..=MAX_LARGE_GLOBAL_GAP_LANES).contains(&baseline.len()) {
+        return None;
+    }
+    let mut ordered = baseline
+        .iter()
+        .map(|(&net, &lane)| (lane, net))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let mut ordered = ordered.into_iter().map(|(_, net)| net).collect::<Vec<_>>();
+    let mut hot = accesses
+        .iter()
+        .map(|(&net, access)| {
+            let vertical_span = access
+                .vertical
+                .iter()
+                .map(|&(low, high)| high - low)
+                .sum::<f64>();
+            (net, access.vertical.len(), vertical_span)
+        })
+        .collect::<Vec<_>>();
+    hot.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| right.2.total_cmp(&left.2))
+            .then(left.0.cmp(&right.0))
+    });
+    hot.truncate(MAX_LARGE_GLOBAL_GAP_HOT_NETS);
+
+    let mut costs = GapPairCosts::new();
+    let mut total_gain = 0usize;
+    for (hot_net, _, _) in hot {
+        let Some(current_index) = ordered.iter().position(|&net| net == hot_net) else {
+            continue;
+        };
+        ordered.remove(current_index);
+        let mut insertion_cost = ordered
+            .iter()
+            .map(|&other| {
+                *costs
+                    .entry((hot_net, other))
+                    .or_insert_with(|| gap_pair_crossings(&accesses[&hot_net], &accesses[&other]))
+            })
+            .fold(0usize, usize::saturating_add);
+        let mut best_index = 0usize;
+        let mut best_cost = insertion_cost;
+        let mut current_cost = if current_index == 0 {
+            insertion_cost
+        } else {
+            0
+        };
+        for (index, &other) in ordered.iter().enumerate() {
+            let hot_before = *costs
+                .entry((hot_net, other))
+                .or_insert_with(|| gap_pair_crossings(&accesses[&hot_net], &accesses[&other]));
+            let other_before = *costs
+                .entry((other, hot_net))
+                .or_insert_with(|| gap_pair_crossings(&accesses[&other], &accesses[&hot_net]));
+            insertion_cost = insertion_cost
+                .saturating_sub(hot_before)
+                .saturating_add(other_before);
+            if index + 1 == current_index {
+                current_cost = insertion_cost;
+            }
+            if insertion_cost < best_cost {
+                best_cost = insertion_cost;
+                best_index = index + 1;
+            }
+        }
+        if current_cost > best_cost {
+            total_gain = total_gain.saturating_add(current_cost - best_cost);
+            ordered.insert(best_index, hot_net);
+        } else {
+            ordered.insert(current_index, hot_net);
+        }
+    }
+    (total_gain > 0).then(|| {
+        (
+            ordered
+                .into_iter()
+                .enumerate()
+                .map(|(lane, net)| (net, lane))
+                .collect(),
+            total_gain,
+        )
+    })
 }
 
 fn global_gap_order_seed(
@@ -3966,6 +4153,7 @@ mod tests {
             &accesses,
             super::FULL_GAP_LANE_ROUNDS,
             &baseline,
+            false,
         )
         .expect("global seed escapes the strict adjacent plateau");
 
@@ -3992,6 +4180,7 @@ mod tests {
                 &tied,
                 super::FULL_GAP_LANE_ROUNDS,
                 &tied_order,
+                false,
             )
             .is_none(),
             "equal nonzero pair costs must retain the non-ID stable lane order"
@@ -4167,8 +4356,9 @@ mod tests {
         let indexed = validate_and_index(&graph, options).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
         let stable = route_planned_candidates(&plan, &geometry, options, false);
-        let routed =
-            route_planned_candidates_with_sparse_global(&plan, &geometry, options, false, true);
+        let routed = route_planned_candidates_with_sparse_global(
+            &plan, &geometry, options, false, true, false,
+        );
 
         assert_eq!(routed.primary, stable.primary);
         assert_eq!(routed.alternatives.len(), 1);
@@ -4184,8 +4374,9 @@ mod tests {
         permuted.edges.reverse();
         let indexed = validate_and_index(&permuted, options).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
-        let permuted =
-            route_planned_candidates_with_sparse_global(&plan, &geometry, options, false, true);
+        let permuted = route_planned_candidates_with_sparse_global(
+            &plan, &geometry, options, false, true, false,
+        );
         assert_eq!(permuted.primary, routed.primary);
         assert_eq!(permuted.alternatives, routed.alternatives);
     }
@@ -4209,7 +4400,7 @@ mod tests {
                 accesses.get_mut(&0).unwrap().vertical.push((0.0, 20.0));
                 accesses.get_mut(&1).unwrap().left_y.push(10.0);
             }
-            global_gap_lane_indices_with_rounds(&current, &accesses, 0, &current)
+            global_gap_lane_indices_with_rounds(&current, &accesses, 0, &current, false)
         };
         assert!(candidates(1).is_none());
         assert!(candidates(2).is_some());
@@ -4228,10 +4419,12 @@ mod tests {
         assert!(global_gap_candidate_work_within_budget(
             &vec![twenty_lanes.clone(); 172],
             &vec![twenty_accesses.clone(); 172],
+            false,
         ));
         assert!(!global_gap_candidate_work_within_budget(
             &vec![twenty_lanes; 173],
             &vec![twenty_accesses; 173],
+            false,
         ));
         let two_lanes = vec![BTreeMap::from([(0, 0), (1, 1)])];
         let access_budget = |vertical_count| {
@@ -4249,10 +4442,12 @@ mod tests {
         assert!(global_gap_candidate_work_within_budget(
             &two_lanes,
             &access_budget(250_000),
+            false,
         ));
         assert!(!global_gap_candidate_work_within_budget(
             &two_lanes,
             &access_budget(250_001),
+            false,
         ));
 
         assert_eq!(super::MIN_GLOBAL_GAP_ORDER_GAIN, 256);
@@ -4267,7 +4462,7 @@ mod tests {
             let indexed = validate_and_index(&graph, options).unwrap();
             let plan = RoutingPlan::new(&indexed, &ranks);
             route_edges_with_lane_rounds_and_global(
-                &plan, &geometry, options, 0, 0, false, false, true,
+                &plan, &geometry, options, 0, 0, false, false, true, false,
             )
             .alternatives
             .len()
@@ -4276,6 +4471,57 @@ mod tests {
         assert_eq!(route(256, 256 * 6), 1);
         assert_eq!(route(256, 2_000), 1);
         assert_eq!(route(256, 2_001), 0);
+    }
+
+    #[test]
+    fn large_gap_hot_insertion_is_bounded_and_deterministic() {
+        let count = 40u32;
+        let current = (0..count)
+            .enumerate()
+            .map(|(lane, net)| (net, lane))
+            .collect::<BTreeMap<_, _>>();
+        let hot = count - 1;
+        let accesses = (0..count)
+            .map(|net| {
+                let access = if net == hot {
+                    GapNetAccess {
+                        vertical: vec![(0.0, 1.0), (2.0, 3.0)],
+                        left_y: vec![100.0],
+                        right_y: vec![0.0],
+                    }
+                } else {
+                    GapNetAccess {
+                        vertical: vec![(50.0, 150.0)],
+                        ..GapNetAccess::default()
+                    }
+                };
+                (net, access)
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert!(
+            global_gap_lane_indices_with_rounds(&current, &accesses, 0, &current, false).is_none(),
+            "large-gap insertion requires the explicit large candidate gate"
+        );
+
+        let (candidate, gain) =
+            global_gap_lane_indices_with_rounds(&current, &accesses, 0, &current, true)
+                .expect("hot net should move across the large gap");
+        assert_eq!(candidate[&hot], 0);
+        assert_eq!(gain, (count - 1) as usize);
+
+        let mut lanes = candidate.values().copied().collect::<Vec<_>>();
+        lanes.sort_unstable();
+        assert_eq!(lanes, (0..count as usize).collect::<Vec<_>>());
+
+        let oversized = (0..=super::MAX_LARGE_GLOBAL_GAP_LANES as u32)
+            .enumerate()
+            .map(|(lane, net)| (net, lane))
+            .collect::<BTreeMap<_, _>>();
+        assert!(
+            global_gap_lane_indices_with_rounds(&oversized, &accesses, 0, &oversized, true)
+                .is_none()
+        );
     }
 
     #[test]
@@ -4294,8 +4540,9 @@ mod tests {
         };
         let indexed = validate_and_index(&graph, options).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
-        let routed =
-            route_planned_candidates_with_sparse_global(&plan, &geometry, options, false, true);
+        let routed = route_planned_candidates_with_sparse_global(
+            &plan, &geometry, options, false, true, false,
+        );
 
         assert!(routed.alternatives.is_empty());
     }

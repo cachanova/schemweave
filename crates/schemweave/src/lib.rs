@@ -182,13 +182,17 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         let candidate = placement::normalize(&mut nodes, &mut edges);
         retain_better_candidate(&mut best, quality, candidate);
     };
-    let mut evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool, sparse_global: bool| {
+    let mut evaluate = |nodes: Vec<NodeGeometry>,
+                        supplemental: bool,
+                        sparse_global: bool,
+                        large_sparse_global: bool| {
         let routed = routing::route_planned_candidates_with_sparse_global(
             &routing_plan,
             &nodes,
             options,
             supplemental,
             sparse_global,
+            large_sparse_global,
         );
         retain(nodes.clone(), routed.primary, routed.primary_quality);
         if let Some((repair_quality, repair)) = routed.repair {
@@ -202,17 +206,18 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
         false,
         false,
+        false,
     );
     let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
     let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
-    evaluate(ordinary_nodes, false, true);
+    evaluate(ordinary_nodes, false, true, false);
     if placement::preferred_alignment_can_be_significant(ordinary_alignment) {
         let preferred_nodes =
             placement::place_preferred_nodes(&indexed, &ranks, quality_layers, options);
         let preferred_alignment =
             placement::port_alignment_error(&indexed, &ranks, &preferred_nodes);
         if placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment) {
-            evaluate(preferred_nodes, true, false);
+            evaluate(preferred_nodes, true, false, false);
         }
     }
     if let Some(net_representative) = net_representative
@@ -221,7 +226,8 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         evaluate(
             placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
             false,
-            false,
+            true,
+            enable_large_sparse_global_candidate(graph.nodes.len()),
         );
     }
     if let Some(alternative_ranks) = latest_ranks {
@@ -254,6 +260,10 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         }
     }
     Ok(best.expect("layout has deterministic candidates").1)
+}
+
+fn enable_large_sparse_global_candidate(node_count: usize) -> bool {
+    (600..=1_000).contains(&node_count)
 }
 
 fn retain_better_candidate(
@@ -323,6 +333,14 @@ mod tests {
         )
     }
 
+    #[test]
+    fn large_sparse_global_candidate_is_admitted_only_for_medium_large_graphs() {
+        assert!(!super::enable_large_sparse_global_candidate(599));
+        assert!(super::enable_large_sparse_global_candidate(600));
+        assert!(super::enable_large_sparse_global_candidate(1_000));
+        assert!(!super::enable_large_sparse_global_candidate(1_001));
+    }
+
     fn sparse_global_layered_graph(
         layer_count: u32,
         source_stride: u32,
@@ -388,7 +406,7 @@ mod tests {
         let ordinary = placement::place_nodes(&indexed, &ranks, layers, options);
         let plan = routing::RoutingPlan::new(&indexed, &ranks);
         let routed = routing::route_planned_candidates_with_sparse_global(
-            &plan, &ordinary, options, false, true,
+            &plan, &ordinary, options, false, true, false,
         );
         (ordinary, routed)
     }
