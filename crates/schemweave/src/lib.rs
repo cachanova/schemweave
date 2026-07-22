@@ -384,6 +384,67 @@ mod tests {
         )
     }
 
+    fn browser_max_effort_graph() -> Graph {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..600)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 25.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 25.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut state = 10;
+        let mut endpoints = Vec::new();
+        for layer in 0..3u32 {
+            let source_start = layer * 50;
+            let target_start = (layer + 1) * 50;
+            for source in source_start..source_start + 50 {
+                for target in target_start..target_start + 50 {
+                    if next(&mut state) % 100 < 16 {
+                        endpoints.push((source, target, source));
+                    }
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target, net))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect();
+        Graph { nodes, edges }
+    }
+
     #[test]
     fn net_representative_sparse_global_is_admitted_only_for_medium_large_graphs() {
         assert_eq!(
@@ -1162,6 +1223,57 @@ mod tests {
             super::layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
             quality
         );
+        assert_eq!(
+            super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
+            max
+        );
+    }
+
+    #[test]
+    fn max_preserves_the_browser_corpus_refined_fallback() {
+        let graph = browser_max_effort_graph();
+        let options = LayoutOptions::default();
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let (ranks, _) = topology::rank_candidates(&indexed);
+        let (_, _, representative) =
+            topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
+        let nodes = placement::place_nodes(
+            &indexed,
+            &ranks,
+            &representative
+                .expect("browser fixture has a representative candidate")
+                .layers,
+            options,
+        );
+        let plan = routing::RoutingPlan::new(&indexed, &ranks);
+        let routed = routing::route_planned_candidates_with_refined_sparse_global(
+            &plan, &nodes, options, false, true, true, true,
+        );
+        assert_eq!(routed.primary_quality.unwrap().crossings, 22_065);
+        assert_eq!(
+            routed
+                .alternatives
+                .iter()
+                .map(|item| item.0.crossings)
+                .collect::<Vec<_>>(),
+            [22_315, 21_959, 22_044]
+        );
+        let quality =
+            super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+        let max = super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+
+        assert_eq!(
+            routing::route_quality(&indexed, &quality.edges).crossings,
+            22_065
+        );
+        assert_eq!(
+            routing::route_quality(&indexed, &max.edges).crossings,
+            21_959
+        );
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
         assert_eq!(
             super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
             max
