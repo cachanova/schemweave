@@ -19,8 +19,10 @@ const SUPPLEMENTAL_GAP_LANE_ROUNDS: usize = 8;
 const MIN_CROSSING_REPAIR_TOTAL: usize = 500;
 const MIN_CROSSING_REPAIR_NET: usize = 64;
 const MAX_CROSSING_REPAIR_EDGES: usize = 10_000;
+const MAX_CROSSING_REPAIR_NODES: usize = 2_000;
 const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
+const MAX_CROSSING_REPAIR_PATH_STATES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RouteQuality {
@@ -570,12 +572,22 @@ fn repair_crossing_heavy_net(
 ) -> (RouteQuality, Option<(RouteQuality, Vec<EdgeGeometry>)>) {
     if plan.edges.len() > MAX_CROSSING_REPAIR_EDGES
         || !sum_within_limit(
+            plan.nodes_by_rank.iter().map(Vec::len),
+            MAX_CROSSING_REPAIR_NODES,
+        )
+        || !sum_within_limit(
             routes.iter().map(|route| route.points.len()),
             MAX_CROSSING_REPAIR_ROUTE_POINTS,
         )
         || !sum_within_limit(
             gap_lanes.iter().map(BTreeMap::len),
             MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS,
+        )
+        || !sum_within_limit(
+            sparse_spans.iter().filter_map(|span| {
+                span.map(|(source_rank, target_rank)| target_rank - source_rank - 1)
+            }),
+            MAX_CROSSING_REPAIR_PATH_STATES,
         )
     {
         return (route_quality_for_plan(plan, routes), None);
