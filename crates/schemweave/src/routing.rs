@@ -125,8 +125,7 @@ pub(crate) fn route_edges(
         .map(|(lane, pair)| (pair, lane))
         .collect();
     let crossing_tie_lane_count = crossing_tie_lanes.len();
-    let outer_lanes = lane_indices(&outer_nets);
-    let outer_lane_count = outer_lanes.len();
+    let outer_lanes = outer_lane_assignments(graph, nodes, &sparse_spans, &outer_nets, top, bottom);
     let endpoint_tracks = endpoint_tracks(
         graph,
         nodes,
@@ -136,7 +135,6 @@ pub(crate) fn route_edges(
         &layer_right,
         &gap_lanes,
         &outer_lanes,
-        outer_lane_count,
         options,
     );
 
@@ -177,7 +175,7 @@ pub(crate) fn route_edges(
                 };
             }
 
-            let lane = outer_lanes[&edge.net];
+            let lane = outer_lanes[&edge.id];
             let source_stub = stub_point(source, source_port.side, options.port_stub);
             let target_stub = stub_point(target, target_port.side, options.port_stub);
             let source_escape_y = if matches!(source_port.side, PortSide::East | PortSide::West) {
@@ -195,8 +193,8 @@ pub(crate) fn route_edges(
                 source_node,
                 source_port.side,
                 ranks[source_index],
-                lane,
-                outer_lane_count,
+                lane.channel_index,
+                lane.channel_count,
                 &layer_left,
                 &layer_right,
                 options,
@@ -206,13 +204,18 @@ pub(crate) fn route_edges(
                 target_node,
                 target_port.side,
                 ranks[target_index],
-                lane,
-                outer_lane_count,
+                lane.channel_index,
+                lane.channel_count,
                 &layer_left,
                 &layer_right,
                 options,
             );
-            let lane_y = top - options.port_stub - (lane + 1) as f64 * options.route_lane_gap;
+            let lane_offset =
+                options.port_stub + (lane.side_index + 1) as f64 * options.route_lane_gap;
+            let lane_y = match lane.side {
+                OuterSide::Top => top - lane_offset,
+                OuterSide::Bottom => bottom + lane_offset,
+            };
             let mut points = Vec::with_capacity(8);
             push_point(&mut points, source);
             push_point(&mut points, source_stub);
@@ -276,6 +279,79 @@ fn lane_indices(nets: &BTreeSet<u32>) -> BTreeMap<u32, usize> {
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OuterSide {
+    Top,
+    Bottom,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OuterLane {
+    side: OuterSide,
+    side_index: usize,
+    channel_index: usize,
+    channel_count: usize,
+}
+
+fn outer_lane_assignments(
+    graph: &IndexedGraph<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    outer_nets: &BTreeSet<u32>,
+    top: f64,
+    bottom: f64,
+) -> BTreeMap<u32, OuterLane> {
+    let mut top_nets = BTreeSet::new();
+    let mut bottom_nets = BTreeSet::new();
+    let mut edge_sides = BTreeMap::new();
+    for (edge, span) in graph.edges.iter().zip(sparse_spans) {
+        if span.is_some() {
+            continue;
+        }
+        let mut cost = (0.0, 0.0);
+        for endpoint in [edge.source, edge.target] {
+            let node_index = graph.node_index[&endpoint.node];
+            let point = port_point(&nodes[node_index], graph.ports[node_index][&endpoint.port]);
+            cost.0 += point.y - top;
+            cost.1 += bottom - point.y;
+        }
+        let side = if cost.1 < cost.0 {
+            bottom_nets.insert(edge.net);
+            OuterSide::Bottom
+        } else {
+            top_nets.insert(edge.net);
+            OuterSide::Top
+        };
+        edge_sides.insert(edge.id, side);
+    }
+
+    let mut assignments = BTreeMap::new();
+    let channel_lanes = lane_indices(outer_nets);
+    let channel_count = channel_lanes.len();
+    let top_lanes = lane_indices(&top_nets);
+    let bottom_lanes = lane_indices(&bottom_nets);
+    for (edge, span) in graph.edges.iter().zip(sparse_spans) {
+        if span.is_some() {
+            continue;
+        }
+        let side = edge_sides[&edge.id];
+        let side_index = match side {
+            OuterSide::Top => top_lanes[&edge.net],
+            OuterSide::Bottom => bottom_lanes[&edge.net],
+        };
+        assignments.insert(
+            edge.id,
+            OuterLane {
+                side,
+                side_index,
+                channel_index: channel_lanes[&edge.net],
+                channel_count,
+            },
+        );
+    }
+    assignments
+}
+
 fn preferred_lane_indices(mut preferences: BTreeMap<u32, Vec<f64>>) -> BTreeMap<u32, usize> {
     let mut ordered = Vec::with_capacity(preferences.len());
     for (net, values) in &mut preferences {
@@ -325,8 +401,7 @@ fn endpoint_tracks(
     layer_left: &[f64],
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<u32, usize>],
-    outer_lanes: &BTreeMap<u32, usize>,
-    outer_lane_count: usize,
+    outer_lanes: &BTreeMap<u32, OuterLane>,
     options: LayoutOptions,
 ) -> BTreeMap<(u32, u32, u8), (usize, usize)> {
     let mut accesses = BTreeMap::<(u32, u32, u8), EndpointAccess>::new();
@@ -354,15 +429,15 @@ fn endpoint_tracks(
                     ),
                 )
             } else {
-                let lane = outer_lanes[&edge.net];
+                let lane = outer_lanes[&edge.id];
                 (
                     channel_point(
                         source_stub,
                         source_node,
                         source_port.side,
                         ranks[source_index],
-                        lane,
-                        outer_lane_count,
+                        lane.channel_index,
+                        lane.channel_count,
                         layer_left,
                         layer_right,
                         options,
@@ -373,8 +448,8 @@ fn endpoint_tracks(
                         target_node,
                         target_port.side,
                         ranks[target_index],
-                        lane,
-                        outer_lane_count,
+                        lane.channel_index,
+                        lane.channel_count,
                         layer_left,
                         layer_right,
                         options,
@@ -834,7 +909,92 @@ fn push_point(points: &mut Vec<Point>, point: Point) {
 
 #[cfg(test)]
 mod tests {
-    use super::{crossing_track_y, distance_transform, shortest_crossing_path};
+    use std::collections::BTreeSet;
+
+    use crate::{
+        Edge, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Port, PortSide,
+        validation::validate_and_index,
+    };
+
+    use super::{
+        OuterSide, crossing_track_y, distance_transform, outer_lane_assignments,
+        shortest_crossing_path,
+    };
+
+    #[test]
+    fn multi_terminal_outer_net_can_branch_above_and_below() {
+        let node = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: if id == 1 {
+                    PortSide::East
+                } else {
+                    PortSide::West
+                },
+                offset: 10.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![node(1), node(2), node(3)],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let geometry = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 50.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 100.0,
+                y: 100.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+
+        let lanes = outer_lane_assignments(
+            &indexed,
+            &geometry,
+            &[None, None],
+            &BTreeSet::from([7]),
+            0.0,
+            120.0,
+        );
+
+        assert_eq!(lanes[&10].side, OuterSide::Top);
+        assert_eq!(lanes[&11].side, OuterSide::Bottom);
+        assert_eq!(lanes[&10].channel_index, lanes[&11].channel_index);
+    }
 
     #[test]
     fn crossing_tie_breaker_separates_coincident_tracks() {
