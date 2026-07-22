@@ -132,7 +132,7 @@ fn preferred_edges(graph: &IndexedGraph<'_>, ranks: &[usize]) -> Vec<bool> {
         let target = graph.node_index[&edge.target.node];
         let source_port = graph.ports[source][&edge.source.port];
         let target_port = graph.ports[target][&edge.target.port];
-        if ranks[target] == ranks[source] + 1
+        if ranks[source].checked_add(1) == Some(ranks[target])
             && source_port.side == PortSide::East
             && target_port.side == PortSide::West
         {
@@ -141,12 +141,16 @@ fn preferred_edges(graph: &IndexedGraph<'_>, ranks: &[usize]) -> Vec<bool> {
             incoming_degree[target] = incoming_degree[target].saturating_add(1);
         }
     }
-    qualifying.sort_unstable_by_key(|&(_, source, target)| {
+    qualifying.sort_unstable_by_key(|&(edge_index, source, target)| {
+        let edge = graph.edges[edge_index];
         (
             outgoing_degree[source].saturating_mul(incoming_degree[target]),
             outgoing_degree[source].saturating_add(incoming_degree[target]),
             graph.nodes[source].id,
             graph.nodes[target].id,
+            edge.id,
+            edge.source.port,
+            edge.target.port,
         )
     });
     let mut edges = vec![false; graph.edges.len()];
@@ -237,7 +241,7 @@ pub(crate) fn port_alignment_error(
         let target = graph.node_index[&edge.target.node];
         let source_port = graph.ports[source][&edge.source.port];
         let target_port = graph.ports[target][&edge.target.port];
-        if ranks[target] == ranks[source] + 1
+        if ranks[source].checked_add(1) == Some(ranks[target])
             && source_port.side == PortSide::East
             && target_port.side == PortSide::West
         {
@@ -250,7 +254,11 @@ pub(crate) fn port_alignment_error(
 
 pub(crate) fn preferred_alignment_is_significant(ordinary: f64, preferred: f64) -> bool {
     ordinary - preferred >= MIN_PREFERRED_ALIGNMENT_IMPROVEMENT
-        && preferred * 20.0 <= ordinary * 19.0
+        && preferred * 50.0 <= ordinary * 47.0
+}
+
+pub(crate) fn preferred_alignment_can_be_significant(ordinary: f64) -> bool {
+    ordinary * 3.0 >= MIN_PREFERRED_ALIGNMENT_IMPROVEMENT * 50.0
 }
 
 fn align_layer(
@@ -382,8 +390,8 @@ pub fn place(
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, align_layer, isotonic_projection, preferred_alignment_is_significant,
-        preferred_edges,
+        Alignment, align_layer, isotonic_projection, preferred_alignment_can_be_significant,
+        preferred_alignment_is_significant, preferred_edges,
     };
     use crate::{
         Edge, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Port, PortSide, place,
@@ -392,13 +400,19 @@ mod tests {
 
     #[test]
     fn preferred_alignment_gate_requires_absolute_and_relative_value() {
-        assert!(!preferred_alignment_is_significant(
-            2_000_000.0,
-            1_900_001.0
-        ));
-        assert!(preferred_alignment_is_significant(2_000_000.0, 1_900_000.0));
+        assert!(!preferred_alignment_can_be_significant(1_666_666.0));
+        assert!(preferred_alignment_can_be_significant(1_666_667.0));
         assert!(!preferred_alignment_is_significant(1_000_000.0, 900_001.0));
         assert!(preferred_alignment_is_significant(1_000_000.0, 900_000.0));
+        assert!(!preferred_alignment_is_significant(
+            2_000_000.0,
+            1_880_001.0
+        ));
+        assert!(preferred_alignment_is_significant(2_000_000.0, 1_880_000.0));
+        assert!(!preferred_alignment_is_significant(
+            3_000_000.0,
+            2_900_000.0
+        ));
         assert!(!preferred_alignment_is_significant(100_000.0, 110_000.0));
     }
 
@@ -454,6 +468,146 @@ mod tests {
 
         assert_eq!(selected(&graph), vec![10, 20]);
         assert_eq!(selected(&permuted), vec![10, 20]);
+    }
+
+    #[test]
+    fn preferred_edge_matching_has_explicit_eligibility_boundaries() {
+        let node = |id| Node {
+            id,
+            width: 40.0,
+            height: 40.0,
+            cycle_breaker: false,
+            ports: vec![
+                Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 10.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::East,
+                    offset: 10.0,
+                },
+                Port {
+                    id: 2,
+                    side: PortSide::North,
+                    offset: 10.0,
+                },
+                Port {
+                    id: 3,
+                    side: PortSide::South,
+                    offset: 10.0,
+                },
+            ],
+        };
+        let edge = |id, source, source_port, target, target_port, participates_in_ranking| Edge {
+            id,
+            source: Endpoint {
+                node: source,
+                port: source_port,
+            },
+            target: Endpoint {
+                node: target,
+                port: target_port,
+            },
+            net: id,
+            participates_in_ranking,
+        };
+        let graph = Graph {
+            nodes: (0..10).map(node).collect(),
+            edges: vec![
+                edge(10, 0, 1, 1, 0, true),
+                edge(20, 2, 1, 3, 0, true),
+                edge(30, 4, 1, 5, 0, true),
+                edge(40, 7, 1, 6, 0, false),
+                edge(50, 8, 2, 9, 3, true),
+                edge(60, 6, 1, 7, 0, false),
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        // Eligible, long-span, same-rank, backward, wrong-side, and non-ranking adjacent.
+        let ranks = [0, 1, 0, 2, 0, 0, 0, 1, 0, 1];
+        let selected = preferred_edges(&indexed, &ranks)
+            .into_iter()
+            .zip(&indexed.edges)
+            .filter_map(|(preferred, edge)| preferred.then_some(edge.id))
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected, vec![10, 60]);
+    }
+
+    #[test]
+    fn preferred_edge_matching_ties_parallel_edges_by_stable_identity() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 0,
+                    width: 40.0,
+                    height: 40.0,
+                    cycle_breaker: false,
+                    ports: vec![
+                        Port {
+                            id: 1,
+                            side: PortSide::East,
+                            offset: 10.0,
+                        },
+                        Port {
+                            id: 3,
+                            side: PortSide::East,
+                            offset: 30.0,
+                        },
+                    ],
+                },
+                Node {
+                    id: 1,
+                    width: 40.0,
+                    height: 40.0,
+                    cycle_breaker: false,
+                    ports: vec![
+                        Port {
+                            id: 0,
+                            side: PortSide::West,
+                            offset: 10.0,
+                        },
+                        Port {
+                            id: 2,
+                            side: PortSide::West,
+                            offset: 30.0,
+                        },
+                    ],
+                },
+            ],
+            edges: vec![
+                Edge {
+                    id: 20,
+                    source: Endpoint { node: 0, port: 1 },
+                    target: Endpoint { node: 1, port: 0 },
+                    net: 20,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 0, port: 3 },
+                    target: Endpoint { node: 1, port: 2 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let selected = |graph: &Graph| {
+            let indexed = validate_and_index(graph, LayoutOptions::default()).unwrap();
+            preferred_edges(&indexed, &[0, 1])
+                .into_iter()
+                .zip(&indexed.edges)
+                .filter_map(|(preferred, edge)| preferred.then_some(edge.id))
+                .collect::<Vec<_>>()
+        };
+        let mut permuted = graph.clone();
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+
+        assert_eq!(selected(&graph), vec![10]);
+        assert_eq!(selected(&permuted), vec![10]);
     }
 
     #[test]

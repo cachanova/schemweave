@@ -174,37 +174,39 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     };
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    let mut evaluate = |mut nodes: Vec<NodeGeometry>| {
-        let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
+    let mut evaluate = |mut nodes: Vec<NodeGeometry>, supplemental: bool| {
+        let mut edges = if supplemental {
+            routing::route_supplemental_edges(&indexed, &nodes, &ranks, options)
+        } else {
+            routing::route_edges(&indexed, &nodes, &ranks, options)
+        };
         let quality = routing::route_quality(&indexed, &edges);
         let candidate = placement::normalize(&mut nodes, &mut edges);
         retain_better_candidate(&mut best, quality, candidate);
     };
-    evaluate(placement::place_baseline_nodes(
-        &indexed,
-        &ranks,
-        &forward.layers,
-        options,
-    ));
+    evaluate(
+        placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
+        false,
+    );
     let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
-    let preferred_nodes =
-        placement::place_preferred_nodes(&indexed, &ranks, quality_layers, options);
     let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
-    let preferred_alignment = placement::port_alignment_error(&indexed, &ranks, &preferred_nodes);
-    if placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment) {
-        evaluate(preferred_nodes);
-    } else {
-        evaluate(ordinary_nodes);
+    evaluate(ordinary_nodes, false);
+    if placement::preferred_alignment_can_be_significant(ordinary_alignment) {
+        let preferred_nodes =
+            placement::place_preferred_nodes(&indexed, &ranks, quality_layers, options);
+        let preferred_alignment =
+            placement::port_alignment_error(&indexed, &ranks, &preferred_nodes);
+        if placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment) {
+            evaluate(preferred_nodes, true);
+        }
     }
     if let Some(net_representative) = net_representative
         && net_representative.layers != *quality_layers
     {
-        evaluate(placement::place_nodes(
-            &indexed,
-            &ranks,
-            &net_representative.layers,
-            options,
-        ));
+        evaluate(
+            placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
+            false,
+        );
     }
     if let Some(alternative_ranks) = latest_ranks {
         let (forward, reverse, _) = topology::order_layer_candidates(
@@ -500,7 +502,7 @@ mod tests {
             .map(|id| Node {
                 id,
                 width: 80.0,
-                height: 2_000.0,
+                height: 4_000.0,
                 cycle_breaker: false,
                 ports: vec![
                     Port {
@@ -511,12 +513,12 @@ mod tests {
                     Port {
                         id: 1,
                         side: PortSide::East,
-                        offset: 1_000.0,
+                        offset: 2_000.0,
                     },
                     Port {
                         id: 2,
                         side: PortSide::West,
-                        offset: 2_000.0,
+                        offset: 4_000.0,
                     },
                 ],
             })
@@ -568,19 +570,25 @@ mod tests {
         let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
         let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
         let preferred = placement::place_preferred_nodes(&indexed, &ranks, &layers, options);
-        assert!(placement::preferred_alignment_is_significant(
-            placement::port_alignment_error(&indexed, &ranks, &ordinary),
-            placement::port_alignment_error(&indexed, &ranks, &preferred),
-        ));
-        let evaluate = |nodes: Vec<NodeGeometry>| {
-            let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
+        let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary);
+        let preferred_alignment = placement::port_alignment_error(&indexed, &ranks, &preferred);
+        assert!(
+            placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment,),
+            "ordinary={ordinary_alignment} preferred={preferred_alignment}"
+        );
+        let evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool| {
+            let mut edges = if supplemental {
+                routing::route_supplemental_edges(&indexed, &nodes, &ranks, options)
+            } else {
+                routing::route_edges(&indexed, &nodes, &ranks, options)
+            };
             let quality = routing::route_quality(&indexed, &edges);
             let mut nodes = nodes;
             let layout = placement::normalize(&mut nodes, &mut edges);
             (quality, layout)
         };
-        let ordinary = evaluate(ordinary);
-        let preferred = evaluate(preferred);
+        let ordinary = evaluate(ordinary, false);
+        let preferred = evaluate(preferred, true);
         assert!(candidate_quality_cmp(preferred.0, &preferred.1, ordinary.0, &ordinary.1).is_lt());
 
         let selected = layout(&graph, options).unwrap();
