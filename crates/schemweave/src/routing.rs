@@ -96,6 +96,8 @@ struct CrossingRepair {
     #[cfg(test)]
     selected_nets: Vec<NetId>,
     #[cfg(test)]
+    candidate_lanes_built: bool,
+    #[cfg(test)]
     candidate_emitted: bool,
 }
 
@@ -1214,6 +1216,8 @@ fn repair_crossing_heavy_net(
             #[cfg(test)]
             selected_nets: Vec::new(),
             #[cfg(test)]
+            candidate_lanes_built: false,
+            #[cfg(test)]
             candidate_emitted: false,
         };
     }
@@ -1223,12 +1227,21 @@ fn repair_crossing_heavy_net(
     // candidate count, regeneration work, and exact scoring work remain unchanged.
     let selected_nets = select_crossing_repair_nets(quality.crossings, &crossing_counts, gap_lanes);
     #[cfg(test)]
+    let mut candidate_lanes_built = false;
+    #[cfg(test)]
     let mut candidate_emitted = false;
     let repair = (|| {
+        if selected_nets.is_empty() {
+            return None;
+        }
         if !candidate_route_points_within_budget(sparse_spans) {
             return None;
         }
         let candidate_lanes = move_nets_to_outer_lanes(gap_lanes, &selected_nets)?;
+        #[cfg(test)]
+        {
+            candidate_lanes_built = true;
+        }
         let endpoint_tracks = build_endpoint_tracks(
             plan,
             nodes,
@@ -1283,6 +1296,8 @@ fn repair_crossing_heavy_net(
         candidate: repair,
         #[cfg(test)]
         selected_nets,
+        #[cfg(test)]
+        candidate_lanes_built,
         #[cfg(test)]
         candidate_emitted,
     }
@@ -1378,6 +1393,9 @@ fn move_nets_to_outer_lanes(
     gap_lanes: &[BTreeMap<NetId, usize>],
     nets: &[NetId],
 ) -> Option<Vec<BTreeMap<NetId, usize>>> {
+    if nets.is_empty() {
+        return None;
+    }
     let mut changed = false;
     let result = gap_lanes
         .iter()
@@ -2925,6 +2943,7 @@ mod tests {
             assert_eq!(lanes, (0..after.len()).collect::<Vec<_>>());
         }
         assert!(move_nets_to_outer_lanes(&moved, &[2, 1]).is_none());
+        assert!(move_nets_to_outer_lanes(&current, &[]).is_none());
         assert_eq!(
             move_nets_to_outer_lanes(&current, &[2]).unwrap()[0],
             BTreeMap::from([(1, 0), (2, 2), (3, 1)])
@@ -3246,7 +3265,31 @@ mod tests {
         );
         assert_eq!(bounded.selected_nets, vec![17, 12]);
         assert!(bounded.candidate.is_none());
+        assert!(!bounded.candidate_lanes_built);
         assert!(!bounded.candidate_emitted);
+
+        let no_selection = repair_crossing_heavy_net(
+            &plan,
+            &nodes,
+            &oversized_spans,
+            &[],
+            &BTreeMap::new(),
+            0,
+            &oversized_free,
+            &[],
+            &[],
+            &synthetic_lanes,
+            &BTreeMap::new(),
+            0.0,
+            0.0,
+            LayoutOptions::default(),
+            &routed.primary,
+            Some((BTreeMap::new(), baseline)),
+        );
+        assert!(no_selection.selected_nets.is_empty());
+        assert!(no_selection.candidate.is_none());
+        assert!(!no_selection.candidate_lanes_built);
+        assert!(!no_selection.candidate_emitted);
 
         let mut permuted_graph = graph.clone();
         permuted_graph.nodes.reverse();
