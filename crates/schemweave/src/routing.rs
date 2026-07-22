@@ -125,7 +125,18 @@ pub(crate) fn route_edges(
         .map(|(lane, pair)| (pair, lane))
         .collect();
     let crossing_tie_lane_count = crossing_tie_lanes.len();
-    let outer_lanes = outer_lane_assignments(graph, nodes, &sparse_spans, &outer_nets, top, bottom);
+    let outer_lanes = outer_lane_assignments(
+        graph,
+        nodes,
+        ranks,
+        &sparse_spans,
+        &outer_nets,
+        &layer_left,
+        &layer_right,
+        top,
+        bottom,
+        options,
+    );
     let endpoint_tracks = endpoint_tracks(
         graph,
         nodes,
@@ -293,13 +304,24 @@ struct OuterLane {
     channel_count: usize,
 }
 
+#[derive(Default)]
+struct OuterNetAccess {
+    horizontal: Vec<(f64, f64)>,
+    vertical_x: Vec<f64>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn outer_lane_assignments(
     graph: &IndexedGraph<'_>,
     nodes: &[NodeGeometry],
+    ranks: &[usize],
     sparse_spans: &[Option<(usize, usize)>],
     outer_nets: &BTreeSet<u32>,
+    layer_left: &[f64],
+    layer_right: &[f64],
     top: f64,
     bottom: f64,
+    options: LayoutOptions,
 ) -> BTreeMap<u32, OuterLane> {
     let mut top_nets = BTreeSet::new();
     let mut bottom_nets = BTreeSet::new();
@@ -328,8 +350,68 @@ fn outer_lane_assignments(
     let mut assignments = BTreeMap::new();
     let channel_lanes = lane_indices(outer_nets);
     let channel_count = channel_lanes.len();
-    let top_lanes = lane_indices(&top_nets);
-    let bottom_lanes = lane_indices(&bottom_nets);
+    let mut top_access = BTreeMap::<u32, OuterNetAccess>::new();
+    let mut bottom_access = BTreeMap::<u32, OuterNetAccess>::new();
+    for (edge, span) in graph.edges.iter().zip(sparse_spans) {
+        if span.is_some() {
+            continue;
+        }
+        let source_index = graph.node_index[&edge.source.node];
+        let target_index = graph.node_index[&edge.target.node];
+        let source_node = &nodes[source_index];
+        let target_node = &nodes[target_index];
+        let source_port = graph.ports[source_index][&edge.source.port];
+        let target_port = graph.ports[target_index][&edge.target.port];
+        let source_stub = stub_point(
+            port_point(source_node, source_port),
+            source_port.side,
+            options.port_stub,
+        );
+        let target_stub = stub_point(
+            port_point(target_node, target_port),
+            target_port.side,
+            options.port_stub,
+        );
+        let channel_index = channel_lanes[&edge.net];
+        let source_x = channel_point(
+            source_stub,
+            source_node,
+            source_port.side,
+            ranks[source_index],
+            channel_index,
+            channel_count,
+            layer_left,
+            layer_right,
+            options,
+        )
+        .x;
+        let target_x = channel_point(
+            target_stub,
+            target_node,
+            target_port.side,
+            ranks[target_index],
+            channel_index,
+            channel_count,
+            layer_left,
+            layer_right,
+            options,
+        )
+        .x;
+        let access_by_net = match edge_sides[&edge.id] {
+            OuterSide::Top => &mut top_access,
+            OuterSide::Bottom => &mut bottom_access,
+        };
+        let access = access_by_net.entry(edge.net).or_default();
+        access
+            .horizontal
+            .push((source_x.min(target_x), source_x.max(target_x)));
+        access.vertical_x.extend([source_x, target_x]);
+    }
+    for access in top_access.values_mut().chain(bottom_access.values_mut()) {
+        access.vertical_x.sort_by(f64::total_cmp);
+    }
+    let top_lanes = crossing_aware_lane_indices(&top_nets, &top_access);
+    let bottom_lanes = crossing_aware_lane_indices(&bottom_nets, &bottom_access);
     for (edge, span) in graph.edges.iter().zip(sparse_spans) {
         if span.is_some() {
             continue;
@@ -350,6 +432,51 @@ fn outer_lane_assignments(
         );
     }
     assignments
+}
+
+fn crossing_aware_lane_indices(
+    nets: &BTreeSet<u32>,
+    accesses: &BTreeMap<u32, OuterNetAccess>,
+) -> BTreeMap<u32, usize> {
+    let mut ordered: Vec<_> = nets.iter().copied().collect();
+    let mut costs = BTreeMap::new();
+    for _ in 0..16 {
+        let mut changed = false;
+        for index in 0..ordered.len().saturating_sub(1) {
+            let inner = ordered[index];
+            let outer = ordered[index + 1];
+            let current = *costs
+                .entry((inner, outer))
+                .or_insert_with(|| outer_pair_crossings(&accesses[&inner], &accesses[&outer]));
+            let swapped = *costs
+                .entry((outer, inner))
+                .or_insert_with(|| outer_pair_crossings(&accesses[&outer], &accesses[&inner]));
+            if swapped < current {
+                ordered.swap(index, index + 1);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, net)| (net, index))
+        .collect()
+}
+
+fn outer_pair_crossings(inner: &OuterNetAccess, outer: &OuterNetAccess) -> usize {
+    inner
+        .horizontal
+        .iter()
+        .map(|&(low, high)| {
+            let start = outer.vertical_x.partition_point(|&x| x <= low);
+            let end = outer.vertical_x.partition_point(|&x| x < high);
+            end - start
+        })
+        .sum()
 }
 
 fn preferred_lane_indices(mut preferences: BTreeMap<u32, Vec<f64>>) -> BTreeMap<u32, usize> {
@@ -909,7 +1036,7 @@ fn push_point(points: &mut Vec<Point>, point: Point) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use crate::{
         Edge, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Port, PortSide,
@@ -917,9 +1044,35 @@ mod tests {
     };
 
     use super::{
-        OuterSide, crossing_track_y, distance_transform, outer_lane_assignments,
-        shortest_crossing_path,
+        OuterNetAccess, OuterSide, crossing_aware_lane_indices, crossing_track_y,
+        distance_transform, outer_lane_assignments, shortest_crossing_path,
     };
+
+    #[test]
+    fn outer_lane_transpose_uses_predicted_crossing_cost() {
+        let nets = BTreeSet::from([1, 2]);
+        let accesses = BTreeMap::from([
+            (
+                1,
+                OuterNetAccess {
+                    horizontal: vec![(0.0, 10.0)],
+                    vertical_x: vec![20.0],
+                },
+            ),
+            (
+                2,
+                OuterNetAccess {
+                    horizontal: vec![(20.0, 30.0)],
+                    vertical_x: vec![5.0],
+                },
+            ),
+        ]);
+
+        let lanes = crossing_aware_lane_indices(&nets, &accesses);
+
+        assert_eq!(lanes[&2], 0);
+        assert_eq!(lanes[&1], 1);
+    }
 
     #[test]
     fn multi_terminal_outer_net_can_branch_above_and_below() {
@@ -985,10 +1138,14 @@ mod tests {
         let lanes = outer_lane_assignments(
             &indexed,
             &geometry,
+            &[0, 1, 1],
             &[None, None],
             &BTreeSet::from([7]),
+            &[0.0, 100.0],
+            &[20.0, 120.0],
             0.0,
             120.0,
+            LayoutOptions::default(),
         );
 
         assert_eq!(lanes[&10].side, OuterSide::Top);
