@@ -26,8 +26,8 @@ const MAX_LARGE_GLOBAL_GAP_LANES: usize = 705;
 const MAX_LARGE_GLOBAL_GAP_HOT_NETS: usize = 32;
 // Keep the production one-pass candidate as an exact fallback, then admit one deeper family.
 // The public comparator exact-scores both, so proxy improvement cannot regress canonical quality.
-const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS: usize = 64;
-const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS: usize = 2;
+const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS: usize = 256;
+const MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS: usize = 5;
 const MIN_GLOBAL_GAP_ORDER_GAIN: usize = 256;
 // Aggregate caps bound the pair table and vertical-access comparisons across every eligible gap;
 // both measured 2,000-node winners remain below these limits.
@@ -36,7 +36,7 @@ const MAX_GLOBAL_GAP_ACCESS_WORK: usize = 500_000;
 const MAX_LARGE_GLOBAL_GAP_PAIRS: usize = 262_144;
 const MAX_LARGE_GLOBAL_GAP_ACCESS_WORK: usize = 2_000_000;
 // Admit exactly two maximum-size refined gaps after charging directional precompute plus every
-// linear locate/remove/gather/fold/walk/insert pass in both rounds.
+// linear locate/remove/gather/fold/walk/insert pass in every configured round.
 const MAX_REFINED_LARGE_GLOBAL_GAP_LANE_WORK: usize = MAX_LARGE_GLOBAL_GAP_LANES
     * MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS
     * (2 + MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS * 6)
@@ -4974,7 +4974,9 @@ mod tests {
         assert_eq!(super::MAX_LARGE_GLOBAL_GAP_LANES, 705);
         assert_eq!(super::MAX_LARGE_GLOBAL_GAP_PAIRS, 262_144);
         assert_eq!(super::MAX_LARGE_GLOBAL_GAP_ACCESS_WORK, 2_000_000);
-        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_LANE_WORK, 1_263_360);
+        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS, 256);
+        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_HOT_ROUNDS, 5);
+        assert_eq!(super::MAX_REFINED_LARGE_GLOBAL_GAP_LANE_WORK, 11_550_720);
         let lanes = |count: u32| {
             (0..count)
                 .enumerate()
