@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
     EdgeGeometry, LayoutOptions, NodeGeometry, Point, Port, PortSide, validation::IndexedGraph,
@@ -7,6 +7,7 @@ use crate::{
 const MAX_SPARSE_NET_EDGES: usize = 300;
 const CROSSING_TRACK_NUDGE: f64 = 1e-4;
 const CROSSING_ALIGNMENT_WEIGHT: f64 = 4.0;
+const MIN_ROUTE_SEGMENT: f64 = 1e-7;
 
 pub(crate) fn route_edges(
     graph: &IndexedGraph<'_>,
@@ -57,8 +58,8 @@ pub(crate) fn route_edges(
             (source_port.side == PortSide::East
                 && target_port.side == PortSide::West
                 && source_rank < target_rank
-                // Large multi-terminal nets are better represented by the shared outer trunk
-                // until sparse routing grows a native tree rather than duplicating point paths.
+                // Extremely large nets are cheaper as one outer trunk; their sparse tree does
+                // not improve quality enough to pay for per-layer corridor construction.
                 && net_edge_counts[&edge.net] <= MAX_SPARSE_NET_EDGES
                 && (source_rank + 1..target_rank).all(|rank| !free_by_rank[rank].is_empty()))
             .then_some((source_rank, target_rank))
@@ -152,6 +153,7 @@ pub(crate) fn route_edges(
         graph,
         nodes,
         &sparse_spans,
+        &net_edge_counts,
         &crossing_lanes,
         &crossing_tie_lanes,
         crossing_tie_lane_count,
@@ -724,6 +726,7 @@ fn sparse_crossing_paths(
     graph: &IndexedGraph<'_>,
     nodes: &[NodeGeometry],
     sparse_spans: &[Option<(usize, usize)>],
+    net_edge_counts: &BTreeMap<u32, usize>,
     crossing_lanes: &[BTreeMap<u32, usize>],
     crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
     crossing_tie_lane_count: usize,
@@ -731,12 +734,90 @@ fn sparse_crossing_paths(
     endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
     port_stub: f64,
 ) -> Vec<Option<Vec<f64>>> {
+    // A single-driver net uses one obstacle-safe backbone; each sink route receives the prefix
+    // that reaches its rank and branches only in the final gap.
+    let mut edges_by_net = HashMap::<u32, Vec<usize>>::new();
+    for (edge_index, edge) in graph.edges.iter().enumerate() {
+        if net_edge_counts[&edge.net] > 1 {
+            edges_by_net.entry(edge.net).or_default().push(edge_index);
+        }
+    }
+    let mut shared_paths = HashMap::<u32, (usize, Vec<f64>)>::new();
+    for (net, edge_indices) in edges_by_net {
+        if edge_indices.len() < 2
+            || edge_indices
+                .iter()
+                .any(|&edge_index| sparse_spans[edge_index].is_none())
+        {
+            continue;
+        }
+        let first_edge = graph.edges[edge_indices[0]];
+        if edge_indices
+            .iter()
+            .any(|&edge_index| graph.edges[edge_index].source != first_edge.source)
+        {
+            continue;
+        }
+        let (source_rank, max_target_rank) = edge_indices
+            .iter()
+            .map(|&edge_index| sparse_spans[edge_index].expect("all spans are sparse"))
+            .fold(
+                (usize::MAX, 0),
+                |(min_source, max_target), (source, target)| {
+                    (min_source.min(source), max_target.max(target))
+                },
+            );
+        if max_target_rank <= source_rank + 1 {
+            continue;
+        }
+        let source_index = graph.node_index[&first_edge.source.node];
+        let source = port_point(
+            &nodes[source_index],
+            graph.ports[source_index][&first_edge.source.port],
+        );
+        let source_y = endpoint_escape_y(source, first_edge.source, 0, endpoint_tracks, port_stub);
+        let mut target_ys = edge_indices
+            .iter()
+            .map(|&edge_index| {
+                let edge = graph.edges[edge_index];
+                let target_index = graph.node_index[&edge.target.node];
+                let target = port_point(
+                    &nodes[target_index],
+                    graph.ports[target_index][&edge.target.port],
+                );
+                endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub)
+            })
+            .collect::<Vec<_>>();
+        target_ys.sort_by(f64::total_cmp);
+        let target_y = target_ys[target_ys.len() / 2];
+        let path = shortest_crossing_path(
+            &free_by_rank[source_rank + 1..max_target_rank],
+            source_y,
+            target_y,
+            &(source_rank + 1..max_target_rank)
+                .map(|rank| crossing_lanes[rank][&net])
+                .collect::<Vec<_>>(),
+            &(source_rank + 1..max_target_rank)
+                .map(|rank| crossing_lanes[rank].len())
+                .collect::<Vec<_>>(),
+            &(source_rank + 1..max_target_rank)
+                .map(|rank| crossing_tie_lanes[&(rank, net)])
+                .collect::<Vec<_>>(),
+            crossing_tie_lane_count,
+        );
+        shared_paths.insert(net, (source_rank, path));
+    }
+
     graph
         .edges
         .iter()
         .zip(sparse_spans)
         .map(|(edge, span)| {
             let &(source_rank, target_rank) = span.as_ref()?;
+            if let Some(&(shared_source_rank, ref shared_path)) = shared_paths.get(&edge.net) {
+                debug_assert_eq!(shared_source_rank, source_rank);
+                return Some(shared_path[..target_rank - source_rank - 1].to_vec());
+            }
             let source_index = graph.node_index[&edge.source.node];
             let target_index = graph.node_index[&edge.target.node];
             let source = port_point(
@@ -930,13 +1011,26 @@ fn sparse_channel_route(
         push_point(&mut points, Point { x, y });
     }
 
-    push_point(
-        &mut points,
-        Point {
-            x,
-            y: target_escape_y,
-        },
-    );
+    let current_y = points.last().expect("route has a source channel").y;
+    if current_y != target_escape_y && (current_y - target_escape_y).abs() <= MIN_ROUTE_SEGMENT {
+        let detour_y = current_y + port_stub;
+        push_point(&mut points, Point { x, y: detour_y });
+        push_point(
+            &mut points,
+            Point {
+                x: target_stub.x,
+                y: detour_y,
+            },
+        );
+    } else {
+        push_point(
+            &mut points,
+            Point {
+                x,
+                y: target_escape_y,
+            },
+        );
+    }
     push_point(
         &mut points,
         Point {
@@ -1217,14 +1311,14 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use crate::{
-        Edge, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Port, PortSide,
+        Edge, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Point, Port, PortSide,
         validation::validate_and_index,
     };
 
     use super::{
         GapNetAccess, OuterNetAccess, OuterSide, crossing_aware_gap_lane_indices,
         crossing_aware_outer_lane_indices, crossing_track_y, distance_transform,
-        outer_lane_assignments, shortest_crossing_path,
+        outer_lane_assignments, shortest_crossing_path, sparse_channel_route,
     };
 
     #[test]
@@ -1368,6 +1462,37 @@ mod tests {
         assert_ne!(first, second);
         assert!(first > 0.0 && first < 4.0);
         assert!(second > 0.0 && second < 2.0);
+    }
+
+    #[test]
+    fn near_equal_endpoint_tracks_use_an_orthogonal_detour() {
+        let source = Point {
+            x: 20.0,
+            y: 840.000_000_000_000_1,
+        };
+        let target = Point { x: 100.0, y: 840.0 };
+        let points = sparse_channel_route(
+            7,
+            source,
+            target,
+            Endpoint { node: 1, port: 0 },
+            Endpoint { node: 2, port: 0 },
+            0,
+            1,
+            &[0.0, 100.0],
+            &[20.0, 120.0],
+            &[BTreeMap::from([(7, 0)])],
+            &[],
+            &BTreeMap::new(),
+            10.0,
+        );
+
+        assert_eq!(points.first(), Some(&source));
+        assert_eq!(points.last(), Some(&target));
+        assert!(points.windows(2).all(|pair| {
+            (pair[0].x == pair[1].x || pair[0].y == pair[1].y)
+                && (pair[0].x != pair[1].x || pair[0].y != pair[1].y)
+        }));
     }
 
     #[test]

@@ -78,6 +78,68 @@ fn is_deterministic_across_input_permutations() {
 }
 
 #[test]
+fn multi_terminal_sparse_net_shares_an_intermediate_backbone() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(4, false),
+        ],
+        edges: vec![
+            Edge {
+                net: 10,
+                ..edge(10, 1, 2)
+            },
+            Edge {
+                net: 11,
+                ..edge(11, 2, 3)
+            },
+            Edge {
+                net: 12,
+                ..edge(12, 2, 4)
+            },
+            Edge {
+                net: 7,
+                ..edge(20, 1, 3)
+            },
+            Edge {
+                net: 7,
+                ..edge(21, 1, 4)
+            },
+        ],
+    };
+
+    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let reversed = Graph {
+        nodes: graph.nodes.iter().cloned().rev().collect(),
+        edges: graph.edges.iter().cloned().rev().collect(),
+    };
+    assert_eq!(result, layout(&reversed, LayoutOptions::default()).unwrap());
+    let first = &result
+        .edges
+        .iter()
+        .find(|edge| edge.id == 20)
+        .unwrap()
+        .points;
+    let second = &result
+        .edges
+        .iter()
+        .find(|edge| edge.id == 21)
+        .unwrap()
+        .points;
+    let shares_backbone = first.windows(2).any(|left| {
+        left[0].y == left[1].y
+            && (left[1].x - left[0].x).abs() > LayoutOptions::default().layer_gap
+            && second
+                .windows(2)
+                .any(|right| left[0] == right[0] && left[1] == right[1])
+    });
+
+    assert!(shares_backbone);
+}
+
+#[test]
 fn returns_exact_orthogonal_port_routes_and_nonnegative_bounds() {
     let graph = Graph {
         nodes: vec![node(1, false), node(2, false)],
