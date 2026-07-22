@@ -18,8 +18,20 @@ jobs:
           toolchain: 1.97.1
           components: clippy,rustfmt
           targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24.11.1
+          cache: npm
+          cache-dependency-path: tools/visual-review/package-lock.json
+      - run: cargo install wasm-bindgen-cli --version 0.2.122 --locked
       - run: cargo fmt --all -- --check
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --locked --all-targets -- -D warnings
       - run: cargo check --locked --package schemweave-wasm --target wasm32-unknown-unknown
       - run: cargo build --locked --release --package schemweave-wasm --target wasm32-unknown-unknown
+      - run: npm ci
+        working-directory: tools/visual-review
+      - run: npm test
+        working-directory: tools/visual-review
+      - run: npm run build
+        working-directory: tools/visual-review

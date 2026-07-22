@@ -1,3 +1,6 @@
 /target/
 **/pkg/
 *.profraw
+/tools/visual-review/dist/
+/tools/visual-review/node_modules/
+/tools/visual-review/src/generated/
