@@ -111,7 +111,7 @@ pub(crate) fn route_edges(
             outer_nets.insert(edge.net);
         }
     }
-    let gap_lanes: Vec<_> = gap_preferences
+    let mut gap_lanes: Vec<_> = gap_preferences
         .into_iter()
         .map(preferred_lane_indices)
         .collect();
@@ -137,7 +137,7 @@ pub(crate) fn route_edges(
         bottom,
         options,
     );
-    let endpoint_tracks = endpoint_tracks(
+    let mut endpoint_tracks = build_endpoint_tracks(
         graph,
         nodes,
         ranks,
@@ -148,12 +148,43 @@ pub(crate) fn route_edges(
         &outer_lanes,
         options,
     );
-
+    let crossing_paths = sparse_crossing_paths(
+        graph,
+        nodes,
+        &sparse_spans,
+        &crossing_lanes,
+        &crossing_tie_lanes,
+        crossing_tie_lane_count,
+        &free_by_rank,
+        &endpoint_tracks,
+        options.port_stub,
+    );
+    gap_lanes = crossing_aware_gap_lanes(
+        graph,
+        nodes,
+        &sparse_spans,
+        &crossing_paths,
+        &gap_lanes,
+        &endpoint_tracks,
+        options.port_stub,
+    );
+    endpoint_tracks = build_endpoint_tracks(
+        graph,
+        nodes,
+        ranks,
+        &sparse_spans,
+        &layer_left,
+        &layer_right,
+        &gap_lanes,
+        &outer_lanes,
+        options,
+    );
     graph
         .edges
         .iter()
         .zip(sparse_spans)
-        .map(|(edge, sparse_span)| {
+        .zip(crossing_paths)
+        .map(|((edge, sparse_span), crossing_path)| {
             let source_index = graph.node_index[&edge.source.node];
             let target_index = graph.node_index[&edge.target.node];
             let source_node = &nodes[source_index];
@@ -162,7 +193,9 @@ pub(crate) fn route_edges(
             let target_port = graph.ports[target_index][&edge.target.port];
             let source = port_point(source_node, source_port);
             let target = port_point(target_node, target_port);
-            if let Some((source_rank, target_rank)) = sparse_span {
+            if let (Some((source_rank, target_rank)), Some(crossing_path)) =
+                (sparse_span, crossing_path)
+            {
                 return EdgeGeometry {
                     id: edge.id,
                     points: sparse_channel_route(
@@ -176,10 +209,7 @@ pub(crate) fn route_edges(
                         &layer_left,
                         &layer_right,
                         &gap_lanes,
-                        &crossing_lanes,
-                        &crossing_tie_lanes,
-                        crossing_tie_lane_count,
-                        &free_by_rank,
+                        &crossing_path,
                         &endpoint_tracks,
                         options.port_stub,
                     ),
@@ -410,8 +440,8 @@ fn outer_lane_assignments(
     for access in top_access.values_mut().chain(bottom_access.values_mut()) {
         access.vertical_x.sort_by(f64::total_cmp);
     }
-    let top_lanes = crossing_aware_lane_indices(&top_nets, &top_access);
-    let bottom_lanes = crossing_aware_lane_indices(&bottom_nets, &bottom_access);
+    let top_lanes = crossing_aware_outer_lane_indices(&top_nets, &top_access);
+    let bottom_lanes = crossing_aware_outer_lane_indices(&bottom_nets, &bottom_access);
     for (edge, span) in graph.edges.iter().zip(sparse_spans) {
         if span.is_some() {
             continue;
@@ -434,7 +464,7 @@ fn outer_lane_assignments(
     assignments
 }
 
-fn crossing_aware_lane_indices(
+fn crossing_aware_outer_lane_indices(
     nets: &BTreeSet<u32>,
     accesses: &BTreeMap<u32, OuterNetAccess>,
 ) -> BTreeMap<u32, usize> {
@@ -520,7 +550,7 @@ struct EndpointAccess {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn endpoint_tracks(
+fn build_endpoint_tracks(
     graph: &IndexedGraph<'_>,
     nodes: &[NodeGeometry],
     ranks: &[usize],
@@ -690,6 +720,172 @@ fn free_intervals(nodes: &[&NodeGeometry], top: f64, bottom: f64) -> Vec<(f64, f
 }
 
 #[allow(clippy::too_many_arguments)]
+fn sparse_crossing_paths(
+    graph: &IndexedGraph<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_lanes: &[BTreeMap<u32, usize>],
+    crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
+    crossing_tie_lane_count: usize,
+    free_by_rank: &[Vec<(f64, f64)>],
+    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    port_stub: f64,
+) -> Vec<Option<Vec<f64>>> {
+    graph
+        .edges
+        .iter()
+        .zip(sparse_spans)
+        .map(|(edge, span)| {
+            let &(source_rank, target_rank) = span.as_ref()?;
+            let source_index = graph.node_index[&edge.source.node];
+            let target_index = graph.node_index[&edge.target.node];
+            let source = port_point(
+                &nodes[source_index],
+                graph.ports[source_index][&edge.source.port],
+            );
+            let target = port_point(
+                &nodes[target_index],
+                graph.ports[target_index][&edge.target.port],
+            );
+            let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
+            let target_y = endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub);
+            Some(shortest_crossing_path(
+                &free_by_rank[source_rank + 1..target_rank],
+                source_y,
+                target_y,
+                &(source_rank + 1..target_rank)
+                    .map(|rank| crossing_lanes[rank][&edge.net])
+                    .collect::<Vec<_>>(),
+                &(source_rank + 1..target_rank)
+                    .map(|rank| crossing_lanes[rank].len())
+                    .collect::<Vec<_>>(),
+                &(source_rank + 1..target_rank)
+                    .map(|rank| crossing_tie_lanes[&(rank, edge.net)])
+                    .collect::<Vec<_>>(),
+                crossing_tie_lane_count,
+            ))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct GapNetAccess {
+    vertical: Vec<(f64, f64)>,
+    left_y: Vec<f64>,
+    right_y: Vec<f64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn crossing_aware_gap_lanes(
+    graph: &IndexedGraph<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_paths: &[Option<Vec<f64>>],
+    current_lanes: &[BTreeMap<u32, usize>],
+    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    port_stub: f64,
+) -> Vec<BTreeMap<u32, usize>> {
+    let mut accesses = (0..current_lanes.len())
+        .map(|_| BTreeMap::<u32, GapNetAccess>::new())
+        .collect::<Vec<_>>();
+    for ((edge, span), path) in graph.edges.iter().zip(sparse_spans).zip(crossing_paths) {
+        let (Some(&(source_rank, target_rank)), Some(path)) = (span.as_ref(), path) else {
+            continue;
+        };
+        let source_index = graph.node_index[&edge.source.node];
+        let target_index = graph.node_index[&edge.target.node];
+        let source = port_point(
+            &nodes[source_index],
+            graph.ports[source_index][&edge.source.port],
+        );
+        let target = port_point(
+            &nodes[target_index],
+            graph.ports[target_index][&edge.target.port],
+        );
+        let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
+        let target_y = endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub);
+        for gap in source_rank..target_rank {
+            let before = if gap == source_rank {
+                source_y
+            } else {
+                path[gap - source_rank - 1]
+            };
+            let after = if gap + 1 == target_rank {
+                target_y
+            } else {
+                path[gap - source_rank]
+            };
+            let access = accesses[gap].entry(edge.net).or_default();
+            access.vertical.push((before.min(after), before.max(after)));
+            access.left_y.push(before);
+            access.right_y.push(after);
+        }
+    }
+    for by_net in &mut accesses {
+        for access in by_net.values_mut() {
+            access.left_y.sort_by(f64::total_cmp);
+            access.right_y.sort_by(f64::total_cmp);
+        }
+    }
+    current_lanes
+        .iter()
+        .zip(&accesses)
+        .map(|(lanes, access)| crossing_aware_gap_lane_indices(lanes, access))
+        .collect()
+}
+
+fn crossing_aware_gap_lane_indices(
+    current: &BTreeMap<u32, usize>,
+    accesses: &BTreeMap<u32, GapNetAccess>,
+) -> BTreeMap<u32, usize> {
+    let mut ordered: Vec<_> = current.iter().map(|(&net, &lane)| (lane, net)).collect();
+    ordered.sort_unstable();
+    let mut ordered: Vec<_> = ordered.into_iter().map(|(_, net)| net).collect();
+    let mut costs = BTreeMap::new();
+    for _ in 0..16 {
+        let mut changed = false;
+        for index in 0..ordered.len().saturating_sub(1) {
+            let left = ordered[index];
+            let right = ordered[index + 1];
+            let current_cost = *costs
+                .entry((left, right))
+                .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]));
+            let swapped_cost = *costs
+                .entry((right, left))
+                .or_insert_with(|| gap_pair_crossings(&accesses[&right], &accesses[&left]));
+            if swapped_cost < current_cost {
+                ordered.swap(index, index + 1);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(index, net)| (net, index))
+        .collect()
+}
+
+fn gap_pair_crossings(left: &GapNetAccess, right: &GapNetAccess) -> usize {
+    vertical_horizontal_crossings(&left.vertical, &right.left_y)
+        + vertical_horizontal_crossings(&right.vertical, &left.right_y)
+}
+
+fn vertical_horizontal_crossings(vertical: &[(f64, f64)], horizontal_y: &[f64]) -> usize {
+    vertical
+        .iter()
+        .map(|&(low, high)| {
+            let start = horizontal_y.partition_point(|&y| y <= low);
+            let end = horizontal_y.partition_point(|&y| y < high);
+            end - start
+        })
+        .sum()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sparse_channel_route(
     net: u32,
     source: Point,
@@ -701,10 +897,7 @@ fn sparse_channel_route(
     layer_left: &[f64],
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<u32, usize>],
-    crossing_lanes: &[BTreeMap<u32, usize>],
-    crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
-    crossing_tie_lane_count: usize,
-    free_by_rank: &[Vec<(f64, f64)>],
+    crossing_path: &[f64],
     endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
     port_stub: f64,
 ) -> Vec<Point> {
@@ -731,22 +924,7 @@ fn sparse_channel_route(
         },
     );
 
-    let crossing_path = shortest_crossing_path(
-        &free_by_rank[source_rank + 1..target_rank],
-        source_escape_y,
-        target_escape_y,
-        &(source_rank + 1..target_rank)
-            .map(|rank| crossing_lanes[rank][&net])
-            .collect::<Vec<_>>(),
-        &(source_rank + 1..target_rank)
-            .map(|rank| crossing_lanes[rank].len())
-            .collect::<Vec<_>>(),
-        &(source_rank + 1..target_rank)
-            .map(|rank| crossing_tie_lanes[&(rank, net)])
-            .collect::<Vec<_>>(),
-        crossing_tie_lane_count,
-    );
-    for (rank, y) in (source_rank + 1..target_rank).zip(crossing_path) {
+    for (rank, &y) in (source_rank + 1..target_rank).zip(crossing_path) {
         push_point(&mut points, Point { x, y });
         x = sparse_gap_x(net, rank, layer_left, layer_right, gap_lanes);
         push_point(&mut points, Point { x, y });
@@ -1044,9 +1222,38 @@ mod tests {
     };
 
     use super::{
-        OuterNetAccess, OuterSide, crossing_aware_lane_indices, crossing_track_y,
-        distance_transform, outer_lane_assignments, shortest_crossing_path,
+        GapNetAccess, OuterNetAccess, OuterSide, crossing_aware_gap_lane_indices,
+        crossing_aware_outer_lane_indices, crossing_track_y, distance_transform,
+        outer_lane_assignments, shortest_crossing_path,
     };
+
+    #[test]
+    fn gap_lane_transpose_uses_predicted_crossing_cost() {
+        let current = BTreeMap::from([(1, 0), (2, 1)]);
+        let accesses = BTreeMap::from([
+            (
+                1,
+                GapNetAccess {
+                    vertical: vec![(0.0, 10.0)],
+                    left_y: Vec::new(),
+                    right_y: Vec::new(),
+                },
+            ),
+            (
+                2,
+                GapNetAccess {
+                    vertical: vec![(20.0, 30.0)],
+                    left_y: vec![5.0],
+                    right_y: Vec::new(),
+                },
+            ),
+        ]);
+
+        let lanes = crossing_aware_gap_lane_indices(&current, &accesses);
+
+        assert_eq!(lanes[&2], 0);
+        assert_eq!(lanes[&1], 1);
+    }
 
     #[test]
     fn outer_lane_transpose_uses_predicted_crossing_cost() {
@@ -1068,7 +1275,7 @@ mod tests {
             ),
         ]);
 
-        let lanes = crossing_aware_lane_indices(&nets, &accesses);
+        let lanes = crossing_aware_outer_lane_indices(&nets, &accesses);
 
         assert_eq!(lanes[&2], 0);
         assert_eq!(lanes[&1], 1);
