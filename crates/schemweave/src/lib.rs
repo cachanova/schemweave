@@ -262,7 +262,10 @@ mod tests {
         retain_better_candidate(&mut best, smaller.0, smaller.1.clone());
         assert_eq!(best.as_ref().unwrap().1, smaller.1);
 
-        let exact_tie = candidate(1, 3, 20.0, 20.0);
+        let mut exact_tie = candidate(1, 3, 20.0, 20.0);
+        exact_tie.1.width = 10.0;
+        exact_tie.1.height = 2.0;
+        assert_ne!(exact_tie.1, smaller.1);
         retain_better_candidate(&mut best, exact_tie.0, exact_tie.1);
         assert_eq!(best.as_ref().unwrap().1, smaller.1);
     }
