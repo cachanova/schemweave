@@ -186,12 +186,16 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         &forward.layers,
         options,
     ));
-    evaluate(placement::place_nodes(
-        &indexed,
-        &ranks,
-        quality_layers,
-        options,
-    ));
+    let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
+    let preferred_nodes =
+        placement::place_preferred_nodes(&indexed, &ranks, quality_layers, options);
+    let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
+    let preferred_alignment = placement::port_alignment_error(&indexed, &ranks, &preferred_nodes);
+    if placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment) {
+        evaluate(preferred_nodes);
+    } else {
+        evaluate(ordinary_nodes);
+    }
     if let Some(net_representative) = net_representative
         && net_representative.layers != *quality_layers
     {
@@ -482,6 +486,109 @@ mod tests {
             })
             .collect();
         Graph { nodes, edges }
+    }
+
+    fn preferred_backbone_graph(seed: u64) -> Graph {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..81)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 2_000.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 0.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 1_000.0,
+                    },
+                    Port {
+                        id: 2,
+                        side: PortSide::West,
+                        offset: 2_000.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut endpoints = Vec::<(u32, u32, u32)>::new();
+        for lane in 0..20u32 {
+            endpoints.push((0, 21 + lane, 0));
+            endpoints.push((1 + lane, 21 + lane, 2));
+            endpoints.push((21 + lane, 41 + lane, 0));
+            endpoints.push((41 + lane, 61 + lane, 0));
+        }
+        let mut state = seed;
+        for source in 21..41u32 {
+            for target in 41..61u32 {
+                if source - 21 != target - 41 && next(&mut state) % 100 < 8 {
+                    endpoints.push((source, target, 0));
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target, target_port))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: target_port,
+                },
+                net: id as u32,
+                participates_in_ranking: true,
+            })
+            .collect();
+        Graph { nodes, edges }
+    }
+
+    #[test]
+    fn selects_a_preferred_backbone_deterministically() {
+        let options = LayoutOptions {
+            ordering_sweeps: 0,
+            ..LayoutOptions::default()
+        };
+        let graph = preferred_backbone_graph(26);
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let ranks = topology::assign_ranks(&indexed);
+        let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
+        let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
+        let preferred = placement::place_preferred_nodes(&indexed, &ranks, &layers, options);
+        assert!(placement::preferred_alignment_is_significant(
+            placement::port_alignment_error(&indexed, &ranks, &ordinary),
+            placement::port_alignment_error(&indexed, &ranks, &preferred),
+        ));
+        let evaluate = |nodes: Vec<NodeGeometry>| {
+            let mut edges = routing::route_edges(&indexed, &nodes, &ranks, options);
+            let quality = routing::route_quality(&indexed, &edges);
+            let mut nodes = nodes;
+            let layout = placement::normalize(&mut nodes, &mut edges);
+            (quality, layout)
+        };
+        let ordinary = evaluate(ordinary);
+        let preferred = evaluate(preferred);
+        assert!(candidate_quality_cmp(preferred.0, &preferred.1, ordinary.0, &ordinary.1).is_lt());
+
+        let selected = layout(&graph, options).unwrap();
+        assert_eq!(selected, preferred.1);
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, options).unwrap(), selected);
     }
 
     #[test]
