@@ -1210,7 +1210,7 @@ fn crossing_aware_gap_lane_indices(
     ordered.sort_unstable();
     let mut ordered: Vec<_> = ordered.into_iter().map(|(_, net)| net).collect();
     let mut costs = BTreeMap::new();
-    for _ in 0..16 {
+    for _ in 0..32 {
         let mut changed = false;
         for index in 0..ordered.len().saturating_sub(1) {
             let left = ordered[index];
@@ -1646,6 +1646,35 @@ mod tests {
 
         assert_eq!(lanes[&2], 0);
         assert_eq!(lanes[&1], 1);
+    }
+
+    #[test]
+    fn gap_lane_transpose_can_move_a_net_across_more_than_sixteen_lanes() {
+        let current = (0..18).map(|net| (net, net as usize)).collect();
+        let mut accesses = (0..17)
+            .map(|net| {
+                (
+                    net,
+                    GapNetAccess {
+                        vertical: vec![(0.0, 10.0)],
+                        left_y: Vec::new(),
+                        right_y: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        accesses.insert(
+            17,
+            GapNetAccess {
+                vertical: vec![(20.0, 30.0)],
+                left_y: vec![5.0],
+                right_y: Vec::new(),
+            },
+        );
+
+        let lanes = crossing_aware_gap_lane_indices(&current, &accesses);
+
+        assert_eq!(lanes[&17], 0);
     }
 
     #[test]
