@@ -389,6 +389,20 @@ fn cycle_breakers_keep_feedback_from_flattening_the_dataflow() {
 }
 
 #[test]
+fn root_inputs_rank_cycle_breakers_without_reopening_feedback() {
+    let graph = Graph {
+        nodes: vec![node(1, false), node(2, true), node(3, false)],
+        edges: vec![edge(10, 1, 2), edge(11, 2, 3), edge(12, 3, 2)],
+    };
+
+    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let x = |id| result.nodes.iter().find(|node| node.id == id).unwrap().x;
+
+    assert!(x(1) < x(2));
+    assert!(x(2) < x(3));
+}
+
+#[test]
 fn pure_cycles_are_supported_without_recursion() {
     let count = 2_000u32;
     let graph = Graph {
