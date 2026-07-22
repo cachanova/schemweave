@@ -91,6 +91,7 @@ name = "schemweave-wasm"
 version = "0.1.0"
 dependencies = [
  "schemweave",
+ "serde",
  "serde_json",
  "wasm-bindgen",
 ]

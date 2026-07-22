@@ -20,6 +20,50 @@ const edges = Array.from({ length: nodeCount - 1 }, (_, inputIndex) => ({
   targetY: 10,
   control: false,
 }))
+const effortFixtureName = 'quality-effort-600'
+const effortNodeCount = 600
+const effortNodes = Array.from({ length: effortNodeCount }, (_, id) => ({
+  id,
+  width: 80,
+  height: 50,
+  register: false,
+}))
+const effortEdges = []
+const effortInputEdges = []
+const addEffortEdge = (from, to, fromPort) => {
+  effortEdges.push({
+    inputIndex: effortEdges.length,
+    from,
+    to,
+    sourceY: 25,
+    targetY: 25,
+    control: false,
+  })
+  effortInputEdges.push({ fromPort, toPort: 'A', control: false })
+}
+for (let target = 8; target < 24; target += 1) addEffortEdge(0, target, 'shared_100')
+let effortState = 81n
+const nextEffortState = () => {
+  effortState = BigInt.asUintN(
+    64,
+    effortState * 6_364_136_223_846_793_005n + 1_442_695_040_888_963_407n,
+  )
+  return effortState
+}
+for (let source = 1; source < 8; source += 1) {
+  for (let target = 8; target < 24; target += 1) {
+    if (nextEffortState() % 100n < 24n) {
+      addEffortEdge(source, target, `net_${effortEdges.length}`)
+    }
+  }
+}
+for (let source = 8; source < 24; source += 1) {
+  for (let target = 24; target < 40; target += 1) {
+    if (nextEffortState() % 100n < 20n) {
+      addEffortEdge(source, target, `net_${effortEdges.length}`)
+    }
+  }
+}
 const corpus = {
   exactBaseSha: '0123456789abcdef0123456789abcdef01234567',
   fixtures: [
@@ -32,6 +76,14 @@ const corpus = {
         edges: edges.map(() => ({ fromPort: 'Y', toPort: 'A', control: false })),
       },
       resolvedInput: { nodes, edges },
+    },
+    {
+      name: effortFixtureName,
+      kind: 'quality-effort-smoke',
+      nodeCount: effortNodeCount,
+      edgeCount: effortEdges.length,
+      layoutInput: { edges: effortInputEdges },
+      resolvedInput: { nodes: effortNodes, edges: effortEdges },
     },
   ],
 }
@@ -57,6 +109,47 @@ const elk = {
         })),
         width: (nodeCount - 1) * 60 + 20,
         height: 20,
+      },
+    },
+    {
+      name: effortFixtureName,
+      samplesMs: [],
+      geometry: {
+        nodes: effortNodes.map((node) => ({
+          id: node.id,
+          x:
+            node.id < 8
+              ? 0
+              : node.id < 24
+                ? 180
+                : node.id < 40
+                  ? 360
+                  : ((node.id - 40) % 20) * 100,
+          y:
+            node.id < 40
+              ? (node.id % 16) * 70
+              : 1_200 + Math.floor((node.id - 40) / 20) * 70,
+          width: node.width,
+          height: node.height,
+        })),
+        edges: effortEdges.map((edge) => {
+          const sourceX = edge.from < 8 ? 80 : 260
+          const sourceY = (edge.from % 16) * 70 + 25
+          const targetX = edge.to < 24 ? 180 : 360
+          const targetY = (edge.to % 16) * 70 + 25
+          const middleX = (sourceX + targetX) / 2
+          return {
+            inputIndex: edge.inputIndex,
+            points: [
+              { x: sourceX, y: sourceY },
+              { x: middleX, y: sourceY },
+              { x: middleX, y: targetY },
+              { x: targetX, y: targetY },
+            ],
+          }
+        }),
+        width: 1_980,
+        height: 3_160,
       },
     },
   ],
@@ -104,12 +197,56 @@ try {
   await page.locator('#preset').selectOption('compact')
   await page.locator('#preset').selectOption('roomy')
   await page.locator('#preset').selectOption('balanced')
+  await page.locator('#fixture').selectOption(effortFixtureName)
+  await waitForCompletedLayout(page, effortNodeCount)
+  const qualityCrossings = await schemweaveCrossings(page)
+  await page.locator('#quality-effort').fill('0')
+  await waitForCompletedLayout(page, effortNodeCount)
+  const fastCrossings = await schemweaveCrossings(page)
+  if (fastCrossings <= qualityCrossings) {
+    throw new Error(`Fast did not expose its quality tradeoff: ${fastCrossings} <= ${qualityCrossings}`)
+  }
+  const queuedStatus = await page.evaluate(() => {
+    const slider = document.querySelector('#quality-effort')
+    const status = document.querySelector('#status')
+    if (!(slider instanceof HTMLInputElement) || status == null) {
+      throw new Error('routing effort controls are unavailable')
+    }
+    return new Promise((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        observer.disconnect()
+        reject(new Error('Fast request did not enter the worker'))
+      }, 10_000)
+      const observer = new MutationObserver(() => {
+        if (!status.textContent?.startsWith('Laying out')) return
+        observer.disconnect()
+        window.clearTimeout(timeout)
+        slider.value = '1'
+        slider.dispatchEvent(new Event('input', { bubbles: true }))
+        resolve(status.textContent)
+      })
+      observer.observe(status, { childList: true, characterData: true, subtree: true })
+      slider.value = '0'
+      slider.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  })
+  if (!String(queuedStatus).includes('newest settings queued')) {
+    throw new Error(`Quality request was not queued behind active Fast: ${queuedStatus}`)
+  }
+  await waitForCompletedLayout(page, effortNodeCount)
+  if ((await schemweaveCrossings(page)) !== qualityCrossings) {
+    throw new Error('latest Quality request did not replace the queued Fast request')
+  }
+  await page.locator('#fixture').selectOption(fixtureName)
   await waitForCompletedLayout(page)
 
   const status = await page.locator('#status').textContent()
   const labels = await page.locator('.metric-label').allTextContents()
   if (await page.locator('#preset').inputValue() !== 'balanced') {
     throw new Error('rapid preset changes did not retain the newest request')
+  }
+  if (await page.locator('#quality-effort-value').textContent() !== 'Quality') {
+    throw new Error('routing quality slider did not retain the newest request')
   }
   if (errors.length > 0) throw new Error(`browser console errors: ${errors.join('; ')}`)
   if (status?.includes('INVALID')) throw new Error(status)
@@ -149,13 +286,18 @@ async function waitForServer(url) {
   throw new Error('Vite did not start within 10 seconds')
 }
 
-async function waitForCompletedLayout(page) {
+async function waitForCompletedLayout(page, expectedNodeCount = nodeCount) {
   await page.waitForFunction(
     (expectedNodes) => {
       const value = document.querySelector('#status')?.textContent ?? ''
       return value.includes(`${expectedNodes.toLocaleString()} nodes`) && value.includes('SchemWeave')
     },
-    nodeCount,
+    expectedNodeCount,
     { timeout: 90_000 },
   )
+}
+
+async function schemweaveCrossings(page) {
+  const value = await page.locator('.metric').first().locator('.schemweave-value').textContent()
+  return Number(value?.replaceAll(',', ''))
 }

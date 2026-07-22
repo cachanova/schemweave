@@ -81,6 +81,14 @@ pub struct LayoutOptions {
     pub ordering_sweeps: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityEffort {
+    Fast,
+    #[default]
+    Quality,
+}
+
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
@@ -163,6 +171,15 @@ pub enum LayoutError {
 
 /// Lay out a graph. Output ordering depends only on stable identifiers, not input order.
 pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutError> {
+    layout_with_quality_effort(graph, options, QualityEffort::Quality)
+}
+
+/// Lay out a graph with an explicit quality-versus-latency policy.
+pub fn layout_with_quality_effort(
+    graph: &Graph,
+    options: LayoutOptions,
+    quality_effort: QualityEffort,
+) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
     let (ranks, latest_ranks) = topology::rank_candidates(&indexed);
     let (forward, reverse, net_representative) =
@@ -224,7 +241,7 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         && net_representative.layers != *quality_layers
     {
         let (sparse_global, large_sparse_global) =
-            net_representative_sparse_global_flags(graph.nodes.len());
+            net_representative_sparse_global_flags(graph.nodes.len(), quality_effort);
         evaluate(
             placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
             false,
@@ -264,9 +281,17 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     Ok(best.expect("layout has deterministic candidates").1)
 }
 
-fn net_representative_sparse_global_flags(node_count: usize) -> (bool, bool) {
-    let admitted = (600..=1_000).contains(&node_count);
-    (admitted, admitted)
+fn net_representative_sparse_global_flags(
+    node_count: usize,
+    quality_effort: QualityEffort,
+) -> (bool, bool) {
+    match quality_effort {
+        QualityEffort::Fast => (false, false),
+        QualityEffort::Quality => {
+            let admitted = (600..=1_000).contains(&node_count);
+            (admitted, admitted)
+        }
+    }
 }
 
 fn retain_better_candidate(
@@ -302,7 +327,7 @@ fn candidate_quality_cmp(
 mod tests {
     use super::{
         Edge, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Port, PortSide,
-        candidate_quality_cmp, layout, placement, retain_better_candidate, routing,
+        QualityEffort, candidate_quality_cmp, layout, placement, retain_better_candidate, routing,
         routing::RouteQuality, topology, validation,
     };
 
@@ -339,19 +364,23 @@ mod tests {
     #[test]
     fn net_representative_sparse_global_is_admitted_only_for_medium_large_graphs() {
         assert_eq!(
-            super::net_representative_sparse_global_flags(599),
+            super::net_representative_sparse_global_flags(599, QualityEffort::Quality),
             (false, false)
         );
         assert_eq!(
-            super::net_representative_sparse_global_flags(600),
+            super::net_representative_sparse_global_flags(600, QualityEffort::Quality),
             (true, true)
         );
         assert_eq!(
-            super::net_representative_sparse_global_flags(1_000),
+            super::net_representative_sparse_global_flags(1_000, QualityEffort::Quality),
             (true, true)
         );
         assert_eq!(
-            super::net_representative_sparse_global_flags(1_001),
+            super::net_representative_sparse_global_flags(1_001, QualityEffort::Quality),
+            (false, false)
+        );
+        assert_eq!(
+            super::net_representative_sparse_global_flags(855, QualityEffort::Fast),
             (false, false)
         );
     }
@@ -472,6 +501,10 @@ mod tests {
     }
 
     fn net_representative_graph() -> Graph {
+        net_representative_graph_with_padding(40, 3)
+    }
+
+    fn net_representative_graph_with_padding(node_count: u32, seed: u64) -> Graph {
         fn next(state: &mut u64) -> u64 {
             *state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
@@ -479,7 +512,7 @@ mod tests {
             *state
         }
 
-        let nodes = (0..40)
+        let nodes = (0..node_count)
             .map(|id| Node {
                 id,
                 width: 80.0,
@@ -501,7 +534,7 @@ mod tests {
             .collect();
         // One 16-branch net activates the guarded path; fixed sparse cross-connections
         // make its retained ordering distinct without storing a large literal fixture.
-        let mut state = 3u64;
+        let mut state = seed;
         let mut endpoints = Vec::new();
         for target in 8..24 {
             endpoints.push((0, target, 100));
@@ -1071,5 +1104,33 @@ mod tests {
         permuted.nodes.reverse();
         permuted.edges.reverse();
         assert_eq!(layout(&permuted, options).unwrap(), selected);
+    }
+
+    #[test]
+    fn quality_effort_controls_the_admitted_public_layout_deterministically() {
+        let graph = net_representative_graph_with_padding(600, 81);
+        let options = LayoutOptions::default();
+        let fast = super::layout_with_quality_effort(&graph, options, QualityEffort::Fast).unwrap();
+        let quality =
+            super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+        assert_eq!(layout(&graph, options).unwrap(), quality);
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let fast_quality = routing::route_quality(&indexed, &fast.edges);
+        let quality_quality = routing::route_quality(&indexed, &quality.edges);
+        assert_eq!(fast_quality.crossings, 552);
+        assert_eq!(quality_quality.crossings, 405);
+        assert!(candidate_quality_cmp(quality_quality, &quality, fast_quality, &fast).is_lt());
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(
+            super::layout_with_quality_effort(&permuted, options, QualityEffort::Fast).unwrap(),
+            fast
+        );
+        assert_eq!(
+            super::layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
+            quality
+        );
     }
 }

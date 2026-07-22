@@ -35,6 +35,7 @@ const layerGap = query<HTMLInputElement>('#layer-gap')
 const nodeGap = query<HTMLInputElement>('#node-gap')
 const laneGap = query<HTMLInputElement>('#lane-gap')
 const sweeps = query<HTMLInputElement>('#sweeps')
+const qualityEffort = query<HTMLInputElement>('#quality-effort')
 const status = query<HTMLElement>('#status')
 const corpusRevision = query<HTMLElement>('#corpus-revision')
 const metrics = query<HTMLElement>('#metrics')
@@ -112,12 +113,14 @@ function currentElk(): ElkRows['rows'][number] | null {
 }
 
 function layoutOptions(): LayoutOptions {
+  const effort = ['fast', 'quality'] as const
   return {
     layer_gap: Number(layerGap.value),
     node_gap: Number(nodeGap.value),
     port_stub: 10,
     route_lane_gap: Number(laneGap.value),
     ordering_sweeps: Number(sweeps.value),
+    quality_effort: effort[Number(qualityEffort.value)] ?? 'quality',
   }
 }
 
@@ -229,6 +232,8 @@ function updateControlLabels(): void {
   query<HTMLOutputElement>('#node-gap-value').value = nodeGap.value
   query<HTMLOutputElement>('#lane-gap-value').value = laneGap.value
   query<HTMLOutputElement>('#sweeps-value').value = sweeps.value
+  query<HTMLOutputElement>('#quality-effort-value').value =
+    ['Fast', 'Quality'][Number(qualityEffort.value)] ?? 'Quality'
   const options = layoutOptions()
   const matching = Object.entries(presets).find(
     ([, preset]) =>
@@ -243,7 +248,7 @@ function updateControlLabels(): void {
 presetSelect.addEventListener('change', () => {
   if (presetSelect.value !== 'custom') applyPreset(presetSelect.value as PresetName)
 })
-for (const control of [layerGap, nodeGap, laneGap, sweeps]) {
+for (const control of [layerGap, nodeGap, laneGap, sweeps, qualityEffort]) {
   control.addEventListener('input', () => {
     updateControlLabels()
     scheduleLayout()

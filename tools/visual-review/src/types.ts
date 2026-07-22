@@ -28,6 +28,7 @@ export interface LayoutOptions {
   port_stub: number
   route_lane_gap: number
   ordering_sweeps: number
+  quality_effort: 'fast' | 'quality'
 }
 
 export interface Layout {

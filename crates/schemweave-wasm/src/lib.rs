@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-use schemweave::{Graph, LayoutOptions};
+use schemweave::{Graph, LayoutOptions, QualityEffort};
+use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
 /// Lay out a graph through a compact JSON boundary suitable for Web Workers.
@@ -14,13 +15,32 @@ pub fn layout_serialized(graph_json: &str, options_json: &str) -> Result<String,
     let graph: Graph =
         serde_json::from_str(graph_json).map_err(|error| format!("invalid graph JSON: {error}"))?;
     let options = if options_json.trim().is_empty() {
-        LayoutOptions::default()
+        SerializedLayoutOptions::default()
     } else {
         serde_json::from_str(options_json)
             .map_err(|error| format!("invalid options JSON: {error}"))?
     };
-    let result = schemweave::layout(&graph, options).map_err(|error| error.to_string())?;
+    let result =
+        schemweave::layout_with_quality_effort(&graph, options.layout, options.quality_effort)
+            .map_err(|error| error.to_string())?;
     serde_json::to_string(&result).map_err(|error| format!("failed to encode layout: {error}"))
+}
+
+#[derive(Deserialize)]
+#[serde(default)]
+struct SerializedLayoutOptions {
+    #[serde(flatten)]
+    layout: LayoutOptions,
+    quality_effort: QualityEffort,
+}
+
+impl Default for SerializedLayoutOptions {
+    fn default() -> Self {
+        Self {
+            layout: LayoutOptions::default(),
+            quality_effort: QualityEffort::Quality,
+        }
+    }
 }
 
 fn js_error(message: impl AsRef<str>) -> JsValue {
@@ -30,6 +50,71 @@ fn js_error(message: impl AsRef<str>) -> JsValue {
 #[cfg(test)]
 mod tests {
     use super::{layout_json, layout_serialized};
+    use schemweave::{Edge, Endpoint, Graph, Node, Port, PortSide};
+
+    fn activating_graph_json() -> String {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let nodes = (0..600)
+            .map(|id| Node {
+                id,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 25.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 25.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut state = 81;
+        let mut endpoints = (8..24).map(|target| (0, target, 100)).collect::<Vec<_>>();
+        for source in 1..8 {
+            for target in 8..24 {
+                if next(&mut state) % 100 < 24 {
+                    endpoints.push((source, target, 1_000 + endpoints.len() as u32));
+                }
+            }
+        }
+        for source in 8..24 {
+            for target in 24..40 {
+                if next(&mut state) % 100 < 20 {
+                    endpoints.push((source, target, 1_000 + endpoints.len() as u32));
+                }
+            }
+        }
+        let edges = endpoints
+            .into_iter()
+            .enumerate()
+            .map(|(id, (source, target, net))| Edge {
+                id: id as u32,
+                source: Endpoint {
+                    node: source,
+                    port: 1,
+                },
+                target: Endpoint {
+                    node: target,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect();
+        serde_json::to_string(&Graph { nodes, edges }).unwrap()
+    }
 
     #[test]
     fn uses_default_options_for_an_empty_options_object() {
@@ -39,6 +124,28 @@ mod tests {
             result,
             r#"{"nodes":[],"edges":[],"width":0.0,"height":0.0}"#
         );
+    }
+
+    #[test]
+    fn accepts_each_quality_effort_over_the_json_boundary() {
+        let graph = r#"{"nodes":[],"edges":[]}"#;
+        for effort in ["fast", "quality"] {
+            let options = format!(r#"{{"quality_effort":"{effort}"}}"#);
+            assert_eq!(
+                layout_serialized(graph, &options).unwrap(),
+                r#"{"nodes":[],"edges":[],"width":0.0,"height":0.0}"#
+            );
+        }
+    }
+
+    #[test]
+    fn omitted_effort_uses_quality_on_an_activating_graph() {
+        let graph = activating_graph_json();
+        let omitted = layout_serialized(&graph, "{}").unwrap();
+        let quality = layout_serialized(&graph, r#"{"quality_effort":"quality"}"#).unwrap();
+        let fast = layout_serialized(&graph, r#"{"quality_effort":"fast"}"#).unwrap();
+        assert_eq!(omitted, quality);
+        assert_ne!(omitted, fast);
     }
 
     #[test]
