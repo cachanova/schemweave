@@ -100,15 +100,62 @@ pub(crate) fn order_layers(
     ranks: &[usize],
     sweeps: usize,
 ) -> Vec<Vec<usize>> {
-    let real_count = graph.nodes.len();
-    let mut ordering = expanded_ordering_graph(graph, ranks);
-    let mut positions = vec![0usize; ordering.stable_keys.len()];
-    for layer in &mut ordering.layers {
-        layer.sort_unstable_by_key(|&item| ordering.stable_keys[item]);
+    let [forward, reverse] = order_layer_candidates(graph, ranks, sweeps);
+    if reverse.crossings < forward.crossings {
+        reverse.layers
+    } else {
+        forward.layers
     }
-    let mut best_layers = ordering.layers.clone();
-    let mut best_crossings = crossing_count(&ordering.layers, &ordering.outgoing, &mut positions);
-    let mut layers = ordering.layers;
+}
+
+pub(crate) struct LayerOrdering {
+    pub(crate) layers: Vec<Vec<usize>>,
+    pub(crate) crossings: usize,
+}
+
+pub(crate) fn order_layer_candidates(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    sweeps: usize,
+) -> [LayerOrdering; 2] {
+    let real_count = graph.nodes.len();
+    let ordering = expanded_ordering_graph(graph, ranks);
+    let (forward_layers, forward_crossings) = optimize_ordering_seed(&ordering, sweeps, false);
+    let (reverse_layers, reverse_crossings) = optimize_ordering_seed(&ordering, sweeps, true);
+    let strip_virtual = |mut layers: Vec<Vec<usize>>| {
+        for layer in &mut layers {
+            layer.retain(|&item| item < real_count);
+        }
+        layers
+    };
+    [
+        LayerOrdering {
+            layers: strip_virtual(forward_layers),
+            crossings: forward_crossings,
+        },
+        LayerOrdering {
+            layers: strip_virtual(reverse_layers),
+            crossings: reverse_crossings,
+        },
+    ]
+}
+
+fn optimize_ordering_seed(
+    ordering: &OrderingGraph,
+    sweeps: usize,
+    reverse: bool,
+) -> (Vec<Vec<usize>>, usize) {
+    let mut positions = vec![0usize; ordering.stable_keys.len()];
+    let mut layers = ordering.layers.clone();
+    for layer in &mut layers {
+        if reverse {
+            layer.sort_unstable_by_key(|&item| Reverse(ordering.stable_keys[item]));
+        } else {
+            layer.sort_unstable_by_key(|&item| ordering.stable_keys[item]);
+        }
+    }
+    let mut best_layers = layers.clone();
+    let mut best_crossings = crossing_count(&layers, &ordering.outgoing, &mut positions);
     refresh_positions(&layers, &mut positions);
     for _ in 0..sweeps {
         for layer in layers.iter_mut().skip(1) {
@@ -147,10 +194,7 @@ pub(crate) fn order_layers(
             &mut best_crossings,
         );
     }
-    for layer in &mut best_layers {
-        layer.retain(|&item| item < real_count);
-    }
-    best_layers
+    (best_layers, best_crossings)
 }
 
 fn transpose_layers(
@@ -375,7 +419,7 @@ mod tests {
         Edge, Endpoint, Graph, LayoutOptions, Node, Port, PortSide, validation::validate_and_index,
     };
 
-    use super::{assign_ranks, expanded_ordering_graph};
+    use super::{assign_ranks, expanded_ordering_graph, optimize_ordering_seed, order_layers};
 
     fn node(id: u32) -> Node {
         Node {
@@ -449,5 +493,50 @@ mod tests {
         assert_eq!(ranks, vec![0, 1]);
         assert_eq!(ordering.outgoing[0], vec![1]);
         assert_eq!(ordering.incoming[1], vec![0]);
+    }
+
+    #[test]
+    fn selects_the_better_of_forward_and_reverse_stable_seeds() {
+        let endpoints = [
+            (0, 4),
+            (1, 4),
+            (1, 6),
+            (1, 7),
+            (4, 8),
+            (4, 9),
+            (4, 11),
+            (5, 8),
+            (5, 10),
+            (6, 9),
+        ];
+        let graph = Graph {
+            nodes: (0..12).map(node).collect(),
+            edges: endpoints
+                .into_iter()
+                .enumerate()
+                .map(|(id, (source, target))| Edge {
+                    id: id as u32,
+                    source: Endpoint {
+                        node: source,
+                        port: 1,
+                    },
+                    target: Endpoint {
+                        node: target,
+                        port: 0,
+                    },
+                    net: id as u32,
+                    participates_in_ranking: true,
+                })
+                .collect(),
+        };
+        let ranks = [0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let ordering = expanded_ordering_graph(&indexed, &ranks);
+        let forward = optimize_ordering_seed(&ordering, 4, false);
+        let reverse = optimize_ordering_seed(&ordering, 4, true);
+
+        assert_eq!(forward.1, 2);
+        assert_eq!(reverse.1, 0);
+        assert_eq!(order_layers(&indexed, &ranks, 4), reverse.0);
     }
 }

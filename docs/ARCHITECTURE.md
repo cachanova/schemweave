@@ -10,9 +10,11 @@ The current pipeline validates and compacts stable caller identifiers, cuts
 feedback dependencies at explicit cycle breakers while retaining acyclic root
 constraints, condenses remaining strongly connected components, and assigns
 left-to-right ranks. Deterministic barycentric ordering operates over real and
-net-scoped virtual items. Placement then aligns connected fixed ports with
-bounded bidirectional sweeps and weighted isotonic projection, preserving node
-order and minimum gaps.
+net-scoped virtual items from both forward and reverse stable seeds. The core
+compares the conservative baseline against the better-seeded, stronger
+port-alignment candidate with a near-linear physical crossing scorer. Placement
+uses bounded bidirectional sweeps and weighted isotonic projection, preserving
+node order and minimum gaps.
 
 Ordinary forward nets route through sparse inter-layer channels and
 obstacle-free vertical corridors. Eligible single-driver multi-terminal nets
@@ -26,8 +28,8 @@ a correctness backstop.
 to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
 and rendering remain responsibilities of the consuming application.
 
-`schemweave-eval` is a development-only quality scorer. It validates the public
-geometry contract and measures node overlap, route/node intersections,
+`schemweave-eval` remains the development-only full quality scorer. It validates
+the public geometry contract and measures node overlap, route/node intersections,
 unrelated segment overlap and contact, physical net crossings, unique physical
 net bends, union wire length, and area. Hard gates operate on the original edge
 routes; same-net merging affects only physical quality measurements. The scorer
