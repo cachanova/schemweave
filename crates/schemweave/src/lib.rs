@@ -175,11 +175,22 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    let mut evaluate = |mut nodes: Vec<NodeGeometry>, supplemental: bool| {
-        let mut edges = routing::route_planned_edges(&routing_plan, &nodes, options, supplemental);
-        let quality = routing::route_quality(&indexed, &edges);
+    let mut retain = |mut nodes: Vec<NodeGeometry>,
+                      mut edges: Vec<EdgeGeometry>,
+                      quality: Option<routing::RouteQuality>| {
+        let quality = quality.unwrap_or_else(|| routing::route_quality(&indexed, &edges));
         let candidate = placement::normalize(&mut nodes, &mut edges);
         retain_better_candidate(&mut best, quality, candidate);
+    };
+    let mut evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool| {
+        let routed =
+            routing::route_planned_candidates(&routing_plan, &nodes, options, supplemental);
+        if let Some((repair_quality, repair)) = routed.repair {
+            retain(nodes.clone(), routed.primary, routed.primary_quality);
+            retain(nodes, repair, Some(repair_quality));
+        } else {
+            retain(nodes, routed.primary, routed.primary_quality);
+        }
     };
     evaluate(
         placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
@@ -224,7 +235,9 @@ pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutErr
         {
             let mut nodes = placement::place_nodes(&indexed, &alternative_ranks, layers, options);
             let alternative_plan = routing::RoutingPlan::new(&indexed, &alternative_ranks);
-            let mut edges = routing::route_planned_edges(&alternative_plan, &nodes, options, false);
+            let mut edges =
+                routing::route_planned_candidates(&alternative_plan, &nodes, options, false)
+                    .primary;
             let quality = routing::route_quality(&indexed, &edges);
             let candidate = placement::normalize(&mut nodes, &mut edges);
             retain_better_candidate(&mut best, quality, candidate);
