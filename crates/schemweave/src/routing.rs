@@ -1532,13 +1532,15 @@ fn align_crossing_path_staircases(
             .expect("backbone span exists")
             .0;
         let net = plan.edges[canonical_index].edge.net;
-        let canonical_aligned = align_one_crossing_path_staircase(
+        let Some(canonical_aligned) = align_one_crossing_path_staircase(
             canonical_path,
             source_rank,
             free_by_rank,
             net_ordinals[&net],
             net_count,
-        );
+        ) else {
+            continue;
+        };
         aligned_transitions += removed_staircase_transitions(canonical_path, &canonical_aligned);
         paths[canonical_index] = Some(canonical_aligned.clone());
 
@@ -1574,16 +1576,22 @@ fn align_one_crossing_path_staircase(
     free_by_rank: &[Vec<(f64, f64)>],
     net_ordinal: usize,
     net_count: usize,
-) -> Vec<f64> {
-    let intervals = path
+) -> Option<Vec<f64>> {
+    let resolved = path
         .iter()
         .enumerate()
         .map(|(offset, &y)| {
-            free_interval_containing(&free_by_rank[source_rank + offset + 1], y)
-                .expect("crossing path ordinate remains in its selected free interval")
+            free_interval_containing_with_one_ulp_clamp(
+                free_by_rank.get(source_rank + offset + 1)?,
+                y,
+            )
         })
+        .collect::<Option<Vec<_>>>()?;
+    let intervals = resolved
+        .iter()
+        .map(|&(interval, _)| interval)
         .collect::<Vec<_>>();
-    let mut aligned = path.to_vec();
+    let mut aligned = resolved.iter().map(|&(_, y)| y).collect::<Vec<_>>();
     let mut start = 0usize;
     while start < path.len() {
         let mut end = start + 1;
@@ -1606,12 +1614,32 @@ fn align_one_crossing_path_staircase(
             } else {
                 (net_ordinal as f64 / (net_count - 1) as f64 - 0.5) * 0.01
             };
-            let y = (path[start] + net_offset).clamp(low + margin, high - margin);
+            let y = (aligned[start] + net_offset).clamp(low + margin, high - margin);
             aligned[start..end].fill(y);
         }
         start = end;
     }
-    aligned
+    Some(aligned)
+}
+
+fn free_interval_containing_with_one_ulp_clamp(
+    intervals: &[(f64, f64)],
+    y: f64,
+) -> Option<((f64, f64), f64)> {
+    if !y.is_finite() {
+        return None;
+    }
+    let index = intervals.partition_point(|&(_, high)| high < y);
+    if let Some(&(low, high)) = intervals.get(index) {
+        if low <= y && y <= high {
+            return Some(((low, high), y));
+        }
+        if y < low && y.next_up() == low {
+            return Some(((low, high), low));
+        }
+    }
+    let &(low, high) = intervals.get(index.checked_sub(1)?)?;
+    (high < y && high.next_up() == y).then_some(((low, high), high))
 }
 
 fn free_interval_containing(intervals: &[(f64, f64)], y: f64) -> Option<(f64, f64)> {
@@ -10980,6 +11008,124 @@ mod tests {
         assert_eq!(aligned[0], aligned[1]);
         assert_eq!(aligned[1], aligned[2]);
         assert!(aligned[0] > 4.0 && aligned[0] < 8.0);
+    }
+
+    #[test]
+    fn staircase_interval_lookup_clamps_one_ulp_and_fails_closed_beyond_it() {
+        let low = 111.202_812_816_054_65_f64;
+        let high = 117.202_812_816_054_63_f64;
+        let below = low.next_down();
+        let above = high.next_up();
+        let intervals = [(low, high)];
+
+        assert_eq!(
+            super::free_interval_containing_with_one_ulp_clamp(&intervals, below),
+            Some(((low, high), low))
+        );
+        assert_eq!(
+            super::free_interval_containing_with_one_ulp_clamp(&intervals, above),
+            Some(((low, high), high))
+        );
+        assert_eq!(
+            super::free_interval_containing_with_one_ulp_clamp(&intervals, below.next_down()),
+            None
+        );
+        assert_eq!(
+            super::free_interval_containing_with_one_ulp_clamp(&intervals, above.next_up()),
+            None
+        );
+    }
+
+    #[test]
+    fn staircase_alignment_clamps_one_ulp_but_rejects_a_larger_interval_miss() {
+        let low = 111.202_812_816_054_65_f64;
+        let high = 117.202_812_816_054_63_f64;
+        let free_by_rank = [Vec::new(), vec![(low, high)], vec![(low, high)]];
+        let one_ulp_below = low.next_down();
+
+        let aligned = super::align_one_crossing_path_staircase(
+            &[one_ulp_below, one_ulp_below],
+            0,
+            &free_by_rank,
+            0,
+            1,
+        )
+        .expect("one-ULP drift is clamped into the valid interval");
+        assert_eq!(aligned[0], aligned[1]);
+        assert!(low <= aligned[0] && aligned[0] <= high);
+
+        assert!(
+            super::align_one_crossing_path_staircase(
+                &[one_ulp_below.next_down(), one_ulp_below],
+                0,
+                &free_by_rank,
+                0,
+                1,
+            )
+            .is_none(),
+            "larger interval misses fail closed"
+        );
+    }
+
+    #[test]
+    fn staircase_alignment_skips_only_the_backbone_outside_ulp_tolerance() {
+        let graph = Graph {
+            nodes: (0..4)
+                .map(|id| Node {
+                    id,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: if id < 2 {
+                            PortSide::East
+                        } else {
+                            PortSide::West
+                        },
+                        offset: 10.0,
+                    }],
+                })
+                .collect(),
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 8,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 0, 3, 3]);
+        let low = 10.0_f64;
+        let invalid = low.next_down().next_down();
+        let original_invalid = vec![invalid, invalid];
+        let original_valid = vec![12.0, 14.0];
+
+        let (aligned, transitions) = align_crossing_path_staircases_for_test(
+            &plan,
+            &[Some((0, 3)), Some((0, 3))],
+            &[Vec::new(), vec![(low, 20.0)], vec![(low, 20.0)], Vec::new()],
+            &[Some(original_invalid.clone()), Some(original_valid.clone())],
+        )
+        .expect("one invalid backbone does not discard safe alignments for other nets");
+
+        assert_eq!(aligned[0], Some(original_invalid));
+        assert_ne!(aligned[1], Some(original_valid));
+        assert_eq!(
+            aligned[1].as_ref().unwrap()[0],
+            aligned[1].as_ref().unwrap()[1]
+        );
+        assert_eq!(transitions, 1);
     }
 
     #[test]

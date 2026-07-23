@@ -1,8 +1,8 @@
 use schemweave::{
     BoundaryTrunk, Edge, EdgeGeometry, Endpoint, Graph, GroupExpansion, GroupExpansionOptions,
-    Layout, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port, PortSide,
-    QualityEffort, expand_group_in_place, layout, layout_with_quality_effort,
-    layout_with_quality_effort_and_constraints,
+    Layout, LayoutConfig, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port,
+    PortSide, QualityEffort, expand_group_in_place, layout, layout_with_config,
+    layout_with_quality_effort, layout_with_quality_effort_and_constraints,
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
@@ -1032,6 +1032,152 @@ fn negotiated_corridor_graph() -> Graph {
         }
     }
     Graph { nodes, edges }
+}
+
+fn rounded_staircase_fanout_graph() -> Graph {
+    const INTERNAL_END: u32 = 17;
+    const BRANCHES: u32 = 5;
+
+    let mut nodes = vec![Node {
+        id: 0,
+        width: 82.0,
+        height: 34.0,
+        cycle_breaker: false,
+        ports: vec![Port {
+            id: 0,
+            side: PortSide::East,
+            offset: 17.0,
+        }],
+    }];
+    for id in 1..=INTERNAL_END {
+        let width = if id < 10 { 82.0 } else { 89.0 };
+        let height = if id % 5 == 0 { 58.0 } else { 46.0 };
+        let mut ports = vec![Port {
+            id: 0,
+            side: PortSide::East,
+            offset: height / 2.0,
+        }];
+        if id <= BRANCHES {
+            ports.push(Port {
+                id: 1,
+                side: PortSide::West,
+                offset: height / 2.0,
+            });
+        } else {
+            ports.extend([
+                Port {
+                    id: 1,
+                    side: PortSide::West,
+                    offset: height / 3.0,
+                },
+                Port {
+                    id: 2,
+                    side: PortSide::West,
+                    offset: height * 2.0 / 3.0,
+                },
+            ]);
+        }
+        nodes.push(Node {
+            id,
+            width,
+            height,
+            cycle_breaker: false,
+            ports,
+        });
+    }
+    for id in INTERNAL_END + 1..=INTERNAL_END + BRANCHES {
+        nodes.push(Node {
+            id,
+            width: 89.0,
+            height: 42.0,
+            cycle_breaker: false,
+            ports: vec![
+                Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 14.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::West,
+                    offset: 28.0,
+                },
+            ],
+        });
+    }
+
+    let mut edges = Vec::new();
+    for node in 1..=INTERNAL_END {
+        edges.push(Edge {
+            id: edges.len() as u32,
+            source: Endpoint { node: 0, port: 0 },
+            target: Endpoint { node, port: 1 },
+            net: 0,
+            participates_in_ranking: true,
+        });
+        let target = node + BRANCHES;
+        edges.push(Edge {
+            id: edges.len() as u32,
+            source: Endpoint { node, port: 0 },
+            target: Endpoint {
+                node: target,
+                port: if target <= INTERNAL_END { 2 } else { 1 },
+            },
+            net: node,
+            participates_in_ranking: true,
+        });
+    }
+    for source in 1..=BRANCHES {
+        edges.push(Edge {
+            id: edges.len() as u32,
+            source: Endpoint {
+                node: source,
+                port: 0,
+            },
+            target: Endpoint {
+                node: INTERNAL_END + source,
+                port: 0,
+            },
+            net: source,
+            participates_in_ranking: true,
+        });
+    }
+    Graph { nodes, edges }
+}
+
+#[test]
+fn rounded_staircase_fanout_highest_quality_is_deterministic_and_hard_safe() {
+    let graph = rounded_staircase_fanout_graph();
+    let config = LayoutConfig::highest_quality();
+    let first = layout_with_config(&graph, &config).unwrap();
+    let mut permuted = graph.clone();
+    permuted.nodes.reverse();
+    for node in &mut permuted.nodes {
+        node.ports.reverse();
+    }
+    permuted.edges.reverse();
+    let second = layout_with_config(&permuted, &config).unwrap();
+    let report = score(&graph, &first, ScoreOptions::default());
+
+    assert_eq!(
+        first, second,
+        "the public Max layout must be stable-ID deterministic"
+    );
+    assert!(report.passes_hard_gates(), "{report:#?}");
+    assert_eq!(report.semantic_violations, 0);
+    assert_eq!(report.node_overlaps, 0);
+    assert_eq!(report.node_intersections, 0);
+    assert_eq!(report.unrelated_overlaps, 0);
+    assert_eq!(report.unrelated_contacts, 0);
+    assert_eq!(report.ranking_direction_violations, 0);
+    assert_eq!(report.reverse_x_length, 0.0);
+    assert!(!report.edge_node_clearance_exhausted);
+    assert_eq!(report.edge_node_clearance_violations, 0);
+    assert!(
+        report
+            .minimum_edge_node_clearance
+            .is_some_and(|clearance| clearance >= 20.0)
+    );
 }
 
 #[test]
