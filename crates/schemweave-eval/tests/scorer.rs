@@ -1,6 +1,6 @@
 use schemweave::{
     Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Point, Port,
-    PortSide, layout,
+    PortSide, QualityEffort, layout, layout_with_quality_effort,
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
@@ -292,6 +292,137 @@ fn measures_physical_route_usage_outside_the_node_envelope() {
     assert_eq!(report.route_length, 240.0);
     assert_eq!(report.perimeter_route_length, 190.0);
     assert_eq!(report.perimeter_route_ratio, 190.0 / 240.0);
+}
+
+#[test]
+fn quality_effort_selects_the_exact_scored_adaptive_gap_tracks() {
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: 1,
+                width: 20.0,
+                height: 40.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 20.0,
+                }],
+            },
+            Node {
+                id: 2,
+                width: 20.0,
+                height: 40.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 20.0,
+                }],
+            },
+            Node {
+                id: 3,
+                width: 20.0,
+                height: 40.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::West,
+                        offset: 30.0,
+                    },
+                ],
+            },
+            Node {
+                id: 4,
+                width: 20.0,
+                height: 40.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::West,
+                        offset: 30.0,
+                    },
+                ],
+            },
+        ],
+        edges: vec![
+            Edge {
+                id: 10,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 3, port: 0 },
+                net: 1,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 11,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 4, port: 0 },
+                net: 1,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 12,
+                source: Endpoint { node: 2, port: 0 },
+                target: Endpoint { node: 3, port: 1 },
+                net: 2,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 13,
+                source: Endpoint { node: 2, port: 0 },
+                target: Endpoint { node: 4, port: 1 },
+                net: 2,
+                participates_in_ranking: true,
+            },
+        ],
+    };
+    let options = LayoutOptions::default();
+    let fast = layout_with_quality_effort(&graph, options, QualityEffort::Fast).unwrap();
+    let quality = layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+    let max = layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+    let fast_report = score(&graph, &fast, ScoreOptions::default());
+    let quality_report = score(&graph, &quality, ScoreOptions::default());
+
+    assert!(fast_report.passes_hard_gates(), "{fast_report:#?}");
+    assert!(quality_report.passes_hard_gates(), "{quality_report:#?}");
+    assert!(
+        quality_report.minimum_parallel_route_separation
+            > fast_report.minimum_parallel_route_separation,
+        "fast={fast_report:#?}\nquality={quality_report:#?}"
+    );
+    assert_eq!(quality_report.crossings, fast_report.crossings);
+    assert_eq!(quality_report.bends, fast_report.bends);
+    assert_eq!(
+        quality_report.max_crossings_on_segment,
+        fast_report.max_crossings_on_segment
+    );
+    assert!(quality_report.route_length <= fast_report.route_length);
+    assert_eq!(quality_report.area, fast_report.area);
+    assert_eq!(
+        quality_report.straight_route_ratio,
+        fast_report.straight_route_ratio
+    );
+    assert_eq!(max, quality);
+
+    let mut permuted = graph;
+    permuted.nodes.reverse();
+    permuted.edges.reverse();
+    assert_eq!(
+        layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
+        quality
+    );
 }
 
 #[test]
