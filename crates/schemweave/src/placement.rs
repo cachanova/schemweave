@@ -1,6 +1,7 @@
 use crate::{
-    EdgeGeometry, Layout, LayoutOptions, NodeGeometry, PortSide, validation::IndexedGraph,
+    EdgeGeometry, Layout, LayoutOptions, NetId, NodeGeometry, PortSide, validation::IndexedGraph,
 };
+use std::collections::BTreeMap;
 
 const PREFERRED_ALIGNMENT_WEIGHT: f64 = 8.0;
 const CHAIN_ALIGNMENT_WEIGHT: f64 = 16.0;
@@ -37,7 +38,27 @@ pub(crate) fn place_nodes(
     layers: &[Vec<usize>],
     options: LayoutOptions,
 ) -> Vec<NodeGeometry> {
-    place_nodes_with_alignment(graph, ranks, layers, options, QUALITY_ALIGNMENT)
+    place_nodes_with_alignment(graph, ranks, layers, options, QUALITY_ALIGNMENT, false)
+}
+
+pub(crate) fn place_demand_aware_nodes(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    layers: &[Vec<usize>],
+    options: LayoutOptions,
+) -> Vec<NodeGeometry> {
+    place_nodes_with_alignment(graph, ranks, layers, options, QUALITY_ALIGNMENT, true)
+}
+
+pub(crate) fn demand_aware_spacing_is_relevant(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    rank_count: usize,
+    options: LayoutOptions,
+) -> bool {
+    demand_aware_layer_gaps(graph, ranks, rank_count, options)
+        .into_iter()
+        .any(|gap| gap >= options.layer_gap * 1.5)
 }
 
 pub(crate) fn place_preferred_nodes(
@@ -46,7 +67,7 @@ pub(crate) fn place_preferred_nodes(
     layers: &[Vec<usize>],
     options: LayoutOptions,
 ) -> Vec<NodeGeometry> {
-    place_nodes_with_alignment(graph, ranks, layers, options, PREFERRED_ALIGNMENT)
+    place_nodes_with_alignment(graph, ranks, layers, options, PREFERRED_ALIGNMENT, false)
 }
 
 pub(crate) fn place_straight_chain_nodes(
@@ -101,7 +122,7 @@ pub(crate) fn place_baseline_nodes(
     layers: &[Vec<usize>],
     options: LayoutOptions,
 ) -> Vec<NodeGeometry> {
-    place_nodes_with_alignment(graph, ranks, layers, options, BASELINE_ALIGNMENT)
+    place_nodes_with_alignment(graph, ranks, layers, options, BASELINE_ALIGNMENT, false)
 }
 
 // Keep one WASM copy of the shared placement loop for all alignment policies.
@@ -112,6 +133,7 @@ fn place_nodes_with_alignment(
     layers: &[Vec<usize>],
     options: LayoutOptions,
     policy: AlignmentPolicy,
+    demand_aware_spacing: bool,
 ) -> Vec<NodeGeometry> {
     let widths: Vec<f64> = layers
         .iter()
@@ -133,9 +155,14 @@ fn place_nodes_with_alignment(
         })
         .collect();
     let canvas_height = heights.iter().copied().fold(0.0, f64::max);
+    let layer_gaps = if demand_aware_spacing {
+        demand_aware_layer_gaps(graph, ranks, layers.len(), options)
+    } else {
+        vec![options.layer_gap; layers.len().saturating_sub(1)]
+    };
     let mut layer_x = vec![0.0; layers.len()];
     for rank in 1..layers.len() {
-        layer_x[rank] = layer_x[rank - 1] + widths[rank - 1] + options.layer_gap;
+        layer_x[rank] = layer_x[rank - 1] + widths[rank - 1] + layer_gaps[rank - 1];
     }
 
     let mut positioned = vec![None; graph.nodes.len()];
@@ -168,6 +195,65 @@ fn place_nodes_with_alignment(
         policy,
     );
     positioned
+}
+
+fn demand_aware_layer_gaps(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    rank_count: usize,
+    options: LayoutOptions,
+) -> Vec<f64> {
+    let gap_count = rank_count.saturating_sub(1);
+    if gap_count == 0 {
+        return Vec::new();
+    }
+    let mut spans_by_net = BTreeMap::<NetId, Vec<(usize, usize)>>::new();
+    for edge in &graph.edges {
+        if !edge.participates_in_ranking {
+            continue;
+        }
+        let source = graph.node_index[&edge.source.node];
+        let target = graph.node_index[&edge.target.node];
+        let source_rank = ranks[source];
+        let target_rank = ranks[target];
+        if source_rank < target_rank
+            && graph.ports[source][&edge.source.port].side == PortSide::East
+            && graph.ports[target][&edge.target.port].side == PortSide::West
+        {
+            spans_by_net
+                .entry(edge.net)
+                .or_default()
+                .push((source_rank, target_rank));
+        }
+    }
+    let mut difference = vec![0isize; rank_count];
+    for spans in spans_by_net.values_mut() {
+        spans.sort_unstable();
+        let mut merged = Vec::with_capacity(spans.len());
+        for &(start, end) in spans.iter() {
+            if let Some((_, merged_end)) = merged.last_mut()
+                && start <= *merged_end
+            {
+                *merged_end = (*merged_end).max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        for (start, end) in merged {
+            difference[start] += 1;
+            difference[end] -= 1;
+        }
+    }
+    let mut active = 0isize;
+    (0..gap_count)
+        .map(|gap| {
+            active += difference[gap];
+            let lane_count = usize::try_from(active).expect("net span count is nonnegative");
+            let demanded = options.port_stub * 2.0
+                + options.route_lane_gap * (lane_count.saturating_add(1) as f64);
+            options.layer_gap.max(demanded)
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -575,8 +661,8 @@ pub fn place(
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, align_layer, isotonic_projection, normalize, normalize_owned,
-        place_straight_chain_nodes, preferred_alignment_can_be_significant,
+        Alignment, align_layer, demand_aware_layer_gaps, isotonic_projection, normalize,
+        normalize_owned, place_straight_chain_nodes, preferred_alignment_can_be_significant,
         preferred_alignment_is_significant, preferred_chain_targets, preferred_edges,
         straight_chain_scale_is_eligible,
     };
@@ -584,6 +670,67 @@ mod tests {
         Edge, EdgeGeometry, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Point, Port,
         PortSide, place, topology::assign_ranks, validation::validate_and_index,
     };
+
+    #[test]
+    fn demand_aware_layer_gaps_count_distinct_net_spans_deterministically() {
+        let nodes = vec![
+            Node {
+                id: 1,
+                width: 40.0,
+                height: 40.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 20.0,
+                }],
+            },
+            Node {
+                id: 2,
+                width: 40.0,
+                height: 40.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 20.0,
+                }],
+            },
+        ];
+        let mut edges = (0..12)
+            .map(|net| Edge {
+                id: net,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect::<Vec<_>>();
+        edges.push(Edge {
+            id: 99,
+            source: Endpoint { node: 1, port: 0 },
+            target: Endpoint { node: 2, port: 0 },
+            net: 0,
+            participates_in_ranking: true,
+        });
+        let graph = Graph { nodes, edges };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index(&graph, options).unwrap();
+
+        assert_eq!(
+            demand_aware_layer_gaps(&indexed, &[0, 2], 3, options),
+            vec![72.0, 72.0],
+        );
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        let indexed = validate_and_index(&permuted, options).unwrap();
+        assert_eq!(
+            demand_aware_layer_gaps(&indexed, &[0, 2], 3, options),
+            vec![72.0, 72.0],
+        );
+    }
 
     #[test]
     fn owned_normalization_matches_the_borrowed_api_exactly() {
