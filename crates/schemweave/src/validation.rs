@@ -101,29 +101,41 @@ pub(crate) fn validate_and_index_with_constraints<'a>(
         &raw_outgoing,
         &raw_incoming,
     )?;
+    let (rank_edges, outgoing, incoming) =
+        runtime_ranking_graph(&nodes, &edges, &node_index, raw_outgoing, raw_incoming);
+    Ok(IndexedGraph {
+        nodes,
+        edges,
+        rank_edges,
+        node_index,
+        ports,
+        outgoing,
+        incoming,
+        boundary_inputs,
+        boundary_outputs,
+    })
+}
+
+pub(crate) fn runtime_ranking_graph(
+    nodes: &[&Node],
+    edges: &[&Edge],
+    node_index: &HashMap<NodeId, usize>,
+    raw_outgoing: Vec<Vec<usize>>,
+    raw_incoming: Vec<Vec<usize>>,
+) -> (Vec<bool>, Vec<Vec<usize>>, Vec<Vec<usize>>) {
     if !nodes.iter().any(|node| node.cycle_breaker) {
         let rank_edges = edges
             .iter()
             .map(|edge| edge.participates_in_ranking)
             .collect();
-        return Ok(IndexedGraph {
-            nodes,
-            edges,
-            rank_edges,
-            node_index,
-            ports,
-            outgoing: raw_outgoing,
-            incoming: raw_incoming,
-            boundary_inputs,
-            boundary_outputs,
-        });
+        return (rank_edges, raw_outgoing, raw_incoming);
     }
     let (raw_component, _) =
         crate::topology::strongly_connected_components(&raw_outgoing, &raw_incoming);
     let mut outgoing = vec![Vec::new(); nodes.len()];
     let mut incoming = vec![Vec::new(); nodes.len()];
     let mut rank_edges = Vec::with_capacity(edges.len());
-    for edge in &edges {
+    for edge in edges {
         if !edge.participates_in_ranking {
             rank_edges.push(false);
             continue;
@@ -139,17 +151,7 @@ pub(crate) fn validate_and_index_with_constraints<'a>(
         outgoing[source].push(target);
         incoming[target].push(source);
     }
-    Ok(IndexedGraph {
-        nodes,
-        edges,
-        rank_edges,
-        node_index,
-        ports,
-        outgoing,
-        incoming,
-        boundary_inputs,
-        boundary_outputs,
-    })
+    (rank_edges, outgoing, incoming)
 }
 
 fn validate_constraints(

@@ -1,6 +1,7 @@
 use schemweave::{
-    Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutConstraints, LayoutOptions, Node,
-    NodeGeometry, Point, Port, PortSide, QualityEffort, layout, layout_with_quality_effort,
+    BoundaryTrunk, Edge, EdgeGeometry, Endpoint, Graph, GroupExpansion, GroupExpansionOptions,
+    Layout, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port, PortSide,
+    QualityEffort, expand_group_in_place, layout, layout_with_quality_effort,
     layout_with_quality_effort_and_constraints,
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
@@ -143,6 +144,90 @@ fn new_quality_fields_preserve_default_json_compatibility() {
 
     assert_eq!(options, ScoreOptions::default());
     assert_eq!(report, QualityReport::default());
+}
+
+#[test]
+fn incremental_group_expansion_preserves_every_hard_gate() {
+    let node = |id| Node {
+        id,
+        width: 80.0,
+        height: 50.0,
+        cycle_breaker: false,
+        ports: vec![
+            Port {
+                id: 0,
+                side: PortSide::West,
+                offset: 25.0,
+            },
+            Port {
+                id: 1,
+                side: PortSide::East,
+                offset: 25.0,
+            },
+        ],
+    };
+    let edge = |id, source, target, net| Edge {
+        id,
+        source: Endpoint {
+            node: source,
+            port: 1,
+        },
+        target: Endpoint {
+            node: target,
+            port: 0,
+        },
+        net,
+        participates_in_ranking: true,
+    };
+    let compact = Graph {
+        nodes: vec![node(1), node(10), node(4)],
+        edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
+    };
+    let options = LayoutOptions::default();
+    let compact_layout = layout(&compact, options).unwrap();
+    let members = (1_000..1_032).collect::<Vec<_>>();
+    let mut nodes = vec![node(1), node(4)];
+    nodes.extend(members.iter().copied().map(node));
+    let mut edges = Vec::new();
+    for (index, &member) in members.iter().enumerate() {
+        edges.push(edge(index as u32 * 2 + 10, 1, member, 100));
+        edges.push(edge(index as u32 * 2 + 11, member, 4, 200));
+    }
+    let expanded = Graph { nodes, edges };
+    let boundary_trunks = (0..members.len())
+        .flat_map(|index| {
+            [
+                BoundaryTrunk {
+                    expanded_edge: index as u32 * 2 + 10,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: index as u32 * 2 + 11,
+                    compact_edge: 2,
+                },
+            ]
+        })
+        .collect();
+    let expanded_layout = expand_group_in_place(
+        &compact,
+        &compact_layout,
+        &expanded,
+        &GroupExpansion {
+            anchor: 10,
+            members,
+            boundary_trunks,
+        },
+        &GroupExpansionOptions {
+            layout: options,
+            quality_effort: QualityEffort::Max,
+            ..GroupExpansionOptions::default()
+        },
+    )
+    .unwrap();
+
+    let report = score(&expanded, &expanded_layout, ScoreOptions::default());
+    assert!(report.passes_hard_gates(), "{report:#?}");
+    assert_eq!(report.ranking_direction_violations, 0, "{report:#?}");
 }
 
 #[test]
@@ -1264,7 +1349,7 @@ fn detects_a_feedback_net_split_across_outer_bands() {
         1,
         50.0,
         70.0,
-        false,
+        true,
         vec![
             Port {
                 id: 0,
@@ -1282,12 +1367,19 @@ fn detects_a_feedback_net_split_across_outer_bands() {
         2,
         200.0,
         20.0,
-        true,
-        vec![Port {
-            id: 0,
-            side: PortSide::West,
-            offset: 10.0,
-        }],
+        false,
+        vec![
+            Port {
+                id: 0,
+                side: PortSide::West,
+                offset: 10.0,
+            },
+            Port {
+                id: 1,
+                side: PortSide::East,
+                offset: 10.0,
+            },
+        ],
     );
     let (bottom, bottom_geometry) = node(
         3,
@@ -1321,6 +1413,13 @@ fn detects_a_feedback_net_split_across_outer_bands() {
                 id: 2,
                 source: Endpoint { node: 1, port: 1 },
                 target: Endpoint { node: 3, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 3,
+                source: Endpoint { node: 2, port: 1 },
+                target: Endpoint { node: 1, port: 0 },
                 net: 7,
                 participates_in_ranking: true,
             },
@@ -1360,8 +1459,19 @@ fn detects_a_feedback_net_split_across_outer_bands() {
                     Point { x: 200.0, y: 130.0 },
                 ],
             },
+            EdgeGeometry {
+                id: 3,
+                points: vec![
+                    Point { x: 220.0, y: 30.0 },
+                    Point { x: 230.0, y: 30.0 },
+                    Point { x: 230.0, y: 0.0 },
+                    Point { x: 40.0, y: 0.0 },
+                    Point { x: 40.0, y: 80.0 },
+                    Point { x: 50.0, y: 80.0 },
+                ],
+            },
         ],
-        width: 220.0,
+        width: 240.0,
         height: 160.0,
     };
 
