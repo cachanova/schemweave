@@ -1,6 +1,7 @@
 use schemweave::{
-    Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Point, Port,
-    PortSide, QualityEffort, layout, layout_with_quality_effort,
+    Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutConstraints, LayoutOptions, Node,
+    NodeGeometry, Point, Port, PortSide, QualityEffort, layout, layout_with_quality_effort,
+    layout_with_quality_effort_and_constraints,
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
@@ -705,6 +706,172 @@ fn fanout_candidate_layout_preserves_all_hard_gates() {
     assert!(report.passes_hard_gates(), "{report:#?}");
     assert_eq!(report.semantic_violations, 0);
     assert_eq!(report.ranking_direction_violations, 0);
+}
+
+fn regional_fanout_graph() -> Graph {
+    let mut nodes = vec![Node {
+        id: 0,
+        width: 82.0,
+        height: 34.0,
+        cycle_breaker: false,
+        ports: vec![Port {
+            id: 0,
+            side: PortSide::East,
+            offset: 17.0,
+        }],
+    }];
+    for id in 1..500 {
+        let width = if id < 10 {
+            82.0
+        } else if id < 100 {
+            89.0
+        } else {
+            96.0
+        };
+        let height = if id >= 492 {
+            42.0
+        } else if id % 5 == 0 {
+            58.0
+        } else {
+            46.0
+        };
+        nodes.push(Node {
+            id,
+            width,
+            height,
+            cycle_breaker: false,
+            ports: std::iter::once(Port {
+                id: 0,
+                side: PortSide::West,
+                offset: if id < 9 { height / 2.0 } else { height / 3.0 },
+            })
+            .chain((id >= 9).then_some(Port {
+                id: 1,
+                side: PortSide::West,
+                offset: height * 2.0 / 3.0,
+            }))
+            .chain((id <= 491).then_some(Port {
+                id: 2,
+                side: PortSide::East,
+                offset: height / 2.0,
+            }))
+            .collect(),
+        });
+    }
+    let mut edges = Vec::new();
+    for node in 1..=491 {
+        edges.push(Edge {
+            id: edges.len() as u32,
+            source: Endpoint { node: 0, port: 0 },
+            target: Endpoint { node, port: 0 },
+            net: 1,
+            participates_in_ranking: true,
+        });
+        edges.push(Edge {
+            id: edges.len() as u32,
+            source: Endpoint { node, port: 2 },
+            target: Endpoint {
+                node: node + 8,
+                port: 1,
+            },
+            net: 10_000 + node,
+            participates_in_ranking: true,
+        });
+    }
+    for source in 1..=8 {
+        edges.push(Edge {
+            id: edges.len() as u32,
+            source: Endpoint {
+                node: source,
+                port: 2,
+            },
+            target: Endpoint {
+                node: 491 + source,
+                port: 0,
+            },
+            net: 10_000 + source,
+            participates_in_ranking: true,
+        });
+    }
+    Graph { nodes, edges }
+}
+
+#[test]
+fn regional_fanout_max_candidate_preserves_every_hard_gate() {
+    let graph = regional_fanout_graph();
+    let options = LayoutOptions::default();
+    let constraints = LayoutConstraints {
+        inputs: vec![0],
+        outputs: (492..500).collect(),
+    };
+    let quality = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Quality,
+        &constraints,
+    )
+    .unwrap();
+    let max = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Max,
+        &constraints,
+    )
+    .unwrap();
+    let quality_report = score(&graph, &quality, ScoreOptions::default());
+    let report = score(&graph, &max, ScoreOptions::default());
+    let top = max
+        .nodes
+        .iter()
+        .map(|node| node.y)
+        .fold(f64::INFINITY, f64::min);
+    let bottom = max
+        .nodes
+        .iter()
+        .map(|node| node.y + node.height)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let max_hot_routes = graph
+        .edges
+        .iter()
+        .zip(&max.edges)
+        .filter(|(edge, _)| edge.net == 1)
+        .map(|(_, route)| route);
+    let quality_hot_routes = graph
+        .edges
+        .iter()
+        .zip(&quality.edges)
+        .filter(|(edge, _)| edge.net == 1)
+        .map(|(_, route)| route);
+
+    assert_ne!(
+        max, quality,
+        "fixture must activate the Max regional candidate"
+    );
+    assert!(
+        report.crossings < quality_report.crossings,
+        "regional trunks must improve exact crossings",
+    );
+    assert!(
+        max_hot_routes
+            .clone()
+            .flat_map(|route| &route.points)
+            .all(|point| point.y >= top && point.y <= bottom),
+        "regional fanout routes must use interior trunks",
+    );
+    assert!(
+        quality_hot_routes
+            .flat_map(|route| &route.points)
+            .any(|point| point.y < top || point.y > bottom),
+        "the control layout must retain its outer fanout trunk",
+    );
+    assert!(report.passes_hard_gates(), "{report:#?}");
+    assert_eq!(report.semantic_violations, 0);
+    assert_eq!(report.node_overlaps, 0);
+    assert_eq!(report.node_intersections, 0);
+    assert_eq!(report.unrelated_overlaps, 0);
+    assert_eq!(report.unrelated_contacts, 0);
+    assert_eq!(report.ranking_direction_violations, 0);
+    assert_eq!(report.reverse_x_length, 0.0);
 }
 
 #[test]

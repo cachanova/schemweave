@@ -280,6 +280,7 @@ fn layout_indexed(
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let adaptive_gap_spacing = quality_effort != QualityEffort::Fast;
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
+    let mut best_uses_primary_ranks = true;
     let candidate_routing = CandidateRouting {
         adaptive_gap_spacing,
         deeper_crossing_repair: quality_effort == QualityEffort::Max,
@@ -422,7 +423,9 @@ fn layout_indexed(
             let quality = routed
                 .primary_quality
                 .expect("planned candidates include exact primary quality");
-            retain_owned_candidate(&mut best, quality, nodes, edges);
+            if retain_owned_candidate(&mut best, quality, nodes, edges) {
+                best_uses_primary_ranks = false;
+            }
         }
     }
     if let Some(straight_chain_nodes) = straight_chain_nodes
@@ -446,11 +449,29 @@ fn layout_indexed(
         let (quality, layout) = straight_chain_best.expect("candidate routing produces a layout");
         if best.as_ref().is_some_and(|(current_quality, current)| {
             straight_chain_cost_is_bounded(quality, &layout, *current_quality, current)
-        }) {
-            retain_better_candidate(&mut best, quality, layout);
+        }) && retain_better_candidate(&mut best, quality, layout)
+        {
+            best_uses_primary_ranks = true;
         }
     }
-    best.expect("layout has deterministic candidates").1
+    let (quality, layout) = best.expect("layout has deterministic candidates");
+    if quality_effort == QualityEffort::Max
+        && best_uses_primary_ranks
+        && let Some((candidate_quality, edges)) = routing::regional_fanout_candidate(
+            &routing_plan,
+            &layout.nodes,
+            &layout.edges,
+            quality,
+            options,
+        )
+    {
+        let candidate = placement::normalize_owned(layout.nodes.clone(), edges);
+        if candidate.width * candidate.height <= layout.width * layout.height * 1.05 {
+            debug_assert!(route_quality_cmp(candidate_quality, quality).is_lt());
+            return candidate;
+        }
+    }
+    layout
 }
 
 fn straight_chain_cost_is_bounded(
@@ -529,13 +550,14 @@ fn retain_better_candidate(
     best: &mut Option<(routing::RouteQuality, Layout)>,
     quality: routing::RouteQuality,
     candidate: Layout,
-) {
+) -> bool {
     let replace = best.as_ref().is_none_or(|(current_quality, current)| {
         candidate_quality_cmp(quality, &candidate, *current_quality, current).is_lt()
     });
     if replace {
         *best = Some((quality, candidate));
     }
+    replace
 }
 
 fn retain_owned_candidate(
@@ -543,14 +565,14 @@ fn retain_owned_candidate(
     quality: routing::RouteQuality,
     nodes: Vec<NodeGeometry>,
     edges: Vec<EdgeGeometry>,
-) {
+) -> bool {
     if best
         .as_ref()
         .is_some_and(|(current_quality, _)| route_quality_cmp(quality, *current_quality).is_gt())
     {
-        return;
+        return false;
     }
-    retain_better_candidate(best, quality, placement::normalize_owned(nodes, edges));
+    retain_better_candidate(best, quality, placement::normalize_owned(nodes, edges))
 }
 
 fn route_quality_cmp(
@@ -1308,6 +1330,12 @@ mod tests {
 
         let selected = layout(&graph, options).unwrap();
         assert_eq!(selected, alternative.1);
+        let max_selected =
+            super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+        assert_eq!(
+            max_selected, alternative.1,
+            "Max must retain the winning alternative-rank plan without a primary-rank post-pass",
+        );
 
         let zero_sweeps = LayoutOptions {
             ordering_sweeps: 0,
