@@ -6,8 +6,9 @@ use std::{
 };
 
 use schemweave::{
-    Edge, EdgeId, Endpoint, Graph, Layout, NetId, NodeGeometry, ParallelSegment, Point, PortSide,
-    measure_parallel_congestion,
+    Edge, EdgeId, EdgeNodeClearanceError, EdgeNodeSegment, Endpoint, Graph, Layout, NetId,
+    NetNodeRelation, NodeGeometry, ParallelSegment, Point, PortSide,
+    measure_edge_node_clearance_bounded, measure_parallel_congestion,
 };
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,11 @@ pub struct ScoreOptions {
     /// Perpendicular distance below which overlapping different-net parallel
     /// routes count as congested, in layout units.
     pub parallel_congestion_threshold: f64,
+    /// Requested minimum distance between route segments and unrelated nodes.
+    pub edge_node_clearance_threshold: f64,
+    /// Maximum segment-node candidates visited by the exact clearance pass,
+    /// including pairs later exempted as electrically related.
+    pub max_edge_node_clearance_pair_visits: usize,
 }
 
 impl Default for ScoreOptions {
@@ -31,6 +37,8 @@ impl Default for ScoreOptions {
             viewport_width: 1_600.0,
             viewport_height: 900.0,
             parallel_congestion_threshold: 4.0,
+            edge_node_clearance_threshold: 20.0,
+            max_edge_node_clearance_pair_visits: 5_000_000,
         }
     }
 }
@@ -96,6 +104,12 @@ pub struct QualityReport {
     /// Fraction of physical route length that runs parallel to a different
     /// electrical net closer than the configured threshold.
     pub parallel_congestion_ratio: f64,
+    /// Smallest distance between any physical same-net route segment and unrelated node.
+    pub minimum_edge_node_clearance: Option<f64>,
+    /// Unique physical segment-node pairs below the configured clearance threshold.
+    pub edge_node_clearance_violations: usize,
+    /// Whether exact clearance measurement exhausted its configured work cap.
+    pub edge_node_clearance_exhausted: bool,
     /// Largest number of unrelated physical crossings on one physical segment.
     pub max_crossings_on_segment: usize,
     /// Union length of the physical same-net geometry.
@@ -143,11 +157,13 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         || options.viewport_height <= 0.0
         || !options.parallel_congestion_threshold.is_finite()
         || options.parallel_congestion_threshold <= 0.0
+        || !options.edge_node_clearance_threshold.is_finite()
+        || options.edge_node_clearance_threshold < 0.0
     {
         report.violation(
             options,
             ViolationKind::InvalidGeometry,
-            "score epsilon, viewport dimensions, and parallel congestion threshold must be finite and valid"
+            "score epsilon, viewport dimensions, and clearance thresholds must be finite and valid"
                 .to_owned(),
         );
         return report;
@@ -300,6 +316,49 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
     score_node_overlaps(&layout.nodes, &mut report);
     score_node_intersections(&segments, &layout.nodes, options.epsilon, &mut report);
     let physical_segments = merged_net_segments(&segments);
+    let clearance_segments = physical_segments
+        .iter()
+        .map(|segment| EdgeNodeSegment {
+            net: segment.net,
+            horizontal: segment.orientation == Orientation::Horizontal,
+            fixed: segment.fixed,
+            start: segment.start,
+            end: segment.end,
+        })
+        .collect::<Vec<_>>();
+    let clearance_relations = graph
+        .edges
+        .iter()
+        .flat_map(|edge| {
+            [
+                NetNodeRelation {
+                    net: edge.net,
+                    node: edge.source.node,
+                },
+                NetNodeRelation {
+                    net: edge.net,
+                    node: edge.target.node,
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    match measure_edge_node_clearance_bounded(
+        &clearance_segments,
+        &layout.nodes,
+        &clearance_relations,
+        options.edge_node_clearance_threshold,
+        options.max_edge_node_clearance_pair_visits,
+    ) {
+        Ok(clearance) => {
+            report.minimum_edge_node_clearance = clearance.minimum_clearance;
+            report.edge_node_clearance_violations = clearance.violations;
+        }
+        Err(EdgeNodeClearanceError::WorkLimitExceeded) => {
+            report.edge_node_clearance_exhausted = true;
+        }
+        Err(EdgeNodeClearanceError::InvalidInput) => {}
+        Err(_) => {}
+    }
     let raw_route_length: f64 = segments
         .iter()
         .map(|segment| segment.end - segment.start)

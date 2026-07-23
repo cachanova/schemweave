@@ -147,6 +147,97 @@ fn new_quality_fields_preserve_default_json_compatibility() {
 }
 
 #[test]
+fn reports_bounded_net_aware_edge_node_clearance() {
+    let (mut graph, mut layout) = constructed_routes(&[(
+        1,
+        vec![Point { x: 20.0, y: 20.0 }, Point { x: 180.0, y: 20.0 }],
+    )]);
+    graph.nodes.push(Node {
+        id: 99,
+        width: 10.0,
+        height: 10.0,
+        cycle_breaker: false,
+        ports: Vec::new(),
+    });
+    layout.nodes.push(NodeGeometry {
+        id: 99,
+        x: 80.0,
+        y: 30.0,
+        width: 10.0,
+        height: 10.0,
+    });
+    let exact = score(
+        &graph,
+        &layout,
+        ScoreOptions {
+            edge_node_clearance_threshold: 10.0,
+            max_edge_node_clearance_pair_visits: 3,
+            ..ScoreOptions::default()
+        },
+    );
+    assert_eq!(exact.minimum_edge_node_clearance, Some(10.0));
+    assert_eq!(exact.edge_node_clearance_violations, 0);
+    assert!(!exact.edge_node_clearance_exhausted);
+
+    let inside = score(
+        &graph,
+        &layout,
+        ScoreOptions {
+            edge_node_clearance_threshold: 10.0 + 1e-9,
+            max_edge_node_clearance_pair_visits: 3,
+            ..ScoreOptions::default()
+        },
+    );
+    assert_eq!(inside.edge_node_clearance_violations, 1);
+
+    let exhausted = score(
+        &graph,
+        &layout,
+        ScoreOptions {
+            edge_node_clearance_threshold: 10.0,
+            max_edge_node_clearance_pair_visits: 2,
+            ..ScoreOptions::default()
+        },
+    );
+    assert!(exhausted.edge_node_clearance_exhausted);
+    assert_eq!(exhausted.minimum_edge_node_clearance, None);
+}
+
+#[test]
+fn shared_same_net_prefix_counts_as_one_physical_clearance_violation() {
+    let route = vec![Point { x: 20.0, y: 20.0 }, Point { x: 180.0, y: 20.0 }];
+    let (mut graph, mut layout) = constructed_routes(&[(7, route.clone()), (7, route)]);
+    graph.nodes.push(Node {
+        id: 99,
+        width: 10.0,
+        height: 10.0,
+        cycle_breaker: false,
+        ports: Vec::new(),
+    });
+    layout.nodes.push(NodeGeometry {
+        id: 99,
+        x: 80.0,
+        y: 25.0,
+        width: 10.0,
+        height: 10.0,
+    });
+
+    let report = score(
+        &graph,
+        &layout,
+        ScoreOptions {
+            edge_node_clearance_threshold: 10.0,
+            max_edge_node_clearance_pair_visits: 5,
+            ..ScoreOptions::default()
+        },
+    );
+
+    assert!(!report.edge_node_clearance_exhausted);
+    assert_eq!(report.minimum_edge_node_clearance, Some(5.0));
+    assert_eq!(report.edge_node_clearance_violations, 1);
+}
+
+#[test]
 fn incremental_group_expansion_preserves_every_hard_gate() {
     let node = |id| Node {
         id,
@@ -1845,6 +1936,8 @@ fn scores_the_full_consumer_bound() {
     assert_eq!(report.forward_edge_count, 0);
     assert_eq!(report.ranking_direction_violations, 0);
     assert_eq!(report.reverse_x_length, 0.0);
+    assert!(report.edge_node_clearance_exhausted);
+    assert_eq!(report.minimum_edge_node_clearance, None);
     assert!(report.passes_hard_gates(), "{report:#?}");
     assert_eq!(
         report.segments,

@@ -21,7 +21,11 @@ pub use incremental::{
 pub use placement::place;
 pub(crate) use readability::measure_parallel_congestion_bounded;
 #[doc(hidden)]
-pub use readability::{ParallelCongestion, ParallelSegment, measure_parallel_congestion};
+pub use readability::{
+    EdgeNodeClearance, EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation,
+    ParallelCongestion, ParallelSegment, measure_edge_node_clearance_bounded,
+    measure_parallel_congestion,
+};
 
 pub type NodeId = u32;
 pub type PortId = u32;
