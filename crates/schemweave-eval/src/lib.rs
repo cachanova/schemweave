@@ -105,6 +105,12 @@ pub struct QualityReport {
     /// Fraction of physical route length that runs parallel to a different
     /// electrical net closer than the configured threshold.
     pub parallel_congestion_ratio: f64,
+    /// Sum of longitudinal overlap length for every different-net parallel
+    /// segment pair closer than the configured threshold.
+    pub parallel_pair_overlap_length: f64,
+    /// Largest number of simultaneously close different-net parallel
+    /// neighbors seen by one segment.
+    pub peak_parallel_close_neighbors: usize,
     /// Smallest distance between any physical same-net route segment and unrelated node.
     pub minimum_edge_node_clearance: Option<f64>,
     /// Unique physical segment-node pairs below the configured clearance threshold.
@@ -427,12 +433,14 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         measure_parallel_separation_bounded(&parallel_segments, usize::MAX)
             .expect("validated physical segments have a finite exact separation sweep")
             .minimum_positive;
+    let parallel_congestion = measure_parallel_congestion(
+        &parallel_segments,
+        options.parallel_congestion_threshold - options.epsilon,
+    );
+    report.parallel_pair_overlap_length = parallel_congestion.pair_overlap_length;
+    report.peak_parallel_close_neighbors = parallel_congestion.peak_close_neighbors;
     report.parallel_congestion_ratio = if report.route_length > options.epsilon {
-        measure_parallel_congestion(
-            &parallel_segments,
-            options.parallel_congestion_threshold - options.epsilon,
-        )
-        .ratio()
+        parallel_congestion.ratio()
     } else {
         0.0
     };

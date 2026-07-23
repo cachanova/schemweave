@@ -740,6 +740,12 @@ fn charge_tree_visit(remaining_tree_visits: &mut usize) -> Result<(), ParallelSe
 pub struct ParallelCongestion {
     pub total_length: f64,
     pub congested_length: f64,
+    /// Sum of longitudinal overlap length for every close different-net
+    /// parallel segment pair.
+    pub pair_overlap_length: f64,
+    /// Largest number of simultaneously close different-net parallel
+    /// neighbors seen by one segment.
+    pub peak_close_neighbors: usize,
 }
 
 impl ParallelCongestion {
@@ -775,7 +781,7 @@ pub(crate) fn measure_parallel_congestion_bounded(
     cutoff: f64,
     max_active_visits: usize,
 ) -> Option<ParallelCongestion> {
-    measure_parallel_congestion_profile_bounded(segments, cutoff, max_active_visits)
+    measure_parallel_density_profile_bounded(segments, cutoff, max_active_visits)
         .map(|(congestion, _)| congestion)
 }
 
@@ -783,6 +789,23 @@ pub(crate) fn measure_parallel_congestion_profile_bounded(
     segments: &[ParallelSegment],
     cutoff: f64,
     max_active_visits: usize,
+) -> Option<(ParallelCongestion, Option<f64>)> {
+    measure_parallel_profile_bounded(segments, cutoff, max_active_visits, false)
+}
+
+pub(crate) fn measure_parallel_density_profile_bounded(
+    segments: &[ParallelSegment],
+    cutoff: f64,
+    max_active_visits: usize,
+) -> Option<(ParallelCongestion, Option<f64>)> {
+    measure_parallel_profile_bounded(segments, cutoff, max_active_visits, true)
+}
+
+fn measure_parallel_profile_bounded(
+    segments: &[ParallelSegment],
+    cutoff: f64,
+    max_active_visits: usize,
+    measure_density: bool,
 ) -> Option<(ParallelCongestion, Option<f64>)> {
     let total_length = segments
         .iter()
@@ -793,12 +816,16 @@ pub(crate) fn measure_parallel_congestion_profile_bounded(
             ParallelCongestion {
                 total_length,
                 congested_length: 0.0,
+                pair_overlap_length: 0.0,
+                peak_close_neighbors: 0,
             },
             None,
         ));
     }
 
     let mut congested_length = 0.0;
+    let mut pair_overlap_length = 0.0;
+    let mut peak_close_neighbors = 0usize;
     let mut minimum_positive_separation = None::<f64>;
     let mut remaining_active_visits = max_active_visits;
     for horizontal in [true, false] {
@@ -807,9 +834,16 @@ pub(crate) fn measure_parallel_congestion_profile_bounded(
             .filter(|segment| segment.horizontal == horizontal)
             .collect::<Vec<_>>();
         if oriented.len() >= 2 {
-            let (oriented_length, oriented_minimum) =
-                congested_length_for_orientation(&oriented, cutoff, &mut remaining_active_visits)?;
+            let (oriented_length, oriented_pair_length, oriented_peak, oriented_minimum) =
+                congested_length_for_orientation(
+                    &oriented,
+                    cutoff,
+                    &mut remaining_active_visits,
+                    measure_density,
+                )?;
             congested_length += oriented_length;
+            pair_overlap_length += oriented_pair_length;
+            peak_close_neighbors = peak_close_neighbors.max(oriented_peak);
             if let Some(oriented_minimum) = oriented_minimum {
                 minimum_positive_separation = Some(
                     minimum_positive_separation
@@ -822,6 +856,8 @@ pub(crate) fn measure_parallel_congestion_profile_bounded(
         ParallelCongestion {
             total_length,
             congested_length,
+            pair_overlap_length,
+            peak_close_neighbors,
         },
         minimum_positive_separation,
     ))
@@ -831,7 +867,8 @@ fn congested_length_for_orientation(
     segments: &[&ParallelSegment],
     cutoff: f64,
     remaining_active_visits: &mut usize,
-) -> Option<(f64, Option<f64>)> {
+    measure_density: bool,
+) -> Option<(f64, f64, usize, Option<f64>)> {
     let mut events = Vec::with_capacity(segments.len() * 2);
     for (index, segment) in segments.iter().enumerate() {
         // End events precede starts so longitudinal endpoint contact has zero
@@ -845,6 +882,9 @@ fn congested_length_for_orientation(
     let mut close_neighbor_counts = vec![0usize; segments.len()];
     let mut congested_active = 0usize;
     let mut congested_length = 0.0;
+    let mut close_pairs = 0usize;
+    let mut pair_overlap_length = 0.0;
+    let mut peak_close_neighbors = 0usize;
     let mut minimum_positive_separation = None::<f64>;
     let mut neighbors = Vec::new();
     let mut previous = events
@@ -853,6 +893,9 @@ fn congested_length_for_orientation(
 
     for (coordinate, event_kind, segment_index) in events {
         congested_length += congested_active as f64 * (coordinate.0 - previous);
+        if measure_density {
+            pair_overlap_length += close_pairs as f64 * (coordinate.0 - previous);
+        }
         previous = coordinate.0;
 
         let segment = segments[segment_index];
@@ -886,6 +929,9 @@ fn congested_length_for_orientation(
                     congested_active -= 1;
                 }
             }
+            if measure_density {
+                close_pairs -= neighbors.len();
+            }
             close_neighbor_counts[segment_index] = 0;
             let coordinate = FloatKey(segment.fixed);
             let remove_coordinate = {
@@ -909,6 +955,14 @@ fn congested_length_for_orientation(
                     congested_active += 1;
                 }
                 *count += 1;
+                if measure_density {
+                    peak_close_neighbors = peak_close_neighbors.max(*count);
+                }
+            }
+            if measure_density {
+                close_pairs += neighbors.len();
+                peak_close_neighbors =
+                    peak_close_neighbors.max(close_neighbor_counts[segment_index]);
             }
             active
                 .entry(FloatKey(segment.fixed))
@@ -918,7 +972,13 @@ fn congested_length_for_orientation(
     }
     debug_assert!(active.is_empty());
     debug_assert_eq!(congested_active, 0);
-    Some((congested_length, minimum_positive_separation))
+    debug_assert_eq!(close_pairs, 0);
+    Some((
+        congested_length,
+        pair_overlap_length,
+        peak_close_neighbors,
+        minimum_positive_separation,
+    ))
 }
 
 fn collect_close_active_other_nets(
@@ -970,10 +1030,11 @@ impl PartialOrd for FloatKey {
 #[cfg(test)]
 mod tests {
     use super::{
-        EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation, ParallelSegment,
-        ParallelSeparation, ParallelSeparationError, measure_edge_node_clearance_bounded,
-        measure_parallel_congestion, measure_parallel_congestion_bounded,
-        measure_parallel_congestion_profile_bounded, measure_parallel_separation_bounded,
+        EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation, ParallelCongestion,
+        ParallelSegment, ParallelSeparation, ParallelSeparationError,
+        measure_edge_node_clearance_bounded, measure_parallel_congestion,
+        measure_parallel_congestion_bounded, measure_parallel_congestion_profile_bounded,
+        measure_parallel_separation_bounded,
     };
     use crate::NodeGeometry;
 
@@ -1460,6 +1521,55 @@ mod tests {
     }
 
     #[test]
+    fn congestion_density_counts_pair_overlap_and_peak_neighbors_exactly() {
+        let mut segments = vec![
+            ParallelSegment {
+                net: 1,
+                horizontal: true,
+                fixed: 0.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            ParallelSegment {
+                net: 2,
+                horizontal: true,
+                fixed: 1.0,
+                start: 2.0,
+                end: 8.0,
+            },
+            ParallelSegment {
+                net: 3,
+                horizontal: true,
+                fixed: 2.0,
+                start: 4.0,
+                end: 6.0,
+            },
+            ParallelSegment {
+                net: 3,
+                horizontal: false,
+                fixed: 1.0,
+                start: 0.0,
+                end: 3.0,
+            },
+            ParallelSegment {
+                net: 4,
+                horizontal: false,
+                fixed: 2.0,
+                start: 1.0,
+                end: 2.0,
+            },
+        ];
+
+        let expected = measure_parallel_congestion(&segments, 4.0);
+        assert_eq!(expected.congested_length, 16.0);
+        assert_eq!(expected.pair_overlap_length, 11.0);
+        assert_eq!(expected.peak_close_neighbors, 2);
+
+        segments.reverse();
+        assert_eq!(measure_parallel_congestion(&segments, 4.0), expected);
+    }
+
+    #[test]
     fn bounded_congestion_stops_at_the_exact_active_visit_budget() {
         let segments = [
             ParallelSegment {
@@ -1485,7 +1595,14 @@ mod tests {
         );
         assert_eq!(
             measure_parallel_congestion_profile_bounded(&segments, 4.0, 4),
-            Some((measure_parallel_congestion(&segments, 4.0), Some(1.0)))
+            Some((
+                ParallelCongestion {
+                    total_length: 20.0,
+                    congested_length: 20.0,
+                    ..ParallelCongestion::default()
+                },
+                Some(1.0),
+            ))
         );
     }
 
@@ -1517,7 +1634,14 @@ mod tests {
 
         assert_eq!(
             measure_parallel_congestion_profile_bounded(&segments, 4.0, 5),
-            Some((measure_parallel_congestion(&segments, 4.0), None))
+            Some((
+                ParallelCongestion {
+                    total_length: 30.0,
+                    congested_length: 20.0,
+                    ..ParallelCongestion::default()
+                },
+                None,
+            ))
         );
         assert!(measure_parallel_congestion_profile_bounded(&segments, 4.0, 4).is_none());
     }

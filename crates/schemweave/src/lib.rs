@@ -30,15 +30,13 @@ pub use incremental::{
     expand_group_in_place,
 };
 pub use placement::place;
+pub(crate) use readability::measure_parallel_congestion_profile_bounded;
 #[doc(hidden)]
 pub use readability::{
     EdgeNodeClearance, EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation,
     ParallelCongestion, ParallelSegment, ParallelSeparation, ParallelSeparationError,
     measure_edge_node_clearance_bounded, measure_parallel_congestion,
     measure_parallel_separation_bounded,
-};
-pub(crate) use readability::{
-    measure_parallel_congestion_bounded, measure_parallel_congestion_profile_bounded,
 };
 
 pub type NodeId = u32;

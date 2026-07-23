@@ -70,6 +70,8 @@ export interface QualityReport {
   segments: number
   minimum_parallel_route_separation: number | null
   parallel_congestion_ratio: number
+  parallel_pair_overlap_length: number
+  peak_parallel_close_neighbors: number
   minimum_edge_node_clearance: number | null
   edge_node_clearance_violations: number
   edge_node_clearance_exhausted: boolean

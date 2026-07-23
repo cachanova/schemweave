@@ -10,8 +10,8 @@ use crate::{
     Edge, EdgeGeometry, EdgeId, EdgeNodeClearance, EdgeNodeClearanceError, EdgeNodeSegment,
     Endpoint, LayoutOptions, NetId, NetNodeRelation, NodeGeometry, ParallelSegment,
     ParallelSeparationError, Point, Port, PortSide, measure_edge_node_clearance_bounded,
-    measure_parallel_congestion_bounded, measure_parallel_congestion_profile_bounded,
-    measure_parallel_separation_bounded, validation::IndexedGraph,
+    measure_parallel_congestion_profile_bounded, measure_parallel_separation_bounded,
+    validation::IndexedGraph,
 };
 
 const MAX_SPARSE_NET_EDGES: usize = 300;
@@ -5205,7 +5205,7 @@ fn regional_segments_have_unrelated_contact(
 }
 
 fn parallel_congestion_ratio(segments: &[PhysicalSegment]) -> Option<f64> {
-    measure_parallel_congestion_bounded(
+    measure_parallel_congestion_profile_bounded(
         &segments
             .iter()
             .map(|segment| ParallelSegment {
@@ -5219,7 +5219,7 @@ fn parallel_congestion_ratio(segments: &[PhysicalSegment]) -> Option<f64> {
         PARALLEL_CONGESTION_CUTOFF,
         MAX_PARALLEL_CONGESTION_ACTIVE_VISITS,
     )
-    .map(|congestion| congestion.ratio())
+    .map(|(congestion, _)| congestion.ratio())
 }
 
 #[cfg(test)]

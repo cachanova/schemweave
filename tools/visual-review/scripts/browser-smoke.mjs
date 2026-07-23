@@ -448,11 +448,13 @@ try {
   if (
     !labels.includes('Min track separation') ||
     !labels.includes('Parallel congestion') ||
+    !labels.includes('Pair-overlap length') ||
+    !labels.includes('Peak close neighbors') ||
     !labels.includes('Edge-node clearance') ||
     !labels.includes('Clearance violations (<20 px)') ||
     !labels.includes('Straight routes') ||
     !labels.includes('Contract violations') ||
-    labels.length !== 16
+    labels.length !== 18
   ) {
     throw new Error(`unexpected metric set: ${labels.join(', ')}`)
   }
