@@ -1532,13 +1532,15 @@ fn align_crossing_path_staircases(
             .expect("backbone span exists")
             .0;
         let net = plan.edges[canonical_index].edge.net;
-        let canonical_aligned = align_one_crossing_path_staircase(
+        let Some(canonical_aligned) = align_one_crossing_path_staircase(
             canonical_path,
             source_rank,
             free_by_rank,
             net_ordinals[&net],
             net_count,
-        )?;
+        ) else {
+            continue;
+        };
         aligned_transitions += removed_staircase_transitions(canonical_path, &canonical_aligned);
         paths[canonical_index] = Some(canonical_aligned.clone());
 
@@ -11032,6 +11034,98 @@ mod tests {
             super::free_interval_containing_with_one_ulp_clamp(&intervals, above.next_up()),
             None
         );
+    }
+
+    #[test]
+    fn staircase_alignment_clamps_one_ulp_but_rejects_a_larger_interval_miss() {
+        let low = 111.202_812_816_054_65_f64;
+        let high = 117.202_812_816_054_63_f64;
+        let free_by_rank = [Vec::new(), vec![(low, high)], vec![(low, high)]];
+        let one_ulp_below = low.next_down();
+
+        let aligned = super::align_one_crossing_path_staircase(
+            &[one_ulp_below, one_ulp_below],
+            0,
+            &free_by_rank,
+            0,
+            1,
+        )
+        .expect("one-ULP drift is clamped into the valid interval");
+        assert_eq!(aligned[0], aligned[1]);
+        assert!(low <= aligned[0] && aligned[0] <= high);
+
+        assert!(
+            super::align_one_crossing_path_staircase(
+                &[one_ulp_below.next_down(), one_ulp_below],
+                0,
+                &free_by_rank,
+                0,
+                1,
+            )
+            .is_none(),
+            "larger interval misses fail closed"
+        );
+    }
+
+    #[test]
+    fn staircase_alignment_skips_only_the_backbone_outside_ulp_tolerance() {
+        let graph = Graph {
+            nodes: (0..4)
+                .map(|id| Node {
+                    id,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: if id < 2 {
+                            PortSide::East
+                        } else {
+                            PortSide::West
+                        },
+                        offset: 10.0,
+                    }],
+                })
+                .collect(),
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 8,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 0, 3, 3]);
+        let low = 10.0_f64;
+        let invalid = low.next_down().next_down();
+        let original_invalid = vec![invalid, invalid];
+        let original_valid = vec![12.0, 14.0];
+
+        let (aligned, transitions) = align_crossing_path_staircases_for_test(
+            &plan,
+            &[Some((0, 3)), Some((0, 3))],
+            &[Vec::new(), vec![(low, 20.0)], vec![(low, 20.0)], Vec::new()],
+            &[Some(original_invalid.clone()), Some(original_valid.clone())],
+        )
+        .expect("one invalid backbone does not discard safe alignments for other nets");
+
+        assert_eq!(aligned[0], Some(original_invalid));
+        assert_ne!(aligned[1], Some(original_valid));
+        assert_eq!(
+            aligned[1].as_ref().unwrap()[0],
+            aligned[1].as_ref().unwrap()[1]
+        );
+        assert_eq!(transitions, 1);
     }
 
     #[test]

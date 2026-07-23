@@ -1,8 +1,8 @@
 use schemweave::{
     BoundaryTrunk, Edge, EdgeGeometry, Endpoint, Graph, GroupExpansion, GroupExpansionOptions,
-    Layout, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port, PortSide,
-    QualityEffort, expand_group_in_place, layout, layout_with_quality_effort,
-    layout_with_quality_effort_and_constraints,
+    Layout, LayoutConfig, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port,
+    PortSide, QualityEffort, expand_group_in_place, layout, layout_with_config,
+    layout_with_quality_effort, layout_with_quality_effort_and_constraints,
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
@@ -911,27 +911,57 @@ fn regional_fanout_graph() -> Graph {
         } else {
             46.0
         };
+        let ports = if id <= 8 {
+            vec![
+                Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: height / 2.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::West,
+                    offset: height / 2.0,
+                },
+            ]
+        } else if id <= 491 {
+            vec![
+                Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: height / 2.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::West,
+                    offset: height / 3.0,
+                },
+                Port {
+                    id: 2,
+                    side: PortSide::West,
+                    offset: height * 2.0 / 3.0,
+                },
+            ]
+        } else {
+            vec![
+                Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: height / 3.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::West,
+                    offset: height * 2.0 / 3.0,
+                },
+            ]
+        };
         nodes.push(Node {
             id,
             width,
             height,
             cycle_breaker: false,
-            ports: std::iter::once(Port {
-                id: 0,
-                side: PortSide::West,
-                offset: if id < 9 { height / 2.0 } else { height / 3.0 },
-            })
-            .chain((id >= 9).then_some(Port {
-                id: 1,
-                side: PortSide::West,
-                offset: height * 2.0 / 3.0,
-            }))
-            .chain((id <= 491).then_some(Port {
-                id: 2,
-                side: PortSide::East,
-                offset: height / 2.0,
-            }))
-            .collect(),
+            ports,
         });
     }
     let mut edges = Vec::new();
@@ -939,18 +969,18 @@ fn regional_fanout_graph() -> Graph {
         edges.push(Edge {
             id: edges.len() as u32,
             source: Endpoint { node: 0, port: 0 },
-            target: Endpoint { node, port: 0 },
-            net: 1,
+            target: Endpoint { node, port: 1 },
+            net: 0,
             participates_in_ranking: true,
         });
         edges.push(Edge {
             id: edges.len() as u32,
-            source: Endpoint { node, port: 2 },
+            source: Endpoint { node, port: 0 },
             target: Endpoint {
                 node: node + 8,
-                port: 1,
+                port: if node + 8 <= 491 { 2 } else { 1 },
             },
-            net: 10_000 + node,
+            net: node,
             participates_in_ranking: true,
         });
     }
@@ -959,13 +989,13 @@ fn regional_fanout_graph() -> Graph {
             id: edges.len() as u32,
             source: Endpoint {
                 node: source,
-                port: 2,
+                port: 0,
             },
             target: Endpoint {
                 node: 491 + source,
                 port: 0,
             },
-            net: 10_000 + source,
+            net: source,
             participates_in_ranking: true,
         });
     }
@@ -1032,6 +1062,27 @@ fn negotiated_corridor_graph() -> Graph {
         }
     }
     Graph { nodes, edges }
+}
+
+#[test]
+fn visual_review_high_fanout_highest_quality_is_deterministic_and_hard_safe() {
+    let graph = regional_fanout_graph();
+    let config = LayoutConfig::highest_quality();
+    let first = layout_with_config(&graph, &config).unwrap();
+    let second = layout_with_config(&graph, &config).unwrap();
+    let report = score(&graph, &first, ScoreOptions::default());
+
+    assert_eq!(first, second, "the public Max layout must be deterministic");
+    assert!(report.passes_hard_gates(), "{report:#?}");
+    assert_eq!(report.semantic_violations, 0);
+    assert_eq!(report.node_overlaps, 0);
+    assert_eq!(report.node_intersections, 0);
+    assert_eq!(report.unrelated_overlaps, 0);
+    assert_eq!(report.unrelated_contacts, 0);
+    assert_eq!(report.ranking_direction_violations, 0);
+    assert_eq!(report.reverse_x_length, 0.0);
+    assert!(!report.edge_node_clearance_exhausted);
+    assert_eq!(report.edge_node_clearance_violations, 0);
 }
 
 #[test]
@@ -1109,13 +1160,13 @@ fn regional_fanout_max_candidate_preserves_every_hard_gate() {
         .edges
         .iter()
         .zip(&max.edges)
-        .filter(|(edge, _)| edge.net == 1)
+        .filter(|(edge, _)| edge.net == 0)
         .map(|(_, route)| route);
     let quality_hot_routes = graph
         .edges
         .iter()
         .zip(&quality.edges)
-        .filter(|(edge, _)| edge.net == 1)
+        .filter(|(edge, _)| edge.net == 0)
         .map(|(_, route)| route);
 
     assert_ne!(
