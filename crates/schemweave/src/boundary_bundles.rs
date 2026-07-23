@@ -11,6 +11,43 @@ use crate::{
 pub(crate) const MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS: usize = 20_000_000;
 const BUNDLE_CLEARANCE_NET_BASE: u32 = 0x8000_0000;
 
+/// Additional horizontal depth assigned to each bundle's member-route corridors.
+///
+/// Boundary nodes share an aligned outer edge, but may have different widths. Reserving corridor
+/// lanes independently per bundle can therefore put unrelated member routes on the same absolute
+/// x coordinate, creating an electrical-looking T contact after route rewriting. Bundles are
+/// already stable-ID ordered, so allocate disjoint depth ranges per boundary role in one bounded
+/// pass. Input and output ranges remain independent because they open from opposite boundaries.
+pub(crate) fn corridor_depth_offsets(graph: &IndexedGraph<'_>, options: LayoutOptions) -> Vec<f64> {
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let rail_depth = crate::boundary_bundle_rail_depth(options);
+    let mut furthest_input = None::<f64>;
+    let mut furthest_output = None::<f64>;
+    graph
+        .boundary_bundles
+        .iter()
+        .map(|bundle| {
+            let node = graph.nodes[graph.node_index[&bundle.endpoint.node]];
+            let boundary_depth = node.width + rail_depth;
+            let furthest = match bundle.role {
+                BoundaryBundleRole::Input => &mut furthest_input,
+                BoundaryBundleRole::Output => &mut furthest_output,
+            };
+            let first_nominal = boundary_depth + pitch;
+            let offset = furthest.map_or(0.0, |used| (used + pitch - first_nominal).max(0.0));
+            let lane_count = bundle
+                .members
+                .last()
+                .map_or(0, |member| member.tap_lane + 1);
+            let last = boundary_depth + offset + lane_count as f64 * pitch;
+            *furthest = Some(furthest.map_or(last, |used| used.max(last)));
+            offset
+        })
+        .collect()
+}
+
 pub(crate) fn route_quality(
     graph: &IndexedGraph<'_>,
     layout: &Layout,
@@ -55,8 +92,9 @@ pub(crate) fn apply_and_normalize(
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
     let rail_depth = crate::boundary_bundle_rail_depth(options);
+    let corridor_offsets = corridor_depth_offsets(graph, options);
     let mut geometries = Vec::with_capacity(graph.boundary_bundles.len());
-    for bundle in &graph.boundary_bundles {
+    for (bundle, corridor_offset) in graph.boundary_bundles.iter().zip(corridor_offsets) {
         let geometry = build_geometry(
             graph,
             bundle,
@@ -65,7 +103,14 @@ pub(crate) fn apply_and_normalize(
             pitch,
             rail_depth,
         );
-        rewrite_member_routes(bundle, &geometry, &route_index, &mut layout.edges, pitch)?;
+        rewrite_member_routes(
+            bundle,
+            &geometry,
+            &route_index,
+            &mut layout.edges,
+            pitch,
+            corridor_offset,
+        )?;
         geometries.push(geometry);
     }
     layout.boundary_bundles = geometries;
@@ -146,13 +191,14 @@ fn rewrite_member_routes(
     route_index: &HashMap<u32, usize>,
     routes: &mut [EdgeGeometry],
     pitch: f64,
+    corridor_offset: f64,
 ) -> Result<(), LayoutError> {
     for (member, indexed_member) in geometry.members.iter().zip(&bundle.members) {
         let route = &mut routes[route_index[&member.edge]];
         if route.points.len() < 2 {
             return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
         }
-        let corridor_depth = (indexed_member.tap_lane + 1) as f64 * pitch;
+        let corridor_depth = corridor_offset + (indexed_member.tap_lane + 1) as f64 * pitch;
         route.points = match bundle.role {
             BoundaryBundleRole::Input => {
                 rewrite_input_route(&route.points, member.tap, corridor_depth)
