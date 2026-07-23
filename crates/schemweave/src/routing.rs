@@ -3,6 +3,9 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
 };
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use crate::{
     Edge, EdgeGeometry, EdgeId, Endpoint, LayoutOptions, NetId, NodeGeometry, Point, Port,
     PortSide, validation::IndexedGraph,
@@ -49,6 +52,10 @@ const MIN_CROSSING_REPAIR_NET: usize = 64;
 // Move a bounded hot-net block before the existing single rebuild and exact score. Two captures
 // the measured quality knee without adding another complete routing/scoring pass.
 const MAX_BATCHED_CROSSING_REPAIR_NETS: usize = 2;
+// Max may evaluate one deeper repair family, but only when a third or fourth movable hot net
+// exists. Otherwise the candidate is byte-identical to the existing two-net repair and a second
+// complete route emission plus exact score would be wasted work.
+const MAX_DEEP_CROSSING_REPAIR_NETS: usize = 4;
 // Outer arm prediction is only a selector; the complete candidate still passes the exact scorer.
 // Require the same visible per-net gain as sparse repair and move at most two whole nets in one
 // bounded rebuild.
@@ -130,6 +137,7 @@ struct RouteFamily {
     primary: Vec<EdgeGeometry>,
     primary_quality: RouteQuality,
     repair: Option<(RouteQuality, Vec<EdgeGeometry>)>,
+    deeper_repair: Option<(RouteQuality, Vec<EdgeGeometry>)>,
     #[cfg(test)]
     feedback_trace: FeedbackCandidateTrace,
     #[cfg(test)]
@@ -319,7 +327,7 @@ pub(crate) fn route_planned_candidates_with_refined_sparse_global(
     large_sparse_global: bool,
     refined_large_sparse_global: bool,
 ) -> RoutedEdges {
-    route_planned_candidates_with_adaptive_gap_spacing(
+    route_planned_candidates_with_quality_options(
         plan,
         nodes,
         options,
@@ -328,11 +336,12 @@ pub(crate) fn route_planned_candidates_with_refined_sparse_global(
         large_sparse_global,
         refined_large_sparse_global,
         false,
+        false,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn route_planned_candidates_with_adaptive_gap_spacing(
+pub(crate) fn route_planned_candidates_with_quality_options(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     options: LayoutOptions,
@@ -341,6 +350,7 @@ pub(crate) fn route_planned_candidates_with_adaptive_gap_spacing(
     large_sparse_global: bool,
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
+    deeper_crossing_repair: bool,
 ) -> RoutedEdges {
     let (outer_rounds, gap_rounds) = if supplemental {
         (SUPPLEMENTAL_OUTER_LANE_ROUNDS, SUPPLEMENTAL_GAP_LANE_ROUNDS)
@@ -359,6 +369,7 @@ pub(crate) fn route_planned_candidates_with_adaptive_gap_spacing(
         large_sparse_global,
         refined_large_sparse_global,
         adaptive_gap_spacing,
+        deeper_crossing_repair,
     );
     if routed.primary_quality.is_none() {
         routed.primary_quality = Some(route_quality_for_plan(plan, &routed.primary));
@@ -427,6 +438,7 @@ fn route_edges_with_lane_rounds_and_global(
         large_sparse_global,
         false,
         false,
+        false,
     )
 }
 
@@ -444,6 +456,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
     large_sparse_global: bool,
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
+    deeper_crossing_repair: bool,
 ) -> RoutedEdges {
     let ranks = &plan.ranks;
     debug_assert_eq!(nodes.len(), ranks.len());
@@ -684,6 +697,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
                 options,
                 outer_lane_rounds,
                 repair_crossings,
+                false,
                 None,
                 candidate_routes,
                 candidate_gap_spacing,
@@ -736,6 +750,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             options,
             outer_lane_rounds,
             repair_crossings,
+            deeper_crossing_repair,
             routes,
             sparse_alternative,
             gap_spacing,
@@ -828,6 +843,21 @@ fn route_edges_with_lane_rounds_and_refined_global(
             primary_quality = Some(baseline_quality);
         }
     }
+    let deeper_repair_within_budget = repair_crossings
+        && deeper_crossing_repair
+        && crossing_repair_within_budget(
+            node_count,
+            plan.edges.len(),
+            &routes,
+            &gap_lanes,
+            &sparse_spans,
+            &free_by_rank,
+        );
+    let shared_repair_profile =
+        deeper_repair_within_budget.then(|| horizontal_crossing_profile_by_net(plan, &routes));
+    let precomputed_repair_profile = shared_repair_profile
+        .as_ref()
+        .map(|(segments, counts, quality)| (segments.as_slice(), counts, *quality));
     let mut repair = if repair_crossings {
         Some(repair_crossing_heavy_net(
             plan,
@@ -846,9 +876,39 @@ fn route_edges_with_lane_rounds_and_refined_global(
             options,
             outer_lane_rounds,
             &routes,
-            None,
+            precomputed_repair_profile,
             gap_spacing,
+            MAX_BATCHED_CROSSING_REPAIR_NETS,
         ))
+    } else {
+        None
+    };
+    let deeper_crossing_repair_candidate = if deeper_repair_within_budget {
+        repair_crossing_heavy_net(
+            plan,
+            nodes,
+            &sparse_spans,
+            &crossing_lanes,
+            &crossing_tie_lanes,
+            crossing_tie_lane_count,
+            &free_by_rank,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            &outer_lanes,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            &routes,
+            precomputed_repair_profile,
+            gap_spacing,
+            MAX_DEEP_CROSSING_REPAIR_NETS,
+        )
+        .candidate
+        .filter(|candidate| {
+            repair.as_ref().and_then(|item| item.candidate.as_ref()) != Some(candidate)
+        })
     } else {
         None
     };
@@ -867,6 +927,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             .into_iter()
             .chain(preserved_refined_sparse_alternative)
             .chain(refined_sparse_alternative)
+            .chain(deeper_crossing_repair_candidate)
             .collect(),
         #[cfg(test)]
         feedback_trace,
@@ -908,6 +969,7 @@ fn finish_fanout_route_families(
     options: LayoutOptions,
     outer_lane_rounds: usize,
     repair_crossings: bool,
+    deeper_crossing_repair: bool,
     stable_routes: Vec<EdgeGeometry>,
     sparse_alternative: Option<(RouteQuality, Vec<EdgeGeometry>)>,
     gap_spacing: GapTrackSpacing,
@@ -955,10 +1017,10 @@ fn finish_fanout_route_families(
         options,
         gap_spacing,
     );
-    let baseline_score = horizontal_crossing_counts_by_net(plan, &stable_routes);
-    let candidate_score = horizontal_crossing_counts_by_net(plan, &adaptive_routes);
-    let baseline_quality = baseline_score.1;
-    let candidate_quality = candidate_score.1;
+    let baseline_profile = horizontal_crossing_profile_by_net(plan, &stable_routes);
+    let candidate_profile = horizontal_crossing_profile_by_net(plan, &adaptive_routes);
+    let baseline_quality = baseline_profile.2;
+    let candidate_quality = candidate_profile.2;
     let adaptive_is_better = route_quality_cmp(candidate_quality, baseline_quality).is_lt();
 
     let (selected, mut alternatives) = if adaptive_is_better {
@@ -982,7 +1044,8 @@ fn finish_fanout_route_families(
             options,
             outer_lane_rounds,
             repair_crossings,
-            Some(candidate_score),
+            deeper_crossing_repair,
+            Some(candidate_profile),
             adaptive_routes,
             gap_spacing,
         );
@@ -1006,12 +1069,16 @@ fn finish_fanout_route_families(
             options,
             outer_lane_rounds,
             repair_crossings,
-            Some(baseline_score),
+            deeper_crossing_repair,
+            Some(baseline_profile),
             stable_routes,
             gap_spacing,
         );
         let mut alternatives = vec![(stable.primary_quality, stable.primary)];
         if let Some(repair) = stable.repair {
+            alternatives.push(repair);
+        }
+        if let Some(repair) = stable.deeper_repair {
             alternatives.push(repair);
         }
         (adaptive, alternatives)
@@ -1037,7 +1104,8 @@ fn finish_fanout_route_families(
                 options,
                 outer_lane_rounds,
                 repair_crossings,
-                Some(baseline_score),
+                deeper_crossing_repair,
+                Some(baseline_profile),
                 stable_routes,
                 gap_spacing,
             ),
@@ -1045,6 +1113,7 @@ fn finish_fanout_route_families(
         )
     };
     alternatives.extend(sparse_alternative);
+    alternatives.extend(selected.deeper_repair);
     RoutedEdges {
         primary: selected.primary,
         primary_quality: Some(selected.primary_quality),
@@ -1110,7 +1179,8 @@ fn finish_route_family(
     options: LayoutOptions,
     outer_lane_rounds: usize,
     repair_crossings: bool,
-    mut precomputed_score: Option<(BTreeMap<NetId, usize>, RouteQuality)>,
+    deeper_crossing_repair: bool,
+    mut precomputed_profile: Option<(Vec<PhysicalSegment>, BTreeMap<NetId, usize>, RouteQuality)>,
     mut routes: Vec<EdgeGeometry>,
     gap_spacing: GapTrackSpacing,
 ) -> RouteFamily {
@@ -1155,10 +1225,10 @@ fn finish_route_family(
             outer_lane_rounds,
             true,
         );
-        let baseline_score = precomputed_score
+        let baseline_profile = precomputed_profile
             .take()
-            .unwrap_or_else(|| horizontal_crossing_counts_by_net(plan, &routes));
-        let baseline_quality = baseline_score.1;
+            .unwrap_or_else(|| horizontal_crossing_profile_by_net(plan, &routes));
+        let baseline_quality = baseline_profile.2;
         // Coherence changes outer side and side-local lane indices, but not the stable per-net
         // channel index. The baseline sparse paths and gap lanes therefore remain valid.
         let candidate_endpoint_tracks = build_endpoint_tracks(
@@ -1188,8 +1258,8 @@ fn finish_route_family(
             options,
             gap_spacing,
         );
-        let candidate_score = horizontal_crossing_counts_by_net(plan, &candidate_routes);
-        let candidate_quality = candidate_score.1;
+        let candidate_profile = horizontal_crossing_profile_by_net(plan, &candidate_routes);
+        let candidate_quality = candidate_profile.2;
         #[cfg(test)]
         {
             feedback_trace.evaluated = true;
@@ -1201,16 +1271,32 @@ fn finish_route_family(
         if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
             routes = candidate_routes;
             outer_lanes = coherent_outer_lanes;
-            precomputed_score = Some(candidate_score);
+            precomputed_profile = Some(candidate_profile);
             #[cfg(test)]
             {
                 feedback_trace.selected = true;
             }
         } else {
-            precomputed_score = Some(baseline_score);
+            precomputed_profile = Some(baseline_profile);
         }
     }
-    let precomputed_quality = precomputed_score.as_ref().map(|(_, quality)| *quality);
+    let deeper_repair_within_budget = repair_crossings
+        && deeper_crossing_repair
+        && crossing_repair_within_budget(
+            node_count,
+            plan.edges.len(),
+            &routes,
+            gap_lanes,
+            sparse_spans,
+            free_by_rank,
+        );
+    if deeper_repair_within_budget && precomputed_profile.is_none() {
+        precomputed_profile = Some(horizontal_crossing_profile_by_net(plan, &routes));
+    }
+    let precomputed_quality = precomputed_profile.as_ref().map(|(_, _, quality)| *quality);
+    let precomputed_repair_profile = precomputed_profile
+        .as_ref()
+        .map(|(segments, counts, quality)| (segments.as_slice(), counts, *quality));
     let mut repair = if repair_crossings {
         Some(repair_crossing_heavy_net(
             plan,
@@ -1229,9 +1315,39 @@ fn finish_route_family(
             options,
             outer_lane_rounds,
             &routes,
-            precomputed_score,
+            precomputed_repair_profile,
             gap_spacing,
+            MAX_BATCHED_CROSSING_REPAIR_NETS,
         ))
+    } else {
+        None
+    };
+    let deeper_repair = if deeper_repair_within_budget {
+        repair_crossing_heavy_net(
+            plan,
+            nodes,
+            sparse_spans,
+            crossing_lanes,
+            crossing_tie_lanes,
+            crossing_tie_lane_count,
+            free_by_rank,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            &outer_lanes,
+            top,
+            bottom,
+            options,
+            outer_lane_rounds,
+            &routes,
+            precomputed_repair_profile,
+            gap_spacing,
+            MAX_DEEP_CROSSING_REPAIR_NETS,
+        )
+        .candidate
+        .filter(|candidate| {
+            repair.as_ref().and_then(|item| item.candidate.as_ref()) != Some(candidate)
+        })
     } else {
         None
     };
@@ -1247,6 +1363,7 @@ fn finish_route_family(
         primary: routes,
         primary_quality,
         repair: repair.as_mut().and_then(|repair| repair.candidate.take()),
+        deeper_repair,
         #[cfg(test)]
         feedback_trace,
         #[cfg(test)]
@@ -1579,8 +1696,9 @@ fn repair_crossing_heavy_net(
     options: LayoutOptions,
     outer_lane_rounds: usize,
     routes: &[EdgeGeometry],
-    precomputed: Option<(BTreeMap<NetId, usize>, RouteQuality)>,
+    precomputed: Option<(&[PhysicalSegment], &BTreeMap<NetId, usize>, RouteQuality)>,
     gap_spacing: GapTrackSpacing,
+    max_repair_nets: usize,
 ) -> CrossingRepair {
     let node_count = plan
         .nodes_by_rank
@@ -1609,25 +1727,46 @@ fn repair_crossing_heavy_net(
             candidate_emitted: false,
         };
     }
-    let (mut physical_segments, crossing_counts, quality) = match precomputed {
-        Some((counts, quality)) => (None, counts, quality),
+    let computed_profile;
+    let (physical_segments, crossing_counts, quality) = match precomputed {
+        Some((segments, counts, quality)) => (segments, counts, quality),
         None => {
-            let (segments, counts, quality) = horizontal_crossing_profile_by_net(plan, routes);
-            (Some(segments), counts, quality)
+            computed_profile = horizontal_crossing_profile_by_net(plan, routes);
+            (
+                computed_profile.0.as_slice(),
+                &computed_profile.1,
+                computed_profile.2,
+            )
         }
     };
     // Sparse-lane attribution and the outer-arm profiles select independent whole-net moves.
     // Combine both bounded repair sets before the one rebuild and exact score so the added
     // selector does not add another complete routing candidate.
-    let selected_nets = select_crossing_repair_nets(quality.crossings, &crossing_counts, gap_lanes);
+    let selected_nets = select_crossing_repair_nets(
+        quality.crossings,
+        crossing_counts,
+        gap_lanes,
+        max_repair_nets,
+    );
+    if !repair_selection_adds_new_nets(max_repair_nets, selected_nets.len()) {
+        return CrossingRepair {
+            baseline_quality: quality,
+            candidate: None,
+            #[cfg(test)]
+            selected_nets,
+            #[cfg(test)]
+            selected_outer_sides: Vec::new(),
+            #[cfg(test)]
+            candidate_lanes_built: false,
+            #[cfg(test)]
+            candidate_emitted: false,
+        };
+    }
     let candidate_points_within_budget = candidate_route_points_within_budget(sparse_spans);
     let selected_outer_sides = if candidate_points_within_budget
         && quality.crossings >= MIN_CROSSING_REPAIR_TOTAL
         && !outer_lanes.is_empty()
     {
-        let segments = physical_segments.get_or_insert_with(|| {
-            physical_route_segments(plan.edges.iter().map(|edge| edge.edge), routes).0
-        });
         select_outer_side_repairs(
             plan,
             nodes,
@@ -1639,7 +1778,7 @@ fn repair_crossing_heavy_net(
             top,
             bottom,
             options,
-            segments,
+            physical_segments,
             gap_spacing,
         )
     } else {
@@ -1758,6 +1897,11 @@ fn repair_crossing_heavy_net(
     }
 }
 
+fn repair_selection_adds_new_nets(max_repair_nets: usize, selected_nets: usize) -> bool {
+    max_repair_nets <= MAX_BATCHED_CROSSING_REPAIR_NETS
+        || selected_nets > MAX_BATCHED_CROSSING_REPAIR_NETS
+}
+
 fn crossing_repair_within_budget(
     node_count: usize,
     edge_count: usize,
@@ -1815,6 +1959,7 @@ fn select_crossing_repair_nets(
     total_crossings: usize,
     crossing_counts: &BTreeMap<NetId, usize>,
     gap_lanes: &[BTreeMap<NetId, usize>],
+    max_repair_nets: usize,
 ) -> Vec<NetId> {
     if total_crossings < MIN_CROSSING_REPAIR_TOTAL {
         return Vec::new();
@@ -1827,7 +1972,7 @@ fn select_crossing_repair_nets(
             }
         }
     }
-    let mut selected = Vec::<(usize, NetId)>::with_capacity(MAX_BATCHED_CROSSING_REPAIR_NETS);
+    let mut selected = Vec::<(usize, NetId)>::with_capacity(max_repair_nets);
     for (&net, &crossings) in crossing_counts {
         if crossings < MIN_CROSSING_REPAIR_NET || !movable.contains(&net) {
             continue;
@@ -1836,9 +1981,9 @@ fn select_crossing_repair_nets(
             selected_crossings > crossings
                 || (selected_crossings == crossings && selected_net < net)
         });
-        if index < MAX_BATCHED_CROSSING_REPAIR_NETS {
+        if index < max_repair_nets {
             selected.insert(index, (crossings, net));
-            selected.truncate(MAX_BATCHED_CROSSING_REPAIR_NETS);
+            selected.truncate(max_repair_nets);
         }
     }
     selected.into_iter().map(|(_, net)| net).collect()
@@ -2542,6 +2687,7 @@ fn physical_crossing_sweep_lines(
 ///
 /// This deliberately uses one sweep: attribution only selects a bounded repair candidate, while
 /// complete layouts are accepted using the orientation-independent exact crossing score.
+#[cfg(test)]
 fn horizontal_crossing_counts_by_net(
     plan: &RoutingPlan<'_>,
     routes: &[EdgeGeometry],
@@ -2554,6 +2700,8 @@ fn horizontal_crossing_profile_by_net(
     plan: &RoutingPlan<'_>,
     routes: &[EdgeGeometry],
 ) -> (Vec<PhysicalSegment>, BTreeMap<NetId, usize>, RouteQuality) {
+    #[cfg(test)]
+    HORIZONTAL_CROSSING_PROFILE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let (segments, bends, route_length) =
         physical_route_segments(plan.edges.iter().map(|edge| edge.edge), routes);
     let mut counts = BTreeMap::<NetId, usize>::new();
@@ -2568,6 +2716,16 @@ fn horizontal_crossing_profile_by_net(
             route_length,
         },
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    static HORIZONTAL_CROSSING_PROFILE_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_horizontal_crossing_profile_calls() -> usize {
+    HORIZONTAL_CROSSING_PROFILE_CALLS.with(|calls| calls.replace(0))
 }
 
 struct CrossingFenwick {
@@ -4695,12 +4853,14 @@ mod tests {
         physical_crossing_sweep, physical_crossing_sweep_lines, physical_route_segments,
         physical_route_segments_btree_reference, port_point,
         refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
-        repair_crossing_heavy_net, route_edges, route_edges_with_lane_rounds,
-        route_edges_with_lane_rounds_and_global, route_planned_candidates,
+        repair_crossing_heavy_net, repair_selection_adds_new_nets, route_edges,
+        route_edges_with_lane_rounds, route_edges_with_lane_rounds_and_global,
+        route_planned_candidates, route_planned_candidates_with_quality_options,
         route_planned_candidates_with_sparse_global, route_planned_edges, route_quality,
         route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
         select_crossing_repair_nets, select_outer_side_repairs, shortest_crossing_path,
-        sparse_channel_route, sparse_gap_x, sum_within_limit, vertical_horizontal_crossings,
+        sparse_channel_route, sparse_gap_x, sum_within_limit,
+        take_horizontal_crossing_profile_calls, vertical_horizontal_crossings,
     };
 
     #[test]
@@ -5846,6 +6006,10 @@ mod tests {
 
     #[test]
     fn repair_selector_honors_thresholds_ties_and_movable_runner_up() {
+        assert!(repair_selection_adds_new_nets(2, 2));
+        assert!(!repair_selection_adds_new_nets(4, 2));
+        assert!(repair_selection_adds_new_nets(4, 3));
+
         let lanes = vec![BTreeMap::from([(1, 2), (2, 0), (3, 1)])];
         let counts = BTreeMap::from([
             (1, MIN_CROSSING_REPAIR_NET + 20),
@@ -5854,11 +6018,21 @@ mod tests {
         ]);
 
         assert_eq!(
-            select_crossing_repair_nets(MIN_CROSSING_REPAIR_TOTAL, &counts, &lanes),
+            select_crossing_repair_nets(
+                MIN_CROSSING_REPAIR_TOTAL,
+                &counts,
+                &lanes,
+                super::MAX_BATCHED_CROSSING_REPAIR_NETS,
+            ),
             vec![2, 3]
         );
         assert_eq!(
-            select_crossing_repair_nets(MIN_CROSSING_REPAIR_TOTAL - 1, &counts, &lanes),
+            select_crossing_repair_nets(
+                MIN_CROSSING_REPAIR_TOTAL - 1,
+                &counts,
+                &lanes,
+                super::MAX_BATCHED_CROSSING_REPAIR_NETS,
+            ),
             Vec::<u32>::new()
         );
         assert_eq!(
@@ -5866,6 +6040,7 @@ mod tests {
                 MIN_CROSSING_REPAIR_TOTAL,
                 &BTreeMap::from([(2, MIN_CROSSING_REPAIR_NET - 1)]),
                 &lanes,
+                super::MAX_BATCHED_CROSSING_REPAIR_NETS,
             ),
             Vec::<u32>::new()
         );
@@ -6131,6 +6306,32 @@ mod tests {
         assert_eq!(route_quality(&indexed, &routed.primary), baseline);
         assert_eq!(route_quality(&indexed, repair), *candidate);
 
+        take_horizontal_crossing_profile_calls();
+        let deeper = route_planned_candidates_with_quality_options(
+            &plan,
+            &nodes,
+            LayoutOptions::default(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert_eq!(
+            take_horizontal_crossing_profile_calls(),
+            1,
+            "both repairs must share one baseline attribution profile",
+        );
+        assert_eq!(deeper.primary, routed.primary);
+        assert_eq!(deeper.primary_quality, routed.primary_quality);
+        assert_eq!(deeper.repair, routed.repair);
+        let (deeper_quality, deeper_routes) = deeper
+            .alternatives
+            .last()
+            .expect("fixture activates the deeper repair");
+        assert_eq!(route_quality(&indexed, deeper_routes), *deeper_quality);
+
         let oversized_spans = vec![Some((0, 500)); SIDE as usize];
         let oversized_free = vec![Vec::new(); 501];
         let synthetic_lanes = vec![
@@ -6158,6 +6359,7 @@ mod tests {
             &routed.primary,
             None,
             GapTrackSpacing::Compact,
+            super::MAX_BATCHED_CROSSING_REPAIR_NETS,
         );
         assert_eq!(bounded.selected_nets, vec![17, 12]);
         assert!(bounded.selected_outer_sides.is_empty());
@@ -6165,6 +6367,8 @@ mod tests {
         assert!(!bounded.candidate_lanes_built);
         assert!(!bounded.candidate_emitted);
 
+        let empty_physical_segments = Vec::new();
+        let empty_crossing_counts = BTreeMap::new();
         let no_selection = repair_crossing_heavy_net(
             &plan,
             &nodes,
@@ -6182,8 +6386,9 @@ mod tests {
             LayoutOptions::default(),
             FULL_OUTER_LANE_ROUNDS,
             &routed.primary,
-            Some((BTreeMap::new(), baseline)),
+            Some((&empty_physical_segments, &empty_crossing_counts, baseline)),
             GapTrackSpacing::Compact,
+            super::MAX_BATCHED_CROSSING_REPAIR_NETS,
         );
         assert!(no_selection.selected_nets.is_empty());
         assert!(no_selection.selected_outer_sides.is_empty());
