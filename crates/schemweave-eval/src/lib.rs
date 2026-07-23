@@ -5,7 +5,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 };
 
-use schemweave::{Edge, EdgeId, Endpoint, Graph, Layout, NetId, NodeGeometry, Point, PortSide};
+use schemweave::{
+    Edge, EdgeId, Endpoint, Graph, Layout, NetId, NodeGeometry, ParallelSegment, Point, PortSide,
+    measure_parallel_congestion,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -307,11 +310,24 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         .sum();
     report.minimum_parallel_route_separation =
         minimum_parallel_route_separation(&physical_segments);
-    report.parallel_congestion_ratio = parallel_congestion_ratio(
-        &physical_segments,
-        options.parallel_congestion_threshold,
-        options.epsilon,
-    );
+    report.parallel_congestion_ratio = if report.route_length > options.epsilon {
+        measure_parallel_congestion(
+            &physical_segments
+                .iter()
+                .map(|segment| ParallelSegment {
+                    net: segment.net,
+                    horizontal: segment.orientation == Orientation::Horizontal,
+                    fixed: segment.fixed,
+                    start: segment.start,
+                    end: segment.end,
+                })
+                .collect::<Vec<_>>(),
+            options.parallel_congestion_threshold - options.epsilon,
+        )
+        .ratio()
+    } else {
+        0.0
+    };
     report.perimeter_route_length =
         perimeter_route_length(&physical_segments, &layout.nodes, options.epsilon);
     if report.route_length > options.epsilon {
@@ -909,130 +925,6 @@ fn minimum_parallel_separation_for_orientation<'a>(
     minimum
 }
 
-/// Measure the exact physical wire length that is difficult to distinguish
-/// from a nearby, parallel route on a different electrical net.
-///
-/// The longitudinal sweep integrates only spans where both segments are
-/// present. A short close approach therefore contributes only its overlap
-/// length rather than the full length of either route. The active coordinate
-/// index enumerates only close segment pairs with positive longitudinal
-/// overlap, for O((S + K) log S) work where K is that local pair count.
-fn parallel_congestion_ratio(segments: &[Segment], threshold: f64, epsilon: f64) -> f64 {
-    let total_length = segments
-        .iter()
-        .map(|segment| segment.end - segment.start)
-        .sum::<f64>();
-    if total_length <= epsilon || threshold <= epsilon {
-        return 0.0;
-    }
-
-    let mut congested_length = 0.0;
-    for orientation in [Orientation::Horizontal, Orientation::Vertical] {
-        let oriented = segments
-            .iter()
-            .filter(|segment| segment.orientation == orientation)
-            .collect::<Vec<_>>();
-        if oriented.len() < 2 {
-            continue;
-        }
-        congested_length +=
-            parallel_congested_length_for_orientation(&oriented, threshold - epsilon);
-    }
-    (congested_length / total_length).clamp(0.0, 1.0)
-}
-
-fn parallel_congested_length_for_orientation(segments: &[&Segment], cutoff: f64) -> f64 {
-    let mut events = Vec::with_capacity(segments.len() * 2);
-    for (index, segment) in segments.iter().enumerate() {
-        // End events precede starts so longitudinal endpoint contact has zero
-        // weight and never becomes an active close pair.
-        events.push((FloatKey(segment.end), 0u8, index));
-        events.push((FloatKey(segment.start), 1u8, index));
-    }
-    events.sort_unstable();
-
-    let mut active = BTreeMap::<FloatKey, BTreeSet<usize>>::new();
-    let mut close_neighbor_counts = vec![0usize; segments.len()];
-    let mut congested_active = 0usize;
-    let mut congested_length = 0.0;
-    let mut neighbors = Vec::new();
-    let mut previous = events
-        .first()
-        .map_or(0.0, |(coordinate, _, _)| coordinate.0);
-
-    for (coordinate, event_kind, segment_index) in events {
-        congested_length += congested_active as f64 * (coordinate.0 - previous);
-        previous = coordinate.0;
-
-        let segment = segments[segment_index];
-        collect_close_active_other_nets(segment, cutoff, segments, &active, &mut neighbors);
-        if event_kind == 0 {
-            if close_neighbor_counts[segment_index] != 0 {
-                congested_active -= 1;
-            }
-            for &neighbor in &neighbors {
-                let count = &mut close_neighbor_counts[neighbor];
-                *count -= 1;
-                if *count == 0 {
-                    congested_active -= 1;
-                }
-            }
-            close_neighbor_counts[segment_index] = 0;
-            let coordinate = FloatKey(segment.fixed);
-            let remove_coordinate = {
-                let members = active
-                    .get_mut(&coordinate)
-                    .expect("ending parallel segment is active");
-                assert!(members.remove(&segment_index));
-                members.is_empty()
-            };
-            if remove_coordinate {
-                active.remove(&coordinate);
-            }
-        } else {
-            close_neighbor_counts[segment_index] = neighbors.len();
-            if !neighbors.is_empty() {
-                congested_active += 1;
-            }
-            for &neighbor in &neighbors {
-                let count = &mut close_neighbor_counts[neighbor];
-                if *count == 0 {
-                    congested_active += 1;
-                }
-                *count += 1;
-            }
-            active
-                .entry(FloatKey(segment.fixed))
-                .or_default()
-                .insert(segment_index);
-        }
-    }
-    debug_assert!(active.is_empty());
-    debug_assert_eq!(congested_active, 0);
-    congested_length
-}
-
-fn collect_close_active_other_nets(
-    query: &Segment,
-    cutoff: f64,
-    segments: &[&Segment],
-    active: &BTreeMap<FloatKey, BTreeSet<usize>>,
-    neighbors: &mut Vec<usize>,
-) {
-    use std::ops::Bound::Excluded;
-
-    neighbors.clear();
-    neighbors.extend(
-        active
-            .range((
-                Excluded(FloatKey(query.fixed - cutoff)),
-                Excluded(FloatKey(query.fixed + cutoff)),
-            ))
-            .flat_map(|(_, members)| members.iter().copied())
-            .filter(|&index| segments[index].net != query.net),
-    );
-}
-
 #[derive(Clone, Copy, Default)]
 struct NetSummary {
     first: Option<NetId>,
@@ -1571,87 +1463,5 @@ impl Ord for FloatKey {
 impl PartialOrd for FloatKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Orientation, Segment, parallel_congestion_ratio};
-
-    fn oracle(segments: &[Segment], threshold: f64, epsilon: f64) -> f64 {
-        let total_length = segments
-            .iter()
-            .map(|segment| segment.end - segment.start)
-            .sum::<f64>();
-        let mut breakpoints = segments
-            .iter()
-            .flat_map(|segment| [segment.start, segment.end])
-            .collect::<Vec<_>>();
-        breakpoints.sort_by(f64::total_cmp);
-        breakpoints.dedup_by(|left, right| left.total_cmp(right).is_eq());
-        let mut congested_length = 0.0;
-        for (index, segment) in segments.iter().enumerate() {
-            for window in breakpoints.windows(2) {
-                let start = window[0].max(segment.start);
-                let end = window[1].min(segment.end);
-                if end <= start {
-                    continue;
-                }
-                if segments
-                    .iter()
-                    .enumerate()
-                    .any(|(candidate_index, candidate)| {
-                        candidate_index != index
-                            && candidate.orientation == segment.orientation
-                            && candidate.net != segment.net
-                            && candidate.start < end
-                            && candidate.end > start
-                            && (candidate.fixed - segment.fixed).abs() < threshold - epsilon
-                    })
-                {
-                    congested_length += end - start;
-                }
-            }
-        }
-        if total_length > epsilon {
-            congested_length / total_length
-        } else {
-            0.0
-        }
-    }
-
-    #[test]
-    fn parallel_congestion_matches_quadratic_oracle() {
-        let mut state = 0x6a09_e667_f3bc_c909u64;
-        let mut next = || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            state
-        };
-        let mut segments = (0..96u32)
-            .map(|edge| {
-                let orientation = if next() & 1 == 0 {
-                    Orientation::Horizontal
-                } else {
-                    Orientation::Vertical
-                };
-                let start = (next() % 80) as f64;
-                let length = (next() % 30 + 1) as f64;
-                Segment {
-                    edge,
-                    net: (next() % 11) as u32,
-                    orientation,
-                    fixed: (next() % 37) as f64 * 0.23,
-                    start,
-                    end: start + length,
-                }
-            })
-            .collect::<Vec<_>>();
-        let expected = oracle(&segments, 4.0, 1e-7);
-        assert_eq!(parallel_congestion_ratio(&segments, 4.0, 1e-7), expected);
-
-        segments.sort_unstable_by_key(|segment| std::cmp::Reverse(segment.edge));
-        assert_eq!(parallel_congestion_ratio(&segments, 4.0, 1e-7), expected);
     }
 }

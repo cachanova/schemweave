@@ -539,6 +539,135 @@ fn quality_effort_selects_the_exact_scored_adaptive_gap_tracks() {
 }
 
 #[test]
+fn quality_spreads_a_dense_small_gap_across_the_full_safe_channel() {
+    let port_count = 10u32;
+    let ports = |side| {
+        (0..port_count)
+            .map(|id| Port {
+                id,
+                side,
+                offset: 10.0 + f64::from(id) * 20.0,
+            })
+            .collect()
+    };
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: 1,
+                width: 20.0,
+                height: 210.0,
+                cycle_breaker: false,
+                ports: ports(PortSide::East),
+            },
+            Node {
+                id: 2,
+                width: 20.0,
+                height: 210.0,
+                cycle_breaker: false,
+                ports: ports(PortSide::West),
+            },
+        ],
+        edges: (0..port_count)
+            .map(|id| Edge {
+                id,
+                source: Endpoint { node: 1, port: id },
+                target: Endpoint {
+                    node: 2,
+                    port: port_count - id - 1,
+                },
+                net: id,
+                participates_in_ranking: true,
+            })
+            .collect(),
+    };
+    let options = LayoutOptions::default();
+    let fast = layout_with_quality_effort(&graph, options, QualityEffort::Fast).unwrap();
+    let quality = layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+    let fast_report = score(&graph, &fast, ScoreOptions::default());
+    let quality_report = score(&graph, &quality, ScoreOptions::default());
+    assert!(fast_report.passes_hard_gates(), "{fast_report:#?}");
+    assert!(quality_report.passes_hard_gates(), "{quality_report:#?}");
+    assert_eq!(quality_report.crossings, fast_report.crossings);
+    assert_eq!(quality_report.bends, fast_report.bends);
+    assert_eq!(quality_report.route_length, fast_report.route_length);
+    assert_eq!(quality_report.area, fast_report.area);
+    assert!(
+        quality_report.parallel_congestion_ratio < fast_report.parallel_congestion_ratio,
+        "fast={fast_report:#?}\nquality={quality_report:#?}"
+    );
+    assert!(
+        quality_report.minimum_parallel_route_separation
+            > fast_report.minimum_parallel_route_separation,
+        "fast={fast_report:#?}\nquality={quality_report:#?}"
+    );
+
+    let mut large_graph = graph.clone();
+    large_graph.nodes.extend((3..=401).map(|id| Node {
+        id,
+        width: 20.0,
+        height: 20.0,
+        cycle_breaker: false,
+        ports: Vec::new(),
+    }));
+    let bounded =
+        layout_with_quality_effort(&large_graph, options, QualityEffort::Quality).unwrap();
+    let maximum = layout_with_quality_effort(&large_graph, options, QualityEffort::Max).unwrap();
+    let bounded_report = score(&large_graph, &bounded, ScoreOptions::default());
+    let maximum_report = score(&large_graph, &maximum, ScoreOptions::default());
+    assert!(bounded_report.passes_hard_gates(), "{bounded_report:#?}");
+    assert!(maximum_report.passes_hard_gates(), "{maximum_report:#?}");
+    assert_eq!(maximum_report.crossings, bounded_report.crossings);
+    assert_eq!(maximum_report.bends, bounded_report.bends);
+    assert!(
+        maximum_report.parallel_congestion_ratio < bounded_report.parallel_congestion_ratio,
+        "quality={bounded_report:#?}\nmax={maximum_report:#?}"
+    );
+
+    let mut mixed_graph = graph.clone();
+    mixed_graph.nodes[0].ports.push(Port {
+        id: port_count,
+        side: PortSide::West,
+        offset: 200.0,
+    });
+    mixed_graph.nodes[1].ports.push(Port {
+        id: port_count,
+        side: PortSide::East,
+        offset: 200.0,
+    });
+    mixed_graph.edges.push(Edge {
+        id: port_count,
+        source: Endpoint {
+            node: 2,
+            port: port_count,
+        },
+        target: Endpoint {
+            node: 1,
+            port: port_count,
+        },
+        net: port_count,
+        participates_in_ranking: false,
+    });
+    let mixed = layout_with_quality_effort(&mixed_graph, options, QualityEffort::Quality).unwrap();
+    let mixed_report = score(&mixed_graph, &mixed, ScoreOptions::default());
+    assert!(mixed_report.passes_hard_gates(), "{mixed_report:#?}");
+    let mut mixed_permuted = mixed_graph.clone();
+    mixed_permuted.nodes.reverse();
+    mixed_permuted.edges.reverse();
+    assert_eq!(
+        layout_with_quality_effort(&mixed_permuted, options, QualityEffort::Quality).unwrap(),
+        mixed
+    );
+
+    let mut permuted = graph;
+    permuted.nodes.reverse();
+    permuted.edges.reverse();
+    assert_eq!(
+        layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
+        quality
+    );
+}
+
+#[test]
 fn accepts_the_current_exact_port_baseline() {
     let graph = graph();
     let layout = layout(&graph, LayoutOptions::default()).unwrap();

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod placement;
+mod readability;
 mod routing;
 mod topology;
 mod validation;
@@ -11,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use placement::place;
+pub(crate) use readability::measure_parallel_congestion_bounded;
+#[doc(hidden)]
+pub use readability::{ParallelCongestion, ParallelSegment, measure_parallel_congestion};
 
 pub type NodeId = u32;
 pub type PortId = u32;

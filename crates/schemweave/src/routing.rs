@@ -7,8 +7,8 @@ use std::{
 use std::cell::Cell;
 
 use crate::{
-    Edge, EdgeGeometry, EdgeId, Endpoint, LayoutOptions, NetId, NodeGeometry, Point, Port,
-    PortSide, validation::IndexedGraph,
+    Edge, EdgeGeometry, EdgeId, Endpoint, LayoutOptions, NetId, NodeGeometry, ParallelSegment,
+    Point, Port, PortSide, measure_parallel_congestion_bounded, validation::IndexedGraph,
 };
 
 const MAX_SPARSE_NET_EDGES: usize = 300;
@@ -79,6 +79,22 @@ const MIN_FANOUT_AWARE_NODES: usize = 1_000;
 // sparse path payload, and the candidate is never admitted without the canonical physical score.
 const MIN_STAIRCASE_ALIGNMENT_TRANSITIONS: usize = 32;
 const MIN_STAIRCASE_ALIGNMENT_RATIO_DENOMINATOR: usize = 9;
+const PARALLEL_CONGESTION_CUTOFF: f64 = 4.0;
+const MAX_ADAPTIVE_SPACING_LENGTH_FACTOR: f64 = 1.05;
+const MAX_ADAPTIVE_SPACING_CONGESTION_FACTOR: f64 = 0.94;
+const MAX_EXPANDED_GAP_SPACING_NODES: usize = 400;
+const MAX_PARALLEL_CONGESTION_ACTIVE_VISITS: usize = 100_000;
+
+fn expanded_gap_spacing_enabled(
+    adaptive_gap_spacing: bool,
+    max_quality_effort: bool,
+    node_count: usize,
+    outer_lanes_are_empty: bool,
+) -> bool {
+    adaptive_gap_spacing
+        && outer_lanes_are_empty
+        && (max_quality_effort || node_count <= MAX_EXPANDED_GAP_SPACING_NODES)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RouteQuality {
@@ -138,6 +154,7 @@ struct RoutedLaneState {
 enum GapTrackSpacing {
     Compact,
     Adaptive,
+    Expanded,
 }
 
 struct RouteFamily {
@@ -627,6 +644,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         large_sparse_global,
         refined_large_sparse_global,
         adaptive_gap_spacing,
+        deeper_crossing_repair,
     );
     let staircase_alternative = align_staircases
         .then(|| {
@@ -685,24 +703,70 @@ fn route_edges_with_lane_rounds_and_refined_global(
         let adaptive_candidate_routes = (adaptive_gap_spacing
             && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
         .then(|| {
-            emit_routes(
-                plan,
-                nodes,
-                &sparse_spans,
-                &crossing_paths,
-                &layer_left,
-                &layer_right,
-                &candidate_lanes,
-                &candidate_endpoint_tracks,
-                &baseline_outer_lanes,
-                top,
-                bottom,
-                options,
+            (
+                emit_routes(
+                    plan,
+                    nodes,
+                    &sparse_spans,
+                    &crossing_paths,
+                    &layer_left,
+                    &layer_right,
+                    &candidate_lanes,
+                    &candidate_endpoint_tracks,
+                    &baseline_outer_lanes,
+                    top,
+                    bottom,
+                    options,
+                    GapTrackSpacing::Adaptive,
+                ),
                 GapTrackSpacing::Adaptive,
             )
         });
+        let selected = select_gap_spacing_candidate(
+            plan,
+            compact_candidate_routes,
+            GapTrackSpacing::Compact,
+            None,
+            adaptive_candidate_routes,
+        );
+        let expanded_candidate_routes = (expanded_gap_spacing_enabled(
+            adaptive_gap_spacing,
+            deeper_crossing_repair,
+            node_count,
+            baseline_outer_lanes.is_empty(),
+        ) && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
+        .then(|| {
+            (
+                emit_routes(
+                    plan,
+                    nodes,
+                    &sparse_spans,
+                    &crossing_paths,
+                    &layer_left,
+                    &layer_right,
+                    &candidate_lanes,
+                    &candidate_endpoint_tracks,
+                    &baseline_outer_lanes,
+                    top,
+                    bottom,
+                    options,
+                    GapTrackSpacing::Expanded,
+                ),
+                GapTrackSpacing::Expanded,
+            )
+        });
         let (candidate_routes, spacing_quality, candidate_gap_spacing) =
-            select_gap_spacing_candidate(plan, compact_candidate_routes, adaptive_candidate_routes);
+            if let Some(expanded_candidate_routes) = expanded_candidate_routes {
+                select_gap_spacing_candidate(
+                    plan,
+                    selected.0,
+                    selected.2,
+                    selected.1,
+                    Some(expanded_candidate_routes),
+                )
+            } else {
+                selected
+            };
         if !route_family_candidate_within_budget(node_count, plan.edges.len(), &candidate_routes) {
             return None;
         }
@@ -1919,6 +1983,7 @@ fn emit_routes_with_outer_lanes(
     large_sparse_global: bool,
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
+    max_quality_effort: bool,
 ) -> RoutedLaneState {
     let initial_endpoint_tracks = build_endpoint_tracks(
         plan,
@@ -1997,13 +2062,47 @@ fn emit_routes_with_outer_lanes(
         options,
         GapTrackSpacing::Compact,
     );
-    // A non-fallback adaptive track implies port_stub < 30% of the gap, stays in the sparse
-    // 55%..(right - stub) band, and preserves lane order; outer tracks stay in 35%..50%.
-    // Pairwise endpoint-access overlap components (and therefore endpoint escapes and crossing
-    // paths) are consequently identical even though the channel x coordinates move apart. Reuse
-    // the compact endpoint work here; the band invariant is covered by a focused regression.
+    // Expanded sparse tracks preserve endpoint-track overlap components only while no outer
+    // lanes share their channel: every spacing remains monotone in lane index, but Expanded
+    // deliberately uses the outer-lane band. Keep the candidate bounded to small graphs, then
+    // require its exact congestion gain to pay for any added length.
+    let node_count = plan.nodes_by_rank.iter().map(Vec::len).sum::<usize>();
     let adaptive_routes = (adaptive_gap_spacing && gap_lanes.iter().any(|lanes| lanes.len() > 1))
         .then(|| {
+            (
+                emit_routes(
+                    plan,
+                    nodes,
+                    sparse_spans,
+                    &crossing_paths,
+                    layer_left,
+                    layer_right,
+                    &gap_lanes,
+                    &endpoint_tracks,
+                    outer_lanes,
+                    top,
+                    bottom,
+                    options,
+                    GapTrackSpacing::Adaptive,
+                ),
+                GapTrackSpacing::Adaptive,
+            )
+        });
+    let selected = select_gap_spacing_candidate(
+        plan,
+        compact_routes,
+        GapTrackSpacing::Compact,
+        None,
+        adaptive_routes,
+    );
+    let expanded_routes = (expanded_gap_spacing_enabled(
+        adaptive_gap_spacing,
+        max_quality_effort,
+        node_count,
+        outer_lanes.is_empty(),
+    ) && gap_lanes.iter().any(|lanes| lanes.len() > 1))
+    .then(|| {
+        (
             emit_routes(
                 plan,
                 nodes,
@@ -2017,11 +2116,22 @@ fn emit_routes_with_outer_lanes(
                 top,
                 bottom,
                 options,
-                GapTrackSpacing::Adaptive,
-            )
-        });
-    let (routes, route_quality, gap_spacing) =
-        select_gap_spacing_candidate(plan, compact_routes, adaptive_routes);
+                GapTrackSpacing::Expanded,
+            ),
+            GapTrackSpacing::Expanded,
+        )
+    });
+    let (routes, route_quality, gap_spacing) = if let Some(expanded_routes) = expanded_routes {
+        select_gap_spacing_candidate(
+            plan,
+            selected.0,
+            selected.2,
+            selected.1,
+            Some(expanded_routes),
+        )
+    } else {
+        selected
+    };
     RoutedLaneState {
         routes,
         route_quality,
@@ -2853,14 +2963,42 @@ pub(crate) fn route_quality(graph: &IndexedGraph<'_>, routes: &[EdgeGeometry]) -
 }
 
 fn route_quality_for_plan(plan: &RoutingPlan<'_>, routes: &[EdgeGeometry]) -> RouteQuality {
+    route_quality_profile_for_plan(plan, routes).0
+}
+
+fn route_quality_profile_for_plan(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+) -> (RouteQuality, Vec<PhysicalSegment>) {
     let (segments, bends, route_length) =
         physical_route_segments(plan.edges.iter().map(|edge| edge.edge), routes);
     let crossings = physical_crossings(&plan.shared_endpoints, &segments);
-    RouteQuality {
-        crossings,
-        bends,
-        route_length,
-    }
+    (
+        RouteQuality {
+            crossings,
+            bends,
+            route_length,
+        },
+        segments,
+    )
+}
+
+fn parallel_congestion_ratio(segments: &[PhysicalSegment]) -> Option<f64> {
+    measure_parallel_congestion_bounded(
+        &segments
+            .iter()
+            .map(|segment| ParallelSegment {
+                net: segment.net,
+                horizontal: segment.horizontal,
+                fixed: segment.fixed,
+                start: segment.start,
+                end: segment.end,
+            })
+            .collect::<Vec<_>>(),
+        PARALLEL_CONGESTION_CUTOFF,
+        MAX_PARALLEL_CONGESTION_ACTIVE_VISITS,
+    )
+    .map(|congestion| congestion.ratio())
 }
 
 fn route_quality_cmp(left: RouteQuality, right: RouteQuality) -> Ordering {
@@ -2870,20 +3008,68 @@ fn route_quality_cmp(left: RouteQuality, right: RouteQuality) -> Ordering {
         .then(left.route_length.total_cmp(&right.route_length))
 }
 
+fn expanded_spacing_readability_is_better(
+    compact: RouteQuality,
+    compact_congestion: f64,
+    expanded: RouteQuality,
+    expanded_congestion: f64,
+) -> bool {
+    expanded.crossings == compact.crossings
+        && expanded.bends == compact.bends
+        && expanded.route_length <= compact.route_length * MAX_ADAPTIVE_SPACING_LENGTH_FACTOR
+        && expanded_congestion < compact_congestion
+        && expanded_congestion <= compact_congestion * MAX_ADAPTIVE_SPACING_CONGESTION_FACTOR
+}
+
 fn select_gap_spacing_candidate(
     plan: &RoutingPlan<'_>,
     compact: Vec<EdgeGeometry>,
-    adaptive: Option<Vec<EdgeGeometry>>,
+    compact_spacing: GapTrackSpacing,
+    compact_quality: Option<RouteQuality>,
+    adaptive: Option<(Vec<EdgeGeometry>, GapTrackSpacing)>,
 ) -> (Vec<EdgeGeometry>, Option<RouteQuality>, GapTrackSpacing) {
-    let Some(adaptive) = adaptive else {
-        return (compact, None, GapTrackSpacing::Compact);
+    let Some((adaptive, adaptive_spacing)) = adaptive else {
+        return (compact, compact_quality, compact_spacing);
     };
-    let compact_quality = route_quality_for_plan(plan, &compact);
-    let adaptive_quality = route_quality_for_plan(plan, &adaptive);
-    if route_quality_cmp(adaptive_quality, compact_quality).is_lt() {
-        (adaptive, Some(adaptive_quality), GapTrackSpacing::Adaptive)
+    if adaptive_spacing != GapTrackSpacing::Expanded {
+        let compact_quality =
+            compact_quality.unwrap_or_else(|| route_quality_for_plan(plan, &compact));
+        let adaptive_quality = route_quality_for_plan(plan, &adaptive);
+        return if route_quality_cmp(adaptive_quality, compact_quality).is_lt() {
+            (adaptive, Some(adaptive_quality), adaptive_spacing)
+        } else {
+            (compact, Some(compact_quality), compact_spacing)
+        };
+    }
+    let (compact_quality, compact_segments) = compact_quality.map_or_else(
+        || route_quality_profile_for_plan(plan, &compact),
+        |quality| {
+            (
+                quality,
+                physical_route_segments(plan.edges.iter().map(|edge| edge.edge), &compact).0,
+            )
+        },
+    );
+    let (adaptive_quality, adaptive_segments) = route_quality_profile_for_plan(plan, &adaptive);
+    let ordinary_quality_is_better = route_quality_cmp(adaptive_quality, compact_quality).is_lt();
+    let readability_is_better = if ordinary_quality_is_better {
+        false
     } else {
-        (compact, Some(compact_quality), GapTrackSpacing::Compact)
+        parallel_congestion_ratio(&compact_segments)
+            .zip(parallel_congestion_ratio(&adaptive_segments))
+            .is_some_and(|(compact_congestion, adaptive_congestion)| {
+                expanded_spacing_readability_is_better(
+                    compact_quality,
+                    compact_congestion,
+                    adaptive_quality,
+                    adaptive_congestion,
+                )
+            })
+    };
+    if ordinary_quality_is_better || readability_is_better {
+        (adaptive, Some(adaptive_quality), adaptive_spacing)
+    } else {
+        (compact, Some(compact_quality), compact_spacing)
     }
 }
 
@@ -5145,7 +5331,11 @@ fn sparse_gap_x(
     if gap_spacing == GapTrackSpacing::Compact {
         return compact_x;
     }
-    let available_left = gap_left + gap_width * 0.55;
+    let available_left = if gap_spacing == GapTrackSpacing::Expanded {
+        gap_left + options.port_stub
+    } else {
+        gap_left + gap_width * 0.55
+    };
     let available_right = gap_right - options.port_stub;
     let available_width = available_right - available_left;
     if available_width <= gap_width * 0.15 {
@@ -5420,13 +5610,14 @@ mod tests {
     use super::{
         FULL_OUTER_LANE_ROUNDS, GapNetAccess, GapTrackSpacing, MAX_CROSSING_REPAIR_EDGES,
         MAX_CROSSING_REPAIR_NODES, MAX_CROSSING_REPAIR_PATH_STATES,
-        MAX_CROSSING_REPAIR_ROUTE_POINTS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
-        OuterLane, OuterNetAccess, OuterSide, PhysicalSegment, RoutingPlan,
-        align_crossing_path_staircases, build_endpoint_tracks,
+        MAX_CROSSING_REPAIR_ROUTE_POINTS, MAX_EXPANDED_GAP_SPACING_NODES, MIN_CROSSING_REPAIR_NET,
+        MIN_CROSSING_REPAIR_TOTAL, OuterLane, OuterNetAccess, OuterSide, PhysicalSegment,
+        RoutingPlan, align_crossing_path_staircases, build_endpoint_tracks,
         candidate_route_points_within_budget, crossing_aware_gap_lane_indices,
         crossing_aware_gap_lane_indices_btree_reference, crossing_aware_outer_lane_indices,
         crossing_paths_have_unrelated_collinear_tracks, crossing_repair_within_budget,
-        crossing_track_y, distance_transform, fanout_outer_channel_lane_indices,
+        crossing_track_y, distance_transform, expanded_gap_spacing_enabled,
+        expanded_spacing_readability_is_better, fanout_outer_channel_lane_indices,
         free_interval_containing, global_gap_candidate_work_within_budget,
         global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
         horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
@@ -5441,8 +5632,8 @@ mod tests {
         route_planned_candidates, route_planned_candidates_with_quality_options,
         route_planned_candidates_with_sparse_global, route_planned_edges, route_quality,
         route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
-        select_crossing_repair_nets, select_outer_side_repairs, shortest_crossing_path,
-        sparse_channel_route, sparse_gap_x, sum_within_limit,
+        select_crossing_repair_nets, select_gap_spacing_candidate, select_outer_side_repairs,
+        shortest_crossing_path, sparse_channel_route, sparse_gap_x, sum_within_limit,
         take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
     };
@@ -8851,10 +9042,180 @@ mod tests {
     }
 
     #[test]
+    fn expanded_gap_tracks_use_the_full_safe_channel() {
+        let options = LayoutOptions::default();
+        let layer_left = [0.0, 86.0];
+        let layer_right = [20.0, 106.0];
+        let lanes = [(10..30)
+            .enumerate()
+            .map(|(lane, net)| (net, lane))
+            .collect()];
+        let adaptive = (10..30)
+            .map(|net| {
+                sparse_gap_x(
+                    net,
+                    0,
+                    &layer_left,
+                    &layer_right,
+                    &lanes,
+                    options,
+                    GapTrackSpacing::Adaptive,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expanded = (10..30)
+            .map(|net| {
+                sparse_gap_x(
+                    net,
+                    0,
+                    &layer_left,
+                    &layer_right,
+                    &lanes,
+                    options,
+                    GapTrackSpacing::Expanded,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(expanded[0] >= layer_right[0] + options.port_stub);
+        assert!(expanded[19] <= layer_left[1] - options.port_stub);
+        assert!(expanded[0] < adaptive[0]);
+        assert!(expanded[19] > adaptive[10]);
+        assert!(expanded[1] - expanded[0] > adaptive[1] - adaptive[0]);
+        assert!(expanded[19] - expanded[0] > adaptive[19] - adaptive[0]);
+    }
+
+    #[test]
+    fn expanded_gap_spacing_has_an_explicit_small_graph_budget() {
+        assert!(!expanded_gap_spacing_enabled(false, false, 1, true));
+        assert!(expanded_gap_spacing_enabled(
+            true,
+            false,
+            MAX_EXPANDED_GAP_SPACING_NODES,
+            true
+        ));
+        assert!(!expanded_gap_spacing_enabled(
+            true,
+            false,
+            MAX_EXPANDED_GAP_SPACING_NODES + 1,
+            true
+        ));
+        assert!(expanded_gap_spacing_enabled(
+            true,
+            true,
+            MAX_EXPANDED_GAP_SPACING_NODES + 1,
+            true
+        ));
+        assert!(!expanded_gap_spacing_enabled(true, true, 1, false));
+    }
+
+    #[test]
+    fn expanded_spacing_requires_material_congestion_gain_with_bounded_cost() {
+        let compact = super::RouteQuality {
+            crossings: 10,
+            bends: 20,
+            route_length: 100.0,
+        };
+        let boundary = super::RouteQuality {
+            crossings: 10,
+            bends: 20,
+            route_length: 105.0,
+        };
+        assert!(expanded_spacing_readability_is_better(
+            compact, 0.5, boundary, 0.47
+        ));
+        assert!(!expanded_spacing_readability_is_better(
+            compact,
+            0.5,
+            super::RouteQuality {
+                route_length: 105.000_001,
+                ..boundary
+            },
+            0.47,
+        ));
+        assert!(!expanded_spacing_readability_is_better(
+            compact, 0.5, boundary, 0.470_001
+        ));
+        assert!(!expanded_spacing_readability_is_better(
+            compact, 0.0, compact, 0.0
+        ));
+        for expanded in [
+            super::RouteQuality {
+                crossings: 11,
+                ..boundary
+            },
+            super::RouteQuality {
+                bends: 21,
+                ..boundary
+            },
+        ] {
+            assert!(!expanded_spacing_readability_is_better(
+                compact, 0.5, expanded, 0.0
+            ));
+        }
+    }
+
+    #[test]
+    fn rejected_expanded_spacing_preserves_the_retained_adaptive_label() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 1,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 5.0,
+                    }],
+                },
+                Node {
+                    id: 2,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 5.0,
+                    }],
+                },
+            ],
+            edges: vec![Edge {
+                id: 0,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 0,
+                participates_in_ranking: true,
+            }],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1]);
+        let retained = vec![EdgeGeometry {
+            id: 0,
+            points: vec![Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 0.0 }],
+        }];
+        let retained_quality = route_quality_for_plan(&plan, &retained);
+
+        let (routes, quality, spacing) = select_gap_spacing_candidate(
+            &plan,
+            retained.clone(),
+            GapTrackSpacing::Adaptive,
+            Some(retained_quality),
+            Some((retained.clone(), GapTrackSpacing::Expanded)),
+        );
+
+        assert_eq!(routes, retained);
+        assert_eq!(quality, Some(retained_quality));
+        assert_eq!(spacing, GapTrackSpacing::Adaptive);
+    }
+
+    #[test]
     fn adaptive_gap_tracks_fall_back_deterministically_when_the_gap_is_too_narrow() {
         let options = LayoutOptions::default();
-        let layer_left = [0.0, 50.0];
-        let layer_right = [20.0, 70.0];
+        let layer_left = [0.0, 42.0];
+        let layer_right = [20.0, 62.0];
         let lanes = [BTreeMap::from([(10, 0), (11, 1)])];
         for net in [10, 11] {
             let compact = sparse_gap_x(
@@ -9021,12 +9382,18 @@ mod tests {
             build(&separated_lanes, GapTrackSpacing::Compact),
             build(&separated_lanes, GapTrackSpacing::Adaptive)
         );
+        assert_eq!(
+            build(&separated_lanes, GapTrackSpacing::Compact),
+            build(&separated_lanes, GapTrackSpacing::Expanded)
+        );
         assert!(build(&separated_lanes, GapTrackSpacing::Compact).is_empty());
 
         let overlapping_lanes = [BTreeMap::from([(10, 1), (11, 0)])];
         let compact = build(&overlapping_lanes, GapTrackSpacing::Compact);
         let adaptive = build(&overlapping_lanes, GapTrackSpacing::Adaptive);
+        let expanded = build(&overlapping_lanes, GapTrackSpacing::Expanded);
         assert_eq!(adaptive, compact);
+        assert_eq!(expanded, compact);
         assert_eq!(
             compact,
             BTreeMap::from([((1, 0, 0), (0, 2)), ((2, 1, 1), (1, 2))])
