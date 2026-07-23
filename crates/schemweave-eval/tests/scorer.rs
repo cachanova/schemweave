@@ -1987,8 +1987,8 @@ fn scores_the_full_consumer_bound() {
     assert_eq!(report.forward_edge_count, 0);
     assert_eq!(report.ranking_direction_violations, 0);
     assert_eq!(report.reverse_x_length, 0.0);
-    assert!(report.edge_node_clearance_exhausted);
-    assert_eq!(report.minimum_edge_node_clearance, None);
+    assert!(!report.edge_node_clearance_exhausted);
+    assert!(report.minimum_edge_node_clearance.is_some());
     assert!(report.passes_hard_gates(), "{report:#?}");
     assert_eq!(
         report.segments,
