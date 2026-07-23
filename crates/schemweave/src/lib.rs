@@ -184,13 +184,25 @@ pub fn layout_with_quality_effort(
 ) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
     let (ranks, latest_ranks) = topology::rank_candidates(&indexed);
-    let (forward, reverse, net_representative) =
-        topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
-    let quality_layers = if reverse.crossings < forward.crossings {
-        &reverse.layers
+    let (forward, reverse, net_representative, max_sifted) = if quality_effort == QualityEffort::Max
+    {
+        topology::order_layer_candidates_with_max_sifting(
+            &indexed,
+            &ranks,
+            options.ordering_sweeps,
+            true,
+        )
     } else {
-        &forward.layers
+        let (forward, reverse, alternative) =
+            topology::order_layer_candidates(&indexed, &ranks, options.ordering_sweeps, true);
+        (forward, reverse, alternative, None)
     };
+    let quality_ordering = if reverse.crossings < forward.crossings {
+        &reverse
+    } else {
+        &forward
+    };
+    let quality_layers = &quality_ordering.layers;
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let adaptive_gap_spacing = quality_effort != QualityEffort::Fast;
@@ -251,6 +263,22 @@ pub fn layout_with_quality_effort(
                 },
             );
         }
+    }
+    if let Some(sifted) = max_sifted
+        && sifted.layers != *quality_layers
+    {
+        let sparse_global = graph.nodes.len() >= 1_000;
+        evaluate_candidate(
+            &indexed,
+            &routing_plan,
+            &mut best,
+            placement::place_nodes(&indexed, &ranks, &sifted.layers, options),
+            options,
+            CandidateRouting {
+                sparse_global,
+                ..candidate_routing
+            },
+        );
     }
     if let Some(net_representative) = net_representative
         && net_representative.layers != *quality_layers
@@ -1525,6 +1553,80 @@ mod tests {
             routing::route_quality(&indexed, &max.edges).crossings,
             21_959
         );
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(
+            super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
+            max
+        );
+    }
+
+    #[test]
+    fn max_sifting_is_exactly_scored_and_deterministic() {
+        let mut state = 16u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state
+        };
+        let nodes = (0..40)
+            .map(|id| Node {
+                id,
+                width: 40.0,
+                height: 30.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 15.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 15.0,
+                    },
+                ],
+            })
+            .collect();
+        let mut edges = Vec::new();
+        for layer in 0..3 {
+            for source in 0..10 {
+                for target in 0..10 {
+                    if next() % 100 < 32 {
+                        let id = edges.len() as u32;
+                        edges.push(Edge {
+                            id,
+                            source: Endpoint {
+                                node: layer * 10 + source,
+                                port: 1,
+                            },
+                            target: Endpoint {
+                                node: (layer + 1) * 10 + target,
+                                port: 0,
+                            },
+                            net: id,
+                            participates_in_ranking: true,
+                        });
+                    }
+                }
+            }
+        }
+        let graph = Graph { nodes, edges };
+        let options = LayoutOptions::default();
+        let quality =
+            super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+        let max = super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let quality_score = routing::route_quality(&indexed, &quality.edges);
+        let max_score = routing::route_quality(&indexed, &max.edges);
+
+        assert_eq!(quality_score.crossings, 434);
+        assert_eq!(max_score.crossings, 426);
+        assert!(candidate_quality_cmp(max_score, &max, quality_score, &quality).is_lt());
 
         let mut permuted = graph;
         permuted.nodes.reverse();
