@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod boundary_bundles;
 mod incremental;
 mod placement;
 mod readability;
@@ -44,6 +45,7 @@ pub type NodeId = u32;
 pub type PortId = u32;
 pub type EdgeId = u32;
 pub type NetId = u32;
+pub type BoundaryBundleId = u32;
 
 /// Classify the edges for which strict left-to-right placement is meaningful.
 ///
@@ -186,6 +188,27 @@ pub struct LayoutConstraints {
     pub inputs: Vec<NodeId>,
     #[serde(default)]
     pub outputs: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundary_bundles: Vec<BoundaryBundleConstraint>,
+}
+
+/// One graphical bus collector anchored at a constrained boundary endpoint.
+///
+/// Members retain independent edge identity. `slots` name occupied positions
+/// within the graphical bus. Same-net members with identical slot sets form a
+/// fanout cohort and share one physical tap; every other overlap is invalid.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BoundaryBundleConstraint {
+    pub id: BoundaryBundleId,
+    pub endpoint: Endpoint,
+    pub width: u32,
+    pub members: Vec<BoundaryBundleMemberConstraint>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BoundaryBundleMemberConstraint {
+    pub edge: EdgeId,
+    pub slots: Vec<u32>,
 }
 
 /// Complete, serializable policy for one layout request.
@@ -266,10 +289,44 @@ pub struct EdgeGeometry {
     pub points: Vec<Point>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryBundleRole {
+    Input,
+    Output,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BoundaryBundleSegment {
+    pub start: Point,
+    pub end: Point,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BoundaryBundleMemberGeometry {
+    pub edge: EdgeId,
+    pub slots: Vec<u32>,
+    pub tap: Point,
+}
+
+/// Output-only geometry for one graphical boundary bus.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BoundaryBundleGeometry {
+    pub id: BoundaryBundleId,
+    pub endpoint: Endpoint,
+    pub role: BoundaryBundleRole,
+    pub width: u32,
+    pub collector: BoundaryBundleSegment,
+    pub spine: BoundaryBundleSegment,
+    pub members: Vec<BoundaryBundleMemberGeometry>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Layout {
     pub nodes: Vec<NodeGeometry>,
     pub edges: Vec<EdgeGeometry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boundary_bundles: Vec<BoundaryBundleGeometry>,
     pub width: f64,
     pub height: f64,
 }
@@ -341,6 +398,12 @@ pub enum LayoutError {
         "parallel-wire spacing verification exceeded its deterministic route-segment limit of {maximum}"
     )]
     ParallelWireSpacingSegmentLimitExceeded { maximum: usize },
+    #[error("boundary bundle geometry does not satisfy the hard readability contract")]
+    BoundaryBundleGeometryUnsatisfied,
+    #[error(
+        "boundary bundle geometry verification exceeded its deterministic work limit of {maximum} segment visits"
+    )]
+    BoundaryBundleGeometryWorkLimitExceeded { maximum: usize },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -361,6 +424,83 @@ pub enum LayoutConstraintError {
     ConstrainedInputHasIncomingEdge(NodeId),
     #[error("constrained output node {0} has a participating outgoing edge")]
     ConstrainedOutputHasOutgoingEdge(NodeId),
+    #[error("duplicate boundary bundle id {0}")]
+    DuplicateBoundaryBundle(BoundaryBundleId),
+    #[error("boundary bundle {bundle} has invalid width {width}")]
+    InvalidBoundaryBundleWidth {
+        bundle: BoundaryBundleId,
+        width: u32,
+    },
+    #[error("boundary bundle {0} has no members")]
+    EmptyBoundaryBundle(BoundaryBundleId),
+    #[error("boundary bundle {bundle} references unknown endpoint node {node}")]
+    UnknownBoundaryBundleEndpointNode {
+        bundle: BoundaryBundleId,
+        node: NodeId,
+    },
+    #[error("boundary bundle {bundle} references unknown endpoint port {node}:{port}")]
+    UnknownBoundaryBundleEndpointPort {
+        bundle: BoundaryBundleId,
+        node: NodeId,
+        port: PortId,
+    },
+    #[error("boundary bundle {bundle} endpoint node {node} is not a constrained boundary node")]
+    UnconstrainedBoundaryBundleEndpoint {
+        bundle: BoundaryBundleId,
+        node: NodeId,
+    },
+    #[error(
+        "boundary bundle {bundle} endpoint {node}:{port} must use an east input port or west output port"
+    )]
+    InvalidBoundaryBundleEndpointSide {
+        bundle: BoundaryBundleId,
+        node: NodeId,
+        port: PortId,
+    },
+    #[error("boundary bundle {bundle} repeats member edge {edge}")]
+    DuplicateBoundaryBundleMember {
+        bundle: BoundaryBundleId,
+        edge: EdgeId,
+    },
+    #[error("edge {edge} belongs to more than one boundary bundle")]
+    BoundaryBundleMemberInMultipleBundles { edge: EdgeId },
+    #[error("boundary bundle {bundle} references unknown member edge {edge}")]
+    UnknownBoundaryBundleMember {
+        bundle: BoundaryBundleId,
+        edge: EdgeId,
+    },
+    #[error("boundary bundle {bundle} member edge {edge} does not use the bundle endpoint")]
+    BoundaryBundleMemberEndpointMismatch {
+        bundle: BoundaryBundleId,
+        edge: EdgeId,
+    },
+    #[error("boundary bundle {bundle} member edge {edge} has no slots")]
+    EmptyBoundaryBundleMemberSlots {
+        bundle: BoundaryBundleId,
+        edge: EdgeId,
+    },
+    #[error("boundary bundle {bundle} member edge {edge} uses slot {slot} outside width {width}")]
+    BoundaryBundleSlotOutOfRange {
+        bundle: BoundaryBundleId,
+        edge: EdgeId,
+        slot: u32,
+        width: u32,
+    },
+    #[error("boundary bundle {bundle} repeats slot {slot} within one member")]
+    DuplicateBoundaryBundleSlot { bundle: BoundaryBundleId, slot: u32 },
+    #[error(
+        "boundary bundle {bundle} member edges {first_edge} and {second_edge} conflict at slot {slot}"
+    )]
+    BoundaryBundleSlotConflict {
+        bundle: BoundaryBundleId,
+        first_edge: EdgeId,
+        second_edge: EdgeId,
+        slot: u32,
+    },
+    #[error(
+        "boundary bundle validation exceeded its deterministic work limit of {maximum} members and slots"
+    )]
+    BoundaryBundleWorkLimitExceeded { maximum: usize },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -449,7 +589,7 @@ fn layout_indexed(
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let adaptive_gap_spacing = quality_effort != QualityEffort::Fast;
-    let mut best: Option<(routing::RouteQuality, Layout)> = None;
+    let mut best: Option<AdmittedCandidate> = None;
     let mut admission_state = CandidateAdmissionState::default();
     let mut best_uses_primary_ranks = true;
     let candidate_routing = CandidateRouting {
@@ -628,8 +768,8 @@ fn layout_indexed(
                     options,
                     &mut admission_state,
                 );
-                if let Some((quality, layout)) = alternative_best
-                    && retain_better_candidate(&mut best, quality, layout)
+                if let Some(candidate) = alternative_best
+                    && retain_better_admitted_candidate(&mut best, candidate)
                 {
                     best_uses_primary_ranks = false;
                 }
@@ -637,9 +777,9 @@ fn layout_indexed(
         }
     }
     if let Some(straight_chain_nodes) = straight_chain_nodes
-        && best.as_ref().is_some_and(|(_, layout)| {
+        && best.as_ref().is_some_and(|candidate| {
             placement::vertical_span(&straight_chain_nodes)
-                <= layout.height * placement::MAX_CHAIN_HEIGHT_FACTOR
+                <= candidate.raw_layout.height * placement::MAX_CHAIN_HEIGHT_FACTOR
         })
     {
         let mut straight_chain_best = None;
@@ -655,10 +795,15 @@ fn layout_indexed(
             },
             &mut admission_state,
         );
-        let (quality, layout) = straight_chain_best.expect("candidate routing produces a layout");
-        if best.as_ref().is_some_and(|(current_quality, current)| {
-            straight_chain_cost_is_bounded(quality, &layout, *current_quality, current)
-        }) && retain_better_candidate(&mut best, quality, layout)
+        let candidate = straight_chain_best.expect("candidate routing produces a layout");
+        if best.as_ref().is_some_and(|current| {
+            straight_chain_cost_is_bounded(
+                candidate.selection_quality,
+                &candidate.raw_layout,
+                current.selection_quality,
+                &current.raw_layout,
+            )
+        }) && retain_better_admitted_candidate(&mut best, candidate)
         {
             best_uses_primary_ranks = true;
         }
@@ -685,8 +830,11 @@ fn layout_indexed(
             &mut admission_state,
         );
     }
-    let (mut quality, mut layout) =
-        best.ok_or_else(|| hard_geometry_failure(options, &admission_state))?;
+    let selected = best.ok_or_else(|| hard_geometry_failure(options, &admission_state))?;
+    let mut selection_quality = selected.selection_quality;
+    let mut quality = selected.quality;
+    let mut raw_layout = selected.raw_layout;
+    let mut layout = selected.layout;
     let mut horizontal_pitch_applied = None;
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
@@ -697,7 +845,7 @@ fn layout_indexed(
             quality_layers.len(),
             options,
         )
-        && routing::route_parallel_congestion(&routing_plan, &layout.edges)
+        && routing::route_parallel_congestion(&routing_plan, &raw_layout.edges)
             .is_some_and(|congestion| congestion >= 0.30)
     {
         let mut demand_aware_best = None;
@@ -713,134 +861,167 @@ fn layout_indexed(
             },
             &mut admission_state,
         );
-        if let Some((demand_quality, demand_layout)) = demand_aware_best
+        if let Some(demand_candidate) = demand_aware_best
             && demand_aware_readability_is_better(
                 &routing_plan,
-                quality,
-                &layout,
-                demand_quality,
-                &demand_layout,
+                routing::route_quality(&indexed, &raw_layout.edges),
+                &raw_layout,
+                demand_candidate.selection_quality,
+                &demand_candidate.raw_layout,
             )
         {
-            quality = demand_quality;
-            layout = demand_layout;
+            selection_quality = demand_candidate.selection_quality;
+            quality = demand_candidate.quality;
+            raw_layout = demand_candidate.raw_layout;
+            layout = demand_candidate.layout;
         }
     }
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && let Some((candidate_quality, edges)) = routing::regional_fanout_candidate(
             &routing_plan,
-            &layout.nodes,
-            &layout.edges,
-            quality,
+            &raw_layout.nodes,
+            &raw_layout.edges,
+            routing::route_quality(&indexed, &raw_layout.edges),
             options,
         )
+        && let Some(candidate) = prepare_owned_candidate(
+            &indexed,
+            candidate_quality,
+            raw_layout.nodes.clone(),
+            edges,
+            options,
+            &mut admission_state,
+        )
+        && candidate.layout.width * candidate.layout.height <= layout.width * layout.height * 1.05
+        && route_quality_cmp(candidate.selection_quality, selection_quality).is_lt()
     {
-        let candidate = placement::normalize_owned(layout.nodes.clone(), edges);
-        if candidate.width * candidate.height <= layout.width * layout.height * 1.05
-            && candidate_satisfies_hard_geometry_contract(
-                &indexed,
-                &candidate,
-                options,
-                &mut admission_state,
-            )
-        {
-            debug_assert!(route_quality_cmp(candidate_quality, quality).is_lt());
-            layout = candidate;
-        }
+        selection_quality = candidate.selection_quality;
+        quality = candidate.quality;
+        raw_layout = candidate.raw_layout;
+        layout = candidate.layout;
     }
     let full_family_pitch = full_family_pitched_spacing_enabled(options);
     let pitched_baseline = (quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && options.edge_node_clearance > 0.0)
-        .then(|| {
-            (
-                routing::route_quality(&indexed, &layout.edges),
-                layout.clone(),
-            )
+        .then(|| AdmittedCandidate {
+            selection_quality,
+            quality: exact_layout_route_quality(&indexed, &layout),
+            raw_layout: raw_layout.clone(),
+            layout: layout.clone(),
         });
     let mut pitched_refinement_applied = false;
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && options.edge_node_clearance > 0.0
         && full_family_pitch
-        && let Some((_candidate_quality, nodes, edges, pitch)) =
+        && let Some((candidate_quality, nodes, edges, pitch)) =
             routing::selected_layout_horizontal_pitch_candidate(
                 &routing_plan,
-                &layout.nodes,
-                &layout.edges,
+                &raw_layout.nodes,
+                &raw_layout.edges,
                 options,
             )
-    {
-        let candidate = placement::normalize_owned(nodes, edges);
-        if candidate.width * candidate.height
+        && let Some(candidate) = prepare_owned_candidate(
+            &indexed,
+            candidate_quality,
+            nodes,
+            edges,
+            options,
+            &mut admission_state,
+        )
+        && candidate.layout.width * candidate.layout.height
             <= layout.width * layout.height * options.max_quality_area_factor
-            && candidate_satisfies_hard_geometry_contract(
-                &indexed,
-                &candidate,
-                options,
-                &mut admission_state,
-            )
-        {
-            layout = candidate;
-            horizontal_pitch_applied = Some(pitch);
-            pitched_refinement_applied = true;
-        }
+    {
+        selection_quality = candidate.selection_quality;
+        quality = candidate.quality;
+        raw_layout = candidate.raw_layout;
+        layout = candidate.layout;
+        horizontal_pitch_applied = Some(pitch);
+        pitched_refinement_applied = true;
     }
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && options.edge_node_clearance > 0.0
-        && let Some((_candidate_quality, nodes, edges)) =
+        && let Some((candidate_quality, nodes, edges)) =
             routing::selected_layout_pitched_gap_candidate(
                 &routing_plan,
-                &layout.nodes,
-                &layout.edges,
+                &raw_layout.nodes,
+                &raw_layout.edges,
                 options,
             )
-    {
-        let candidate = placement::normalize_owned(nodes, edges);
-        if candidate.width * candidate.height
+        && let Some(candidate) = prepare_owned_candidate(
+            &indexed,
+            candidate_quality,
+            nodes,
+            edges,
+            options,
+            &mut admission_state,
+        )
+        && candidate.layout.width * candidate.layout.height
             <= layout.width * layout.height * options.max_quality_area_factor
-            && (!full_family_pitch
-                || routing::layout_vertical_gap_pitch_is_satisfied(
-                    &routing_plan,
-                    &candidate.nodes,
-                    &candidate.edges,
-                    options.route_lane_gap,
-                ))
-            && horizontal_pitch_applied.is_none_or(|pitch| {
-                routing::layout_horizontal_crossing_pitch_is_satisfied(
-                    &routing_plan,
-                    &candidate.nodes,
-                    &candidate.edges,
-                    options,
-                    pitch,
-                )
-            })
-            && candidate_satisfies_hard_geometry_contract(
-                &indexed,
-                &candidate,
+        && (!full_family_pitch
+            || routing::layout_vertical_gap_pitch_is_satisfied(
+                &routing_plan,
+                &candidate.raw_layout.nodes,
+                &candidate.raw_layout.edges,
+                options.route_lane_gap,
+            ))
+        && horizontal_pitch_applied.is_none_or(|pitch| {
+            routing::layout_horizontal_crossing_pitch_is_satisfied(
+                &routing_plan,
+                &candidate.raw_layout.nodes,
+                &candidate.raw_layout.edges,
                 options,
-                &mut admission_state,
+                pitch,
             )
-        {
-            layout = candidate;
-            pitched_refinement_applied = true;
-        }
+        })
+    {
+        selection_quality = candidate.selection_quality;
+        quality = candidate.quality;
+        raw_layout = candidate.raw_layout;
+        layout = candidate.layout;
+        pitched_refinement_applied = true;
     }
     if pitched_refinement_applied
-        && let Some((baseline_quality, baseline)) = pitched_baseline
+        && let Some(baseline) = pitched_baseline
         && !composite_pitched_quality_is_admissible(
-            baseline_quality,
-            baseline.width * baseline.height,
-            routing::route_quality(&indexed, &layout.edges),
+            baseline.quality,
+            baseline.layout.width * baseline.layout.height,
+            exact_layout_route_quality(&indexed, &layout),
             layout.width * layout.height,
             options,
         )
     {
-        layout = baseline;
+        selection_quality = baseline.selection_quality;
+        quality = baseline.quality;
+        raw_layout = baseline.raw_layout;
+        layout = baseline.layout;
     }
-    Ok(layout)
+    let selected = AdmittedCandidate {
+        selection_quality,
+        quality,
+        raw_layout,
+        layout,
+    };
+    if cfg!(debug_assertions) {
+        let exact = exact_layout_route_quality(&indexed, &selected.layout);
+        assert_eq!(selected.quality.crossings, exact.crossings);
+        assert_eq!(selected.quality.bends, exact.bends);
+        let tolerance = quality
+            .route_length
+            .abs()
+            .max(exact.route_length.abs())
+            .max(1.0)
+            * f64::EPSILON
+            * 8.0;
+        assert!(
+            (selected.quality.route_length - exact.route_length).abs() <= tolerance,
+            "retained quality must describe the returned layout"
+        );
+    }
+    Ok(selected.layout)
 }
 
 fn composite_pitched_quality_is_admissible(
@@ -922,6 +1103,8 @@ struct CandidateRouting {
 
 #[derive(Default)]
 struct CandidateAdmissionState {
+    boundary_bundle_rejected: bool,
+    boundary_bundle_work_exhausted: bool,
     clearance_work_exhausted: bool,
     clearance_satisfied: bool,
     contact_segment_exhausted: bool,
@@ -938,7 +1121,13 @@ fn hard_geometry_failure(
     options: LayoutOptions,
     admission_state: &CandidateAdmissionState,
 ) -> LayoutError {
-    if admission_state.contact_segment_exhausted {
+    if admission_state.boundary_bundle_work_exhausted {
+        LayoutError::BoundaryBundleGeometryWorkLimitExceeded {
+            maximum: boundary_bundles::MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
+        }
+    } else if admission_state.boundary_bundle_rejected {
+        LayoutError::BoundaryBundleGeometryUnsatisfied
+    } else if admission_state.contact_segment_exhausted {
         LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
             maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
         }
@@ -977,7 +1166,7 @@ fn hard_geometry_failure(
 fn evaluate_candidate(
     indexed: &validation::IndexedGraph<'_>,
     routing_plan: &routing::RoutingPlan<'_>,
-    best: &mut Option<(routing::RouteQuality, Layout)>,
+    best: &mut Option<AdmittedCandidate>,
     nodes: Vec<NodeGeometry>,
     options: LayoutOptions,
     routing: CandidateRouting,
@@ -999,7 +1188,7 @@ fn evaluate_candidate(
 
 fn retain_routed_candidates(
     indexed: &validation::IndexedGraph<'_>,
-    best: &mut Option<(routing::RouteQuality, Layout)>,
+    best: &mut Option<AdmittedCandidate>,
     nodes: Vec<NodeGeometry>,
     routed: routing::RoutedEdges,
     options: LayoutOptions,
@@ -1054,6 +1243,7 @@ fn net_representative_sparse_global_flags(
     }
 }
 
+#[cfg(test)]
 fn retain_better_candidate(
     best: &mut Option<(routing::RouteQuality, Layout)>,
     quality: routing::RouteQuality,
@@ -1068,9 +1258,36 @@ fn retain_better_candidate(
     replace
 }
 
+#[derive(Clone, Debug)]
+struct AdmittedCandidate {
+    selection_quality: routing::RouteQuality,
+    quality: routing::RouteQuality,
+    raw_layout: Layout,
+    layout: Layout,
+}
+
+fn retain_better_admitted_candidate(
+    best: &mut Option<AdmittedCandidate>,
+    candidate: AdmittedCandidate,
+) -> bool {
+    let replace = best.as_ref().is_none_or(|current| {
+        candidate_quality_cmp(
+            candidate.selection_quality,
+            &candidate.raw_layout,
+            current.selection_quality,
+            &current.raw_layout,
+        )
+        .is_lt()
+    });
+    if replace {
+        *best = Some(candidate);
+    }
+    replace
+}
+
 fn retain_owned_candidate(
     indexed: &validation::IndexedGraph<'_>,
-    best: &mut Option<(routing::RouteQuality, Layout)>,
+    best: &mut Option<AdmittedCandidate>,
     quality: routing::RouteQuality,
     nodes: Vec<NodeGeometry>,
     edges: Vec<EdgeGeometry>,
@@ -1079,15 +1296,66 @@ fn retain_owned_candidate(
 ) -> bool {
     if best
         .as_ref()
-        .is_some_and(|(current_quality, _)| route_quality_cmp(quality, *current_quality).is_gt())
+        .is_some_and(|current| route_quality_cmp(quality, current.selection_quality).is_gt())
     {
         return false;
     }
-    let candidate = placement::normalize_owned(nodes, edges);
-    if !candidate_satisfies_hard_geometry_contract(indexed, &candidate, options, admission_state) {
+    let Some(candidate) =
+        prepare_owned_candidate(indexed, quality, nodes, edges, options, admission_state)
+    else {
         return false;
+    };
+    retain_better_admitted_candidate(best, candidate)
+}
+
+fn prepare_owned_candidate(
+    indexed: &validation::IndexedGraph<'_>,
+    quality: routing::RouteQuality,
+    nodes: Vec<NodeGeometry>,
+    edges: Vec<EdgeGeometry>,
+    options: LayoutOptions,
+    admission_state: &mut CandidateAdmissionState,
+) -> Option<AdmittedCandidate> {
+    let raw_layout = placement::normalize_owned(nodes, edges);
+    let mut candidate = raw_layout.clone();
+    if !indexed.boundary_bundles.is_empty() {
+        candidate = match boundary_bundles::apply_and_normalize(indexed, candidate, options) {
+            Ok(candidate) => candidate,
+            Err(LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. }) => {
+                admission_state.boundary_bundle_work_exhausted = true;
+                return None;
+            }
+            Err(_) => {
+                admission_state.boundary_bundle_rejected = true;
+                return None;
+            }
+        };
     }
-    retain_better_candidate(best, quality, candidate)
+    if !candidate_satisfies_hard_geometry_contract(indexed, &candidate, options, admission_state) {
+        return None;
+    }
+    let exact_quality = if indexed.boundary_bundles.is_empty() {
+        quality
+    } else {
+        boundary_bundles::route_quality(indexed, &candidate)
+    };
+    Some(AdmittedCandidate {
+        selection_quality: quality,
+        quality: exact_quality,
+        raw_layout,
+        layout: candidate,
+    })
+}
+
+fn exact_layout_route_quality(
+    indexed: &validation::IndexedGraph<'_>,
+    layout: &Layout,
+) -> routing::RouteQuality {
+    if indexed.boundary_bundles.is_empty() {
+        routing::route_quality(indexed, &layout.edges)
+    } else {
+        boundary_bundles::route_quality(indexed, layout)
+    }
 }
 
 #[cfg(test)]
@@ -1265,15 +1533,16 @@ fn candidate_quality_cmp(
 #[cfg(test)]
 mod tests {
     use super::{
-        CandidateAdmissionState, Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutError,
-        LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS, Node, NodeGeometry, Point, Port,
-        PortSide, QualityEffort, candidate_quality_cmp,
+        AdmittedCandidate, BoundaryBundleConstraint, BoundaryBundleMemberConstraint,
+        CandidateAdmissionState, Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutConstraints,
+        LayoutError, LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS, Node, NodeGeometry, Point,
+        Port, PortSide, QualityEffort, candidate_quality_cmp,
         candidate_satisfies_edge_node_clearance_bounded, composite_pitched_quality_is_admissible,
         demand_aware_quality_is_better, demand_aware_scale_is_eligible, effective_layout_options,
         effective_ranking_edges, full_family_pitched_spacing_enabled, hard_geometry_failure,
-        layout, outward_obstacle_clearance_stub, placement, retain_better_candidate,
-        retain_owned_candidate, retain_owned_candidate_unchecked, routing, routing::RouteQuality,
-        topology, validation,
+        layout, outward_obstacle_clearance_stub, placement, retain_better_admitted_candidate,
+        retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
+        routing::RouteQuality, topology, validation,
     };
 
     mod active_fanout_fixture {
@@ -1300,10 +1569,42 @@ mod tests {
             Layout {
                 nodes: Vec::new(),
                 edges: Vec::new(),
+                boundary_bundles: Vec::new(),
                 width: area,
                 height: 1.0,
             },
         )
+    }
+
+    #[test]
+    fn admitted_initial_candidate_selection_uses_raw_quality_and_area() {
+        let selection_quality = RouteQuality {
+            crossings: 1,
+            bends: 2,
+            route_length: 3.0,
+        };
+        let admitted = |raw_area, rendered_area, rendered_crossings| AdmittedCandidate {
+            selection_quality,
+            quality: RouteQuality {
+                crossings: rendered_crossings,
+                ..selection_quality
+            },
+            raw_layout: candidate(0, 0, 0.0, raw_area).1,
+            layout: candidate(0, 0, 0.0, rendered_area).1,
+        };
+        let mut best = None;
+        assert!(retain_better_admitted_candidate(
+            &mut best,
+            admitted(10.0, 100.0, 9),
+        ));
+        assert!(!retain_better_admitted_candidate(
+            &mut best,
+            admitted(20.0, 1.0, 0),
+        ));
+        let selected = best.unwrap();
+        assert_eq!(selected.raw_layout.width, 10.0);
+        assert_eq!(selected.layout.width, 100.0);
+        assert_eq!(selected.quality.crossings, 9);
     }
 
     #[test]
@@ -1328,6 +1629,135 @@ mod tests {
         assert_eq!(parallel_spacing.route_lane_gap, 6.0);
         assert_eq!(parallel_spacing.minimum_parallel_wire_spacing, 6.0);
         assert_eq!(effective_layout_options(parallel_spacing), parallel_spacing);
+    }
+
+    #[test]
+    fn bundle_aware_candidate_admission_rejects_a_raw_winner_and_keeps_its_clean_sibling() {
+        let endpoint_node = |id, side| Node {
+            id,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 5.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint_node(1, PortSide::East),
+                endpoint_node(2, PortSide::West),
+                Node {
+                    id: 3,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: Vec::new(),
+                },
+            ],
+            edges: vec![Edge {
+                id: 10,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 10,
+                participates_in_ranking: true,
+            }],
+        };
+        let options = LayoutOptions::default();
+        let constraints = LayoutConstraints {
+            inputs: vec![1],
+            outputs: vec![2],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 1, port: 0 },
+                width: 1,
+                members: vec![BoundaryBundleMemberConstraint {
+                    edge: 10,
+                    slots: vec![0],
+                }],
+            }],
+        };
+        let indexed =
+            validation::validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let nodes = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 30.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ];
+        let raw_winner = RouteQuality {
+            crossings: 0,
+            bends: 2,
+            route_length: 120.0,
+        };
+        let clean_sibling = RouteQuality {
+            crossings: 1,
+            bends: 4,
+            route_length: 130.0,
+        };
+        let mut best = None;
+        let mut admission_state = CandidateAdmissionState::default();
+        assert!(!retain_owned_candidate(
+            &indexed,
+            &mut best,
+            raw_winner,
+            nodes.clone(),
+            vec![EdgeGeometry {
+                id: 10,
+                points: vec![
+                    Point { x: 10.0, y: 5.0 },
+                    Point { x: 10.0, y: 20.0 },
+                    Point { x: 100.0, y: 20.0 },
+                    Point { x: 100.0, y: 5.0 },
+                ],
+            }],
+            options,
+            &mut admission_state,
+        ));
+        assert!(best.is_none());
+        assert!(retain_owned_candidate(
+            &indexed,
+            &mut best,
+            clean_sibling,
+            nodes,
+            vec![EdgeGeometry {
+                id: 10,
+                points: vec![
+                    Point { x: 10.0, y: 5.0 },
+                    Point { x: 10.0, y: 20.0 },
+                    Point { x: 25.0, y: 20.0 },
+                    Point { x: 100.0, y: 20.0 },
+                    Point { x: 100.0, y: 5.0 },
+                ],
+            }],
+            options,
+            &mut admission_state,
+        ));
+        let selected = best.unwrap().layout;
+        assert_eq!(selected.boundary_bundles.len(), 1);
+        assert_eq!(
+            selected.edges[0].points[0],
+            selected.boundary_bundles[0].members[0].tap
+        );
+        assert!(admission_state.boundary_bundle_rejected);
     }
 
     #[test]
@@ -1660,6 +2090,7 @@ mod tests {
                 id: 1,
                 points: vec![Point { x: 20.0, y: 10.0 }, Point { x: 100.0, y: 10.0 }],
             }],
+            boundary_bundles: Vec::new(),
             width: 120.0,
             height: 40.0,
         };
@@ -1786,7 +2217,7 @@ mod tests {
             options,
             &mut admission_state,
         ));
-        assert_eq!(best.unwrap().0, safe_quality);
+        assert_eq!(best.unwrap().selection_quality, safe_quality);
         assert!(!admission_state.clearance_work_exhausted);
         assert!(!admission_state.contact_work_exhausted);
     }
@@ -1929,7 +2360,7 @@ mod tests {
             options,
             &mut admission_state,
         ));
-        assert_eq!(best.unwrap().0, safe_sibling);
+        assert_eq!(best.unwrap().selection_quality, safe_sibling);
         assert!(!admission_state.clearance_work_exhausted);
         assert!(!admission_state.contact_work_exhausted);
         assert!(admission_state.contact_rejected);
@@ -2073,7 +2504,7 @@ mod tests {
             options,
             &mut admission_state,
         ));
-        assert_eq!(best.unwrap().0, safe_quality);
+        assert_eq!(best.unwrap().selection_quality, safe_quality);
         assert!(admission_state.parallel_spacing_rejected);
         assert!(admission_state.parallel_spacing_satisfied);
     }
@@ -3170,6 +3601,107 @@ mod tests {
         assert_eq!(
             super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
             max
+        );
+    }
+
+    #[test]
+    fn max_horizontal_pitch_refinement_remains_active_with_a_boundary_bundle() {
+        let endpoint = |id, side| Node {
+            id,
+            width: 20.0,
+            height: 100.0,
+            cycle_breaker: false,
+            ports: (0..4)
+                .map(|port| Port {
+                    id: port,
+                    side,
+                    offset: 25.0 + port as f64,
+                })
+                .collect(),
+        };
+        let blocker = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: Vec::new(),
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint(0, PortSide::East),
+                blocker(1),
+                blocker(2),
+                endpoint(3, PortSide::West),
+            ],
+            edges: (0..4)
+                .map(|edge| Edge {
+                    id: 100 + edge,
+                    source: Endpoint {
+                        node: 0,
+                        port: edge,
+                    },
+                    target: Endpoint {
+                        node: 3,
+                        port: edge,
+                    },
+                    net: [7, 7, 8, 9][edge as usize],
+                    participates_in_ranking: true,
+                })
+                .collect(),
+        };
+        let options = LayoutOptions {
+            route_lane_gap: 6.0,
+            edge_node_clearance: 20.0,
+            max_quality_area_factor: 2.0,
+            max_quality_route_length_factor: 1.25,
+            ..LayoutOptions::default()
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![0],
+            outputs: vec![3],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 0, port: 0 },
+                width: 1,
+                members: vec![BoundaryBundleMemberConstraint {
+                    edge: 100,
+                    slots: vec![0],
+                }],
+            }],
+        };
+        let quality = super::layout_with_quality_effort_and_constraints(
+            &graph,
+            options,
+            QualityEffort::Quality,
+            &constraints,
+        )
+        .unwrap();
+        let max = super::layout_with_quality_effort_and_constraints(
+            &graph,
+            options,
+            QualityEffort::Max,
+            &constraints,
+        )
+        .unwrap();
+        assert_ne!(max, quality, "the Max refinement fixture must activate");
+        let indexed =
+            validation::validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let (ranks, _) = topology::rank_candidates(&indexed);
+        let plan = routing::RoutingPlan::new(&indexed, &ranks);
+        let quality_congestion = routing::route_parallel_congestion(&plan, &quality.edges).unwrap();
+        let max_congestion = routing::route_parallel_congestion(&plan, &max.edges).unwrap();
+        assert!(max_congestion < quality_congestion * 0.5);
+        assert!(routing::layout_horizontal_crossing_pitch_is_satisfied(
+            &plan,
+            &max.nodes,
+            &max.edges,
+            options,
+            options.route_lane_gap,
+        ));
+        assert_eq!(max.boundary_bundles.len(), 1);
+        assert_eq!(
+            max.edges[0].points[0],
+            max.boundary_bundles[0].members[0].tap
         );
     }
 }

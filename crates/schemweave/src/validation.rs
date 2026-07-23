@@ -1,9 +1,30 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    ConstrainedLayoutError, Edge, Endpoint, Graph, LayoutConstraintError, LayoutConstraints,
-    LayoutError, LayoutOptions, Node, NodeId, Port, PortId, PortSide,
+    BoundaryBundleId, BoundaryBundleRole, ConstrainedLayoutError, Edge, EdgeId, Endpoint, Graph,
+    LayoutConstraintError, LayoutConstraints, LayoutError, LayoutOptions, Node, NodeId, Port,
+    PortId, PortSide,
 };
+
+const MAX_BOUNDARY_BUNDLE_WIDTH: u32 = 1_000_000;
+const MAX_BOUNDARY_BUNDLE_VALIDATION_WORK: usize = 1_000_000;
+
+#[derive(Clone)]
+pub(crate) struct IndexedBoundaryBundleMember {
+    pub(crate) edge: EdgeId,
+    pub(crate) net: u32,
+    pub(crate) slots: Vec<u32>,
+    pub(crate) tap_lane: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct IndexedBoundaryBundle {
+    pub(crate) id: BoundaryBundleId,
+    pub(crate) endpoint: Endpoint,
+    pub(crate) role: BoundaryBundleRole,
+    pub(crate) width: u32,
+    pub(crate) members: Vec<IndexedBoundaryBundleMember>,
+}
 
 pub(crate) struct IndexedGraph<'a> {
     pub(crate) nodes: Vec<&'a Node>,
@@ -15,6 +36,7 @@ pub(crate) struct IndexedGraph<'a> {
     pub(crate) incoming: Vec<Vec<usize>>,
     pub(crate) boundary_inputs: Vec<bool>,
     pub(crate) boundary_outputs: Vec<bool>,
+    pub(crate) boundary_bundles: Vec<IndexedBoundaryBundle>,
 }
 
 pub(crate) fn validate_and_index(
@@ -101,6 +123,14 @@ pub(crate) fn validate_and_index_with_constraints<'a>(
         &raw_outgoing,
         &raw_incoming,
     )?;
+    let boundary_bundles = validate_boundary_bundles(
+        constraints,
+        &node_index,
+        &ports,
+        &edges,
+        &boundary_inputs,
+        &boundary_outputs,
+    )?;
     let (rank_edges, outgoing, incoming) =
         runtime_ranking_graph(&nodes, &edges, &node_index, raw_outgoing, raw_incoming);
     Ok(IndexedGraph {
@@ -113,7 +143,210 @@ pub(crate) fn validate_and_index_with_constraints<'a>(
         incoming,
         boundary_inputs,
         boundary_outputs,
+        boundary_bundles,
     })
+}
+
+fn validate_boundary_bundles(
+    constraints: &LayoutConstraints,
+    node_index: &HashMap<NodeId, usize>,
+    ports: &[HashMap<PortId, &Port>],
+    edges: &[&Edge],
+    boundary_inputs: &[bool],
+    boundary_outputs: &[bool],
+) -> Result<Vec<IndexedBoundaryBundle>, LayoutConstraintError> {
+    let mut bundles = constraints.boundary_bundles.iter().collect::<Vec<_>>();
+    bundles.sort_unstable_by_key(|bundle| bundle.id);
+    if let Some(id) = bundles
+        .windows(2)
+        .find_map(|pair| (pair[0].id == pair[1].id).then_some(pair[0].id))
+    {
+        return Err(LayoutConstraintError::DuplicateBoundaryBundle(id));
+    }
+    let edge_index = edges
+        .iter()
+        .enumerate()
+        .map(|(index, edge)| (edge.id, index))
+        .collect::<HashMap<_, _>>();
+    let mut globally_bundled_edges = HashMap::<EdgeId, (bool, bool)>::new();
+    let mut work = bundles.len();
+    let mut indexed = Vec::with_capacity(bundles.len());
+    for bundle in bundles {
+        if bundle.width == 0 || bundle.width > MAX_BOUNDARY_BUNDLE_WIDTH {
+            return Err(LayoutConstraintError::InvalidBoundaryBundleWidth {
+                bundle: bundle.id,
+                width: bundle.width,
+            });
+        }
+        if bundle.members.is_empty() {
+            return Err(LayoutConstraintError::EmptyBoundaryBundle(bundle.id));
+        }
+        let Some(&node) = node_index.get(&bundle.endpoint.node) else {
+            return Err(LayoutConstraintError::UnknownBoundaryBundleEndpointNode {
+                bundle: bundle.id,
+                node: bundle.endpoint.node,
+            });
+        };
+        let Some(port) = ports[node].get(&bundle.endpoint.port) else {
+            return Err(LayoutConstraintError::UnknownBoundaryBundleEndpointPort {
+                bundle: bundle.id,
+                node: bundle.endpoint.node,
+                port: bundle.endpoint.port,
+            });
+        };
+        let role = if boundary_inputs[node] {
+            BoundaryBundleRole::Input
+        } else if boundary_outputs[node] {
+            BoundaryBundleRole::Output
+        } else {
+            return Err(LayoutConstraintError::UnconstrainedBoundaryBundleEndpoint {
+                bundle: bundle.id,
+                node: bundle.endpoint.node,
+            });
+        };
+        let expected_side = match role {
+            BoundaryBundleRole::Input => PortSide::East,
+            BoundaryBundleRole::Output => PortSide::West,
+        };
+        if port.side != expected_side {
+            return Err(LayoutConstraintError::InvalidBoundaryBundleEndpointSide {
+                bundle: bundle.id,
+                node: bundle.endpoint.node,
+                port: bundle.endpoint.port,
+            });
+        }
+        let mut members = bundle.members.iter().collect::<Vec<_>>();
+        members.sort_unstable_by_key(|member| member.edge);
+        if let Some(edge) = members
+            .windows(2)
+            .find_map(|pair| (pair[0].edge == pair[1].edge).then_some(pair[0].edge))
+        {
+            return Err(LayoutConstraintError::DuplicateBoundaryBundleMember {
+                bundle: bundle.id,
+                edge,
+            });
+        }
+        work = work.saturating_add(members.len());
+        if work > MAX_BOUNDARY_BUNDLE_VALIDATION_WORK {
+            return Err(LayoutConstraintError::BoundaryBundleWorkLimitExceeded {
+                maximum: MAX_BOUNDARY_BUNDLE_VALIDATION_WORK,
+            });
+        }
+        let mut indexed_members = Vec::with_capacity(members.len());
+        for member in members {
+            let Some(&edge_index) = edge_index.get(&member.edge) else {
+                return Err(LayoutConstraintError::UnknownBoundaryBundleMember {
+                    bundle: bundle.id,
+                    edge: member.edge,
+                });
+            };
+            let memberships = globally_bundled_edges.entry(member.edge).or_default();
+            let duplicate_role = match role {
+                BoundaryBundleRole::Input => std::mem::replace(&mut memberships.0, true),
+                BoundaryBundleRole::Output => std::mem::replace(&mut memberships.1, true),
+            };
+            if duplicate_role {
+                return Err(
+                    LayoutConstraintError::BoundaryBundleMemberInMultipleBundles {
+                        edge: member.edge,
+                    },
+                );
+            }
+            let edge = edges[edge_index];
+            let endpoint_matches = match role {
+                BoundaryBundleRole::Input => edge.source == bundle.endpoint,
+                BoundaryBundleRole::Output => edge.target == bundle.endpoint,
+            };
+            if !endpoint_matches {
+                return Err(
+                    LayoutConstraintError::BoundaryBundleMemberEndpointMismatch {
+                        bundle: bundle.id,
+                        edge: member.edge,
+                    },
+                );
+            }
+            if member.slots.is_empty() {
+                return Err(LayoutConstraintError::EmptyBoundaryBundleMemberSlots {
+                    bundle: bundle.id,
+                    edge: member.edge,
+                });
+            }
+            let mut slots = member.slots.clone();
+            slots.sort_unstable();
+            work = work.saturating_add(slots.len());
+            if work > MAX_BOUNDARY_BUNDLE_VALIDATION_WORK {
+                return Err(LayoutConstraintError::BoundaryBundleWorkLimitExceeded {
+                    maximum: MAX_BOUNDARY_BUNDLE_VALIDATION_WORK,
+                });
+            }
+            for (slot_index, &slot) in slots.iter().enumerate() {
+                if slot >= bundle.width {
+                    return Err(LayoutConstraintError::BoundaryBundleSlotOutOfRange {
+                        bundle: bundle.id,
+                        edge: member.edge,
+                        slot,
+                        width: bundle.width,
+                    });
+                }
+                if slot_index > 0 && slots[slot_index - 1] == slot {
+                    return Err(LayoutConstraintError::DuplicateBoundaryBundleSlot {
+                        bundle: bundle.id,
+                        slot,
+                    });
+                }
+            }
+            indexed_members.push(IndexedBoundaryBundleMember {
+                edge: member.edge,
+                net: edge.net,
+                slots,
+                tap_lane: 0,
+            });
+        }
+        indexed_members.sort_unstable_by(|left, right| {
+            left.slots
+                .cmp(&right.slots)
+                .then(left.edge.cmp(&right.edge))
+        });
+        let mut occupied_slots = BTreeMap::<u32, (usize, EdgeId)>::new();
+        let mut cohort_slots = Vec::<Vec<u32>>::new();
+        let mut cohort_nets = Vec::<u32>::new();
+        for member in &mut indexed_members {
+            let net = member.net;
+            let cohort = cohort_slots
+                .last()
+                .filter(|slots| **slots == member.slots)
+                .map_or(cohort_slots.len(), |_| cohort_slots.len() - 1);
+            if cohort == cohort_slots.len() {
+                cohort_slots.push(member.slots.clone());
+                cohort_nets.push(net);
+            }
+            member.tap_lane = cohort;
+            for &slot in &member.slots {
+                if let Some(&(prior_cohort, prior_edge)) = occupied_slots.get(&slot) {
+                    if cohort_slots[prior_cohort] != member.slots
+                        || cohort_nets[prior_cohort] != net
+                    {
+                        return Err(LayoutConstraintError::BoundaryBundleSlotConflict {
+                            bundle: bundle.id,
+                            first_edge: prior_edge,
+                            second_edge: member.edge,
+                            slot,
+                        });
+                    }
+                } else {
+                    occupied_slots.insert(slot, (cohort, member.edge));
+                }
+            }
+        }
+        indexed.push(IndexedBoundaryBundle {
+            id: bundle.id,
+            endpoint: bundle.endpoint,
+            role,
+            width: bundle.width,
+            members: indexed_members,
+        });
+    }
+    Ok(indexed)
 }
 
 pub(crate) fn runtime_ranking_graph(

@@ -6,10 +6,10 @@ use std::{
 };
 
 use schemweave::{
-    Edge, EdgeId, EdgeNodeClearanceError, EdgeNodeSegment, Endpoint, Graph, Layout, NetId,
-    NetNodeRelation, NodeGeometry, ParallelSegment, Point, PortSide,
-    measure_edge_node_clearance_bounded, measure_parallel_congestion,
-    measure_parallel_separation_bounded,
+    BoundaryBundleRole, BoundaryBundleSegment, Edge, EdgeId, EdgeNodeClearanceError,
+    EdgeNodeSegment, Endpoint, Graph, Layout, NetId, NetNodeRelation, NodeGeometry,
+    ParallelSegment, Point, PortSide, measure_edge_node_clearance_bounded,
+    measure_parallel_congestion, measure_parallel_separation_bounded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -185,6 +185,26 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
     }
     let input_nodes: HashMap<_, _> = graph.nodes.iter().map(|node| (node.id, node)).collect();
     let input_edges: HashMap<_, _> = graph.edges.iter().map(|edge| (edge.id, edge)).collect();
+    let mut bundle_taps = HashMap::<EdgeId, (Option<Point>, Option<Point>)>::new();
+    for bundle in &layout.boundary_bundles {
+        for member in &bundle.members {
+            let taps = bundle_taps.entry(member.edge).or_default();
+            let target = match bundle.role {
+                BoundaryBundleRole::Input => &mut taps.0,
+                BoundaryBundleRole::Output => &mut taps.1,
+            };
+            if target.replace(member.tap).is_some() {
+                report.violation(
+                    options,
+                    ViolationKind::DuplicateId,
+                    format!(
+                        "route {} has duplicate {:?} boundary taps",
+                        member.edge, bundle.role
+                    ),
+                );
+            }
+        }
+    }
     let ranking_edges = effective_ranking_edges(graph);
     report.forward_edge_count = ranking_edges.len();
     let mut nodes = HashMap::with_capacity(layout.nodes.len());
@@ -277,6 +297,7 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             edge,
             route.points.as_slice(),
             &nodes,
+            bundle_taps.get(&edge.id).copied(),
             layout,
             options,
             &mut report,
@@ -313,11 +334,13 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         report.straight_route_ratio =
             report.straight_route_count as f64 / report.scored_route_count as f64;
     }
-    report.segments = segments.len();
+    let boundary_segments = boundary_bundle_scoring_segments(graph, layout);
+    report.segments = segments.len() + boundary_segments.len();
     score_node_overlaps(&layout.nodes, &mut report);
     score_node_intersections(&segments, &layout.nodes, options.epsilon, &mut report);
+    score_boundary_bundle_node_intersections(layout, options, &mut report);
     let physical_segments = merged_net_segments(&segments);
-    let clearance_segments = physical_segments
+    let mut clearance_segments = physical_segments
         .iter()
         .map(|segment| EdgeNodeSegment {
             net: segment.net,
@@ -327,7 +350,7 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             end: segment.end,
         })
         .collect::<Vec<_>>();
-    let clearance_relations = graph
+    let mut clearance_relations = graph
         .edges
         .iter()
         .flat_map(|edge| {
@@ -343,6 +366,14 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             ]
         })
         .collect::<Vec<_>>();
+    append_boundary_bundle_clearance_geometry(
+        graph,
+        layout,
+        &mut clearance_segments,
+        &mut clearance_relations,
+        options,
+        &mut report,
+    );
     match measure_edge_node_clearance_bounded(
         &clearance_segments,
         &layout.nodes,
@@ -360,14 +391,17 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         Err(EdgeNodeClearanceError::InvalidInput) => {}
         Err(_) => {}
     }
+    let bundle_length = boundary_bundle_length(layout);
     let raw_route_length: f64 = segments
         .iter()
         .map(|segment| segment.end - segment.start)
-        .sum();
+        .sum::<f64>()
+        + bundle_length;
     report.route_length = physical_segments
         .iter()
         .map(|segment| segment.end - segment.start)
-        .sum();
+        .sum::<f64>()
+        + bundle_length;
     let parallel_segments = physical_segments
         .iter()
         .map(|segment| ParallelSegment {
@@ -377,6 +411,17 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             start: segment.start,
             end: segment.end,
         })
+        .chain(
+            boundary_segments
+                .iter()
+                .map(|(_, segment)| ParallelSegment {
+                    net: segment.net,
+                    horizontal: segment.orientation == Orientation::Horizontal,
+                    fixed: segment.fixed,
+                    start: segment.start,
+                    end: segment.end,
+                }),
+        )
         .collect::<Vec<_>>();
     report.minimum_parallel_route_separation =
         measure_parallel_separation_bounded(&parallel_segments, usize::MAX)
@@ -407,8 +452,22 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
     }
     (report.split_feedback_nets, report.feedback_net_count) =
         split_feedback_nets(graph, layout, &input_edges, &ranking_edges, options.epsilon);
-    report.bends = bend_points.len();
+    report.bends = bend_points.len()
+        + layout
+            .boundary_bundles
+            .iter()
+            .filter(|bundle| {
+                bundle.collector.start != bundle.collector.end
+                    && bundle.spine.start != bundle.spine.end
+            })
+            .count();
     score_segment_relationships(&segments, &physical_segments, &input_edges, &mut report);
+    score_boundary_bundle_relationships(
+        layout,
+        &physical_segments,
+        &boundary_segments,
+        &mut report,
+    );
     report
 }
 
@@ -517,6 +576,7 @@ fn validate_route(
     edge: &Edge,
     points: &[Point],
     nodes: &HashMap<u32, &NodeGeometry>,
+    bundle_taps: Option<(Option<Point>, Option<Point>)>,
     layout: &Layout,
     options: ScoreOptions,
     report: &mut QualityReport,
@@ -550,7 +610,12 @@ fn validate_route(
         (edge.source, points[0], true),
         (edge.target, points[points.len() - 1], false),
     ] {
-        let Some(expected) = endpoint_point(graph, endpoint, nodes) else {
+        let expected = match (bundle_taps, source) {
+            (Some((Some(tap), _)), true) => Some((tap, PortSide::East)),
+            (Some((_, Some(tap))), false) => Some((tap, PortSide::West)),
+            _ => endpoint_point(graph, endpoint, nodes),
+        };
+        let Some(expected) = expected else {
             continue;
         };
         if !near_point(point, expected.0, options.epsilon) {
@@ -826,6 +891,328 @@ fn score_node_intersections(
             }
         }
     }
+}
+
+fn score_boundary_bundle_node_intersections(
+    layout: &Layout,
+    options: ScoreOptions,
+    report: &mut QualityReport,
+) {
+    let epsilon = options.epsilon;
+    for bundle in &layout.boundary_bundles {
+        for segment in [bundle.collector, bundle.spine] {
+            let segment = match bundle_segment(segment, bundle.id, bundle.id) {
+                Ok(Some(segment)) => segment,
+                Ok(None) => continue,
+                Err(()) => {
+                    report.violation(
+                        options,
+                        ViolationKind::InvalidGeometry,
+                        format!("boundary bundle {} contains invalid geometry", bundle.id),
+                    );
+                    continue;
+                }
+            };
+            for node in layout
+                .nodes
+                .iter()
+                .filter(|node| node.id != bundle.endpoint.node)
+            {
+                let intersects = match segment.orientation {
+                    Orientation::Horizontal => {
+                        segment.fixed > node.y + epsilon
+                            && segment.fixed < node.y + node.height - epsilon
+                            && segment.start < node.x + node.width - epsilon
+                            && segment.end > node.x + epsilon
+                    }
+                    Orientation::Vertical => {
+                        segment.fixed > node.x + epsilon
+                            && segment.fixed < node.x + node.width - epsilon
+                            && segment.start < node.y + node.height - epsilon
+                            && segment.end > node.y + epsilon
+                    }
+                };
+                if intersects {
+                    report.node_intersections += 1;
+                }
+            }
+        }
+    }
+}
+
+fn append_boundary_bundle_clearance_geometry(
+    graph: &Graph,
+    layout: &Layout,
+    segments: &mut Vec<EdgeNodeSegment>,
+    relations: &mut Vec<NetNodeRelation>,
+    options: ScoreOptions,
+    report: &mut QualityReport,
+) {
+    let mut used_nets = graph
+        .edges
+        .iter()
+        .map(|edge| edge.net)
+        .collect::<HashSet<_>>();
+    let mut candidate = 0u32;
+    for bundle in &layout.boundary_bundles {
+        while used_nets.contains(&candidate) {
+            candidate = candidate.wrapping_add(1);
+        }
+        let net = candidate;
+        used_nets.insert(net);
+        candidate = candidate.wrapping_add(1);
+        relations.push(NetNodeRelation {
+            net,
+            node: bundle.endpoint.node,
+        });
+        for geometry in [bundle.collector, bundle.spine] {
+            let segment = match bundle_segment(geometry, bundle.id, net) {
+                Ok(Some(segment)) => segment,
+                Ok(None) => continue,
+                Err(()) => {
+                    report.violation(
+                        options,
+                        ViolationKind::InvalidGeometry,
+                        format!("boundary bundle {} contains invalid geometry", bundle.id),
+                    );
+                    continue;
+                }
+            };
+            segments.push(EdgeNodeSegment {
+                net,
+                horizontal: segment.orientation == Orientation::Horizontal,
+                fixed: segment.fixed,
+                start: segment.start,
+                end: segment.end,
+            });
+        }
+    }
+}
+
+fn boundary_bundle_length(layout: &Layout) -> f64 {
+    layout
+        .boundary_bundles
+        .iter()
+        .flat_map(|bundle| [bundle.collector, bundle.spine])
+        .map(|segment| {
+            (segment.end.x - segment.start.x).abs() + (segment.end.y - segment.start.y).abs()
+        })
+        .sum()
+}
+
+fn bundle_segment(
+    geometry: BoundaryBundleSegment,
+    edge: EdgeId,
+    net: NetId,
+) -> Result<Option<Segment>, ()> {
+    if ![
+        geometry.start.x,
+        geometry.start.y,
+        geometry.end.x,
+        geometry.end.y,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    {
+        return Err(());
+    }
+    if geometry.start == geometry.end {
+        return Ok(None);
+    }
+    let orientation = if geometry.start.x == geometry.end.x {
+        Orientation::Vertical
+    } else if geometry.start.y == geometry.end.y {
+        Orientation::Horizontal
+    } else {
+        return Err(());
+    };
+    Ok(Some(Segment::new(
+        edge,
+        net,
+        geometry.start,
+        geometry.end,
+        orientation,
+    )))
+}
+
+fn boundary_bundle_scoring_segments(graph: &Graph, layout: &Layout) -> Vec<(usize, Segment)> {
+    let mut used_nets = graph
+        .edges
+        .iter()
+        .map(|edge| edge.net)
+        .collect::<HashSet<_>>();
+    let mut candidate = 0u32;
+    let mut result = Vec::with_capacity(layout.boundary_bundles.len() * 2);
+    for (bundle_index, bundle) in layout.boundary_bundles.iter().enumerate() {
+        while used_nets.contains(&candidate) {
+            candidate = candidate.wrapping_add(1);
+        }
+        let net = candidate;
+        used_nets.insert(net);
+        candidate = candidate.wrapping_add(1);
+        for geometry in [bundle.collector, bundle.spine] {
+            if let Ok(Some(segment)) = bundle_segment(geometry, bundle.id, net) {
+                result.push((bundle_index, segment));
+            }
+        }
+    }
+    result
+}
+
+#[derive(Clone, Copy)]
+enum BoundaryRelationship {
+    Overlap,
+    Contact(Point),
+    Crossing(Point),
+}
+
+fn score_boundary_bundle_relationships(
+    layout: &Layout,
+    routes: &[Segment],
+    buses: &[(usize, Segment)],
+    report: &mut QualityReport,
+) {
+    let permitted_taps = layout
+        .boundary_bundles
+        .iter()
+        .map(|bundle| {
+            bundle
+                .members
+                .iter()
+                .map(|member| (member.edge, member.tap))
+                .collect::<HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let mut route_crossings = vec![0usize; routes.len()];
+    let mut bus_crossings = vec![0usize; buses.len()];
+    for (bus_index, &(bundle, bus)) in buses.iter().enumerate() {
+        for (route_index, route) in routes.iter().enumerate() {
+            let permitted = permitted_taps[bundle].get(&route.edge).copied();
+            if let Some(relationship) = boundary_relationship(bus, *route) {
+                if relationship_point(relationship).is_some_and(|point| {
+                    permitted == Some(point) && segment_has_endpoint(*route, point)
+                }) {
+                    continue;
+                }
+                score_boundary_relationship(
+                    relationship,
+                    route_index,
+                    bus_index,
+                    &mut route_crossings,
+                    &mut bus_crossings,
+                    report,
+                );
+            }
+        }
+    }
+    for left in 0..buses.len() {
+        for right in left + 1..buses.len() {
+            if buses[left].0 == buses[right].0 {
+                continue;
+            }
+            if let Some(relationship) = boundary_relationship(buses[left].1, buses[right].1) {
+                match relationship {
+                    BoundaryRelationship::Overlap => report.unrelated_overlaps += 1,
+                    BoundaryRelationship::Contact(_) => report.unrelated_contacts += 1,
+                    BoundaryRelationship::Crossing(_) => {
+                        report.crossings += 1;
+                        bus_crossings[left] += 1;
+                        bus_crossings[right] += 1;
+                    }
+                }
+            }
+        }
+    }
+    report.max_crossings_on_segment = report
+        .max_crossings_on_segment
+        .max(route_crossings.into_iter().max().unwrap_or(0))
+        .max(bus_crossings.into_iter().max().unwrap_or(0));
+}
+
+fn segment_has_endpoint(segment: Segment, point: Point) -> bool {
+    match segment.orientation {
+        Orientation::Horizontal => {
+            point.y == segment.fixed && (point.x == segment.start || point.x == segment.end)
+        }
+        Orientation::Vertical => {
+            point.x == segment.fixed && (point.y == segment.start || point.y == segment.end)
+        }
+    }
+}
+
+fn score_boundary_relationship(
+    relationship: BoundaryRelationship,
+    route: usize,
+    bus: usize,
+    route_crossings: &mut [usize],
+    bus_crossings: &mut [usize],
+    report: &mut QualityReport,
+) {
+    match relationship {
+        BoundaryRelationship::Overlap => report.unrelated_overlaps += 1,
+        BoundaryRelationship::Contact(_) => report.unrelated_contacts += 1,
+        BoundaryRelationship::Crossing(_) => {
+            report.crossings += 1;
+            route_crossings[route] += 1;
+            bus_crossings[bus] += 1;
+        }
+    }
+}
+
+fn relationship_point(relationship: BoundaryRelationship) -> Option<Point> {
+    match relationship {
+        BoundaryRelationship::Overlap => None,
+        BoundaryRelationship::Contact(point) | BoundaryRelationship::Crossing(point) => Some(point),
+    }
+}
+
+fn boundary_relationship(left: Segment, right: Segment) -> Option<BoundaryRelationship> {
+    if left.orientation == right.orientation {
+        if left.fixed != right.fixed || left.start > right.end || right.start > left.end {
+            return None;
+        }
+        let start = left.start.max(right.start);
+        let end = left.end.min(right.end);
+        if start < end {
+            return Some(BoundaryRelationship::Overlap);
+        }
+        let point = match left.orientation {
+            Orientation::Horizontal => Point {
+                x: start,
+                y: left.fixed,
+            },
+            Orientation::Vertical => Point {
+                x: left.fixed,
+                y: start,
+            },
+        };
+        return Some(BoundaryRelationship::Contact(point));
+    }
+    let (horizontal, vertical) = if left.orientation == Orientation::Horizontal {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if vertical.fixed < horizontal.start
+        || vertical.fixed > horizontal.end
+        || horizontal.fixed < vertical.start
+        || horizontal.fixed > vertical.end
+    {
+        return None;
+    }
+    let point = Point {
+        x: vertical.fixed,
+        y: horizontal.fixed,
+    };
+    let endpoint = vertical.fixed == horizontal.start
+        || vertical.fixed == horizontal.end
+        || horizontal.fixed == vertical.start
+        || horizontal.fixed == vertical.end;
+    Some(if endpoint {
+        BoundaryRelationship::Contact(point)
+    } else {
+        BoundaryRelationship::Crossing(point)
+    })
 }
 
 struct NodeGrid {

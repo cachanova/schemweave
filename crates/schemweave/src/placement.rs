@@ -707,6 +707,7 @@ pub(crate) fn normalize(nodes: &mut [NodeGeometry], edges: &mut [EdgeGeometry]) 
     Layout {
         nodes: nodes.to_vec(),
         edges: edges.to_vec(),
+        boundary_bundles: Vec::new(),
         width,
         height,
     }
@@ -720,6 +721,7 @@ pub(crate) fn normalize_owned(
     Layout {
         nodes,
         edges,
+        boundary_bundles: Vec::new(),
         width,
         height,
     }

@@ -223,6 +223,11 @@ pub fn expand_group_in_place(
         &options.constraints,
     )
     .map_err(GroupExpansionError::InvalidExpandedGraph)?;
+    if !options.constraints.boundary_bundles.is_empty()
+        || !compact_layout.boundary_bundles.is_empty()
+    {
+        return Err(GroupExpansionError::NeedsFullRelayout);
+    }
     if options.layout.edge_node_clearance > 0.0
         || options.layout.minimum_parallel_wire_spacing > 0.0
     {
@@ -252,6 +257,7 @@ pub fn expand_group_in_place(
             .copied()
             .filter(|node| contract.members.contains(node))
             .collect(),
+        boundary_bundles: Vec::new(),
     };
     let member_layout = layout_with_quality_effort_and_constraints(
         &member_graph,
@@ -963,6 +969,7 @@ fn pack_disconnected_components(
     Layout {
         nodes: translated_nodes,
         edges: translated_edges,
+        boundary_bundles: Vec::new(),
         width: column_widths.iter().sum::<f64>() + gap * columns.saturating_sub(1) as f64,
         height: row_heights.iter().sum::<f64>() + gap * rows.saturating_sub(1) as f64,
     }
@@ -1692,6 +1699,7 @@ fn compose_candidate(
     Ok(Layout {
         nodes,
         edges,
+        boundary_bundles: Vec::new(),
         width,
         height,
     })
@@ -2646,6 +2654,7 @@ mod tests {
             &crate::LayoutConstraints {
                 inputs: vec![1],
                 outputs: vec![9, 10],
+                boundary_bundles: Vec::new(),
             },
         )
         .unwrap();
@@ -2672,6 +2681,7 @@ mod tests {
                 constraints: crate::LayoutConstraints {
                     inputs: vec![1],
                     outputs: vec![2, 3, 9],
+                    boundary_bundles: Vec::new(),
                 },
                 ..GroupExpansionOptions::default()
             },
@@ -2705,6 +2715,7 @@ mod tests {
             &crate::LayoutConstraints {
                 inputs: vec![1, 10],
                 outputs: vec![9],
+                boundary_bundles: Vec::new(),
             },
         )
         .unwrap();
@@ -2731,6 +2742,7 @@ mod tests {
                 constraints: crate::LayoutConstraints {
                     inputs: vec![1, 2, 3],
                     outputs: vec![9],
+                    boundary_bundles: Vec::new(),
                 },
                 ..GroupExpansionOptions::default()
             },
@@ -2796,6 +2808,7 @@ mod tests {
                     constraints: crate::LayoutConstraints {
                         inputs: vec![1],
                         outputs: vec![2, 3, 9],
+                        boundary_bundles: Vec::new(),
                     },
                     ..GroupExpansionOptions::default()
                 },
@@ -2846,6 +2859,7 @@ mod tests {
                     Point { x: 400.0, y: 25.0 },
                 ],
             }],
+            boundary_bundles: Vec::new(),
             width: 480.0,
             height: 200.0,
         };
@@ -2901,6 +2915,7 @@ mod tests {
                     constraints: crate::LayoutConstraints {
                         inputs: vec![999],
                         outputs: Vec::new(),
+                        boundary_bundles: Vec::new(),
                     },
                     ..GroupExpansionOptions::default()
                 },
@@ -3000,6 +3015,7 @@ mod tests {
                     ],
                 },
             ],
+            boundary_bundles: Vec::new(),
             width: 480.0,
             height: 250.0,
         };
@@ -3079,6 +3095,7 @@ mod tests {
         let compact = Layout {
             nodes: Vec::new(),
             edges: Vec::new(),
+            boundary_bundles: Vec::new(),
             width: 10_000.0,
             height: 8_000.0,
         };
@@ -3092,6 +3109,7 @@ mod tests {
         let members = Layout {
             nodes: Vec::new(),
             edges: Vec::new(),
+            boundary_bundles: Vec::new(),
             width: 300.0,
             height: 200.0,
         };

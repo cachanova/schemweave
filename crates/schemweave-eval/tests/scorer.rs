@@ -1,8 +1,9 @@
 use schemweave::{
-    BoundaryTrunk, Edge, EdgeGeometry, Endpoint, Graph, GroupExpansion, GroupExpansionOptions,
-    Layout, LayoutConfig, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port,
-    PortSide, QualityEffort, expand_group_in_place, layout, layout_with_config,
-    layout_with_quality_effort, layout_with_quality_effort_and_constraints,
+    BoundaryBundleConstraint, BoundaryBundleGeometry, BoundaryBundleMemberConstraint,
+    BoundaryBundleRole, BoundaryBundleSegment, BoundaryTrunk, Edge, EdgeGeometry, Endpoint, Graph,
+    GroupExpansion, GroupExpansionOptions, Layout, LayoutConfig, LayoutConstraints, LayoutOptions,
+    Node, NodeGeometry, Point, Port, PortSide, QualityEffort, expand_group_in_place, layout,
+    layout_with_config, layout_with_quality_effort, layout_with_quality_effort_and_constraints,
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
 
@@ -131,6 +132,7 @@ fn constructed_routes(routes: &[(u32, Vec<Point>)]) -> (Graph, Layout) {
         Layout {
             nodes: node_geometry,
             edges: edge_geometry,
+            boundary_bundles: Vec::new(),
             width,
             height,
         },
@@ -1224,6 +1226,7 @@ fn regional_fanout_max_candidate_preserves_every_hard_gate() {
     let constraints = LayoutConstraints {
         inputs: vec![0],
         outputs: (492..500).collect(),
+        boundary_bundles: Vec::new(),
     };
     let quality = layout_with_quality_effort_and_constraints(
         &graph,
@@ -1301,6 +1304,7 @@ fn positive_clearance_covers_regional_fanout_and_boundary_constraints() {
     let constraints = LayoutConstraints {
         inputs: vec![0],
         outputs: (492..500).collect(),
+        boundary_bundles: Vec::new(),
     };
     let layout = layout_with_quality_effort_and_constraints(
         &graph,
@@ -1591,6 +1595,7 @@ fn p95_forward_stretch_uses_the_nearest_rank_boundary() {
     let layout = Layout {
         nodes: node_geometry,
         edges: edge_geometry,
+        boundary_bundles: Vec::new(),
         width: 260.0,
         height: 990.0,
     };
@@ -1633,6 +1638,7 @@ fn ranking_edges_must_advance_to_a_nonoverlapping_x_range() {
                 Point { x: 70.0, y: 125.0 },
             ],
         }],
+        boundary_bundles: Vec::new(),
         width: 180.0,
         height: 180.0,
     };
@@ -1765,6 +1771,7 @@ fn excludes_scc_internal_edges_but_scores_edges_leaving_the_component() {
                 points: vec![Point { x: 140.0, y: 10.0 }, Point { x: 220.0, y: 10.0 }],
             },
         ],
+        boundary_bundles: Vec::new(),
         width: 260.0,
         height: 60.0,
     };
@@ -1935,6 +1942,7 @@ fn detects_a_feedback_net_split_across_outer_bands() {
                 ],
             },
         ],
+        boundary_bundles: Vec::new(),
         width: 240.0,
         height: 160.0,
     };
@@ -2148,6 +2156,7 @@ fn boundary_rounding_does_not_count_as_a_node_intersection() {
             id: 1,
             points: vec![Point { x: 0.3, y: 0.5 }, Point { x: 1.0, y: 0.5 }],
         }],
+        boundary_bundles: Vec::new(),
         width: 1.2,
         height: 1.0,
     };
@@ -2329,6 +2338,7 @@ fn counts_overlapping_same_net_branches_as_one_physical_crossing() {
                 points: vec![Point { x: 10.0, y: 45.0 }, Point { x: 90.0, y: 45.0 }],
             },
         ],
+        boundary_bundles: Vec::new(),
         width: 100.0,
         height: 100.0,
     };
@@ -2415,6 +2425,7 @@ fn shared_same_net_corners_count_once() {
             },
             EdgeGeometry { id: 2, points },
         ],
+        boundary_bundles: Vec::new(),
         width: 100.0,
         height: 50.0,
     };
@@ -2425,4 +2436,173 @@ fn shared_same_net_corners_count_once() {
     assert_eq!(report.route_length, 120.0);
     assert_eq!(report.shared_route_ratio, 0.5);
     assert_eq!(report.bends, 2);
+}
+
+#[test]
+fn boundary_bundle_geometry_and_tap_endpoints_participate_in_scoring() {
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: 1,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 1,
+                    side: PortSide::East,
+                    offset: 25.0,
+                }],
+            },
+            Node {
+                id: 2,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 25.0,
+                }],
+            },
+            Node {
+                id: 3,
+                width: 80.0,
+                height: 50.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 25.0,
+                }],
+            },
+        ],
+        edges: vec![
+            Edge {
+                id: 10,
+                source: Endpoint { node: 1, port: 1 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 10,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 11,
+                source: Endpoint { node: 1, port: 1 },
+                target: Endpoint { node: 3, port: 0 },
+                net: 11,
+                participates_in_ranking: true,
+            },
+        ],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![2, 3],
+        boundary_bundles: vec![
+            BoundaryBundleConstraint {
+                id: 3,
+                endpoint: Endpoint { node: 1, port: 1 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            },
+            BoundaryBundleConstraint {
+                id: 4,
+                endpoint: Endpoint { node: 2, port: 0 },
+                width: 1,
+                members: vec![BoundaryBundleMemberConstraint {
+                    edge: 10,
+                    slots: vec![0],
+                }],
+            },
+        ],
+    };
+    let layout = layout_with_quality_effort_and_constraints(
+        &graph,
+        LayoutOptions::default(),
+        QualityEffort::Quality,
+        &constraints,
+    )
+    .unwrap();
+    let report = score(
+        &graph,
+        &layout,
+        ScoreOptions {
+            edge_node_clearance_threshold: 0.0,
+            ..ScoreOptions::default()
+        },
+    );
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.node_intersections, 0, "{report:#?}");
+    assert_eq!(report.edge_node_clearance_violations, 0, "{report:#?}");
+    let bus_length = layout
+        .boundary_bundles
+        .iter()
+        .flat_map(|bundle| [bundle.collector, bundle.spine])
+        .map(|segment| {
+            (segment.end.x - segment.start.x).abs() + (segment.end.y - segment.start.y).abs()
+        })
+        .sum::<f64>();
+    let member_length = layout
+        .edges
+        .iter()
+        .flat_map(|edge| edge.points.windows(2))
+        .map(|pair| (pair[1].x - pair[0].x).abs() + (pair[1].y - pair[0].y).abs())
+        .sum::<f64>();
+    assert_eq!(report.route_length, member_length + bus_length);
+}
+
+#[test]
+fn boundary_bundle_segments_participate_in_crossing_and_parallel_spacing_metrics() {
+    let graph = graph();
+    let layout = Layout {
+        nodes: vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 80.0,
+                height: 50.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 120.0,
+                y: 0.0,
+                width: 80.0,
+                height: 50.0,
+            },
+        ],
+        edges: vec![EdgeGeometry {
+            id: 10,
+            points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 120.0, y: 25.0 }],
+        }],
+        boundary_bundles: vec![BoundaryBundleGeometry {
+            id: 99,
+            endpoint: Endpoint { node: 1, port: 1 },
+            role: BoundaryBundleRole::Input,
+            width: 1,
+            collector: BoundaryBundleSegment {
+                start: Point { x: 100.0, y: 0.0 },
+                end: Point { x: 100.0, y: 50.0 },
+            },
+            spine: BoundaryBundleSegment {
+                start: Point { x: 80.0, y: 29.0 },
+                end: Point { x: 100.0, y: 29.0 },
+            },
+            members: Vec::new(),
+        }],
+        width: 200.0,
+        height: 50.0,
+    };
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.crossings, 1, "{report:#?}");
+    assert_eq!(report.minimum_parallel_route_separation, Some(4.0));
 }
