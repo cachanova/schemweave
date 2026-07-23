@@ -176,11 +176,12 @@ fn place_nodes_with_alignment(
         })
         .collect();
     let canvas_height = heights.iter().copied().fold(0.0, f64::max);
-    let layer_gaps = if demand_aware_spacing {
+    let mut layer_gaps = if demand_aware_spacing {
         demand_aware_layer_gaps(graph, ranks, layers.len(), options)
     } else {
         vec![options.layer_gap; layers.len().saturating_sub(1)]
     };
+    reserve_boundary_bundle_corridors(graph, ranks, &widths, options, &mut layer_gaps);
     let mut layer_x = vec![0.0; layers.len()];
     for rank in 1..layers.len() {
         layer_x[rank] = layer_x[rank - 1] + widths[rank - 1] + layer_gaps[rank - 1];
@@ -224,6 +225,7 @@ fn clearance_aware_node_gaps(
         .iter()
         .map(|layer| vec![base_gap; layer.len().saturating_sub(1)])
         .collect::<Vec<_>>();
+    reserve_boundary_bundle_vertical_envelopes(graph, layers, options, &mut gaps);
     if options.edge_node_clearance == 0.0 {
         return gaps;
     }
@@ -298,6 +300,88 @@ fn clearance_aware_node_gaps(
         }
     }
     gaps
+}
+
+fn reserve_boundary_bundle_corridors(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    layer_widths: &[f64],
+    options: LayoutOptions,
+    layer_gaps: &mut [f64],
+) {
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let rail_depth = crate::outward_obstacle_clearance_stub(options) + options.route_lane_gap;
+    for bundle in &graph.boundary_bundles {
+        let node = graph.node_index[&bundle.endpoint.node];
+        let rank = ranks[node];
+        let lane_count = bundle
+            .members
+            .last()
+            .map_or(0, |member| member.tap_lane + 1);
+        let node_inset = layer_widths[rank] - graph.nodes[node].width;
+        let required = (rail_depth
+            + lane_count as f64 * pitch
+            + options
+                .edge_node_clearance
+                .max(options.minimum_parallel_wire_spacing)
+                .max(options.route_lane_gap)
+            - node_inset)
+            .max(0.0);
+        let gap = match bundle.role {
+            crate::BoundaryBundleRole::Input => layer_gaps.get_mut(rank),
+            crate::BoundaryBundleRole::Output => {
+                rank.checked_sub(1).and_then(|gap| layer_gaps.get_mut(gap))
+            }
+        };
+        if let Some(gap) = gap {
+            *gap = gap.max(required);
+        }
+    }
+}
+
+fn reserve_boundary_bundle_vertical_envelopes(
+    graph: &IndexedGraph<'_>,
+    layers: &[Vec<usize>],
+    options: LayoutOptions,
+    gaps: &mut [Vec<f64>],
+) {
+    if graph.boundary_bundles.is_empty() {
+        return;
+    }
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let clearance = options
+        .edge_node_clearance
+        .max(options.minimum_parallel_wire_spacing);
+    let mut envelopes: Vec<(f64, f64)> = graph
+        .nodes
+        .iter()
+        .map(|node| (0.0, node.height))
+        .collect::<Vec<_>>();
+    for bundle in &graph.boundary_bundles {
+        let node = graph.node_index[&bundle.endpoint.node];
+        let port = graph.ports[node][&bundle.endpoint.port];
+        let lane_count = bundle
+            .members
+            .last()
+            .map_or(0, |member| member.tap_lane + 1);
+        let half_span = lane_count.saturating_sub(1) as f64 * pitch / 2.0;
+        envelopes[node].0 = envelopes[node].0.min(port.offset - half_span);
+        envelopes[node].1 = envelopes[node].1.max(port.offset + half_span);
+    }
+    for (rank, layer) in layers.iter().enumerate() {
+        for (position, pair) in layer.windows(2).enumerate() {
+            let upper = pair[0];
+            let lower = pair[1];
+            let required = (envelopes[upper].1 - graph.nodes[upper].height - envelopes[lower].0
+                + clearance)
+                .max(options.node_gap);
+            gaps[rank][position] = gaps[rank][position].max(required);
+        }
+    }
 }
 
 fn demand_aware_layer_gaps(
@@ -799,12 +883,106 @@ mod tests {
         Alignment, align_layer, demand_aware_layer_gaps, isotonic_projection, normalize,
         normalize_owned, place_straight_chain_nodes, preferred_alignment_can_be_significant,
         preferred_alignment_is_significant, preferred_chain_targets, preferred_edges,
+        reserve_boundary_bundle_corridors, reserve_boundary_bundle_vertical_envelopes,
         straight_chain_scale_is_eligible,
     };
     use crate::{
-        Edge, EdgeGeometry, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Point, Port,
-        PortSide, place, topology::assign_ranks, validation::validate_and_index,
+        BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, EdgeGeometry, Endpoint,
+        Graph, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port, PortSide, place,
+        topology::assign_ranks,
+        validation::{validate_and_index, validate_and_index_with_constraints},
     };
+
+    #[test]
+    fn boundary_bundle_reservations_cover_the_outer_track_and_vertical_overhang() {
+        let boundary_node = |id, side| Node {
+            id,
+            width: 40.0,
+            height: 40.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 20.0,
+            }],
+        };
+        let mut edges = (0..32)
+            .map(|slot| Edge {
+                id: slot,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: slot,
+                participates_in_ranking: true,
+            })
+            .collect::<Vec<_>>();
+        edges.push(Edge {
+            id: 100,
+            source: Endpoint { node: 1, port: 0 },
+            target: Endpoint { node: 3, port: 0 },
+            net: 100,
+            participates_in_ranking: true,
+        });
+        let graph = Graph {
+            nodes: vec![
+                boundary_node(1, PortSide::East),
+                boundary_node(2, PortSide::West),
+                boundary_node(3, PortSide::West),
+            ],
+            edges,
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1],
+            outputs: vec![2, 3],
+            boundary_bundles: vec![
+                BoundaryBundleConstraint {
+                    id: 1,
+                    endpoint: Endpoint { node: 2, port: 0 },
+                    width: 32,
+                    members: (0..32)
+                        .map(|slot| BoundaryBundleMemberConstraint {
+                            edge: slot,
+                            slots: vec![slot],
+                        })
+                        .collect(),
+                },
+                BoundaryBundleConstraint {
+                    id: 2,
+                    endpoint: Endpoint { node: 3, port: 0 },
+                    width: 1,
+                    members: vec![BoundaryBundleMemberConstraint {
+                        edge: 100,
+                        slots: vec![0],
+                    }],
+                },
+            ],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let source = indexed.node_index[&1];
+        let wide = indexed.node_index[&2];
+        let narrow = indexed.node_index[&3];
+        let layers = vec![vec![source], vec![wide, narrow]];
+        let ranks = [0, 1, 1];
+
+        let mut vertical_gaps = vec![Vec::new(), vec![options.node_gap]];
+        reserve_boundary_bundle_vertical_envelopes(&indexed, &layers, options, &mut vertical_gaps);
+        assert_eq!(vertical_gaps[1], vec![42.0]);
+        assert_eq!(
+            20.0 + 31.0 * options.route_lane_gap / 2.0 - (40.0 + vertical_gaps[1][0] - 1.0),
+            1.0,
+            "one pixel less would overlap the width-32 collector envelope"
+        );
+
+        let mut layer_gaps = vec![options.layer_gap];
+        reserve_boundary_bundle_corridors(
+            &indexed,
+            &ranks,
+            &[40.0, 40.0],
+            options,
+            &mut layer_gaps,
+        );
+        assert_eq!(layer_gaps, vec![146.0]);
+    }
 
     #[test]
     fn demand_aware_layer_gaps_count_distinct_net_spans_deterministically() {

@@ -1577,6 +1577,19 @@ fn input_boundary_bundle_emits_a_pitched_collector_and_unique_horizontal_taps() 
             - wider_pitch.boundary_bundles[0].members[0].tap.y,
         6.0
     );
+
+    let mut sparse_declared_width = constraints.clone();
+    sparse_declared_width.boundary_bundles[0].width = 1_000_000;
+    let sparse =
+        layout_with_constraints(&graph, LayoutOptions::default(), &sparse_declared_width).unwrap();
+    assert_eq!(sparse.nodes, result.nodes);
+    assert_eq!(sparse.edges, result.edges);
+    assert_eq!(sparse.width, result.width);
+    assert_eq!(sparse.height, result.height);
+    assert_eq!(
+        sparse.boundary_bundles[0].collector,
+        result.boundary_bundles[0].collector
+    );
 }
 
 #[test]
@@ -1630,6 +1643,171 @@ fn output_boundary_bundle_routes_members_horizontally_into_unique_taps() {
         );
         assert!(route.points[route.points.len() - 2].x < member.tap.x);
     }
+}
+
+#[test]
+fn wide_live_shape_bundles_reserve_distinct_boundary_corridors() {
+    let mut nodes = vec![node(1, false), node(2, false), node(3, false)];
+    nodes.extend((0..32).map(|slot| node(100 + slot, false)));
+    let mut edges = Vec::new();
+    for slot in 0..32 {
+        edges.push(Edge {
+            net: slot,
+            ..edge(10 + slot, 1, 100 + slot)
+        });
+        edges.push(Edge {
+            net: 100 + slot,
+            ..edge(200 + slot, 100 + slot, 3)
+        });
+        if slot < 5 {
+            edges.push(Edge {
+                net: 200 + slot,
+                ..edge(300 + slot, 100 + slot, 2)
+            });
+        }
+    }
+    let graph = Graph { nodes, edges };
+    let slot_members = |first_edge: u32, width: u32| {
+        (0..width)
+            .map(|slot| BoundaryBundleMemberConstraint {
+                edge: first_edge + slot,
+                slots: vec![slot],
+            })
+            .collect::<Vec<_>>()
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![2, 3],
+        boundary_bundles: vec![
+            BoundaryBundleConstraint {
+                id: 0,
+                endpoint: Endpoint { node: 1, port: 1 },
+                width: 32,
+                members: slot_members(10, 32),
+            },
+            BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 2, port: 0 },
+                width: 5,
+                members: slot_members(300, 5),
+            },
+            BoundaryBundleConstraint {
+                id: 2,
+                endpoint: Endpoint { node: 3, port: 0 },
+                width: 32,
+                members: slot_members(200, 32),
+            },
+        ],
+    };
+    let config = LayoutConfig {
+        constraints: constraints.clone(),
+        ..LayoutConfig::highest_quality()
+    };
+    let zero_clearance = layout_with_config(
+        &graph,
+        &LayoutConfig {
+            constraints: constraints.clone(),
+            ..LayoutConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(zero_clearance.boundary_bundles.len(), 3);
+    assert_routes_avoid_node_interiors(&zero_clearance);
+    assert!(zero_clearance.edges.iter().all(|route| {
+        route.points[0].y == route.points[1].y
+            && route.points[route.points.len() - 2].y == route.points[route.points.len() - 1].y
+    }));
+    assert!(
+        zero_clearance
+            .nodes
+            .iter()
+            .filter(|node| node.id == 2 || node.id == 3)
+            .map(|node| node.x + node.width)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|right_edges| right_edges[0] == right_edges[1])
+    );
+    let result = layout_with_config(&graph, &config).unwrap();
+    assert_eq!(result.boundary_bundles.len(), 3);
+    assert_routes_avoid_node_interiors(&result);
+    assert_edge_node_clearance(&graph, &result, config.layout.edge_node_clearance);
+    assert!(result.edges.iter().all(|route| {
+        route.points[0].y == route.points[1].y
+            && route.points[route.points.len() - 2].y == route.points[route.points.len() - 1].y
+    }));
+    assert!(
+        result
+            .nodes
+            .iter()
+            .filter(|node| node.id == 2 || node.id == 3)
+            .map(|node| node.x + node.width)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .all(|right_edges| right_edges[0] == right_edges[1])
+    );
+
+    for bundle in &result.boundary_bundles {
+        let corridor_x = bundle
+            .members
+            .iter()
+            .map(|member| {
+                let route = result
+                    .edges
+                    .iter()
+                    .find(|route| route.id == member.edge)
+                    .unwrap();
+                match bundle.role {
+                    BoundaryBundleRole::Input => route.points[1].x,
+                    BoundaryBundleRole::Output => route.points[route.points.len() - 2].x,
+                }
+                .to_bits()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(corridor_x.len(), bundle.width as usize);
+    }
+    let wide_collectors = result
+        .boundary_bundles
+        .iter()
+        .filter(|bundle| bundle.role == BoundaryBundleRole::Output)
+        .map(|bundle| {
+            (
+                bundle.collector.start.y.min(bundle.collector.end.y),
+                bundle.collector.start.y.max(bundle.collector.end.y),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        wide_collectors[0].1 + config.layout.edge_node_clearance <= wide_collectors[1].0
+            || wide_collectors[1].1 + config.layout.edge_node_clearance <= wide_collectors[0].0
+    );
+
+    let mut permuted = graph.clone();
+    permuted.nodes.reverse();
+    permuted.edges.reverse();
+    for node in &mut permuted.nodes {
+        node.ports.reverse();
+    }
+    let mut permuted_constraints = constraints;
+    permuted_constraints.inputs.reverse();
+    permuted_constraints.outputs.reverse();
+    permuted_constraints.boundary_bundles.reverse();
+    for bundle in &mut permuted_constraints.boundary_bundles {
+        bundle.members.reverse();
+        for member in &mut bundle.members {
+            member.slots.reverse();
+        }
+    }
+    assert_eq!(
+        result,
+        layout_with_config(
+            &permuted,
+            &LayoutConfig {
+                constraints: permuted_constraints,
+                ..LayoutConfig::highest_quality()
+            },
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -1708,6 +1886,20 @@ fn same_net_fanout_with_identical_slots_shares_one_visible_tap_deterministically
             tap(edge)
         );
     }
+    let corridor_x = |edge| {
+        result
+            .edges
+            .iter()
+            .find(|route| route.id == edge)
+            .unwrap()
+            .points[1]
+            .x
+    };
+    assert_eq!(corridor_x(10), corridor_x(11));
+    assert_eq!(
+        corridor_x(12) - corridor_x(10),
+        LayoutOptions::default().route_lane_gap
+    );
 
     let mut permuted_graph = graph.clone();
     permuted_graph.nodes.reverse();

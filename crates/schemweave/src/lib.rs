@@ -1783,12 +1783,7 @@ mod tests {
             nodes.clone(),
             vec![EdgeGeometry {
                 id: 10,
-                points: vec![
-                    Point { x: 10.0, y: 5.0 },
-                    Point { x: 10.0, y: 20.0 },
-                    Point { x: 100.0, y: 20.0 },
-                    Point { x: 100.0, y: 5.0 },
-                ],
+                points: vec![Point { x: 10.0, y: 5.0 }, Point { x: 100.0, y: 5.0 },],
             }],
             options,
             &mut admission_state,
