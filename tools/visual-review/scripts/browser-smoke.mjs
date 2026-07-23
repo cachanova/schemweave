@@ -248,13 +248,71 @@ try {
   await waitForServer(`http://127.0.0.1:${port}/`)
   browser = await chromium.launch({ headless: true })
   const page = await browser.newPage({ viewport: { width: 1_440, height: 900 } })
+  await page.addInitScript(() => {
+    const requests = []
+    Object.defineProperty(window, '__schemweaveWorkerRequests', { value: requests })
+    const postMessage = Worker.prototype.postMessage
+    Worker.prototype.postMessage = function (...args) {
+      requests.push(structuredClone(args[0]))
+      return postMessage.apply(this, args)
+    }
+  })
   const errors = []
   page.on('console', (message) => {
     if (message.type() === 'error') errors.push(message.text())
   })
   page.on('pageerror', (error) => errors.push(error.message))
   await page.goto(`http://127.0.0.1:${port}/`)
-  await waitForCompletedLayout(page)
+  await waitForCompletedLayout(page, nodeCount, 'Max')
+
+  const initialRequest = await page.evaluate(() =>
+    window.__schemweaveWorkerRequests.find((request) => request.type === 'layout'),
+  )
+  if (
+    initialRequest?.options?.quality_effort !== 'max' ||
+    initialRequest?.options?.edge_node_clearance !== 20
+  ) {
+    throw new Error(`highest-quality request mismatch: ${JSON.stringify(initialRequest?.options)}`)
+  }
+  if (await page.locator('#preset').inputValue() !== 'highest-quality') {
+    throw new Error('highest-quality preset was not the initial isolated review profile')
+  }
+  if (await page.locator('#edge-node-clearance-value').textContent() !== '20 px') {
+    throw new Error('wire-to-gate clearance did not display the highest-quality threshold')
+  }
+  if (!(await page.locator('#status').textContent())?.includes('clearance ≥ 20 px')) {
+    throw new Error('completed layout did not report its active clearance threshold')
+  }
+
+  const clearanceSlider = page.getByRole('slider', { name: 'Wire-to-gate clearance' })
+  if ((await clearanceSlider.count()) !== 1) {
+    throw new Error('wire-to-gate clearance slider has no unique accessible name')
+  }
+  const requestCountBeforeClearanceChange = await workerRequestCount(page)
+  await clearanceSlider.fill('5')
+  await clearanceSlider.fill('15')
+  await page.waitForFunction(
+    ({ previousCount }) => {
+      const requests = window.__schemweaveWorkerRequests
+      const latest = requests.at(-1)
+      return (
+        requests.length > previousCount &&
+        latest?.type === 'layout' &&
+        latest.options.edge_node_clearance === 15
+      )
+    },
+    { previousCount: requestCountBeforeClearanceChange },
+  )
+  await waitForCompletedLayout(page, nodeCount, 'Max')
+  if (await page.locator('#preset').inputValue() !== 'custom') {
+    throw new Error('non-preset clearance did not select Custom')
+  }
+  if (await page.locator('#edge-node-clearance-value').textContent() !== '15 px') {
+    throw new Error('wire-to-gate clearance did not retain the newest slider value')
+  }
+  if (!(await page.locator('#status').textContent())?.includes('clearance ≥ 15 px')) {
+    throw new Error('completed layout did not report the newest clearance threshold')
+  }
 
   const responsivenessStarted = performance.now()
   await page.locator('#preset').selectOption('debug')
@@ -287,7 +345,7 @@ try {
     )
   }
   if (await page.locator('#quality-effort-value').textContent() !== 'Max') {
-    throw new Error('routing quality slider did not display Max')
+    throw new Error('layout quality slider did not display Max')
   }
   await page.locator('#quality-effort').fill('1')
   await waitForRefiningLayout(page, effortNodeCount, 'Quality')
@@ -308,7 +366,7 @@ try {
     const slider = document.querySelector('#quality-effort')
     const status = document.querySelector('#status')
     if (!(slider instanceof HTMLInputElement) || status == null) {
-      throw new Error('routing effort controls are unavailable')
+      throw new Error('layout quality controls are unavailable')
     }
     return new Promise((resolve, reject) => {
       const timeout = window.setTimeout(() => {
@@ -345,7 +403,7 @@ try {
     throw new Error('rapid preset changes did not retain the newest request')
   }
   if (await page.locator('#quality-effort-value').textContent() !== 'Quality') {
-    throw new Error('routing quality slider did not retain the newest request')
+    throw new Error('layout quality slider did not retain the newest request')
   }
   if (errors.length > 0) throw new Error(`browser console errors: ${errors.join('; ')}`)
   if (status?.includes('INVALID')) throw new Error(status)
@@ -353,12 +411,21 @@ try {
     !labels.includes('Min track separation') ||
     !labels.includes('Parallel congestion') ||
     !labels.includes('Edge-node clearance') ||
-    !labels.includes('Clearance violations') ||
+    !labels.includes('Clearance violations (<20 px)') ||
     !labels.includes('Straight routes') ||
     !labels.includes('Contract violations') ||
     labels.length !== 16
   ) {
     throw new Error(`unexpected metric set: ${labels.join(', ')}`)
+  }
+  const clearanceMetricTitle = await page
+    .locator('.metric-label', { hasText: 'Clearance violations (<20 px)' })
+    .getAttribute('title')
+  if (
+    clearanceMetricTitle !==
+    'Fixed 20 px comparison threshold; independent of the active layout clearance setting.'
+  ) {
+    throw new Error(`unexpected clearance metric tooltip: ${clearanceMetricTitle}`)
   }
 
   const fallback = await browser.newPage({ viewport: { width: 1_200, height: 800 } })
@@ -370,7 +437,7 @@ try {
     document.querySelector('#status')?.textContent?.includes('Select corpus.json'),
   )
   await fallback.locator('#data-files').setInputFiles([corpusPath, elkPath])
-  await waitForCompletedLayout(fallback)
+  await waitForCompletedLayout(fallback, nodeCount, 'Max')
 
   process.stdout.write(
     `PASS: ${nodeCount} nodes, 600-node Quality Fast ${fastPhaseMs.toFixed(1)} ms / final ${finalPhaseMs.toFixed(1)} ms, Max ${maxFixtureQualityCrossings}->${maxCrossings} crossings, latest-only presets, ${mainThreadResponseMs.toFixed(1)} ms control response, synchronized worker scoring, file fallback\n`,
@@ -426,4 +493,8 @@ async function waitForRefiningLayout(page, expectedNodeCount, effort) {
 async function schemweaveCrossings(page) {
   const value = await page.locator('.metric').first().locator('.schemweave-value').textContent()
   return Number(value?.replaceAll(',', ''))
+}
+
+async function workerRequestCount(page) {
+  return page.evaluate(() => window.__schemweaveWorkerRequests.length)
 }

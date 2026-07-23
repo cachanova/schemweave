@@ -46,6 +46,7 @@ it('refines a large Max request directly to Max without a Quality phase', () => 
   harness.requests.submit(submission(600, 'max'))
   const initial = harness.sent[0] as WorkerLayoutRequest
   expect(initial.options.quality_effort).toBe('max')
+  expect(initial.options.edge_node_clearance).toBe(20)
 
   harness.requests.receive(result(initial, 'fast', 'fast', false))
   vi.advanceTimersByTime(REFINE_QUIESCENCE_MS)
@@ -100,6 +101,24 @@ it('keeps only the newest request queued behind a small active layout', () => {
   expect(harness.restartWorker).not.toHaveBeenCalled()
 })
 
+it('keeps the newest clearance setting and rejects a stale result', () => {
+  const harness = createHarness()
+  harness.requests.submit(submission(20, 'max', 1, 5))
+  const stale = harness.sent[0] as WorkerLayoutRequest
+  harness.requests.submit(submission(20, 'max', 2, 10))
+  harness.requests.submit(submission(20, 'max', 3, 20))
+
+  harness.requests.receive(result(stale, 'direct', 'max', true))
+  const current = harness.sent[1] as WorkerLayoutRequest
+  expect(current.id).toBe(3)
+  expect(current.options.edge_node_clearance).toBe(20)
+
+  harness.requests.receive(result(stale, 'direct', 'max', true))
+  expect(harness.results).toHaveLength(1)
+  harness.requests.receive(result(current, 'direct', 'max', true))
+  expect(harness.results.map((response) => response.id)).toEqual([1, 3])
+})
+
 function createHarness() {
   const sent: WorkerRequest[] = []
   const results: Array<Exclude<WorkerResponse, { error: string }>> = []
@@ -122,6 +141,7 @@ function submission(
   nodeCount: number,
   effort: LayoutOptions['quality_effort'],
   id = 1,
+  clearance = 20,
 ): LayoutSubmission {
   return {
     id,
@@ -143,6 +163,7 @@ function submission(
       node_gap: 30,
       port_stub: 10,
       route_lane_gap: 4,
+      edge_node_clearance: clearance,
       ordering_sweeps: 4,
       quality_effort: effort,
     },

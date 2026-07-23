@@ -3,6 +3,7 @@ import './style.css'
 import { CanvasView } from './canvasView'
 import { prepareDataset, type PreparedDataset } from './dataset'
 import { elkAsLayout } from './graph'
+import { layoutPresets, matchingPreset, type PresetName } from './layoutControls'
 import { StagedLayoutRequests } from './latestRequest'
 import type {
   Corpus,
@@ -13,15 +14,6 @@ import type {
   QualityReport,
   WorkerResponse,
 } from './types'
-
-const presets = {
-  compact: { layer_gap: 48, node_gap: 20, route_lane_gap: 3, ordering_sweeps: 2 },
-  balanced: { layer_gap: 66, node_gap: 30, route_lane_gap: 4, ordering_sweeps: 4 },
-  roomy: { layer_gap: 84, node_gap: 45, route_lane_gap: 6, ordering_sweeps: 4 },
-  debug: { layer_gap: 108, node_gap: 60, route_lane_gap: 8, ordering_sweeps: 8 },
-} as const
-
-type PresetName = keyof typeof presets
 
 function query<T extends Element>(selector: string): T {
   const value = document.querySelector<T>(selector)
@@ -34,6 +26,7 @@ const presetSelect = query<HTMLSelectElement>('#preset')
 const layerGap = query<HTMLInputElement>('#layer-gap')
 const nodeGap = query<HTMLInputElement>('#node-gap')
 const laneGap = query<HTMLInputElement>('#lane-gap')
+const edgeNodeClearance = query<HTMLInputElement>('#edge-node-clearance')
 const sweeps = query<HTMLInputElement>('#sweeps')
 const qualityEffort = query<HTMLInputElement>('#quality-effort')
 const status = query<HTMLElement>('#status')
@@ -115,7 +108,9 @@ function displayLayout(response: Exclude<WorkerResponse, { error: string }>): vo
   const refinement = response.final
     ? ''
     : ` · refining to ${capitalize(response.requestedEffort)}…`
-  status.textContent = `${invalid > 0 ? `INVALID: ELK ${elkInvalid}, SchemWeave ${schemweaveInvalid} · ` : ''}${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${capitalize(response.effort)} ${response.elapsedMs.toFixed(1)} ms${refinement}`
+  const clearance = layoutOptions().edge_node_clearance
+  const clearanceStatus = clearance > 0 ? ` · clearance ≥ ${clearance} px` : ' · clearance off'
+  status.textContent = `${invalid > 0 ? `INVALID: ELK ${elkInvalid}, SchemWeave ${schemweaveInvalid} · ` : ''}${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${capitalize(response.effort)} ${response.elapsedMs.toFixed(1)} ms${clearanceStatus}${refinement}`
   lastFixtureName = fixture.name
 }
 
@@ -135,6 +130,7 @@ function layoutOptions(): LayoutOptions {
     node_gap: Number(nodeGap.value),
     port_stub: 10,
     route_lane_gap: Number(laneGap.value),
+    edge_node_clearance: Number(edgeNodeClearance.value),
     ordering_sweeps: Number(sweeps.value),
     quality_effort: effort[Number(qualityEffort.value)] ?? 'quality',
   }
@@ -235,11 +231,13 @@ query<HTMLInputElement>('#data-files').addEventListener('change', async (event) 
 })
 
 function applyPreset(name: PresetName): void {
-  const preset = presets[name]
+  const preset = layoutPresets[name]
   layerGap.value = String(preset.layer_gap)
   nodeGap.value = String(preset.node_gap)
   laneGap.value = String(preset.route_lane_gap)
+  edgeNodeClearance.value = String(preset.edge_node_clearance)
   sweeps.value = String(preset.ordering_sweeps)
+  qualityEffort.value = String(['fast', 'quality', 'max'].indexOf(preset.quality_effort))
   updateControlLabels()
   scheduleLayout()
 }
@@ -248,24 +246,26 @@ function updateControlLabels(): void {
   query<HTMLOutputElement>('#layer-gap-value').value = layerGap.value
   query<HTMLOutputElement>('#node-gap-value').value = nodeGap.value
   query<HTMLOutputElement>('#lane-gap-value').value = laneGap.value
+  query<HTMLOutputElement>('#edge-node-clearance-value').value =
+    `${edgeNodeClearance.value} px`
   query<HTMLOutputElement>('#sweeps-value').value = sweeps.value
   query<HTMLOutputElement>('#quality-effort-value').value =
     ['Fast', 'Quality', 'Max'][Number(qualityEffort.value)] ?? 'Quality'
   const options = layoutOptions()
-  const matching = Object.entries(presets).find(
-    ([, preset]) =>
-      preset.layer_gap === options.layer_gap &&
-      preset.node_gap === options.node_gap &&
-      preset.route_lane_gap === options.route_lane_gap &&
-      preset.ordering_sweeps === options.ordering_sweeps,
-  )
-  presetSelect.value = matching?.[0] ?? 'custom'
+  presetSelect.value = matchingPreset(options) ?? 'custom'
 }
 
 presetSelect.addEventListener('change', () => {
   if (presetSelect.value !== 'custom') applyPreset(presetSelect.value as PresetName)
 })
-for (const control of [layerGap, nodeGap, laneGap, sweeps, qualityEffort]) {
+for (const control of [
+  layerGap,
+  nodeGap,
+  laneGap,
+  edgeNodeClearance,
+  sweeps,
+  qualityEffort,
+]) {
   control.addEventListener('input', () => {
     updateControlLabels()
     scheduleLayout()
@@ -298,6 +298,7 @@ function dimensions(width: number, height: number): string {
 
 interface MetricDefinition {
   label: string
+  title?: string
   elk: (quality: QualityReport) => number
   format: (value: number, quality: QualityReport) => string
   higherIsBetter?: boolean
@@ -352,7 +353,8 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       higherIsBetter: true,
     },
     {
-      label: 'Clearance violations',
+      label: 'Clearance violations (<20 px)',
+      title: 'Fixed 20 px comparison threshold; independent of the active layout clearance setting.',
       elk: (q) =>
         q.edge_node_clearance_exhausted ? Number.NaN : q.edge_node_clearance_violations,
       format: nullableInteger,
@@ -379,7 +381,7 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       const card = document.createElement('div')
       card.className = 'metric'
       card.innerHTML = `
-        <div class="metric-label" title="${definition.label}">${definition.label}</div>
+        <div class="metric-label" title="${definition.title ?? definition.label}">${definition.label}</div>
         <div class="metric-values">
           <span class="elk-value">${definition.format(elkValue, elkQuality)}</span>
           <span class="schemweave-value">${definition.format(schemweaveValue, schemweaveQuality)}</span>

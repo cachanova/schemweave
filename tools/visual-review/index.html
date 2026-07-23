@@ -29,9 +29,10 @@
           Preset
           <select id="preset">
             <option value="compact">Compact</option>
-            <option value="balanced" selected>Balanced</option>
+            <option value="balanced">Balanced</option>
             <option value="roomy">Roomy</option>
             <option value="debug">Debug</option>
+            <option value="highest-quality" selected>Highest quality</option>
             <option value="custom">Custom</option>
           </select>
         </label>
@@ -48,19 +49,31 @@
           <input id="lane-gap" type="range" min="2" max="8" step="1" value="4" />
         </label>
         <label>
+          Wire-to-gate clearance <output id="edge-node-clearance-value">20 px</output>
+          <input
+            id="edge-node-clearance"
+            type="range"
+            min="0"
+            max="40"
+            step="5"
+            value="20"
+            aria-label="Wire-to-gate clearance"
+          />
+        </label>
+        <label>
           Ordering effort <output id="sweeps-value">4</output>
           <input id="sweeps" type="range" min="2" max="8" step="2" value="4" />
         </label>
         <label>
-          Routing effort <output id="quality-effort-value">Quality</output>
+          Layout quality <output id="quality-effort-value">Max</output>
           <input
             id="quality-effort"
             type="range"
             min="0"
             max="2"
             step="1"
-            value="1"
-            aria-label="Routing effort"
+            value="2"
+            aria-label="Layout quality"
           />
         </label>
         <div class="status-block">

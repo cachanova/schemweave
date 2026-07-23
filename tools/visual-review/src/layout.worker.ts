@@ -3,6 +3,7 @@
 import init, { review_layout_json, score_json } from './generated/schemweave_review_wasm.js'
 import { DatasetCache } from './datasetCache'
 import { elkAsLayout } from './graph'
+import { initialLayoutOptions } from './layoutStaging'
 import { LARGE_LAYOUT_NODE_THRESHOLD } from './latestRequest'
 import type {
   Layout,
@@ -54,9 +55,7 @@ workerScope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     const large = request.graph.nodes.length >= LARGE_LAYOUT_NODE_THRESHOLD
     const needsRefinement = large && request.options.quality_effort !== 'fast'
     if (needsRefinement) retained = current
-    const options = needsRefinement
-      ? { ...request.options, quality_effort: 'fast' as const }
-      : request.options
+    const options = initialLayoutOptions(request.options, needsRefinement)
     postLayout(current, options, large ? 'fast' : 'direct', !needsRefinement)
   } catch (error) {
     retained = null
