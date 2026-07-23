@@ -23,6 +23,7 @@ const MAX_REGIONAL_FANOUT_ORDINATES: usize = 32_768;
 const MAX_REGIONAL_FANOUT_ARM_RELATIONS: usize = 500_000;
 const MAX_REGIONAL_FANOUT_SCORE_VISITS: usize = 20_000_000;
 const MAX_REGIONAL_FANOUT_SAFETY_VISITS: usize = 20_000_000;
+const MAX_COMPLETE_ROUTE_SEGMENTS: usize = 100_000;
 const REGIONAL_FANOUT_EDGES_PER_TRUNK: usize = 128;
 const MAX_REGIONAL_FANOUT_TRUNKS: usize = 4;
 const MIN_REGIONAL_FANOUT_CROSSING_GAIN: usize = 32;
@@ -46,6 +47,7 @@ const NEGOTIATED_CORRIDOR_CROSSING_COST: f64 = 256.0;
 const NEGOTIATED_CORRIDOR_PARALLEL_COST: f64 = 4.0;
 const MAX_NEGOTIATED_CORRIDOR_LENGTH_FACTOR: f64 = 1.05;
 const CROSSING_TRACK_NUDGE: f64 = 1e-4;
+const POSITIVE_CLEARANCE_SPARSE_CHANNEL_FRACTION: f64 = 0.55;
 const CROSSING_ALIGNMENT_WEIGHT: f64 = 4.0;
 const MIN_ROUTE_SEGMENT: f64 = 1e-7;
 const FULL_OUTER_LANE_ROUNDS: usize = 16;
@@ -270,6 +272,13 @@ struct RawRouteSegment {
     fixed: f64,
     start: f64,
     end: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RouteContactError {
+    SegmentLimitExceeded,
+    WorkLimitExceeded,
+    InvalidInput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4377,7 +4386,9 @@ fn selected_route_family_is_safe(
         .iter()
         .filter(|segment| selected_nets.contains(&segment.net))
         .collect::<Vec<_>>();
-    let raw_segments = raw_route_segments(plan, routes);
+    let Ok(raw_segments) = raw_route_segments(plan, routes, MAX_COMPLETE_ROUTE_SEGMENTS) else {
+        return false;
+    };
     let Some(node_visits) = selected_segments.len().checked_mul(nodes.len()) else {
         return false;
     };
@@ -4396,33 +4407,81 @@ fn selected_route_family_is_safe(
         .is_some_and(|has_contact| !has_contact)
 }
 
-fn raw_route_segments(plan: &RoutingPlan<'_>, routes: &[EdgeGeometry]) -> Vec<RawRouteSegment> {
+fn raw_route_segments(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+    max_segments: usize,
+) -> Result<Vec<RawRouteSegment>, RouteContactError> {
+    raw_route_segments_bounded(
+        plan.edges.iter().map(|resolved| resolved.edge),
+        routes,
+        max_segments,
+    )
+}
+
+fn raw_route_segments_bounded<'a>(
+    edges: impl ExactSizeIterator<Item = &'a Edge>,
+    routes: &[EdgeGeometry],
+    max_segments: usize,
+) -> Result<Vec<RawRouteSegment>, RouteContactError> {
+    if edges.len() != routes.len() {
+        return Err(RouteContactError::InvalidInput);
+    }
     let mut segments = Vec::new();
-    for (resolved, route) in plan.edges.iter().zip(routes) {
+    for (edge, route) in edges.zip(routes) {
+        if route.id != edge.id
+            || route.points.len() < 2
+            || route
+                .points
+                .iter()
+                .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        {
+            return Err(RouteContactError::InvalidInput);
+        }
         for points in route.points.windows(2) {
             let horizontal = points[0].y == points[1].y;
-            let (fixed, first, second) = if horizontal {
-                (points[0].y, points[0].x, points[1].x)
-            } else {
-                (points[0].x, points[0].y, points[1].y)
+            let vertical = points[0].x == points[1].x;
+            let (fixed, first, second) = match (horizontal, vertical) {
+                (true, false) => (points[0].y, points[0].x, points[1].x),
+                (false, true) => (points[0].x, points[0].y, points[1].y),
+                (true, true) => continue,
+                (false, false) => return Err(RouteContactError::InvalidInput),
             };
             let start = first.min(second);
             let end = first.max(second);
-            if start != end {
-                segments.push(RawRouteSegment {
-                    edge: resolved.edge.id,
-                    net: resolved.edge.net,
-                    source: resolved.edge.source,
-                    target: resolved.edge.target,
-                    horizontal,
-                    fixed,
-                    start,
-                    end,
-                });
+            if segments.len() == max_segments {
+                return Err(RouteContactError::SegmentLimitExceeded);
             }
+            segments.push(RawRouteSegment {
+                edge: edge.id,
+                net: edge.net,
+                source: edge.source,
+                target: edge.target,
+                horizontal,
+                fixed,
+                start,
+                end,
+            });
         }
     }
-    segments
+    Ok(segments)
+}
+
+pub(crate) fn route_family_has_unrelated_contact_bounded(
+    graph: &IndexedGraph<'_>,
+    routes: &[EdgeGeometry],
+    max_segments: usize,
+    max_visits: usize,
+) -> Result<bool, RouteContactError> {
+    let segments = raw_route_segments_bounded(graph.edges.iter().copied(), routes, max_segments)?;
+    let selected_nets = graph
+        .edges
+        .iter()
+        .map(|edge| edge.net)
+        .collect::<BTreeSet<_>>();
+    let mut remaining_visits = max_visits;
+    raw_route_family_has_unrelated_contact(&segments, &selected_nets, &mut remaining_visits)
+        .ok_or(RouteContactError::WorkLimitExceeded)
 }
 
 fn raw_route_segments_have_unrelated_contact(
@@ -4528,6 +4587,13 @@ fn raw_route_family_has_unrelated_contact(
                 }
             }
         }
+    }
+
+    if segments
+        .iter()
+        .all(|segment| selected_nets.contains(&segment.net))
+    {
+        return Some(false);
     }
 
     // A moved segment can contain an endpoint owned by an unchanged segment. Query the reverse
@@ -6944,6 +7010,15 @@ fn sparse_channel_route(
     );
     let source_escape_y = endpoint_escape_y(source, source_endpoint, 0, endpoint_tracks, port_stub);
     let target_escape_y = endpoint_escape_y(target, target_endpoint, 1, endpoint_tracks, port_stub);
+    let mut x = sparse_gap_x(
+        net,
+        source_rank,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        options,
+        gap_spacing,
+    );
     let mut points = Vec::with_capacity(2 * (target_rank - source_rank) + 8);
     push_point(&mut points, source);
     push_point(&mut points, source_stub);
@@ -6953,15 +7028,6 @@ fn sparse_channel_route(
             x: source_stub.x,
             y: source_escape_y,
         },
-    );
-    let mut x = sparse_gap_x(
-        net,
-        source_rank,
-        layer_left,
-        layer_right,
-        gap_lanes,
-        options,
-        gap_spacing,
     );
     push_point(
         &mut points,
@@ -7047,10 +7113,9 @@ fn sparse_gap_x(
         if options.edge_node_clearance == 0.0 {
             x
         } else {
-            x.clamp(
-                gap_left + options.edge_node_clearance,
-                gap_right - options.edge_node_clearance,
-            )
+            let left = gap_left + options.edge_node_clearance;
+            let right = gap_right - options.edge_node_clearance;
+            left + (right - left) * POSITIVE_CLEARANCE_SPARSE_CHANNEL_FRACTION * lane_fraction
         }
     };
     if gap_spacing == GapTrackSpacing::Compact {
@@ -7281,14 +7346,16 @@ fn channel_point(
     let mut west_x = west_limit + (layer_left[rank] - west_limit) * fraction;
     let mut east_x = layer_right[rank] + (east_limit - layer_right[rank]) * fraction;
     if options.edge_node_clearance > 0.0 {
-        west_x = west_x.clamp(
-            west_limit + options.edge_node_clearance,
-            layer_left[rank] - options.edge_node_clearance,
-        );
-        east_x = east_x.clamp(
-            layer_right[rank] + options.edge_node_clearance,
-            east_limit - options.edge_node_clearance,
-        );
+        west_x = west_limit
+            + options.edge_node_clearance
+            + (layer_left[rank] - west_limit - options.edge_node_clearance * 2.0)
+                * (POSITIVE_CLEARANCE_SPARSE_CHANNEL_FRACTION
+                    + (1.0 - POSITIVE_CLEARANCE_SPARSE_CHANNEL_FRACTION) * lane_fraction);
+        east_x = layer_right[rank]
+            + options.edge_node_clearance
+            + (east_limit - layer_right[rank] - options.edge_node_clearance * 2.0)
+                * (POSITIVE_CLEARANCE_SPARSE_CHANNEL_FRACTION
+                    + (1.0 - POSITIVE_CLEARANCE_SPARSE_CHANNEL_FRACTION) * lane_fraction);
     }
     match side {
         PortSide::East => Point {
@@ -7352,20 +7419,21 @@ mod tests {
         MAX_REGIONAL_FANOUT_ARM_RELATIONS, MAX_REGIONAL_FANOUT_ORDINATES,
         MAX_REGIONAL_FANOUT_ROUTE_POINTS, MAX_REGIONAL_FANOUT_SAFETY_VISITS,
         MAX_REGIONAL_FANOUT_SCORE_VISITS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
-        OuterLane, OuterNetAccess, OuterSide, PhysicalSegment, RouteQuality, RoutingPlan,
-        align_crossing_path_staircases, build_endpoint_tracks, build_regional_fanout_candidate,
-        candidate_route_points_within_budget, charge_negotiated_relations, charge_negotiated_work,
-        charge_regional_relation, charge_regional_work, common_free_intervals,
-        crossing_aware_gap_lane_indices, crossing_aware_gap_lane_indices_btree_reference,
-        crossing_aware_outer_lane_indices, crossing_paths_have_unrelated_collinear_tracks,
-        crossing_repair_within_budget, crossing_track_y, distance_transform,
-        expanded_gap_spacing_enabled, expanded_spacing_readability_is_better,
-        fanout_outer_channel_lane_indices, free_interval_containing, free_intervals_by_rank,
-        global_gap_candidate_work_within_budget, global_gap_lane_indices_with_rounds,
-        global_gap_order_seed, has_split_feedback_net, horizontal_crossing_counts_by_net,
-        lane_indices, large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
-        large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
-        large_gap_hot_nets, large_gap_hot_nets_with_limit, move_nets_to_outer_lanes,
+        OuterLane, OuterNetAccess, OuterSide, PhysicalSegment, RouteContactError, RouteQuality,
+        RoutingPlan, align_crossing_path_staircases, build_endpoint_tracks,
+        build_regional_fanout_candidate, candidate_route_points_within_budget,
+        charge_negotiated_relations, charge_negotiated_work, charge_regional_relation,
+        charge_regional_work, common_free_intervals, crossing_aware_gap_lane_indices,
+        crossing_aware_gap_lane_indices_btree_reference, crossing_aware_outer_lane_indices,
+        crossing_paths_have_unrelated_collinear_tracks, crossing_repair_within_budget,
+        crossing_track_y, distance_transform, expanded_gap_spacing_enabled,
+        expanded_spacing_readability_is_better, fanout_outer_channel_lane_indices,
+        free_interval_containing, free_intervals_by_rank, global_gap_candidate_work_within_budget,
+        global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
+        horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
+        large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
+        large_gap_hot_insertion_order_with_rounds, large_gap_hot_nets,
+        large_gap_hot_nets_with_limit, move_nets_to_outer_lanes,
         negotiated_corridor_quality_is_better, outer_lane_assignments, outer_lane_channels_match,
         outer_pair_crossings, physical_crossing_sweep, physical_crossing_sweep_lines,
         physical_route_segments, physical_route_segments_btree_reference,
@@ -7377,12 +7445,13 @@ mod tests {
         regional_segment_intersects_node_interior, regional_segments_have_unrelated_contact,
         repair_crossing_heavy_net, repair_selection_adds_new_nets, route_edges,
         route_edges_with_lane_rounds, route_edges_with_lane_rounds_and_global,
-        route_planned_candidates, route_planned_candidates_with_quality_options,
-        route_planned_candidates_with_sparse_global, route_planned_edges, route_quality,
-        route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
-        select_crossing_repair_nets, select_gap_spacing_candidate, select_outer_side_repairs,
-        selected_route_family_is_safe, shortest_crossing_path, sparse_channel_route, sparse_gap_x,
-        sum_within_limit, take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
+        route_family_has_unrelated_contact_bounded, route_planned_candidates,
+        route_planned_candidates_with_quality_options, route_planned_candidates_with_sparse_global,
+        route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
+        route_supplemental_edges, select_crossing_repair_nets, select_gap_spacing_candidate,
+        select_outer_side_repairs, selected_route_family_is_safe, shortest_crossing_path,
+        sparse_channel_route, sparse_gap_x, sum_within_limit,
+        take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
     };
 
@@ -7391,6 +7460,83 @@ mod tests {
         assert_eq!(
             vertical_horizontal_crossings(&[(20.0, 20.0)], &[10.0, 20.0, 30.0]),
             0
+        );
+    }
+
+    #[test]
+    fn complete_route_contact_admission_has_exact_caps_and_permutation_determinism() {
+        let endpoint_node = |id, side| Node {
+            id,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 5.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint_node(1, PortSide::East),
+                endpoint_node(2, PortSide::West),
+                endpoint_node(3, PortSide::East),
+                endpoint_node(4, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 4, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let routes = vec![
+            EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 10.0, y: 5.0 }, Point { x: 100.0, y: 5.0 }],
+            },
+            EdgeGeometry {
+                id: 2,
+                points: vec![Point { x: 10.0, y: 105.0 }, Point { x: 100.0, y: 105.0 }],
+            },
+        ];
+        let options = LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index(&graph, options).unwrap();
+
+        assert_eq!(
+            route_family_has_unrelated_contact_bounded(&indexed, &routes, 2, 2),
+            Ok(false),
+        );
+        assert_eq!(
+            route_family_has_unrelated_contact_bounded(&indexed, &routes, 2, 1),
+            Err(RouteContactError::WorkLimitExceeded),
+        );
+        assert_eq!(
+            route_family_has_unrelated_contact_bounded(&indexed, &routes, 1, 2),
+            Err(RouteContactError::SegmentLimitExceeded),
+        );
+
+        let permuted = Graph {
+            nodes: graph.nodes.iter().cloned().rev().collect(),
+            edges: graph.edges.iter().cloned().rev().collect(),
+        };
+        let permuted = validate_and_index(&permuted, options).unwrap();
+        assert_eq!(
+            route_family_has_unrelated_contact_bounded(&permuted, &routes, 2, 2),
+            Ok(false),
         );
     }
 
@@ -9927,7 +10073,7 @@ mod tests {
         ];
         let segments =
             physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), &routes).0;
-        let raw_segments = raw_route_segments(&plan, &routes);
+        let raw_segments = raw_route_segments(&plan, &routes, usize::MAX).unwrap();
         let selected_nets = BTreeSet::from([0, 1]);
         let mut no_visits = 0;
         assert_eq!(
@@ -11530,7 +11676,7 @@ mod tests {
                     .iter()
                     .all(|node| !regional_segment_intersects_node_interior(segment, node))
             }));
-            let raw_segments = raw_route_segments(&plan, &candidate);
+            let raw_segments = raw_route_segments(&plan, &candidate, usize::MAX).unwrap();
             for (index, segment) in raw_segments.iter().enumerate() {
                 assert!(
                     raw_segments[index + 1..]

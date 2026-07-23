@@ -14,6 +14,8 @@ const MAX_DEMAND_AWARE_SPACING_NODES: usize = 400;
 const MIN_DEMAND_AWARE_SPACING_EDGES: usize = 250;
 const MAX_DEMAND_AWARE_SPACING_EDGES: usize = 400;
 const MAX_LAYOUT_CLEARANCE_PAIR_VISITS: usize = 20_000_000;
+const MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS: usize = 100_000;
+const MAX_LAYOUT_ROUTE_CONTACT_VISITS: usize = 20_000_000;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -297,6 +299,18 @@ pub enum LayoutError {
         "edge-to-node clearance verification exceeded its deterministic work limit of {maximum} candidate visits"
     )]
     EdgeNodeClearanceWorkLimitExceeded { maximum: usize },
+    #[error(
+        "no complete positive-clearance layout avoids overlap or contact between unrelated routes"
+    )]
+    UnrelatedRouteContactUnsatisfied,
+    #[error(
+        "unrelated-route contact verification exceeded its deterministic work limit of {maximum} candidate visits"
+    )]
+    UnrelatedRouteContactWorkLimitExceeded { maximum: usize },
+    #[error(
+        "unrelated-route contact verification exceeded its deterministic route-segment limit of {maximum}"
+    )]
+    UnrelatedRouteContactSegmentLimitExceeded { maximum: usize },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -406,7 +420,7 @@ fn layout_indexed(
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let adaptive_gap_spacing = quality_effort != QualityEffort::Fast;
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    let mut clearance_work_exhausted = false;
+    let mut admission_state = CandidateAdmissionState::default();
     let mut best_uses_primary_ranks = true;
     let candidate_routing = CandidateRouting {
         adaptive_gap_spacing,
@@ -420,7 +434,7 @@ fn layout_indexed(
         placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
         options,
         candidate_routing,
-        &mut clearance_work_exhausted,
+        &mut admission_state,
     );
     let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
     let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
@@ -447,7 +461,7 @@ fn layout_indexed(
             sparse_global: true,
             ..candidate_routing
         },
-        &mut clearance_work_exhausted,
+        &mut admission_state,
     );
     if placement::preferred_alignment_can_be_significant(ordinary_alignment) {
         let preferred_nodes =
@@ -465,7 +479,7 @@ fn layout_indexed(
                     supplemental: true,
                     ..candidate_routing
                 },
-                &mut clearance_work_exhausted,
+                &mut admission_state,
             );
         }
     }
@@ -483,7 +497,7 @@ fn layout_indexed(
                 sparse_global,
                 ..candidate_routing
             },
-            &mut clearance_work_exhausted,
+            &mut admission_state,
         );
     }
     if let Some(net_representative) = net_representative
@@ -511,7 +525,7 @@ fn layout_indexed(
                 nodes,
                 routed,
                 options,
-                &mut clearance_work_exhausted,
+                &mut admission_state,
             );
         } else {
             evaluate_candidate(
@@ -525,7 +539,7 @@ fn layout_indexed(
                     large_sparse_global,
                     ..candidate_routing
                 },
-                &mut clearance_work_exhausted,
+                &mut admission_state,
             );
         }
     }
@@ -570,7 +584,7 @@ fn layout_indexed(
                     nodes,
                     routed.primary,
                     options,
-                    &mut clearance_work_exhausted,
+                    &mut admission_state,
                 ) {
                     best_uses_primary_ranks = false;
                 }
@@ -582,7 +596,7 @@ fn layout_indexed(
                     nodes,
                     routed,
                     options,
-                    &mut clearance_work_exhausted,
+                    &mut admission_state,
                 );
                 if let Some((quality, layout)) = alternative_best
                     && retain_better_candidate(&mut best, quality, layout)
@@ -609,7 +623,7 @@ fn layout_indexed(
                 supplemental: true,
                 ..candidate_routing
             },
-            &mut clearance_work_exhausted,
+            &mut admission_state,
         );
         let (quality, layout) = straight_chain_best.expect("candidate routing produces a layout");
         if best.as_ref().is_some_and(|(current_quality, current)| {
@@ -619,17 +633,30 @@ fn layout_indexed(
             best_uses_primary_ranks = true;
         }
     }
-    let (mut quality, mut layout) = best.ok_or({
-        if clearance_work_exhausted {
-            LayoutError::EdgeNodeClearanceWorkLimitExceeded {
-                maximum: MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
-            }
-        } else {
-            LayoutError::EdgeNodeClearanceUnsatisfied {
-                clearance: options.edge_node_clearance,
-            }
-        }
-    })?;
+    if options.edge_node_clearance > 0.0
+        && best.is_none()
+        && placement::demand_aware_spacing_is_relevant(
+            &indexed,
+            &ranks,
+            quality_layers.len(),
+            options,
+        )
+    {
+        evaluate_candidate(
+            &indexed,
+            &routing_plan,
+            &mut best,
+            placement::place_demand_aware_nodes(&indexed, &ranks, quality_layers, options),
+            options,
+            CandidateRouting {
+                sparse_global: true,
+                ..candidate_routing
+            },
+            &mut admission_state,
+        );
+    }
+    let (mut quality, mut layout) =
+        best.ok_or_else(|| positive_clearance_failure(options, &admission_state))?;
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && demand_aware_scale_is_eligible(graph.nodes.len(), graph.edges.len())
@@ -653,7 +680,7 @@ fn layout_indexed(
                 sparse_global: true,
                 ..candidate_routing
             },
-            &mut clearance_work_exhausted,
+            &mut admission_state,
         );
         if let Some((demand_quality, demand_layout)) = demand_aware_best
             && demand_aware_readability_is_better(
@@ -680,11 +707,11 @@ fn layout_indexed(
     {
         let candidate = placement::normalize_owned(layout.nodes.clone(), edges);
         if candidate.width * candidate.height <= layout.width * layout.height * 1.05
-            && candidate_satisfies_edge_node_clearance(
+            && candidate_satisfies_positive_clearance_contract(
                 &indexed,
                 &candidate,
                 options,
-                &mut clearance_work_exhausted,
+                &mut admission_state,
             )
         {
             debug_assert!(route_quality_cmp(candidate_quality, quality).is_lt());
@@ -756,6 +783,40 @@ struct CandidateRouting {
     deeper_crossing_repair: bool,
 }
 
+#[derive(Default)]
+struct CandidateAdmissionState {
+    clearance_work_exhausted: bool,
+    contact_segment_exhausted: bool,
+    contact_work_exhausted: bool,
+    contact_rejected: bool,
+    contact_satisfied: bool,
+}
+
+fn positive_clearance_failure(
+    options: LayoutOptions,
+    admission_state: &CandidateAdmissionState,
+) -> LayoutError {
+    if admission_state.contact_segment_exhausted {
+        LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
+            maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+        }
+    } else if admission_state.contact_work_exhausted {
+        LayoutError::UnrelatedRouteContactWorkLimitExceeded {
+            maximum: MAX_LAYOUT_ROUTE_CONTACT_VISITS,
+        }
+    } else if admission_state.clearance_work_exhausted {
+        LayoutError::EdgeNodeClearanceWorkLimitExceeded {
+            maximum: MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
+        }
+    } else if admission_state.contact_rejected && !admission_state.contact_satisfied {
+        LayoutError::UnrelatedRouteContactUnsatisfied
+    } else {
+        LayoutError::EdgeNodeClearanceUnsatisfied {
+            clearance: options.edge_node_clearance,
+        }
+    }
+}
+
 fn evaluate_candidate(
     indexed: &validation::IndexedGraph<'_>,
     routing_plan: &routing::RoutingPlan<'_>,
@@ -763,7 +824,7 @@ fn evaluate_candidate(
     nodes: Vec<NodeGeometry>,
     options: LayoutOptions,
     routing: CandidateRouting,
-    clearance_work_exhausted: &mut bool,
+    admission_state: &mut CandidateAdmissionState,
 ) {
     let routed = routing::route_planned_candidates_with_quality_options(
         routing_plan,
@@ -776,14 +837,7 @@ fn evaluate_candidate(
         routing.adaptive_gap_spacing,
         routing.deeper_crossing_repair,
     );
-    retain_routed_candidates(
-        indexed,
-        best,
-        nodes,
-        routed,
-        options,
-        clearance_work_exhausted,
-    );
+    retain_routed_candidates(indexed, best, nodes, routed, options, admission_state);
 }
 
 fn retain_routed_candidates(
@@ -792,7 +846,7 @@ fn retain_routed_candidates(
     nodes: Vec<NodeGeometry>,
     routed: routing::RoutedEdges,
     options: LayoutOptions,
-    clearance_work_exhausted: &mut bool,
+    admission_state: &mut CandidateAdmissionState,
 ) {
     let quality = routed
         .primary_quality
@@ -804,7 +858,7 @@ fn retain_routed_candidates(
         nodes.clone(),
         routed.primary,
         options,
-        clearance_work_exhausted,
+        admission_state,
     );
     if let Some((quality, edges)) = routed.repair {
         retain_owned_candidate(
@@ -814,7 +868,7 @@ fn retain_routed_candidates(
             nodes.clone(),
             edges,
             options,
-            clearance_work_exhausted,
+            admission_state,
         );
     }
     for (quality, edges) in routed.alternatives {
@@ -825,7 +879,7 @@ fn retain_routed_candidates(
             nodes.clone(),
             edges,
             options,
-            clearance_work_exhausted,
+            admission_state,
         );
     }
 }
@@ -864,7 +918,7 @@ fn retain_owned_candidate(
     nodes: Vec<NodeGeometry>,
     edges: Vec<EdgeGeometry>,
     options: LayoutOptions,
-    clearance_work_exhausted: &mut bool,
+    admission_state: &mut CandidateAdmissionState,
 ) -> bool {
     if best
         .as_ref()
@@ -873,11 +927,11 @@ fn retain_owned_candidate(
         return false;
     }
     let candidate = placement::normalize_owned(nodes, edges);
-    if !candidate_satisfies_edge_node_clearance(
+    if !candidate_satisfies_positive_clearance_contract(
         indexed,
         &candidate,
         options,
-        clearance_work_exhausted,
+        admission_state,
     ) {
         return false;
     }
@@ -916,6 +970,43 @@ pub(crate) fn effective_layout_options(mut options: LayoutOptions) -> LayoutOpti
 /// remains authoritative.
 pub(crate) fn outward_obstacle_clearance_stub(options: LayoutOptions) -> f64 {
     options.port_stub.max(options.edge_node_clearance)
+}
+
+fn candidate_satisfies_positive_clearance_contract(
+    indexed: &validation::IndexedGraph<'_>,
+    candidate: &Layout,
+    options: LayoutOptions,
+    admission_state: &mut CandidateAdmissionState,
+) -> bool {
+    if options.edge_node_clearance == 0.0 {
+        return true;
+    }
+    match routing::route_family_has_unrelated_contact_bounded(
+        indexed,
+        &candidate.edges,
+        MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+        MAX_LAYOUT_ROUTE_CONTACT_VISITS,
+    ) {
+        Ok(false) => admission_state.contact_satisfied = true,
+        Ok(true) | Err(routing::RouteContactError::InvalidInput) => {
+            admission_state.contact_rejected = true;
+            return false;
+        }
+        Err(routing::RouteContactError::WorkLimitExceeded) => {
+            admission_state.contact_work_exhausted = true;
+            return false;
+        }
+        Err(routing::RouteContactError::SegmentLimitExceeded) => {
+            admission_state.contact_segment_exhausted = true;
+            return false;
+        }
+    }
+    candidate_satisfies_edge_node_clearance(
+        indexed,
+        candidate,
+        options,
+        &mut admission_state.clearance_work_exhausted,
+    )
 }
 
 fn candidate_satisfies_edge_node_clearance(
@@ -984,13 +1075,14 @@ fn candidate_quality_cmp(
 #[cfg(test)]
 mod tests {
     use super::{
-        Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Point,
-        Port, PortSide, QualityEffort, candidate_quality_cmp,
+        CandidateAdmissionState, Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutError,
+        LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS, Node, NodeGeometry, Point, Port,
+        PortSide, QualityEffort, candidate_quality_cmp,
         candidate_satisfies_edge_node_clearance_bounded, demand_aware_quality_is_better,
         demand_aware_scale_is_eligible, effective_layout_options, effective_ranking_edges, layout,
-        outward_obstacle_clearance_stub, placement, retain_better_candidate,
-        retain_owned_candidate, retain_owned_candidate_unchecked, routing, routing::RouteQuality,
-        topology, validation,
+        outward_obstacle_clearance_stub, placement, positive_clearance_failure,
+        retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
+        routing::RouteQuality, topology, validation,
     };
 
     mod active_fanout_fixture {
@@ -1445,7 +1537,7 @@ mod tests {
             route_length: 140.0,
         };
         let mut best = None;
-        let mut exhausted = false;
+        let mut admission_state = CandidateAdmissionState::default();
         assert!(!retain_owned_candidate(
             &indexed,
             &mut best,
@@ -1456,7 +1548,7 @@ mod tests {
                 points: vec![Point { x: 10.0, y: 5.0 }, Point { x: 100.0, y: 5.0 }],
             }],
             options,
-            &mut exhausted,
+            &mut admission_state,
         ));
         assert!(best.is_none());
         assert!(retain_owned_candidate(
@@ -1474,10 +1566,187 @@ mod tests {
                 ],
             }],
             options,
-            &mut exhausted,
+            &mut admission_state,
         ));
         assert_eq!(best.unwrap().0, safe_quality);
-        assert!(!exhausted);
+        assert!(!admission_state.clearance_work_exhausted);
+        assert!(!admission_state.contact_work_exhausted);
+    }
+
+    #[test]
+    fn positive_clearance_admission_rejects_an_overlapping_quality_winner() {
+        let endpoint_node = |id, side| Node {
+            id,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 5.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint_node(1, PortSide::East),
+                endpoint_node(2, PortSide::West),
+                endpoint_node(3, PortSide::East),
+                endpoint_node(4, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 4, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let options = LayoutOptions {
+            edge_node_clearance: 10.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let nodes = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 0.0,
+                y: 100.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 4,
+                x: 100.0,
+                y: 100.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ];
+        let overlapping = vec![
+            EdgeGeometry {
+                id: 1,
+                points: vec![
+                    Point { x: 10.0, y: 5.0 },
+                    Point { x: 20.0, y: 5.0 },
+                    Point { x: 20.0, y: 50.0 },
+                    Point { x: 100.0, y: 50.0 },
+                    Point { x: 100.0, y: 5.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 2,
+                points: vec![
+                    Point { x: 10.0, y: 105.0 },
+                    Point { x: 20.0, y: 105.0 },
+                    Point { x: 20.0, y: 50.0 },
+                    Point { x: 100.0, y: 50.0 },
+                    Point { x: 100.0, y: 105.0 },
+                ],
+            },
+        ];
+        let clean = vec![
+            overlapping[0].clone(),
+            EdgeGeometry {
+                id: 2,
+                points: vec![
+                    Point { x: 10.0, y: 105.0 },
+                    Point { x: 20.0, y: 105.0 },
+                    Point { x: 20.0, y: 70.0 },
+                    Point { x: 100.0, y: 70.0 },
+                    Point { x: 100.0, y: 105.0 },
+                ],
+            },
+        ];
+        let quality_winner = RouteQuality {
+            crossings: 0,
+            bends: 6,
+            route_length: 300.0,
+        };
+        let safe_sibling = RouteQuality {
+            crossings: 1,
+            bends: 6,
+            route_length: 260.0,
+        };
+        let mut best = None;
+        let mut admission_state = CandidateAdmissionState::default();
+
+        assert!(!retain_owned_candidate(
+            &indexed,
+            &mut best,
+            quality_winner,
+            nodes.clone(),
+            overlapping,
+            options,
+            &mut admission_state,
+        ));
+        assert!(retain_owned_candidate(
+            &indexed,
+            &mut best,
+            safe_sibling,
+            nodes,
+            clean,
+            options,
+            &mut admission_state,
+        ));
+        assert_eq!(best.unwrap().0, safe_sibling);
+        assert!(!admission_state.clearance_work_exhausted);
+        assert!(!admission_state.contact_work_exhausted);
+        assert!(admission_state.contact_rejected);
+        assert!(admission_state.contact_satisfied);
+    }
+
+    #[test]
+    fn contact_clean_candidate_preserves_clearance_failure_classification() {
+        let state = CandidateAdmissionState {
+            contact_rejected: true,
+            contact_satisfied: true,
+            ..CandidateAdmissionState::default()
+        };
+        assert_eq!(
+            positive_clearance_failure(
+                LayoutOptions {
+                    edge_node_clearance: 20.0,
+                    ..LayoutOptions::default()
+                },
+                &state,
+            ),
+            LayoutError::EdgeNodeClearanceUnsatisfied { clearance: 20.0 },
+        );
+        assert_eq!(
+            positive_clearance_failure(
+                LayoutOptions::default(),
+                &CandidateAdmissionState {
+                    contact_segment_exhausted: true,
+                    ..CandidateAdmissionState::default()
+                },
+            ),
+            LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
+                maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+            },
+        );
     }
 
     fn sparse_global_layered_graph(
