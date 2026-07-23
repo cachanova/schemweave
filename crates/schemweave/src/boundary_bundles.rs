@@ -65,7 +65,7 @@ pub(crate) fn apply_and_normalize(
             pitch,
             rail_depth,
         );
-        rewrite_member_routes(bundle, &geometry, &route_index, &mut layout.edges)?;
+        rewrite_member_routes(bundle, &geometry, &route_index, &mut layout.edges, pitch)?;
         geometries.push(geometry);
     }
     layout.boundary_bundles = geometries;
@@ -145,15 +145,21 @@ fn rewrite_member_routes(
     geometry: &BoundaryBundleGeometry,
     route_index: &HashMap<u32, usize>,
     routes: &mut [EdgeGeometry],
+    pitch: f64,
 ) -> Result<(), LayoutError> {
-    for member in &geometry.members {
+    for (member, indexed_member) in geometry.members.iter().zip(&bundle.members) {
         let route = &mut routes[route_index[&member.edge]];
         if route.points.len() < 2 {
             return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
         }
+        let corridor_depth = (indexed_member.tap_lane + 1) as f64 * pitch;
         route.points = match bundle.role {
-            BoundaryBundleRole::Input => rewrite_input_route(&route.points, member.tap),
-            BoundaryBundleRole::Output => rewrite_output_route(&route.points, member.tap),
+            BoundaryBundleRole::Input => {
+                rewrite_input_route(&route.points, member.tap, corridor_depth)
+            }
+            BoundaryBundleRole::Output => {
+                rewrite_output_route(&route.points, member.tap, corridor_depth)
+            }
         }
         .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
         if route.points.len() < 2 {
@@ -163,50 +169,74 @@ fn rewrite_member_routes(
     Ok(())
 }
 
-fn rewrite_input_route(points: &[Point], tap: Point) -> Option<Vec<Point>> {
-    let anchor_index = points
-        .iter()
-        .enumerate()
-        .skip(1)
-        .find_map(|(index, point)| (point.x > tap.x).then_some(index))?;
-    let anchor = points[anchor_index];
-    let mut rewritten = Vec::with_capacity(points.len() - anchor_index + 3);
+fn rewrite_input_route(points: &[Point], tap: Point, pitch: f64) -> Option<Vec<Point>> {
+    let corridor_x = tap.x + pitch;
+    let (segment, intersection) = first_vertical_line_intersection(points, corridor_x)?;
+    let mut rewritten = Vec::with_capacity(points.len() - segment + 3);
     push_point(&mut rewritten, tap);
     push_point(
         &mut rewritten,
         Point {
-            x: anchor.x,
+            x: corridor_x,
             y: tap.y,
         },
     );
-    push_point(&mut rewritten, anchor);
-    for &point in &points[anchor_index + 1..] {
+    push_point(&mut rewritten, intersection);
+    for &point in &points[segment + 1..] {
         push_point(&mut rewritten, point);
     }
     Some(rewritten)
 }
 
-fn rewrite_output_route(points: &[Point], tap: Point) -> Option<Vec<Point>> {
-    let anchor_index = points
-        .iter()
-        .enumerate()
-        .rev()
-        .skip(1)
-        .find_map(|(index, point)| (point.x < tap.x).then_some(index))?;
-    let anchor = points[anchor_index];
-    let mut rewritten = Vec::with_capacity(anchor_index + 4);
-    for &point in &points[..=anchor_index] {
+fn rewrite_output_route(points: &[Point], tap: Point, pitch: f64) -> Option<Vec<Point>> {
+    let corridor_x = tap.x - pitch;
+    let (segment, intersection) = last_vertical_line_intersection(points, corridor_x)?;
+    let mut rewritten = Vec::with_capacity(segment + 4);
+    for &point in &points[..=segment] {
         push_point(&mut rewritten, point);
     }
+    push_point(&mut rewritten, intersection);
     push_point(
         &mut rewritten,
         Point {
-            x: anchor.x,
+            x: corridor_x,
             y: tap.y,
         },
     );
     push_point(&mut rewritten, tap);
     Some(rewritten)
+}
+
+fn first_vertical_line_intersection(points: &[Point], x: f64) -> Option<(usize, Point)> {
+    points.windows(2).enumerate().find_map(|(segment, pair)| {
+        segment_vertical_line_intersection(pair[0], pair[1], x, false).map(|point| (segment, point))
+    })
+}
+
+fn last_vertical_line_intersection(points: &[Point], x: f64) -> Option<(usize, Point)> {
+    points
+        .windows(2)
+        .enumerate()
+        .rev()
+        .find_map(|(segment, pair)| {
+            segment_vertical_line_intersection(pair[0], pair[1], x, true)
+                .map(|point| (segment, point))
+        })
+}
+
+fn segment_vertical_line_intersection(
+    start: Point,
+    end: Point,
+    x: f64,
+    prefer_end: bool,
+) -> Option<Point> {
+    if start.y == end.y && x >= start.x.min(end.x) && x <= start.x.max(end.x) {
+        return Some(Point { x, y: start.y });
+    }
+    if start.x == x && end.x == x {
+        return Some(if prefer_end { end } else { start });
+    }
+    None
 }
 
 fn push_point(points: &mut Vec<Point>, point: Point) {
@@ -639,6 +669,7 @@ mod tests {
             rewrite_input_route(
                 &[Point { x: 0.0, y: 0.0 }, Point { x: 5.0, y: 0.0 }],
                 Point { x: 10.0, y: 0.0 },
+                1.0,
             )
             .is_none()
         );
@@ -646,6 +677,7 @@ mod tests {
             rewrite_output_route(
                 &[Point { x: 15.0, y: 0.0 }, Point { x: 20.0, y: 0.0 }],
                 Point { x: 10.0, y: 0.0 },
+                1.0,
             )
             .is_none()
         );
@@ -659,11 +691,79 @@ mod tests {
                 Point { x: 20.0, y: 10.0 },
             ],
             tap,
+            1.0,
         )
         .unwrap();
         assert_eq!(rewritten.last(), Some(&tap));
         assert!(rewritten[rewritten.len() - 2].x < tap.x);
         assert_eq!(rewritten[rewritten.len() - 2].y, tap.y);
+    }
+
+    #[test]
+    fn corridor_splice_preserves_obstacle_aware_routes_and_separates_visible_cohorts() {
+        let points = [
+            Point { x: 125.0, y: 913.0 },
+            Point { x: 149.0, y: 913.0 },
+            Point { x: 149.0, y: 962.0 },
+            Point { x: 295.0, y: 962.0 },
+            Point {
+                x: 295.0,
+                y: 1_010.0,
+            },
+        ];
+        let tap = Point { x: 151.0, y: 905.0 };
+        let first = rewrite_input_route(&points, tap, 6.0).unwrap();
+        let second = rewrite_input_route(&points, tap, 12.0).unwrap();
+        assert_eq!(
+            first[..3],
+            [
+                tap,
+                Point { x: 157.0, y: 905.0 },
+                Point { x: 157.0, y: 962.0 },
+            ]
+        );
+        assert_eq!(first[3..], points[3..]);
+        assert_eq!(second[1].x - first[1].x, 6.0);
+        assert_eq!(second[2].x - first[2].x, 6.0);
+        assert_eq!(rewrite_input_route(&points, tap, 6.0).unwrap(), first);
+
+        let output_points = [
+            Point {
+                x: 2_025.0,
+                y: 746.0,
+            },
+            Point {
+                x: 2_166.0,
+                y: 746.0,
+            },
+            Point {
+                x: 2_166.0,
+                y: 679.0,
+            },
+            Point {
+                x: 2_179.0,
+                y: 679.0,
+            },
+        ];
+        let output_tap = Point {
+            x: 2_165.0,
+            y: 713.0,
+        };
+        let rewritten = rewrite_output_route(&output_points, output_tap, 6.0).unwrap();
+        assert_eq!(
+            rewritten[rewritten.len() - 3..],
+            [
+                Point {
+                    x: 2_159.0,
+                    y: 746.0,
+                },
+                Point {
+                    x: 2_159.0,
+                    y: 713.0,
+                },
+                output_tap,
+            ]
+        );
     }
 
     #[test]
