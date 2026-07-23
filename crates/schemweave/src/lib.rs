@@ -654,9 +654,7 @@ fn demand_aware_quality_is_better(
     candidate_area: f64,
     candidate_congestion: f64,
 ) -> bool {
-    let allowed_crossings = baseline
-        .crossings
-        .saturating_add((baseline.crossings / 20).max(32));
+    let allowed_crossings = baseline.crossings.saturating_add(baseline.crossings / 20);
     candidate.crossings <= allowed_crossings
         && candidate.bends as f64 <= baseline.bends as f64 * 1.05
         && candidate.route_length <= baseline.route_length * 1.65
@@ -881,6 +879,24 @@ mod tests {
                 5_600_000.0,
                 0.43,
                 rejected,
+                10_360_000.0,
+                0.15,
+            ));
+        }
+        for crossings in [0, 1, 19] {
+            let baseline = RouteQuality {
+                crossings,
+                ..baseline
+            };
+            let candidate = RouteQuality {
+                crossings: crossings + 1,
+                ..candidate
+            };
+            assert!(!demand_aware_quality_is_better(
+                baseline,
+                5_600_000.0,
+                0.43,
+                candidate,
                 10_360_000.0,
                 0.15,
             ));
