@@ -28,6 +28,18 @@ a correctness backstop.
 to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
 and rendering remain responsibilities of the consuming application.
 
+Incremental group expansion is also a core geometry operation. The consumer
+supplies a compact graph and layout, an expanded graph, and the stable identity
+of the replaced anchor and its members. Every expanded boundary edge explicitly
+names the compact trunk it replaces, so separate named pins are never inferred
+from net identity. SchemWeave preserves unrelated geometry, propagates input and
+output boundary constraints, packs unconstrained disconnected member components,
+lays out connected member logic with the canonical engine, and admits a composed
+result only when every hard geometry and left-to-right invariant remains clean.
+If exact preservation is impossible or exceeds the deterministic work budget,
+the typed result requires a full relayout. Grouping semantics, focus state, and
+expansion policy remain consumer concerns.
+
 `schemweave-eval` remains the development-only full quality scorer. It validates
 the public geometry contract and measures node overlap, route/node intersections,
 unrelated segment overlap and contact, physical net crossings, unique physical

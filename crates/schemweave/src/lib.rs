@@ -2,15 +2,22 @@
 
 #![forbid(unsafe_code)]
 
+mod incremental;
 mod placement;
 mod readability;
 mod routing;
 mod topology;
 mod validation;
 
+use std::collections::{BTreeSet, HashMap};
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use incremental::{
+    BoundaryTrunk, GroupExpansion, GroupExpansionError, GroupExpansionOptions,
+    expand_group_in_place,
+};
 pub use placement::place;
 pub(crate) use readability::measure_parallel_congestion_bounded;
 #[doc(hidden)]
@@ -20,6 +27,52 @@ pub type NodeId = u32;
 pub type PortId = u32;
 pub type EdgeId = u32;
 pub type NetId = u32;
+
+/// Classify the edges for which strict left-to-right placement is meaningful.
+///
+/// This is public only so the development scorer can share the runtime
+/// classification exactly.
+#[doc(hidden)]
+pub fn effective_ranking_edges(graph: &Graph) -> BTreeSet<EdgeId> {
+    let nodes = graph.nodes.iter().collect::<Vec<_>>();
+    let node_index = nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id, index))
+        .collect::<HashMap<_, _>>();
+    let edges = graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            node_index.contains_key(&edge.source.node) && node_index.contains_key(&edge.target.node)
+        })
+        .collect::<Vec<_>>();
+    let mut outgoing = vec![Vec::new(); graph.nodes.len()];
+    let mut incoming = vec![Vec::new(); graph.nodes.len()];
+    for edge in &edges {
+        if !edge.participates_in_ranking {
+            continue;
+        }
+        let source = node_index[&edge.source.node];
+        let target = node_index[&edge.target.node];
+        outgoing[source].push(target);
+        incoming[target].push(source);
+    }
+    let (runtime_mask, runtime_outgoing, runtime_incoming) =
+        validation::runtime_ranking_graph(&nodes, &edges, &node_index, outgoing, incoming);
+    let (components, _) =
+        topology::strongly_connected_components(&runtime_outgoing, &runtime_incoming);
+    edges
+        .into_iter()
+        .zip(runtime_mask)
+        .filter(|(edge, ranking)| {
+            *ranking
+                && components[node_index[&edge.source.node]]
+                    != components[node_index[&edge.target.node]]
+        })
+        .map(|(edge, _)| edge.id)
+        .collect()
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Graph {
@@ -601,8 +654,9 @@ fn candidate_quality_cmp(
 mod tests {
     use super::{
         Edge, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Port, PortSide,
-        QualityEffort, candidate_quality_cmp, layout, placement, retain_better_candidate,
-        retain_owned_candidate, routing, routing::RouteQuality, topology, validation,
+        QualityEffort, candidate_quality_cmp, effective_ranking_edges, layout, placement,
+        retain_better_candidate, retain_owned_candidate, routing, routing::RouteQuality, topology,
+        validation,
     };
 
     mod active_fanout_fixture {
@@ -633,6 +687,52 @@ mod tests {
                 height: 1.0,
             },
         )
+    }
+
+    #[test]
+    fn effective_ranking_keeps_acyclic_data_into_a_cycle_breaker() {
+        let node = |id, cycle_breaker| Node {
+            id,
+            width: 80.0,
+            height: 50.0,
+            cycle_breaker,
+            ports: vec![
+                Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 25.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::East,
+                    offset: 25.0,
+                },
+            ],
+        };
+        let graph = Graph {
+            nodes: vec![node(1, false), node(2, false), node(3, true)],
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 1 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 2, port: 1 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+
+        assert_eq!(
+            effective_ranking_edges(&graph),
+            [1, 2].into_iter().collect()
+        );
     }
 
     fn browser_max_effort_graph() -> Graph {

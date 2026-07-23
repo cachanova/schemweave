@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
-use schemweave::{Graph, LayoutConstraints, LayoutOptions, QualityEffort};
-use serde::Deserialize;
+use schemweave::{
+    Graph, GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConstraints,
+    LayoutOptions, QualityEffort,
+};
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 /// Lay out a graph through a compact JSON boundary suitable for Web Workers.
@@ -30,6 +33,95 @@ pub fn layout_serialized(graph_json: &str, options_json: &str) -> Result<String,
     serde_json::to_string(&result).map_err(|error| format!("failed to encode layout: {error}"))
 }
 
+/// Expand one compact group through the same JSON boundary used by Web Workers.
+#[wasm_bindgen]
+pub fn expand_group_json(
+    compact_graph_json: &str,
+    compact_layout_json: &str,
+    expanded_graph_json: &str,
+    expansion_json: &str,
+    options_json: &str,
+) -> Result<String, JsValue> {
+    expand_group_serialized(
+        compact_graph_json,
+        compact_layout_json,
+        expanded_graph_json,
+        expansion_json,
+        options_json,
+    )
+    .map_err(js_error)
+}
+
+/// Execute incremental group expansion without converting errors to JavaScript values.
+pub fn expand_group_serialized(
+    compact_graph_json: &str,
+    compact_layout_json: &str,
+    expanded_graph_json: &str,
+    expansion_json: &str,
+    options_json: &str,
+) -> Result<String, String> {
+    let compact_graph: Graph = serde_json::from_str(compact_graph_json)
+        .map_err(|error| format!("invalid compact graph JSON: {error}"))?;
+    let compact_layout: Layout = serde_json::from_str(compact_layout_json)
+        .map_err(|error| format!("invalid compact layout JSON: {error}"))?;
+    let expanded_graph: Graph = serde_json::from_str(expanded_graph_json)
+        .map_err(|error| format!("invalid expanded graph JSON: {error}"))?;
+    let expansion: GroupExpansion = serde_json::from_str(expansion_json)
+        .map_err(|error| format!("invalid group expansion JSON: {error}"))?;
+    let options = if options_json.trim().is_empty() {
+        SerializedLayoutOptions::default()
+    } else {
+        serde_json::from_str(options_json)
+            .map_err(|error| format!("invalid options JSON: {error}"))?
+    };
+    let result = match schemweave::expand_group_in_place(
+        &compact_graph,
+        &compact_layout,
+        &expanded_graph,
+        &expansion,
+        &GroupExpansionOptions {
+            layout: options.layout,
+            quality_effort: options.quality_effort,
+            constraints: options.constraints,
+        },
+    ) {
+        Ok(layout) => SerializedGroupExpansionResult::Layout { layout },
+        Err(GroupExpansionError::NeedsFullRelayout) => {
+            SerializedGroupExpansionResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::Geometry,
+            }
+        }
+        Err(GroupExpansionError::ExpansionWorkLimitExceeded { .. }) => {
+            SerializedGroupExpansionResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::WorkLimit,
+            }
+        }
+        Err(GroupExpansionError::PreservedGeometryTooLarge { .. }) => {
+            SerializedGroupExpansionResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::PreservedGeometryTooLarge,
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    serde_json::to_string(&result)
+        .map_err(|error| format!("failed to encode expanded layout: {error}"))
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum SerializedGroupExpansionResult {
+    Layout { layout: Layout },
+    NeedsFullRelayout { reason: FullRelayoutReason },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FullRelayoutReason {
+    Geometry,
+    WorkLimit,
+    PreservedGeometryTooLarge,
+}
+
 #[derive(Deserialize)]
 #[serde(default)]
 struct SerializedLayoutOptions {
@@ -56,8 +148,17 @@ fn js_error(message: impl AsRef<str>) -> JsValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{layout_json, layout_serialized};
-    use schemweave::{Edge, Endpoint, Graph, Layout, Node, Port, PortSide};
+    use super::{expand_group_serialized, layout_json, layout_serialized};
+    use schemweave::{
+        BoundaryTrunk, Edge, Endpoint, Graph, GroupExpansion, Layout, LayoutOptions, Node, Port,
+        PortSide, layout, layout_with_constraints,
+    };
+
+    fn decode_expanded_layout(response: String) -> Layout {
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["status"], "layout");
+        serde_json::from_value(value["layout"].clone()).unwrap()
+    }
 
     fn activating_graph_json() -> String {
         fn next(state: &mut u64) -> u64 {
@@ -184,6 +285,43 @@ mod tests {
         serde_json::to_string(&Graph { nodes, edges }).unwrap()
     }
 
+    fn node(id: u32) -> Node {
+        Node {
+            id,
+            width: 80.0,
+            height: 50.0,
+            cycle_breaker: false,
+            ports: vec![
+                Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 25.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::East,
+                    offset: 25.0,
+                },
+            ],
+        }
+    }
+
+    fn edge(id: u32, source: u32, target: u32, net: u32) -> Edge {
+        Edge {
+            id,
+            source: Endpoint {
+                node: source,
+                port: 1,
+            },
+            target: Endpoint {
+                node: target,
+                port: 0,
+            },
+            net,
+            participates_in_ranking: true,
+        }
+    }
+
     #[test]
     fn uses_default_options_for_an_empty_options_object() {
         let graph = r#"{"nodes":[],"edges":[]}"#;
@@ -191,6 +329,216 @@ mod tests {
         assert_eq!(
             result,
             r#"{"nodes":[],"edges":[],"width":0.0,"height":0.0}"#
+        );
+    }
+
+    #[test]
+    fn expands_a_group_over_the_json_boundary_with_max_effort() {
+        let mut anchor = node(10);
+        anchor.width = 260.0;
+        let compact = Graph {
+            nodes: vec![node(1), anchor, node(4)],
+            edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), node(3), node(4)],
+            edges: vec![
+                edge(11, 1, 2, 100),
+                edge(12, 2, 3, 150),
+                edge(13, 3, 4, 200),
+            ],
+        };
+        let result = decode_expanded_layout(
+            expand_group_serialized(
+                &serde_json::to_string(&compact).unwrap(),
+                &serde_json::to_string(&compact_layout).unwrap(),
+                &serde_json::to_string(&expanded).unwrap(),
+                &serde_json::to_string(&GroupExpansion {
+                    anchor: 10,
+                    members: vec![2, 3],
+                    boundary_trunks: vec![
+                        BoundaryTrunk {
+                            expanded_edge: 11,
+                            compact_edge: 1,
+                        },
+                        BoundaryTrunk {
+                            expanded_edge: 13,
+                            compact_edge: 2,
+                        },
+                    ],
+                })
+                .unwrap(),
+                r#"{"quality_effort":"max"}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            result.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            result.edges.iter().map(|edge| edge.id).collect::<Vec<_>>(),
+            vec![11, 12, 13]
+        );
+    }
+
+    #[test]
+    fn expansion_honors_boundary_constraints_over_the_json_boundary() {
+        let compact = Graph {
+            nodes: vec![node(1), node(10), node(9)],
+            edges: vec![edge(1, 1, 10, 100), edge(3, 1, 9, 300)],
+        };
+        let compact_layout = layout_with_constraints(
+            &compact,
+            LayoutOptions::default(),
+            &schemweave::LayoutConstraints {
+                inputs: vec![1],
+                outputs: vec![9, 10],
+            },
+        )
+        .unwrap();
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), node(3), node(9)],
+            edges: vec![edge(11, 1, 2, 101), edge(12, 1, 3, 102), edge(3, 1, 9, 300)],
+        };
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: vec![2, 3],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 11,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 12,
+                    compact_edge: 1,
+                },
+            ],
+        };
+        let result = decode_expanded_layout(
+            expand_group_serialized(
+                &serde_json::to_string(&compact).unwrap(),
+                &serde_json::to_string(&compact_layout).unwrap(),
+                &serde_json::to_string(&expanded).unwrap(),
+                &serde_json::to_string(&expansion).unwrap(),
+                r#"{"quality_effort":"max","constraints":{"inputs":[1],"outputs":[2,3,9]}}"#,
+            )
+            .unwrap(),
+        );
+        let geometry = |id| result.nodes.iter().find(|node| node.id == id).unwrap();
+        let right = |id| geometry(id).x + geometry(id).width;
+
+        assert_eq!(right(2), right(3));
+        assert_eq!(right(2), right(9));
+        assert!(geometry(1).x + geometry(1).width < geometry(2).x);
+    }
+
+    #[test]
+    fn expansion_returns_a_stable_full_relayout_status() {
+        let compact = Graph {
+            nodes: vec![node(1), node(10), node(4)],
+            edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), node(3), node(4)],
+            edges: vec![
+                edge(11, 1, 2, 100),
+                edge(12, 2, 3, 150),
+                edge(13, 3, 4, 200),
+            ],
+        };
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: vec![2, 3],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 11,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 13,
+                    compact_edge: 2,
+                },
+            ],
+        };
+        let response: serde_json::Value = serde_json::from_str(
+            &expand_group_serialized(
+                &serde_json::to_string(&compact).unwrap(),
+                &serde_json::to_string(&compact_layout).unwrap(),
+                &serde_json::to_string(&expanded).unwrap(),
+                &serde_json::to_string(&expansion).unwrap(),
+                r#"{"quality_effort":"max"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "status":"needs_full_relayout",
+                "reason":"geometry"
+            })
+        );
+
+        let mut invalid = expansion;
+        invalid.boundary_trunks.clear();
+        let error = expand_group_serialized(
+            &serde_json::to_string(&compact).unwrap(),
+            &serde_json::to_string(&compact_layout).unwrap(),
+            &serde_json::to_string(&expanded).unwrap(),
+            &serde_json::to_string(&invalid).unwrap(),
+            r#"{"quality_effort":"max"}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("has no compact trunk mapping"), "{error}");
+    }
+
+    #[test]
+    fn expansion_work_limit_is_a_stable_full_relayout_status() {
+        let compact = Graph {
+            nodes: vec![node(1), node(10)],
+            edges: vec![edge(1, 1, 10, 100)],
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let members = (1_000..2_000).collect::<Vec<_>>();
+        let edges = (0..4_000)
+            .map(|index| edge(index + 100, 1, members[index as usize % members.len()], 100))
+            .collect::<Vec<_>>();
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: members.clone(),
+            boundary_trunks: edges
+                .iter()
+                .map(|edge| BoundaryTrunk {
+                    expanded_edge: edge.id,
+                    compact_edge: 1,
+                })
+                .collect(),
+        };
+        let mut nodes = vec![node(1)];
+        nodes.extend(members.into_iter().map(node));
+        let expanded = Graph { nodes, edges };
+        let response: serde_json::Value = serde_json::from_str(
+            &expand_group_serialized(
+                &serde_json::to_string(&compact).unwrap(),
+                &serde_json::to_string(&compact_layout).unwrap(),
+                &serde_json::to_string(&expanded).unwrap(),
+                &serde_json::to_string(&expansion).unwrap(),
+                r#"{"quality_effort":"fast"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "status":"needs_full_relayout",
+                "reason":"work_limit"
+            })
         );
     }
 
