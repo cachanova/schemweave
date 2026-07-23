@@ -74,6 +74,11 @@ const MIN_FANOUT_AWARE_CHANNEL_EDGES: usize = 16;
 // actual outer sink work to amortize that cost; smaller clusters keep the historical fast path.
 const MIN_FANOUT_AWARE_OUTER_BRANCHES: usize = 512;
 const MIN_FANOUT_AWARE_NODES: usize = 1_000;
+// Emitting and exactly scoring a complete route family is only worthwhile when the obstacle-safe
+// crossing paths contain enough removable stair steps. Work stays linear in the already-bounded
+// sparse path payload, and the candidate is never admitted without the canonical physical score.
+const MIN_STAIRCASE_ALIGNMENT_TRANSITIONS: usize = 32;
+const MIN_STAIRCASE_ALIGNMENT_RATIO_DENOMINATOR: usize = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct RouteQuality {
@@ -586,6 +591,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         .unwrap_or(usize::MAX);
     let sparse_global = sparse_global
         && route_family_candidate_shape_within_budget(node_count, plan.edges.len(), &sparse_spans);
+    let align_staircases = adaptive_gap_spacing && sparse_global;
     let adaptive_gap_spacing = adaptive_gap_spacing
         && route_family_candidate_shape_within_budget(node_count, plan.edges.len(), &sparse_spans);
     let RoutedLaneState {
@@ -618,6 +624,27 @@ fn route_edges_with_lane_rounds_and_refined_global(
         refined_large_sparse_global,
         adaptive_gap_spacing,
     );
+    let staircase_alternative = align_staircases
+        .then(|| {
+            build_staircase_alignment_alternative(
+                plan,
+                nodes,
+                &sparse_spans,
+                &free_by_rank,
+                &layer_left,
+                &layer_right,
+                &gap_lanes,
+                &crossing_paths,
+                &baseline_outer_lanes,
+                top,
+                bottom,
+                options,
+                gap_spacing,
+                &routes,
+                spacing_quality,
+            )
+        })
+        .flatten();
     let build_sparse_alternative = |candidate_lanes: Vec<BTreeMap<u32, usize>>| {
         if !route_family_candidate_within_budget(node_count, plan.edges.len(), &routes) {
             return None;
@@ -759,6 +786,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             .alternatives
             .extend(preserved_refined_sparse_alternative);
         routed.alternatives.extend(refined_sparse_alternative);
+        routed.alternatives.extend(staircase_alternative);
         return routed;
     }
     let mut outer_lanes = baseline_outer_lanes;
@@ -928,6 +956,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             .chain(preserved_refined_sparse_alternative)
             .chain(refined_sparse_alternative)
             .chain(deeper_crossing_repair_candidate)
+            .chain(staircase_alternative)
             .collect(),
         #[cfg(test)]
         feedback_trace,
@@ -942,6 +971,357 @@ fn route_edges_with_lane_rounds_and_refined_global(
         repair_nets: repair.map_or_else(Vec::new, |repair| repair.selected_nets),
         #[cfg(test)]
         repair_outer_sides,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_staircase_alignment_alternative(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    free_by_rank: &[Vec<(f64, f64)>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    crossing_paths: &[Option<Vec<f64>>],
+    outer_lanes: &BTreeMap<EdgeId, OuterLane>,
+    top: f64,
+    bottom: f64,
+    options: LayoutOptions,
+    gap_spacing: GapTrackSpacing,
+    baseline_routes: &[EdgeGeometry],
+    baseline_quality: Option<RouteQuality>,
+) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
+    let (candidate_paths, aligned_transitions) = align_crossing_path_staircases(
+        plan,
+        sparse_spans,
+        free_by_rank,
+        crossing_paths,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        options,
+        gap_spacing,
+    )?;
+    if aligned_transitions < MIN_STAIRCASE_ALIGNMENT_TRANSITIONS {
+        return None;
+    }
+    let baseline_quality =
+        baseline_quality.unwrap_or_else(|| route_quality_for_plan(plan, baseline_routes));
+    if aligned_transitions
+        < baseline_quality
+            .bends
+            .div_ceil(MIN_STAIRCASE_ALIGNMENT_RATIO_DENOMINATOR)
+    {
+        return None;
+    }
+    let endpoint_tracks = build_endpoint_tracks(
+        plan,
+        nodes,
+        &plan.ranks,
+        sparse_spans,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        outer_lanes,
+        options,
+        gap_spacing,
+    );
+    let candidate_routes = emit_routes(
+        plan,
+        nodes,
+        sparse_spans,
+        &candidate_paths,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        &endpoint_tracks,
+        outer_lanes,
+        top,
+        bottom,
+        options,
+        gap_spacing,
+    );
+    let candidate_quality = route_quality_for_plan(plan, &candidate_routes);
+    (candidate_quality.crossings <= baseline_quality.crossings
+        && route_quality_cmp(candidate_quality, baseline_quality).is_lt())
+    .then_some((candidate_quality, candidate_routes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn align_crossing_path_staircases(
+    plan: &RoutingPlan<'_>,
+    sparse_spans: &[Option<(usize, usize)>],
+    free_by_rank: &[Vec<(f64, f64)>],
+    crossing_paths: &[Option<Vec<f64>>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    options: LayoutOptions,
+    gap_spacing: GapTrackSpacing,
+) -> Option<(Vec<Option<Vec<f64>>>, usize)> {
+    let net_ordinals = plan
+        .edges
+        .iter()
+        .map(|resolved| resolved.edge.net)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, net)| (net, ordinal))
+        .collect::<BTreeMap<_, _>>();
+    let net_count = net_ordinals.len();
+    let mut paths = crossing_paths.to_vec();
+    let mut backbones = BTreeMap::<(NetId, u32, u32), Vec<usize>>::new();
+    for (edge_index, ((resolved, span), path)) in plan
+        .edges
+        .iter()
+        .zip(sparse_spans)
+        .zip(crossing_paths)
+        .enumerate()
+    {
+        let (Some(&(source_rank, target_rank)), Some(path)) = (span.as_ref(), path.as_ref()) else {
+            continue;
+        };
+        debug_assert_eq!(path.len(), target_rank - source_rank - 1);
+        if !path.is_empty() {
+            backbones
+                .entry((
+                    resolved.edge.net,
+                    resolved.edge.source.node,
+                    resolved.edge.source.port,
+                ))
+                .or_default()
+                .push(edge_index);
+        }
+    }
+
+    let mut aligned_transitions = 0usize;
+    for edge_indices in backbones.values_mut() {
+        edge_indices.sort_unstable_by(|&left, &right| {
+            crossing_paths[right]
+                .as_ref()
+                .expect("backbone path exists")
+                .len()
+                .cmp(
+                    &crossing_paths[left]
+                        .as_ref()
+                        .expect("backbone path exists")
+                        .len(),
+                )
+                .then(plan.edges[left].edge.id.cmp(&plan.edges[right].edge.id))
+        });
+        let canonical_index = edge_indices[0];
+        let canonical_path = crossing_paths[canonical_index]
+            .as_ref()
+            .expect("backbone path exists");
+        if canonical_path.len() < 2 {
+            continue;
+        }
+        let source_rank = sparse_spans[canonical_index]
+            .expect("backbone span exists")
+            .0;
+        let net = plan.edges[canonical_index].edge.net;
+        let canonical_aligned = align_one_crossing_path_staircase(
+            canonical_path,
+            source_rank,
+            free_by_rank,
+            net_ordinals[&net],
+            net_count,
+        );
+        aligned_transitions += removed_staircase_transitions(canonical_path, &canonical_aligned);
+        paths[canonical_index] = Some(canonical_aligned.clone());
+
+        for &edge_index in edge_indices.iter().skip(1) {
+            let path = crossing_paths[edge_index]
+                .as_ref()
+                .expect("backbone path exists");
+            if path.len() <= canonical_path.len()
+                && path.as_slice() == &canonical_path[..path.len()]
+            {
+                let aligned = canonical_aligned[..path.len()].to_vec();
+                paths[edge_index] = Some(aligned);
+            }
+        }
+    }
+
+    (!crossing_paths_have_unrelated_collinear_tracks(
+        plan,
+        sparse_spans,
+        &paths,
+        layer_left,
+        layer_right,
+        gap_lanes,
+        options,
+        gap_spacing,
+    ))
+    .then_some((paths, aligned_transitions))
+}
+
+fn align_one_crossing_path_staircase(
+    path: &[f64],
+    source_rank: usize,
+    free_by_rank: &[Vec<(f64, f64)>],
+    net_ordinal: usize,
+    net_count: usize,
+) -> Vec<f64> {
+    let intervals = path
+        .iter()
+        .enumerate()
+        .map(|(offset, &y)| {
+            free_interval_containing(&free_by_rank[source_rank + offset + 1], y)
+                .expect("crossing path ordinate remains in its selected free interval")
+        })
+        .collect::<Vec<_>>();
+    let mut aligned = path.to_vec();
+    let mut start = 0usize;
+    while start < path.len() {
+        let mut end = start + 1;
+        let mut low = intervals[start].0;
+        let mut high = intervals[start].1;
+        while end < path.len() {
+            let next_low = low.max(intervals[end].0);
+            let next_high = high.min(intervals[end].1);
+            if next_low >= next_high {
+                break;
+            }
+            low = next_low;
+            high = next_high;
+            end += 1;
+        }
+        if end - start >= 2 {
+            let margin = (CROSSING_TRACK_NUDGE * (net_ordinal + 1) as f64).min((high - low) / 4.0);
+            let net_offset = if net_count < 2 {
+                0.0
+            } else {
+                (net_ordinal as f64 / (net_count - 1) as f64 - 0.5) * 0.01
+            };
+            let y = (path[start] + net_offset).clamp(low + margin, high - margin);
+            aligned[start..end].fill(y);
+        }
+        start = end;
+    }
+    aligned
+}
+
+fn free_interval_containing(intervals: &[(f64, f64)], y: f64) -> Option<(f64, f64)> {
+    let index = intervals.partition_point(|&(_, high)| high < y);
+    intervals
+        .get(index)
+        .copied()
+        .filter(|&(low, high)| low <= y && y <= high)
+}
+
+fn removed_staircase_transitions(original: &[f64], aligned: &[f64]) -> usize {
+    original
+        .windows(2)
+        .zip(aligned.windows(2))
+        .filter(|(original, aligned)| original[0] != original[1] && aligned[0] == aligned[1])
+        .count()
+}
+
+#[derive(Clone, Copy)]
+struct HorizontalCrossingRun {
+    net: NetId,
+    start: f64,
+    end: f64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn crossing_paths_have_unrelated_collinear_tracks(
+    plan: &RoutingPlan<'_>,
+    sparse_spans: &[Option<(usize, usize)>],
+    paths: &[Option<Vec<f64>>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    options: LayoutOptions,
+    gap_spacing: GapTrackSpacing,
+) -> bool {
+    let mut runs_by_y = BTreeMap::<FloatKey, Vec<HorizontalCrossingRun>>::new();
+    for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(paths) {
+        let (Some(&(source_rank, _)), Some(path)) = (span.as_ref(), path.as_ref()) else {
+            continue;
+        };
+        for (offset, &y) in path.iter().enumerate() {
+            let rank = source_rank + offset + 1;
+            let left = sparse_gap_x(
+                resolved.edge.net,
+                rank - 1,
+                layer_left,
+                layer_right,
+                gap_lanes,
+                options,
+                gap_spacing,
+            );
+            let right = sparse_gap_x(
+                resolved.edge.net,
+                rank,
+                layer_left,
+                layer_right,
+                gap_lanes,
+                options,
+                gap_spacing,
+            );
+            let y = if y == 0.0 { 0.0 } else { y };
+            runs_by_y
+                .entry(FloatKey(y))
+                .or_default()
+                .push(HorizontalCrossingRun {
+                    net: resolved.edge.net,
+                    start: left.min(right),
+                    end: left.max(right),
+                });
+        }
+    }
+
+    runs_by_y.into_values().any(|mut runs| {
+        runs.sort_unstable_by(|left, right| {
+            left.start
+                .total_cmp(&right.start)
+                .then(left.end.total_cmp(&right.end))
+                .then(left.net.cmp(&right.net))
+        });
+        let mut longest = None;
+        let mut second_longest = None;
+        for run in runs {
+            let unrelated_end = longest
+                .filter(|&(net, _)| net != run.net)
+                .or_else(|| second_longest.filter(|&(net, _)| net != run.net))
+                .map(|(_, end)| end);
+            if unrelated_end.is_some_and(|end| end >= run.start) {
+                return true;
+            }
+            update_longest_track_ends(&mut longest, &mut second_longest, run.net, run.end);
+        }
+        false
+    })
+}
+
+fn update_longest_track_ends(
+    longest: &mut Option<(NetId, f64)>,
+    second_longest: &mut Option<(NetId, f64)>,
+    net: NetId,
+    end: f64,
+) {
+    if let Some((candidate, current_end)) = longest.as_mut()
+        && *candidate == net
+    {
+        *current_end = current_end.max(end);
+        return;
+    }
+    if let Some((candidate, current_end)) = second_longest.as_mut()
+        && *candidate == net
+    {
+        *current_end = current_end.max(end);
+    } else if longest.is_none() {
+        *longest = Some((net, end));
+    } else if second_longest.is_none_or(|(_, current_end)| end > current_end) {
+        *second_longest = Some((net, end));
+    }
+    if longest.zip(*second_longest).is_some_and(|(first, second)| {
+        second.1.total_cmp(&first.1).is_gt() || (second.1 == first.1 && second.0 < first.0)
+    }) {
+        std::mem::swap(longest, second_longest);
     }
 }
 
@@ -4840,11 +5220,13 @@ mod tests {
         FULL_OUTER_LANE_ROUNDS, GapNetAccess, GapTrackSpacing, MAX_CROSSING_REPAIR_EDGES,
         MAX_CROSSING_REPAIR_NODES, MAX_CROSSING_REPAIR_PATH_STATES,
         MAX_CROSSING_REPAIR_ROUTE_POINTS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
-        OuterLane, OuterNetAccess, OuterSide, PhysicalSegment, RoutingPlan, build_endpoint_tracks,
+        OuterLane, OuterNetAccess, OuterSide, PhysicalSegment, RoutingPlan,
+        align_crossing_path_staircases, build_endpoint_tracks,
         candidate_route_points_within_budget, crossing_aware_gap_lane_indices,
         crossing_aware_gap_lane_indices_btree_reference, crossing_aware_outer_lane_indices,
-        crossing_repair_within_budget, crossing_track_y, distance_transform,
-        fanout_outer_channel_lane_indices, global_gap_candidate_work_within_budget,
+        crossing_paths_have_unrelated_collinear_tracks, crossing_repair_within_budget,
+        crossing_track_y, distance_transform, fanout_outer_channel_lane_indices,
+        free_interval_containing, global_gap_candidate_work_within_budget,
         global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
         horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
         large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
@@ -4868,6 +5250,388 @@ mod tests {
         assert_eq!(
             vertical_horizontal_crossings(&[(20.0, 20.0)], &[10.0, 20.0, 30.0]),
             0
+        );
+    }
+
+    fn align_crossing_path_staircases_for_test(
+        plan: &RoutingPlan<'_>,
+        sparse_spans: &[Option<(usize, usize)>],
+        free_by_rank: &[Vec<(f64, f64)>],
+        crossing_paths: &[Option<Vec<f64>>],
+    ) -> Option<(Vec<Option<Vec<f64>>>, usize)> {
+        let rank_count = free_by_rank.len();
+        let layer_left = (0..rank_count)
+            .map(|rank| rank as f64 * 100.0)
+            .collect::<Vec<_>>();
+        let layer_right = layer_left
+            .iter()
+            .map(|left| left + 20.0)
+            .collect::<Vec<_>>();
+        let nets = plan
+            .edges
+            .iter()
+            .map(|resolved| resolved.edge.net)
+            .collect::<BTreeSet<_>>();
+        let gap_lanes = (1..rank_count)
+            .map(|_| {
+                nets.iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(lane, net)| (net, lane))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .collect::<Vec<_>>();
+        align_crossing_path_staircases(
+            plan,
+            sparse_spans,
+            free_by_rank,
+            crossing_paths,
+            &layer_left,
+            &layer_right,
+            &gap_lanes,
+            LayoutOptions::default(),
+            GapTrackSpacing::Compact,
+        )
+    }
+
+    #[test]
+    fn staircase_alignment_uses_one_interior_ordinate_across_overlapping_free_spans() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 0,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 1,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+            ],
+            edges: vec![Edge {
+                id: 0,
+                source: Endpoint { node: 0, port: 0 },
+                target: Endpoint { node: 1, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            }],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 4]);
+        let (aligned, transitions) = align_crossing_path_staircases_for_test(
+            &plan,
+            &[Some((0, 4))],
+            &[
+                Vec::new(),
+                vec![(0.0, 10.0)],
+                vec![(2.0, 9.0)],
+                vec![(4.0, 8.0)],
+                Vec::new(),
+            ],
+            &[Some(vec![1.0, 5.0, 7.0])],
+        )
+        .expect("single-net alignment stays separated");
+
+        let aligned = aligned[0].as_ref().unwrap();
+        assert_eq!(transitions, 2);
+        assert_eq!(aligned[0], aligned[1]);
+        assert_eq!(aligned[1], aligned[2]);
+        assert!(aligned[0] > 4.0 && aligned[0] < 8.0);
+    }
+
+    #[test]
+    fn staircase_alignment_preserves_paths_without_a_shared_free_span() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 0,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 1,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+            ],
+            edges: vec![Edge {
+                id: 0,
+                source: Endpoint { node: 0, port: 0 },
+                target: Endpoint { node: 1, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            }],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 3]);
+        let original = vec![1.0, 5.0];
+        let (aligned, transitions) = align_crossing_path_staircases_for_test(
+            &plan,
+            &[Some((0, 3))],
+            &[Vec::new(), vec![(0.0, 2.0)], vec![(4.0, 6.0)], Vec::new()],
+            &[Some(original.clone())],
+        )
+        .expect("unaligned single-net path stays separated");
+
+        assert_eq!(transitions, 0);
+        assert_eq!(aligned[0], Some(original));
+    }
+
+    #[test]
+    fn staircase_alignment_propagates_long_backbone_to_unequal_rank_sink_prefix() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 0,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 1,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 2,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+            ],
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 1, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 3, 5]);
+        let (aligned, transitions) = align_crossing_path_staircases_for_test(
+            &plan,
+            &[Some((0, 5)), Some((0, 3))],
+            &[
+                Vec::new(),
+                vec![(0.0, 10.0)],
+                vec![(4.0, 10.0)],
+                vec![(8.0, 10.0)],
+                vec![(0.0, 6.0)],
+                Vec::new(),
+            ],
+            &[Some(vec![1.0, 5.0, 9.0, 3.0]), Some(vec![1.0, 5.0])],
+        )
+        .expect("shared net has no unrelated track collision");
+
+        let long = aligned[0].as_ref().unwrap();
+        let short = aligned[1].as_ref().unwrap();
+        assert_eq!(transitions, 2);
+        assert_eq!(short, &long[..short.len()]);
+        assert_eq!(long[0], long[1]);
+        assert_eq!(long[1], long[2]);
+        assert!(long[0] > 8.0 && long[0] < 10.0);
+    }
+
+    #[test]
+    fn staircase_alignment_rejects_narrow_multi_net_track_collision_before_emission() {
+        let nodes = (0..8)
+            .map(|id| Node {
+                id,
+                width: 20.0,
+                height: 20.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: if id < 4 {
+                        PortSide::East
+                    } else {
+                        PortSide::West
+                    },
+                    offset: 10.0,
+                }],
+            })
+            .collect();
+        let edges = (0..4)
+            .map(|net| Edge {
+                id: net,
+                source: Endpoint { node: net, port: 0 },
+                target: Endpoint {
+                    node: net + 4,
+                    port: 0,
+                },
+                net,
+                participates_in_ranking: true,
+            })
+            .collect();
+        let graph = Graph { nodes, edges };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 0, 0, 0, 3, 3, 3, 3]);
+        let candidate = align_crossing_path_staircases_for_test(
+            &plan,
+            &[Some((0, 3)); 4],
+            &[
+                Vec::new(),
+                vec![(0.0, 0.000_001)],
+                vec![(0.0, 0.000_001)],
+                Vec::new(),
+            ],
+            &[
+                Some(vec![0.000_000_40, 0.000_000_50]),
+                Some(vec![0.000_000_45, 0.000_000_55]),
+                Some(vec![0.000_000_50, 0.000_000_60]),
+                Some(vec![0.000_000_55, 0.000_000_65]),
+            ],
+        );
+
+        assert!(candidate.is_none());
+    }
+
+    fn two_sparse_net_graph() -> Graph {
+        Graph {
+            nodes: (0..4)
+                .map(|id| Node {
+                    id,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: if id < 2 {
+                            PortSide::East
+                        } else {
+                            PortSide::West
+                        },
+                        offset: 10.0,
+                    }],
+                })
+                .collect(),
+            edges: (0..2)
+                .map(|net| Edge {
+                    id: net,
+                    source: Endpoint { node: net, port: 0 },
+                    target: Endpoint {
+                        node: net + 2,
+                        port: 0,
+                    },
+                    net,
+                    participates_in_ranking: true,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn staircase_alignment_rejects_adjacent_rank_lane_reversal_contact() {
+        let graph = two_sparse_net_graph();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 0, 3, 3]);
+        let gap_lanes = [
+            BTreeMap::from([(0, 0), (1, 1)]),
+            BTreeMap::from([(0, 1), (1, 0)]),
+            BTreeMap::from([(0, 0), (1, 1)]),
+        ];
+
+        assert!(crossing_paths_have_unrelated_collinear_tracks(
+            &plan,
+            &[Some((0, 3)); 2],
+            &[Some(vec![5.0, 6.0]), Some(vec![7.0, 5.0])],
+            &[0.0, 100.0, 200.0, 300.0],
+            &[20.0, 120.0, 220.0, 320.0],
+            &gap_lanes,
+            LayoutOptions::default(),
+            GapTrackSpacing::Compact,
+        ));
+    }
+
+    #[test]
+    fn staircase_alignment_treats_signed_zero_tracks_as_collinear() {
+        let graph = two_sparse_net_graph();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 0, 3, 3]);
+        let gap_lanes = [
+            BTreeMap::from([(0, 0), (1, 1)]),
+            BTreeMap::from([(0, 0), (1, 1)]),
+            BTreeMap::from([(0, 0), (1, 1)]),
+        ];
+
+        assert!(crossing_paths_have_unrelated_collinear_tracks(
+            &plan,
+            &[Some((0, 3)); 2],
+            &[Some(vec![-0.0, 6.0]), Some(vec![0.0, 7.0])],
+            &[0.0, 100.0, 200.0, 300.0],
+            &[20.0, 120.0, 220.0, 320.0],
+            &gap_lanes,
+            LayoutOptions::default(),
+            GapTrackSpacing::Compact,
+        ));
+    }
+
+    #[test]
+    fn free_interval_lookup_preserves_ordered_boundary_semantics() {
+        let intervals = [(0.0, 1.0), (3.0, 4.0), (10.0, 12.0)];
+        assert_eq!(free_interval_containing(&intervals, 0.0), Some((0.0, 1.0)));
+        assert_eq!(free_interval_containing(&intervals, 1.0), Some((0.0, 1.0)));
+        assert_eq!(free_interval_containing(&intervals, 3.0), Some((3.0, 4.0)));
+        assert_eq!(
+            free_interval_containing(&intervals, 11.0),
+            Some((10.0, 12.0))
+        );
+        assert_eq!(free_interval_containing(&intervals, 2.0), None);
+        assert_eq!(free_interval_containing(&intervals, 13.0), None);
+        assert_eq!(
+            free_interval_containing(&[(0.0, 1.0), (1.0, 2.0)], 1.0),
+            Some((0.0, 1.0))
         );
     }
 
