@@ -254,6 +254,17 @@ pub(crate) struct LayerOrdering {
     pub(crate) crossings: usize,
 }
 
+const MAX_SIFT_LAYER_ITEMS: usize = 256;
+const MAX_SIFT_WORK_LIMIT: usize = 1_000_000;
+const MIN_MAX_SIFT_CROSSINGS_PER_EDGE: usize = 3;
+
+struct SiftAttempt {
+    layers: Vec<Vec<usize>>,
+    crossings: usize,
+    work: usize,
+    exhausted: bool,
+}
+
 struct OptimizedSeed {
     edge_layers: Vec<Vec<usize>>,
     edge_crossings: usize,
@@ -272,6 +283,37 @@ pub(crate) fn order_layer_candidates(
     sweeps: usize,
     include_alternative: bool,
 ) -> (LayerOrdering, LayerOrdering, Option<LayerOrdering>) {
+    let (forward, reverse, alternative, _) =
+        order_layer_candidates_inner(graph, ranks, sweeps, include_alternative, false);
+    (forward, reverse, alternative)
+}
+
+pub(crate) fn order_layer_candidates_with_max_sifting(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    sweeps: usize,
+    include_alternative: bool,
+) -> (
+    LayerOrdering,
+    LayerOrdering,
+    Option<LayerOrdering>,
+    Option<LayerOrdering>,
+) {
+    order_layer_candidates_inner(graph, ranks, sweeps, include_alternative, true)
+}
+
+fn order_layer_candidates_inner(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    sweeps: usize,
+    include_alternative: bool,
+    max_sifting: bool,
+) -> (
+    LayerOrdering,
+    LayerOrdering,
+    Option<LayerOrdering>,
+    Option<LayerOrdering>,
+) {
     let real_count = graph.nodes.len();
     let alternative = include_alternative
         .then(|| alternative_ordering_candidate(graph))
@@ -304,28 +346,184 @@ pub(crate) fn order_layer_candidates(
             edge_crossings: median.edge_crossings,
         }
     });
-    let strip_virtual = |mut layers: Vec<Vec<usize>>| {
+    let max_sifted = max_sifting
+        .then(|| {
+            let (seed_layers, seed_crossings) = if reverse.edge_crossings < forward.edge_crossings {
+                (&reverse.edge_layers, reverse.edge_crossings)
+            } else {
+                (&forward.edge_layers, forward.edge_crossings)
+            };
+            max_sift_ordering_candidate(graph, &ordering, seed_layers, seed_crossings)
+        })
+        .flatten();
+    let strip_virtual = |mut layers: Vec<Vec<usize>>, crossings| {
         for layer in &mut layers {
             layer.retain(|&item| item < real_count);
         }
-        layers
+        LayerOrdering { layers, crossings }
     };
     (
-        LayerOrdering {
-            layers: strip_virtual(forward.edge_layers),
-            crossings: forward.edge_crossings,
-        },
-        LayerOrdering {
-            layers: strip_virtual(reverse.edge_layers),
-            crossings: reverse.edge_crossings,
-        },
+        strip_virtual(forward.edge_layers, forward.edge_crossings),
+        strip_virtual(reverse.edge_layers, reverse.edge_crossings),
         forward
             .alternative
             .or(reverse_median)
-            .map(|ordering| LayerOrdering {
-                layers: strip_virtual(ordering.layers),
-                crossings: ordering.crossings,
-            }),
+            .map(|ordering| strip_virtual(ordering.layers, ordering.crossings)),
+        max_sifted.map(|(layers, crossings)| strip_virtual(layers, crossings)),
+    )
+}
+
+fn max_sift_ordering_candidate(
+    graph: &IndexedGraph<'_>,
+    ordering: &OrderingGraph,
+    seed_layers: &[Vec<usize>],
+    seed_crossings: usize,
+) -> Option<(Vec<Vec<usize>>, usize)> {
+    let ranking_edge_count = graph
+        .rank_edges
+        .iter()
+        .filter(|&&participates| participates)
+        .count();
+    if !max_sift_seed_is_admitted(seed_crossings, ranking_edge_count, seed_layers) {
+        return None;
+    }
+    let attempt = sift_ordering(ordering, seed_layers, seed_crossings, MAX_SIFT_WORK_LIMIT);
+    debug_assert!(attempt.work <= MAX_SIFT_WORK_LIMIT);
+    let minimum_gain = seed_crossings.div_ceil(100);
+    if attempt.exhausted || seed_crossings.saturating_sub(attempt.crossings) < minimum_gain {
+        return None;
+    }
+    let real_order_changed = seed_layers
+        .iter()
+        .zip(&attempt.layers)
+        .any(|(seed, candidate)| {
+            seed.iter()
+                .filter(|&&item| item < graph.nodes.len())
+                .ne(candidate.iter().filter(|&&item| item < graph.nodes.len()))
+        });
+    real_order_changed.then_some((attempt.layers, attempt.crossings))
+}
+
+fn max_sift_seed_is_admitted(
+    seed_crossings: usize,
+    ranking_edge_count: usize,
+    seed_layers: &[Vec<usize>],
+) -> bool {
+    seed_crossings > 0
+        && seed_crossings >= ranking_edge_count.saturating_mul(MIN_MAX_SIFT_CROSSINGS_PER_EDGE)
+        && seed_layers
+            .iter()
+            .all(|layer| layer.len() <= MAX_SIFT_LAYER_ITEMS)
+}
+
+fn sift_ordering(
+    ordering: &OrderingGraph,
+    seed_layers: &[Vec<usize>],
+    seed_crossings: usize,
+    work_limit: usize,
+) -> SiftAttempt {
+    let mut layers = seed_layers.to_vec();
+    let mut positions = vec![0usize; ordering.stable_keys.len()];
+    refresh_positions(&layers, &mut positions);
+    let mut work = 0usize;
+    let mut exhausted = false;
+
+    'layers: for layer in &mut layers {
+        if layer.len() < 2 || layer.len() > MAX_SIFT_LAYER_ITEMS {
+            continue;
+        }
+        let items = layer.clone();
+        for item in items {
+            let current = positions[item];
+            let mut best_position = current;
+            let mut best_gain = 0isize;
+            let mut gain = 0isize;
+
+            for (candidate, &neighbor) in layer.iter().enumerate().take(current).rev() {
+                if !charge_pair_work(ordering, neighbor, item, &mut work, work_limit) {
+                    exhausted = true;
+                    break 'layers;
+                }
+                gain += pair_item_crossing_gain(ordering, neighbor, item, &positions);
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_position = candidate;
+                }
+            }
+
+            gain = 0;
+            for (candidate, &neighbor) in layer.iter().enumerate().skip(current + 1) {
+                if !charge_pair_work(ordering, item, neighbor, &mut work, work_limit) {
+                    exhausted = true;
+                    break 'layers;
+                }
+                gain += pair_item_crossing_gain(ordering, item, neighbor, &positions);
+                if gain > best_gain {
+                    best_gain = gain;
+                    best_position = candidate;
+                }
+            }
+
+            if best_position != current {
+                let moved = layer.remove(current);
+                layer.insert(best_position, moved);
+                refresh_layer(layer, &mut positions);
+            }
+        }
+    }
+
+    let crossings = if exhausted {
+        seed_crossings
+    } else {
+        crossing_score(&layers, ordering, &mut positions, CrossingScore::Edge)
+    };
+    SiftAttempt {
+        layers,
+        crossings,
+        work,
+        exhausted,
+    }
+}
+
+fn charge_pair_work(
+    ordering: &OrderingGraph,
+    left: usize,
+    right: usize,
+    work: &mut usize,
+    work_limit: usize,
+) -> bool {
+    let pair_work = 1usize
+        .saturating_add(
+            ordering.incoming[left]
+                .len()
+                .saturating_mul(ordering.incoming[right].len()),
+        )
+        .saturating_add(
+            ordering.outgoing[left]
+                .len()
+                .saturating_mul(ordering.outgoing[right].len()),
+        );
+    if pair_work > work_limit.saturating_sub(*work) {
+        return false;
+    }
+    *work += pair_work;
+    true
+}
+
+fn pair_item_crossing_gain(
+    ordering: &OrderingGraph,
+    left: usize,
+    right: usize,
+    positions: &[usize],
+) -> isize {
+    pair_crossing_gain(
+        &ordering.incoming[left],
+        &ordering.incoming[right],
+        positions,
+    ) + pair_crossing_gain(
+        &ordering.outgoing[left],
+        &ordering.outgoing[right],
+        positions,
     )
 }
 
@@ -851,11 +1049,33 @@ mod tests {
     };
 
     use super::{
-        AlternativeOrdering, NeighborMeasure, accept_latest_rank_candidate,
+        AlternativeOrdering, NeighborMeasure, OrderingGraph, accept_latest_rank_candidate,
         alternative_ordering_candidate, assign_ranks, crossing_count, expanded_ordering_graph,
-        median, net_representative_crossing_count, optimize_ordering_seed, order_layers,
-        rank_candidates,
+        max_sift_seed_is_admitted, median, net_representative_crossing_count,
+        optimize_ordering_seed, order_layers, rank_candidates, refresh_positions, sift_ordering,
+        transpose_layers,
     };
+
+    fn insertion_plateau_ordering() -> OrderingGraph {
+        let mut outgoing = vec![Vec::new(); 8];
+        outgoing[0] = vec![6];
+        outgoing[1] = vec![4, 6, 7];
+        outgoing[2] = vec![7];
+        outgoing[3] = vec![7];
+        let mut incoming = vec![Vec::new(); 8];
+        for (source, targets) in outgoing.iter().enumerate() {
+            for &target in targets {
+                incoming[target].push(source);
+            }
+        }
+        OrderingGraph {
+            layers: vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]],
+            incoming,
+            outgoing,
+            outgoing_arcs: None,
+            stable_keys: (0..8).map(|item| (0, item, 0)).collect(),
+        }
+    }
 
     fn node(id: u32) -> Node {
         Node {
@@ -876,6 +1096,65 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn max_sifting_escapes_an_adjacent_transposition_plateau() {
+        let ordering = insertion_plateau_ordering();
+        let mut transposed = ordering.layers.clone();
+        let mut positions = vec![0; ordering.stable_keys.len()];
+        refresh_positions(&transposed, &mut positions);
+        transpose_layers(
+            &mut transposed,
+            &ordering.incoming,
+            &ordering.outgoing,
+            &mut positions,
+        );
+        assert_eq!(transposed, ordering.layers);
+
+        let attempt = sift_ordering(&ordering, &ordering.layers, 1, usize::MAX);
+        assert_eq!(attempt.crossings, 0);
+        assert_ne!(attempt.layers, ordering.layers);
+        assert!(!attempt.exhausted);
+    }
+
+    #[test]
+    fn max_sifting_keeps_stable_order_on_exact_ties() {
+        let ordering = OrderingGraph {
+            layers: vec![vec![0, 1, 2, 3]],
+            incoming: vec![Vec::new(); 4],
+            outgoing: vec![Vec::new(); 4],
+            outgoing_arcs: None,
+            stable_keys: (0..4).map(|item| (0, item, 0)).collect(),
+        };
+
+        let attempt = sift_ordering(&ordering, &ordering.layers, 0, usize::MAX);
+        assert_eq!(attempt.layers, ordering.layers);
+        assert_eq!(attempt.crossings, 0);
+        assert_eq!(attempt.work, 12);
+        assert!(!attempt.exhausted);
+    }
+
+    #[test]
+    fn max_sifting_stops_before_crossing_its_aggregate_work_cap() {
+        let ordering = insertion_plateau_ordering();
+        let attempt = sift_ordering(&ordering, &ordering.layers, 1, 4);
+
+        assert_eq!(attempt.work, 4);
+        assert!(attempt.exhausted);
+        assert_eq!(attempt.layers, ordering.layers);
+        assert_eq!(attempt.crossings, 1);
+    }
+
+    #[test]
+    fn max_sifting_admission_enforces_density_and_expanded_layer_bounds() {
+        let boundary_layers = vec![vec![0; super::MAX_SIFT_LAYER_ITEMS]];
+        assert!(max_sift_seed_is_admitted(30, 10, &boundary_layers));
+        assert!(!max_sift_seed_is_admitted(29, 10, &boundary_layers));
+        assert!(!max_sift_seed_is_admitted(0, 0, &boundary_layers));
+
+        let oversized_layers = vec![vec![0; super::MAX_SIFT_LAYER_ITEMS + 1]];
+        assert!(!max_sift_seed_is_admitted(30, 10, &oversized_layers));
     }
 
     #[test]
