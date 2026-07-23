@@ -8,6 +8,8 @@ export type LayoutPreset = Pick<
   | 'route_lane_gap'
   | 'minimum_parallel_wire_spacing'
   | 'edge_node_clearance'
+  | 'max_quality_area_factor'
+  | 'max_quality_route_length_factor'
   | 'ordering_sweeps'
   | 'quality_effort'
 >
@@ -20,6 +22,8 @@ export const layoutPresets = {
     route_lane_gap: 3,
     minimum_parallel_wire_spacing: 0,
     edge_node_clearance: 0,
+    max_quality_area_factor: 1.2,
+    max_quality_route_length_factor: 1.1,
     ordering_sweeps: 2,
     quality_effort: 'quality',
   },
@@ -30,6 +34,8 @@ export const layoutPresets = {
     route_lane_gap: 4,
     minimum_parallel_wire_spacing: 0,
     edge_node_clearance: 0,
+    max_quality_area_factor: 1.2,
+    max_quality_route_length_factor: 1.1,
     ordering_sweeps: 4,
     quality_effort: 'quality',
   },
@@ -40,6 +46,8 @@ export const layoutPresets = {
     route_lane_gap: 6,
     minimum_parallel_wire_spacing: 0,
     edge_node_clearance: 20,
+    max_quality_area_factor: 1.2,
+    max_quality_route_length_factor: 1.1,
     ordering_sweeps: 4,
     quality_effort: 'quality',
   },
@@ -50,6 +58,8 @@ export const layoutPresets = {
     route_lane_gap: 8,
     minimum_parallel_wire_spacing: 0,
     edge_node_clearance: 20,
+    max_quality_area_factor: 1.2,
+    max_quality_route_length_factor: 1.1,
     ordering_sweeps: 8,
     quality_effort: 'max',
   },
@@ -60,6 +70,8 @@ export const layoutPresets = {
     route_lane_gap: 6,
     minimum_parallel_wire_spacing: 0,
     edge_node_clearance: 20,
+    max_quality_area_factor: 2,
+    max_quality_route_length_factor: 1.25,
     ordering_sweeps: 4,
     quality_effort: 'max',
   },
