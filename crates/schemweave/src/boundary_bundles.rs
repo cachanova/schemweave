@@ -54,7 +54,7 @@ pub(crate) fn apply_and_normalize(
     let pitch = options
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
-    let rail_depth = crate::outward_obstacle_clearance_stub(options) + options.route_lane_gap;
+    let rail_depth = crate::boundary_bundle_rail_depth(options);
     let mut geometries = Vec::with_capacity(graph.boundary_bundles.len());
     for bundle in &graph.boundary_bundles {
         let geometry = build_geometry(

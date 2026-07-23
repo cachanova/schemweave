@@ -1460,6 +1460,19 @@ pub(crate) fn outward_obstacle_clearance_stub(options: LayoutOptions) -> f64 {
     options.port_stub.max(options.edge_node_clearance)
 }
 
+/// Horizontal depth of a graphical boundary-bundle spine.
+///
+/// Positive-clearance sparse channels begin immediately beyond the clearance envelope. Extending
+/// the spine by the endpoint stub or another lane pitch can therefore intrude into the first legal
+/// channel. Zero-clearance layouts retain the original visible stub plus one lane gap.
+pub(crate) fn boundary_bundle_rail_depth(options: LayoutOptions) -> f64 {
+    if options.edge_node_clearance > 0.0 {
+        options.edge_node_clearance
+    } else {
+        options.port_stub + options.route_lane_gap
+    }
+}
+
 fn candidate_satisfies_hard_geometry_contract(
     indexed: &validation::IndexedGraph<'_>,
     candidate: &Layout,
@@ -1595,15 +1608,15 @@ mod tests {
         AdmittedCandidate, BoundaryBundleConstraint, BoundaryBundleMemberConstraint,
         CandidateAdmissionState, CandidateRouting, Edge, EdgeGeometry, EdgeId, Endpoint, Graph,
         Layout, LayoutConstraints, LayoutError, LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
-        Node, NodeGeometry, Point, Port, PortSide, QualityEffort, candidate_quality_cmp,
-        candidate_satisfies_edge_node_clearance_bounded, composite_pitched_quality_is_admissible,
-        demand_aware_quality_is_better, demand_aware_scale_is_eligible, effective_layout_options,
-        effective_ranking_edges, evaluate_candidate, full_family_pitched_spacing_enabled,
-        hard_geometry_failure, layout, outward_obstacle_clearance_stub, placement,
-        retain_better_admitted_candidate, retain_better_candidate, retain_owned_candidate,
-        retain_owned_candidate_unchecked, routing, routing::RouteQuality,
-        straight_chain_cost_is_bounded, straight_chain_large_gain_is_significant, topology,
-        validation,
+        Node, NodeGeometry, Point, Port, PortSide, QualityEffort, boundary_bundle_rail_depth,
+        candidate_quality_cmp, candidate_satisfies_edge_node_clearance_bounded,
+        composite_pitched_quality_is_admissible, demand_aware_quality_is_better,
+        demand_aware_scale_is_eligible, effective_layout_options, effective_ranking_edges,
+        evaluate_candidate, full_family_pitched_spacing_enabled, hard_geometry_failure, layout,
+        outward_obstacle_clearance_stub, placement, retain_better_admitted_candidate,
+        retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
+        routing::RouteQuality, straight_chain_cost_is_bounded,
+        straight_chain_large_gain_is_significant, topology, validation,
     };
 
     mod active_fanout_fixture {
@@ -1672,6 +1685,19 @@ mod tests {
     fn effective_spacing_options_are_canonical_idempotent_and_zero_identity() {
         let defaults = LayoutOptions::default();
         assert_eq!(effective_layout_options(defaults), defaults);
+        assert_eq!(
+            boundary_bundle_rail_depth(defaults),
+            defaults.port_stub + defaults.route_lane_gap
+        );
+        for clearance in [f64::EPSILON, 1.0, 9.0, 10.0, 11.0, 29.0, 30.0, 31.0] {
+            assert_eq!(
+                boundary_bundle_rail_depth(LayoutOptions {
+                    edge_node_clearance: clearance,
+                    ..defaults
+                }),
+                clearance
+            );
+        }
 
         let requested = LayoutOptions {
             edge_node_clearance: 40.0,

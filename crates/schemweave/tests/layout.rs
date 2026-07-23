@@ -1646,6 +1646,199 @@ fn output_boundary_bundle_routes_members_horizontally_into_unique_taps() {
 }
 
 #[test]
+fn positive_clearance_bundle_spine_stays_before_the_first_unrelated_gap_channel() {
+    let input = |id| Node {
+        id,
+        width: 40.0,
+        height: 30.0,
+        cycle_breaker: false,
+        ports: vec![Port {
+            id: 0,
+            side: PortSide::East,
+            offset: 15.0,
+        }],
+    };
+    let graph = Graph {
+        nodes: vec![
+            input(1),
+            input(2),
+            input(3),
+            Node {
+                id: 4,
+                width: 40.0,
+                height: 60.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::West,
+                        offset: 30.0,
+                    },
+                    Port {
+                        id: 2,
+                        side: PortSide::West,
+                        offset: 50.0,
+                    },
+                ],
+            },
+        ],
+        edges: vec![
+            Edge {
+                id: 0,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 4, port: 2 },
+                net: 0,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 1,
+                source: Endpoint { node: 2, port: 0 },
+                target: Endpoint { node: 4, port: 0 },
+                net: 1,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 2,
+                source: Endpoint { node: 3, port: 0 },
+                target: Endpoint { node: 4, port: 1 },
+                net: 2,
+                participates_in_ranking: true,
+            },
+        ],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1, 2, 3],
+        outputs: vec![4],
+        boundary_bundles: vec![BoundaryBundleConstraint {
+            id: 0,
+            endpoint: Endpoint { node: 2, port: 0 },
+            width: 8,
+            members: vec![BoundaryBundleMemberConstraint {
+                edge: 1,
+                slots: (0..8).collect(),
+            }],
+        }],
+    };
+    let config = LayoutConfig {
+        constraints: constraints.clone(),
+        ..LayoutConfig::highest_quality()
+    };
+    let defaults = LayoutOptions::default();
+    for clearance in [
+        1.0,
+        defaults.port_stub - 1.0,
+        defaults.port_stub,
+        defaults.port_stub + 1.0,
+    ] {
+        let mut boundary_config = LayoutConfig::highest_quality();
+        boundary_config.layout.edge_node_clearance = clearance;
+        boundary_config.constraints = constraints.clone();
+        let boundary_result = layout_with_config(&graph, &boundary_config)
+            .unwrap_or_else(|error| panic!("clearance {clearance}: {error:?}"));
+        let boundary_bundle = &boundary_result.boundary_bundles[0];
+        assert_eq!(
+            boundary_bundle.spine.end.x - boundary_bundle.spine.start.x,
+            clearance
+        );
+        let unrelated = boundary_result
+            .edges
+            .iter()
+            .find(|route| route.id == 0)
+            .unwrap();
+        let crossing_channel = unrelated
+            .points
+            .windows(2)
+            .find(|pair| {
+                pair[0].x == pair[1].x
+                    && pair[0].y.min(pair[1].y) <= boundary_bundle.spine.start.y
+                    && pair[0].y.max(pair[1].y) >= boundary_bundle.spine.start.y
+            })
+            .unwrap();
+        assert!(crossing_channel[0].x > boundary_bundle.spine.end.x);
+        assert_edge_node_clearance(&graph, &boundary_result, clearance);
+    }
+
+    let result = layout_with_config(&graph, &config).unwrap();
+    let bundle = &result.boundary_bundles[0];
+    assert_eq!(
+        bundle.spine.end.x - bundle.spine.start.x,
+        config.layout.edge_node_clearance
+    );
+    let unrelated = result.edges.iter().find(|route| route.id == 0).unwrap();
+    let crossing_channel = unrelated
+        .points
+        .windows(2)
+        .find(|pair| {
+            pair[0].x == pair[1].x
+                && pair[0].y.min(pair[1].y) <= bundle.spine.start.y
+                && pair[0].y.max(pair[1].y) >= bundle.spine.start.y
+        })
+        .unwrap();
+    assert!(crossing_channel[0].x > bundle.spine.end.x);
+    assert_edge_node_clearance(&graph, &result, config.layout.edge_node_clearance);
+
+    let input_x = result
+        .nodes
+        .iter()
+        .filter(|node| constraints.inputs.contains(&node.id))
+        .map(|node| node.x)
+        .collect::<Vec<_>>();
+    assert!(input_x.windows(2).all(|pair| pair[0] == pair[1]));
+    let output = result.nodes.iter().find(|node| node.id == 4).unwrap();
+    assert!(
+        result
+            .nodes
+            .iter()
+            .filter(|node| constraints.inputs.contains(&node.id))
+            .all(|node| node.x + node.width < output.x)
+    );
+
+    let zero_clearance = layout_with_config(
+        &graph,
+        &LayoutConfig {
+            constraints: constraints.clone(),
+            ..LayoutConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        zero_clearance.boundary_bundles[0].spine.end.x
+            - zero_clearance.boundary_bundles[0].spine.start.x,
+        LayoutOptions::default().port_stub + LayoutOptions::default().route_lane_gap
+    );
+
+    let mut permuted_graph = graph.clone();
+    permuted_graph.nodes.reverse();
+    permuted_graph.edges.reverse();
+    for node in &mut permuted_graph.nodes {
+        node.ports.reverse();
+    }
+    let mut permuted_constraints = constraints;
+    permuted_constraints.inputs.reverse();
+    permuted_constraints.boundary_bundles.reverse();
+    permuted_constraints.boundary_bundles[0].members.reverse();
+    permuted_constraints.boundary_bundles[0].members[0]
+        .slots
+        .reverse();
+    assert_eq!(
+        result,
+        layout_with_config(
+            &permuted_graph,
+            &LayoutConfig {
+                constraints: permuted_constraints,
+                ..LayoutConfig::highest_quality()
+            },
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn wide_live_shape_bundles_reserve_distinct_boundary_corridors() {
     let mut nodes = vec![node(1, false), node(2, false), node(3, false)];
     nodes.extend((0..32).map(|slot| node(100 + slot, false)));
