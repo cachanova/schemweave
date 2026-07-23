@@ -12,6 +12,21 @@ use crate::{
 };
 
 const MAX_SPARSE_NET_EDGES: usize = 300;
+const MIN_REGIONAL_FANOUT_EDGES: usize = MAX_SPARSE_NET_EDGES + 1;
+const MAX_REGIONAL_FANOUT_EDGES: usize = 512;
+const MAX_REGIONAL_FANOUT_NODES: usize = 1_000;
+const MAX_REGIONAL_FANOUT_GRAPH_EDGES: usize = 2_000;
+const MAX_REGIONAL_FANOUT_ROUTE_POINTS: usize = 100_000;
+const MAX_REGIONAL_FANOUT_ORDINATES: usize = 32_768;
+const MAX_REGIONAL_FANOUT_ARM_RELATIONS: usize = 500_000;
+const MAX_REGIONAL_FANOUT_SCORE_VISITS: usize = 20_000_000;
+const MAX_REGIONAL_FANOUT_SAFETY_VISITS: usize = 10_000_000;
+const REGIONAL_FANOUT_EDGES_PER_TRUNK: usize = 128;
+const MAX_REGIONAL_FANOUT_TRUNKS: usize = 4;
+const MIN_REGIONAL_FANOUT_CROSSING_GAIN: usize = 32;
+const MIN_REGIONAL_FANOUT_CROSSING_GAIN_DENOMINATOR: usize = 10;
+const MAX_REGIONAL_FANOUT_BEND_FACTOR: f64 = 1.10;
+const MAX_REGIONAL_FANOUT_LENGTH_FACTOR: f64 = 1.05;
 const CROSSING_TRACK_NUDGE: f64 = 1e-4;
 const CROSSING_ALIGNMENT_WEIGHT: f64 = 4.0;
 const MIN_ROUTE_SEGMENT: f64 = 1e-7;
@@ -2990,6 +3005,624 @@ fn route_quality_profile_for_plan(
     )
 }
 
+pub(crate) fn regional_fanout_candidate(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline: &[EdgeGeometry],
+    baseline_quality: RouteQuality,
+    options: LayoutOptions,
+) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
+    if nodes.len() > MAX_REGIONAL_FANOUT_NODES
+        || plan.edges.len() > MAX_REGIONAL_FANOUT_GRAPH_EDGES
+        || baseline.len() != plan.edges.len()
+        || !sum_within_limit(
+            baseline.iter().map(|route| route.points.len()),
+            MAX_REGIONAL_FANOUT_ROUTE_POINTS,
+        )
+    {
+        return None;
+    }
+    let eligible = regional_fanout_edges(plan, nodes);
+    if eligible.is_empty() {
+        return None;
+    }
+    let baseline_segments =
+        physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), baseline).0;
+    let baseline_congestion = parallel_congestion_ratio(&baseline_segments)?;
+    let free_by_rank = free_intervals_by_rank(plan, nodes);
+    let minimum_crossing_gain = MIN_REGIONAL_FANOUT_CROSSING_GAIN.max(
+        baseline_quality
+            .crossings
+            .div_ceil(MIN_REGIONAL_FANOUT_CROSSING_GAIN_DENOMINATOR),
+    );
+    let candidate = build_regional_fanout_candidate(
+        plan,
+        nodes,
+        baseline,
+        &baseline_segments,
+        &free_by_rank,
+        &eligible,
+        options,
+    )?;
+    let (quality, segments) = route_quality_profile_for_plan(plan, &candidate);
+    if !regional_fanout_candidate_is_safe(plan, nodes, &candidate, &segments, &eligible) {
+        return None;
+    }
+    let congestion = parallel_congestion_ratio(&segments)?;
+    if regional_fanout_quality_is_better(
+        baseline_quality,
+        baseline_congestion,
+        quality,
+        congestion,
+        minimum_crossing_gain,
+    ) {
+        Some((quality, candidate))
+    } else {
+        None
+    }
+}
+
+fn regional_fanout_quality_is_better(
+    baseline: RouteQuality,
+    baseline_congestion: f64,
+    candidate: RouteQuality,
+    candidate_congestion: f64,
+    minimum_crossing_gain: usize,
+) -> bool {
+    baseline.crossings.saturating_sub(candidate.crossings) >= minimum_crossing_gain
+        && candidate.bends as f64 <= baseline.bends as f64 * MAX_REGIONAL_FANOUT_BEND_FACTOR
+        && candidate.route_length <= baseline.route_length * MAX_REGIONAL_FANOUT_LENGTH_FACTOR
+        && candidate_congestion <= baseline_congestion + f64::EPSILON
+}
+
+fn regional_fanout_edges(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+) -> Vec<(NetId, Vec<usize>)> {
+    let mut layer_left = vec![f64::INFINITY; plan.nodes_by_rank.len()];
+    let mut layer_right = vec![f64::NEG_INFINITY; plan.nodes_by_rank.len()];
+    for (node, &rank) in nodes.iter().zip(&plan.ranks) {
+        layer_left[rank] = layer_left[rank].min(node.x);
+        layer_right[rank] = layer_right[rank].max(node.x + node.width);
+    }
+    let mut by_net = BTreeMap::<NetId, Vec<usize>>::new();
+    for (index, resolved) in plan.edges.iter().enumerate() {
+        by_net.entry(resolved.edge.net).or_default().push(index);
+    }
+    by_net
+        .into_iter()
+        .filter_map(|(net, indices)| {
+            if !(MIN_REGIONAL_FANOUT_EDGES..=MAX_REGIONAL_FANOUT_EDGES).contains(&indices.len()) {
+                return None;
+            }
+            let first = plan.edges[*indices.first()?];
+            indices
+                .iter()
+                .all(|&index| {
+                    let resolved = plan.edges[index];
+                    let source_rank = plan.ranks[resolved.source_index];
+                    let target_rank = plan.ranks[resolved.target_index];
+                    resolved.edge.source == first.edge.source
+                        && resolved.source_port.side == PortSide::East
+                        && resolved.target_port.side == PortSide::West
+                        && source_rank < target_rank
+                        && nodes[resolved.source_index].x + nodes[resolved.source_index].width
+                            == layer_right[source_rank]
+                        && nodes[resolved.target_index].x == layer_left[target_rank]
+                })
+                .then_some((net, indices))
+        })
+        .collect()
+}
+
+fn free_intervals_by_rank(plan: &RoutingPlan<'_>, nodes: &[NodeGeometry]) -> Vec<Vec<(f64, f64)>> {
+    let top = nodes.iter().map(|node| node.y).fold(0.0, f64::min);
+    let bottom = nodes
+        .iter()
+        .map(|node| node.y + node.height)
+        .fold(0.0, f64::max);
+    plan.nodes_by_rank
+        .iter()
+        .map(|indices| {
+            let mut layer = indices
+                .iter()
+                .map(|&index| &nodes[index])
+                .collect::<Vec<_>>();
+            layer.sort_by(|left, right| left.y.total_cmp(&right.y).then(left.id.cmp(&right.id)));
+            free_intervals(&layer, top, bottom)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_regional_fanout_candidate(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline: &[EdgeGeometry],
+    baseline_segments: &[PhysicalSegment],
+    free_by_rank: &[Vec<(f64, f64)>],
+    eligible: &[(NetId, Vec<usize>)],
+    options: LayoutOptions,
+) -> Option<Vec<EdgeGeometry>> {
+    let mut candidate = baseline.to_vec();
+    let mut chosen_trunks = Vec::<(NetId, f64, f64, f64)>::new();
+    let mut remaining_score_visits = MAX_REGIONAL_FANOUT_SCORE_VISITS;
+    for &(net, ref unsorted_edges) in eligible {
+        let mut edges = unsorted_edges.clone();
+        edges.sort_unstable_by(|&left, &right| {
+            let left_resolved = plan.edges[left];
+            let right_resolved = plan.edges[right];
+            let left_target = port_point(
+                &nodes[left_resolved.target_index],
+                left_resolved.target_port,
+            );
+            let right_target = port_point(
+                &nodes[right_resolved.target_index],
+                right_resolved.target_port,
+            );
+            left_target
+                .y
+                .total_cmp(&right_target.y)
+                .then(
+                    left_resolved
+                        .edge
+                        .target
+                        .node
+                        .cmp(&right_resolved.edge.target.node),
+                )
+                .then(
+                    left_resolved
+                        .edge
+                        .target
+                        .port
+                        .cmp(&right_resolved.edge.target.port),
+                )
+                .then(left_resolved.edge.id.cmp(&right_resolved.edge.id))
+        });
+        let trunk_count = edges
+            .len()
+            .div_ceil(REGIONAL_FANOUT_EDGES_PER_TRUNK)
+            .min(MAX_REGIONAL_FANOUT_TRUNKS);
+        for trunk in 0..trunk_count {
+            let start = edges.len() * trunk / trunk_count;
+            let end = edges.len() * (trunk + 1) / trunk_count;
+            let group = &edges[start..end];
+            let first = plan.edges[*group.first()?];
+            let source_rank = plan.ranks[first.source_index];
+            let max_target_rank = group
+                .iter()
+                .map(|&index| plan.ranks[plan.edges[index].target_index])
+                .max()?;
+            if max_target_rank <= source_rank + 1 {
+                return None;
+            }
+            let common = common_free_intervals(&free_by_rank[source_rank + 1..max_target_rank]);
+            if common.is_empty() {
+                return None;
+            }
+            let source = port_point(&nodes[first.source_index], first.source_port);
+            let source_stub = stub_point(source, PortSide::East, options.port_stub);
+            let mut target_stubs = Vec::with_capacity(group.len());
+            let mut high_x = source_stub.x;
+            for &index in group {
+                let resolved = plan.edges[index];
+                let target = port_point(&nodes[resolved.target_index], resolved.target_port);
+                let target_stub = stub_point(target, PortSide::West, options.port_stub);
+                target_stubs.push(Point {
+                    x: target_stub.x,
+                    y: target.y,
+                });
+                high_x = high_x.max(target_stub.x);
+            }
+            target_stubs
+                .sort_by(|left, right| left.y.total_cmp(&right.y).then(left.x.total_cmp(&right.x)));
+            let target_ys = target_stubs
+                .iter()
+                .map(|target| target.y)
+                .collect::<Vec<_>>();
+            let preferred_y = target_ys[target_ys.len() / 2];
+            let trunk_y = select_regional_trunk_y(
+                &common,
+                preferred_y,
+                Point {
+                    x: source_stub.x,
+                    y: source.y,
+                },
+                &target_stubs,
+                high_x,
+                net,
+                baseline_segments,
+                &chosen_trunks,
+                &mut remaining_score_visits,
+            )?;
+            chosen_trunks.push((net, trunk_y, source_stub.x, high_x));
+            for &index in group {
+                let resolved = plan.edges[index];
+                let source = port_point(&nodes[resolved.source_index], resolved.source_port);
+                let target = port_point(&nodes[resolved.target_index], resolved.target_port);
+                let source_stub = stub_point(source, PortSide::East, options.port_stub);
+                let target_stub = stub_point(target, PortSide::West, options.port_stub);
+                let mut points = Vec::with_capacity(6);
+                push_point(&mut points, source);
+                push_point(&mut points, source_stub);
+                push_point(
+                    &mut points,
+                    Point {
+                        x: source_stub.x,
+                        y: trunk_y,
+                    },
+                );
+                push_point(
+                    &mut points,
+                    Point {
+                        x: target_stub.x,
+                        y: trunk_y,
+                    },
+                );
+                push_point(&mut points, target_stub);
+                push_point(&mut points, target);
+                candidate[index] = EdgeGeometry {
+                    id: resolved.edge.id,
+                    points,
+                };
+            }
+        }
+    }
+    Some(candidate)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_regional_trunk_y(
+    intervals: &[(f64, f64)],
+    preferred_y: f64,
+    source_stub: Point,
+    target_stubs: &[Point],
+    high_x: f64,
+    net: NetId,
+    baseline_segments: &[PhysicalSegment],
+    chosen_trunks: &[(NetId, f64, f64, f64)],
+    remaining_score_visits: &mut usize,
+) -> Option<f64> {
+    const CLEARANCE: f64 = 1e-3;
+    let low_x = source_stub.x;
+    let overlaps_span = |start: f64, end: f64| start < high_x && end > low_x;
+    let mut arms = Vec::with_capacity(target_stubs.len() + 1);
+    arms.push(source_stub);
+    arms.extend_from_slice(target_stubs);
+    charge_regional_work(
+        remaining_score_visits,
+        baseline_segments.len().checked_mul(arms.len())?,
+    )?;
+    let mut arm_crossings = vec![Vec::<f64>::new(); arms.len()];
+    let mut arm_parallel = vec![Vec::<(f64, f64)>::new(); arms.len()];
+    let mut arm_relations = 0usize;
+    for segment in baseline_segments {
+        if segment.net == net {
+            continue;
+        }
+        for (index, arm) in arms.iter().enumerate() {
+            if segment.horizontal {
+                if segment.start < arm.x && arm.x < segment.end {
+                    charge_regional_relation(&mut arm_relations)?;
+                    arm_crossings[index].push(segment.fixed);
+                }
+            } else if (segment.fixed - arm.x).abs() < PARALLEL_CONGESTION_CUTOFF {
+                charge_regional_relation(&mut arm_relations)?;
+                arm_parallel[index].push((segment.start, segment.end));
+            }
+        }
+    }
+    for crossings in &mut arm_crossings {
+        crossings.sort_by(f64::total_cmp);
+    }
+    let mut candidates = Vec::new();
+    charge_regional_work(
+        remaining_score_visits,
+        intervals
+            .len()
+            .checked_mul(baseline_segments.len())?
+            .checked_mul(6)?,
+    )?;
+    for &(low, high) in intervals {
+        let low = low + CLEARANCE;
+        let high = high - CLEARANCE;
+        if low > high {
+            continue;
+        }
+        let mut blockers = vec![low, high];
+        for y in [low, high, preferred_y.clamp(low, high), (low + high) / 2.0] {
+            push_regional_ordinate(&mut candidates, y)?;
+        }
+        for segment in baseline_segments {
+            if segment.net == net || !overlaps_span(segment.start, segment.end) {
+                continue;
+            }
+            if segment.horizontal {
+                if (low..=high).contains(&segment.fixed) {
+                    blockers.push(segment.fixed);
+                }
+                for y in [
+                    segment.fixed - CLEARANCE,
+                    segment.fixed + CLEARANCE,
+                    segment.fixed - PARALLEL_CONGESTION_CUTOFF,
+                    segment.fixed + PARALLEL_CONGESTION_CUTOFF,
+                ] {
+                    if (low..=high).contains(&y) {
+                        push_regional_ordinate(&mut candidates, y)?;
+                    }
+                }
+            } else {
+                for y in [segment.start, segment.end] {
+                    for candidate in [y - CLEARANCE, y + CLEARANCE] {
+                        if (low..=high).contains(&candidate) {
+                            push_regional_ordinate(&mut candidates, candidate)?;
+                        }
+                    }
+                }
+            }
+        }
+        for &(trunk_net, y, start, end) in chosen_trunks {
+            if trunk_net != net && overlaps_span(start, end) && (low..=high).contains(&y) {
+                blockers.push(y);
+            }
+        }
+        blockers.sort_by(f64::total_cmp);
+        blockers.dedup_by(|left, right| left.total_cmp(right).is_eq());
+        for window in blockers.windows(2) {
+            push_regional_ordinate(&mut candidates, (window[0] + window[1]) / 2.0)?;
+        }
+        for arm in &arms {
+            if (low..=high).contains(&arm.y) {
+                push_regional_ordinate(&mut candidates, arm.y)?;
+            }
+        }
+    }
+    candidates.sort_by(f64::total_cmp);
+    candidates.dedup_by(|left, right| left.total_cmp(right).is_eq());
+    let arm_parallel_ranges = arm_parallel
+        .iter()
+        .map(Vec::len)
+        .try_fold(0usize, |total, count| total.checked_add(count))?;
+    let visits_per_candidate = baseline_segments
+        .len()
+        .checked_add(arms.len())?
+        .checked_add(arm_parallel_ranges)?
+        .checked_add(chosen_trunks.len())?;
+    charge_regional_work(
+        remaining_score_visits,
+        candidates.len().checked_mul(visits_per_candidate)?,
+    )?;
+    let mut scored = Vec::with_capacity(candidates.len());
+    for ordinate in candidates {
+        let score = regional_trunk_score(
+            ordinate,
+            preferred_y,
+            &arms,
+            &arm_crossings,
+            &arm_parallel,
+            low_x,
+            high_x,
+            net,
+            baseline_segments,
+            chosen_trunks,
+        );
+        scored.push((ordinate, score));
+    }
+    scored
+        .into_iter()
+        .min_by(|(left, left_score), (right, right_score)| {
+            left_score
+                .1
+                .total_cmp(&right_score.1)
+                .then(left_score.0.cmp(&right_score.0))
+                .then(left_score.2.total_cmp(&right_score.2))
+                .then(left.total_cmp(right))
+        })
+        .map(|(ordinate, _)| ordinate)
+}
+
+fn push_regional_ordinate(candidates: &mut Vec<f64>, ordinate: f64) -> Option<()> {
+    if candidates.len() >= MAX_REGIONAL_FANOUT_ORDINATES {
+        return None;
+    }
+    candidates.push(ordinate);
+    Some(())
+}
+
+fn charge_regional_work(remaining: &mut usize, work: usize) -> Option<()> {
+    *remaining = remaining.checked_sub(work)?;
+    Some(())
+}
+
+fn charge_regional_relation(relations: &mut usize) -> Option<()> {
+    *relations = relations.checked_add(1)?;
+    (*relations <= MAX_REGIONAL_FANOUT_ARM_RELATIONS).then_some(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn regional_trunk_score(
+    y: f64,
+    preferred_y: f64,
+    arms: &[Point],
+    arm_crossings: &[Vec<f64>],
+    arm_parallel: &[Vec<(f64, f64)>],
+    low_x: f64,
+    high_x: f64,
+    net: NetId,
+    baseline_segments: &[PhysicalSegment],
+    chosen_trunks: &[(NetId, f64, f64, f64)],
+) -> (usize, f64, f64) {
+    let mut crossings = 0usize;
+    let mut congestion = 0.0;
+    for segment in baseline_segments {
+        if segment.net == net {
+            continue;
+        }
+        if segment.horizontal {
+            if (segment.fixed - y).abs() < PARALLEL_CONGESTION_CUTOFF {
+                congestion += (segment.end.min(high_x) - segment.start.max(low_x)).max(0.0);
+            }
+        } else if segment.fixed > low_x
+            && segment.fixed < high_x
+            && y > segment.start
+            && y < segment.end
+        {
+            crossings += 1;
+        }
+    }
+    for ((arm, crossing_ys), parallel) in arms.iter().zip(arm_crossings).zip(arm_parallel) {
+        let low = y.min(arm.y);
+        let high = y.max(arm.y);
+        crossings += crossing_ys.partition_point(|&fixed| fixed < high)
+            - crossing_ys.partition_point(|&fixed| fixed <= low);
+        for &(start, end) in parallel {
+            congestion += (end.min(high) - start.max(low)).max(0.0);
+        }
+    }
+    for &(trunk_net, trunk_y, start, end) in chosen_trunks {
+        if trunk_net != net && (trunk_y - y).abs() < PARALLEL_CONGESTION_CUTOFF {
+            congestion += (end.min(high_x) - start.max(low_x)).max(0.0);
+        }
+    }
+    let distance = arms.iter().map(|arm| (arm.y - y).abs()).sum::<f64>() + (preferred_y - y).abs();
+    (crossings, congestion, distance)
+}
+
+fn common_free_intervals(layers: &[Vec<(f64, f64)>]) -> Vec<(f64, f64)> {
+    let Some(first) = layers.first() else {
+        return Vec::new();
+    };
+    let mut common = first.clone();
+    for layer in &layers[1..] {
+        let mut intersections = Vec::new();
+        let (mut left, mut right) = (0usize, 0usize);
+        while left < common.len() && right < layer.len() {
+            let low = common[left].0.max(layer[right].0);
+            let high = common[left].1.min(layer[right].1);
+            if low < high {
+                intersections.push((low, high));
+            }
+            if common[left].1 < layer[right].1 {
+                left += 1;
+            } else {
+                right += 1;
+            }
+        }
+        common = intersections;
+        if common.is_empty() {
+            break;
+        }
+    }
+    common
+}
+
+fn regional_fanout_candidate_is_safe(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    segments: &[PhysicalSegment],
+    eligible: &[(NetId, Vec<usize>)],
+) -> bool {
+    let selected_nets = eligible
+        .iter()
+        .map(|(net, _)| *net)
+        .collect::<BTreeSet<_>>();
+    for (resolved, route) in plan.edges.iter().zip(routes) {
+        if selected_nets.contains(&resolved.edge.net)
+            && (route.points.len() < 2
+                || route
+                    .points
+                    .iter()
+                    .any(|point| !point.x.is_finite() || !point.y.is_finite())
+                || route.points.windows(2).any(|points| {
+                    let horizontal = points[0].y == points[1].y;
+                    let vertical = points[0].x == points[1].x;
+                    horizontal == vertical || points[1].x < points[0].x
+                }))
+        {
+            return false;
+        }
+    }
+    let selected_segments = segments
+        .iter()
+        .filter(|segment| selected_nets.contains(&segment.net))
+        .collect::<Vec<_>>();
+    if !regional_safety_work_within_budget(selected_segments.len(), nodes.len(), segments.len()) {
+        return false;
+    }
+    for segment in &selected_segments {
+        if nodes
+            .iter()
+            .any(|node| regional_segment_intersects_node_interior(segment, node))
+        {
+            return false;
+        }
+        if segments.iter().any(|other| {
+            segment.net != other.net && regional_segments_have_unrelated_contact(segment, other)
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn regional_safety_work_within_budget(
+    selected_segments: usize,
+    nodes: usize,
+    segments: usize,
+) -> bool {
+    selected_segments
+        .checked_mul(nodes)
+        .and_then(|node_visits| {
+            selected_segments
+                .checked_mul(segments)
+                .and_then(|relation_visits| node_visits.checked_add(relation_visits))
+        })
+        .is_some_and(|visits| visits <= MAX_REGIONAL_FANOUT_SAFETY_VISITS)
+}
+
+fn regional_segment_intersects_node_interior(
+    segment: &PhysicalSegment,
+    node: &NodeGeometry,
+) -> bool {
+    if segment.horizontal {
+        segment.fixed > node.y
+            && segment.fixed < node.y + node.height
+            && segment.start < node.x + node.width
+            && segment.end > node.x
+    } else {
+        segment.fixed > node.x
+            && segment.fixed < node.x + node.width
+            && segment.start < node.y + node.height
+            && segment.end > node.y
+    }
+}
+
+fn regional_segments_have_unrelated_contact(
+    left: &PhysicalSegment,
+    right: &PhysicalSegment,
+) -> bool {
+    if left.horizontal == right.horizontal {
+        return left.fixed == right.fixed && left.start <= right.end && right.start <= left.end;
+    }
+    let (horizontal, vertical) = if left.horizontal {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if vertical.fixed < horizontal.start
+        || vertical.fixed > horizontal.end
+        || horizontal.fixed < vertical.start
+        || horizontal.fixed > vertical.end
+    {
+        return false;
+    }
+    vertical.fixed == horizontal.start
+        || vertical.fixed == horizontal.end
+        || horizontal.fixed == vertical.start
+        || horizontal.fixed == vertical.end
+}
+
 fn parallel_congestion_ratio(segments: &[PhysicalSegment]) -> Option<f64> {
     measure_parallel_congestion_bounded(
         &segments
@@ -5619,14 +6252,18 @@ mod tests {
         MAX_CROSSING_REPAIR_NODES, MAX_CROSSING_REPAIR_PATH_STATES,
         MAX_CROSSING_REPAIR_ROUTE_POINTS, MAX_EXPANDED_GAP_SPACING_EDGES,
         MAX_EXPANDED_GAP_SPACING_MAX_NODES, MAX_EXPANDED_GAP_SPACING_NODES,
-        MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL, OuterLane, OuterNetAccess, OuterSide,
-        PhysicalSegment, RoutingPlan, align_crossing_path_staircases, build_endpoint_tracks,
-        candidate_route_points_within_budget, crossing_aware_gap_lane_indices,
+        MAX_REGIONAL_FANOUT_ARM_RELATIONS, MAX_REGIONAL_FANOUT_ORDINATES,
+        MAX_REGIONAL_FANOUT_ROUTE_POINTS, MAX_REGIONAL_FANOUT_SAFETY_VISITS,
+        MAX_REGIONAL_FANOUT_SCORE_VISITS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
+        OuterLane, OuterNetAccess, OuterSide, PhysicalSegment, RouteQuality, RoutingPlan,
+        align_crossing_path_staircases, build_endpoint_tracks, build_regional_fanout_candidate,
+        candidate_route_points_within_budget, charge_regional_relation, charge_regional_work,
+        common_free_intervals, crossing_aware_gap_lane_indices,
         crossing_aware_gap_lane_indices_btree_reference, crossing_aware_outer_lane_indices,
         crossing_paths_have_unrelated_collinear_tracks, crossing_repair_within_budget,
         crossing_track_y, distance_transform, expanded_gap_spacing_enabled,
         expanded_spacing_readability_is_better, fanout_outer_channel_lane_indices,
-        free_interval_containing, global_gap_candidate_work_within_budget,
+        free_interval_containing, free_intervals_by_rank, global_gap_candidate_work_within_budget,
         global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
         horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
         large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
@@ -5634,7 +6271,10 @@ mod tests {
         large_gap_hot_nets_with_limit, move_nets_to_outer_lanes, outer_lane_assignments,
         outer_lane_channels_match, physical_crossing_sweep, physical_crossing_sweep_lines,
         physical_route_segments, physical_route_segments_btree_reference, port_point,
-        refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
+        push_regional_ordinate, refined_large_gap_candidate_work_within_budget,
+        refined_large_gap_hot_insertion_orders, regional_fanout_edges,
+        regional_fanout_quality_is_better, regional_safety_work_within_budget,
+        regional_segment_intersects_node_interior, regional_segments_have_unrelated_contact,
         repair_crossing_heavy_net, repair_selection_adds_new_nets, route_edges,
         route_edges_with_lane_rounds, route_edges_with_lane_rounds_and_global,
         route_planned_candidates, route_planned_candidates_with_quality_options,
@@ -7759,6 +8399,275 @@ mod tests {
         }));
 
         (Graph { nodes, edges }, geometry, ranks)
+    }
+
+    #[test]
+    fn regional_fanout_eligibility_has_exact_branch_boundaries() {
+        for (branches, expected) in [(300, false), (301, true), (512, true), (513, false)] {
+            let (graph, geometry, ranks) = fanout_candidate_fixture(branches, 0);
+            let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            assert_eq!(
+                !regional_fanout_edges(&plan, &geometry).is_empty(),
+                expected,
+                "unexpected eligibility at {branches} branches",
+            );
+        }
+
+        let (graph, mut geometry, ranks) = fanout_candidate_fixture(301, 1);
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let other_rank_zero_node = 303usize;
+        geometry[other_rank_zero_node].width += 20.0;
+        assert!(
+            regional_fanout_edges(&plan, &geometry).is_empty(),
+            "the source feeder must start beyond every node in its rank",
+        );
+    }
+
+    #[test]
+    fn common_free_intervals_intersect_every_rank_deterministically() {
+        assert_eq!(
+            common_free_intervals(&[
+                vec![(0.0, 20.0), (30.0, 80.0)],
+                vec![(10.0, 40.0), (50.0, 90.0)],
+                vec![(5.0, 15.0), (35.0, 60.0), (70.0, 100.0)],
+            ]),
+            vec![(10.0, 15.0), (35.0, 40.0), (50.0, 60.0), (70.0, 80.0)],
+        );
+        assert!(common_free_intervals(&[]).is_empty());
+    }
+
+    #[test]
+    fn regional_fanout_candidate_is_exact_safe_and_permutation_invariant() {
+        let options = LayoutOptions::default();
+        let (mut graph, mut geometry, ranks) = fanout_candidate_fixture(512, 16);
+        let blocker = 513usize;
+        graph.nodes[blocker].height = 1_000.0;
+        geometry[blocker].y = 4_000.0;
+        geometry[blocker].height = 1_000.0;
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let routed = route_planned_candidates(&plan, &geometry, options, false);
+        let baseline_segments = physical_route_segments(
+            plan.edges.iter().map(|resolved| resolved.edge),
+            &routed.primary,
+        )
+        .0;
+        let eligible = regional_fanout_edges(&plan, &geometry);
+        let candidate = build_regional_fanout_candidate(
+            &plan,
+            &geometry,
+            &routed.primary,
+            &baseline_segments,
+            &free_intervals_by_rank(&plan, &geometry),
+            &eligible,
+            options,
+        )
+        .expect("fixture constructs regional fanout routing");
+        let candidate_quality = route_quality(&indexed, &candidate);
+
+        assert_eq!(route_quality(&indexed, &candidate), candidate_quality);
+        let trunk_ys = candidate[..512]
+            .iter()
+            .flat_map(|route| route.points.windows(2))
+            .filter(|points| points[0].y == points[1].y && points[1].x - points[0].x > 100.0)
+            .map(|points| points[0].y.to_bits())
+            .collect::<BTreeSet<_>>();
+        assert!((2..=4).contains(&trunk_ys.len()));
+        for (resolved, route) in plan.edges.iter().zip(&candidate) {
+            assert_eq!(route.id, resolved.edge.id);
+            assert_eq!(
+                route.points.first(),
+                Some(&port_point(
+                    &geometry[resolved.source_index],
+                    resolved.source_port,
+                )),
+            );
+            assert_eq!(
+                route.points.last(),
+                Some(&port_point(
+                    &geometry[resolved.target_index],
+                    resolved.target_port,
+                )),
+            );
+            assert!(
+                route
+                    .points
+                    .windows(2)
+                    .all(|points| { (points[0].x == points[1].x) ^ (points[0].y == points[1].y) })
+            );
+        }
+
+        let mut permuted_graph = graph.clone();
+        permuted_graph.nodes.reverse();
+        permuted_graph.edges.reverse();
+        let permuted_indexed = validate_and_index(&permuted_graph, options).unwrap();
+        let permuted_plan = RoutingPlan::new(&permuted_indexed, &ranks);
+        let permuted_routed = route_planned_candidates(&permuted_plan, &geometry, options, false);
+        let permuted_segments = physical_route_segments(
+            permuted_plan.edges.iter().map(|resolved| resolved.edge),
+            &permuted_routed.primary,
+        )
+        .0;
+        let permuted_eligible = regional_fanout_edges(&permuted_plan, &geometry);
+        let permuted_candidate = build_regional_fanout_candidate(
+            &permuted_plan,
+            &geometry,
+            &permuted_routed.primary,
+            &permuted_segments,
+            &free_intervals_by_rank(&permuted_plan, &geometry),
+            &permuted_eligible,
+            options,
+        )
+        .expect("permuted fixture constructs regional fanout routing");
+
+        assert_eq!(permuted_routed.primary, routed.primary);
+        assert_eq!(
+            route_quality(&permuted_indexed, &permuted_candidate),
+            candidate_quality
+        );
+        assert_eq!(permuted_candidate, candidate);
+    }
+
+    #[test]
+    fn regional_fanout_admission_requires_every_balanced_quality_gate() {
+        let baseline = RouteQuality {
+            crossings: 1_000,
+            bends: 1_000,
+            route_length: 10_000.0,
+        };
+        let accepted = RouteQuality {
+            crossings: 900,
+            bends: 1_100,
+            route_length: 10_500.0,
+        };
+        assert!(regional_fanout_quality_is_better(
+            baseline, 0.1, accepted, 0.1, 100,
+        ));
+        for rejected in [
+            RouteQuality {
+                crossings: 901,
+                ..accepted
+            },
+            RouteQuality {
+                bends: 1_101,
+                ..accepted
+            },
+            RouteQuality {
+                route_length: 10_501.0,
+                ..accepted
+            },
+        ] {
+            assert!(!regional_fanout_quality_is_better(
+                baseline, 0.1, rejected, 0.1, 100,
+            ));
+        }
+        assert!(!regional_fanout_quality_is_better(
+            baseline, 0.1, accepted, 0.100_001, 100,
+        ));
+    }
+
+    #[test]
+    fn regional_fanout_work_and_geometry_guards_are_exact() {
+        assert!(sum_within_limit(
+            [MAX_REGIONAL_FANOUT_ROUTE_POINTS].into_iter(),
+            MAX_REGIONAL_FANOUT_ROUTE_POINTS,
+        ));
+        assert!(!sum_within_limit(
+            [MAX_REGIONAL_FANOUT_ROUTE_POINTS, 1].into_iter(),
+            MAX_REGIONAL_FANOUT_ROUTE_POINTS,
+        ));
+
+        let mut ordinates = vec![0.0; MAX_REGIONAL_FANOUT_ORDINATES - 1];
+        assert_eq!(push_regional_ordinate(&mut ordinates, 1.0), Some(()));
+        assert_eq!(push_regional_ordinate(&mut ordinates, 2.0), None);
+
+        let mut relations = MAX_REGIONAL_FANOUT_ARM_RELATIONS - 1;
+        assert_eq!(charge_regional_relation(&mut relations), Some(()));
+        assert_eq!(charge_regional_relation(&mut relations), None);
+
+        let mut remaining = MAX_REGIONAL_FANOUT_SCORE_VISITS;
+        assert_eq!(
+            charge_regional_work(&mut remaining, MAX_REGIONAL_FANOUT_SCORE_VISITS),
+            Some(()),
+        );
+        assert_eq!(remaining, 0);
+        assert_eq!(charge_regional_work(&mut remaining, 1), None);
+
+        assert!(regional_safety_work_within_budget(
+            1,
+            MAX_REGIONAL_FANOUT_SAFETY_VISITS,
+            0,
+        ));
+        assert!(!regional_safety_work_within_budget(
+            1,
+            MAX_REGIONAL_FANOUT_SAFETY_VISITS,
+            1,
+        ));
+        assert!(!regional_safety_work_within_budget(usize::MAX, 2, 2));
+
+        let node = NodeGeometry {
+            id: 1,
+            x: 10.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let interior = PhysicalSegment {
+            net: 1,
+            source: Endpoint { node: 0, port: 0 },
+            target: Endpoint { node: 1, port: 0 },
+            horizontal: true,
+            fixed: 20.0,
+            start: 0.0,
+            end: 40.0,
+        };
+        let boundary = PhysicalSegment {
+            fixed: 10.0,
+            ..interior
+        };
+        assert!(regional_segment_intersects_node_interior(&interior, &node));
+        assert!(!regional_segment_intersects_node_interior(&boundary, &node));
+
+        let horizontal = PhysicalSegment {
+            horizontal: true,
+            fixed: 10.0,
+            start: 0.0,
+            end: 20.0,
+            ..interior
+        };
+        let interior_crossing = PhysicalSegment {
+            net: 2,
+            horizontal: false,
+            fixed: 10.0,
+            start: 0.0,
+            end: 20.0,
+            ..interior
+        };
+        let endpoint_contact = PhysicalSegment {
+            start: 10.0,
+            end: 30.0,
+            ..interior_crossing
+        };
+        let collinear_contact = PhysicalSegment {
+            net: 2,
+            start: 20.0,
+            end: 30.0,
+            ..horizontal
+        };
+        assert!(!regional_segments_have_unrelated_contact(
+            &horizontal,
+            &interior_crossing,
+        ));
+        assert!(regional_segments_have_unrelated_contact(
+            &horizontal,
+            &endpoint_contact,
+        ));
+        assert!(regional_segments_have_unrelated_contact(
+            &horizontal,
+            &collinear_contact,
+        ));
     }
 
     fn add_crossing_repair_fixture(
