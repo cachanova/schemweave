@@ -312,7 +312,7 @@ fn reserve_boundary_bundle_corridors(
     let pitch = options
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
-    let rail_depth = crate::outward_obstacle_clearance_stub(options) + options.route_lane_gap;
+    let rail_depth = crate::boundary_bundle_rail_depth(options);
     for bundle in &graph.boundary_bundles {
         let node = graph.node_index[&bundle.endpoint.node];
         let rank = ranks[node];
@@ -982,6 +982,34 @@ mod tests {
             &mut layer_gaps,
         );
         assert_eq!(layer_gaps, vec![146.0]);
+
+        let highest = crate::LayoutConfig::highest_quality().layout;
+        let layer_gap_clearance_boundary = (options.layer_gap - highest.route_lane_gap) / 2.0;
+        for clearance in [
+            1.0,
+            options.port_stub - 1.0,
+            options.port_stub,
+            options.port_stub + 1.0,
+            layer_gap_clearance_boundary - 1.0,
+            layer_gap_clearance_boundary,
+            layer_gap_clearance_boundary + 1.0,
+        ] {
+            let positive = LayoutOptions {
+                edge_node_clearance: clearance,
+                ..highest
+            };
+            let mut layer_gaps = vec![positive.layer_gap];
+            reserve_boundary_bundle_corridors(
+                &indexed,
+                &ranks,
+                &[40.0, 40.0],
+                positive,
+                &mut layer_gaps,
+            );
+            let expected =
+                clearance + 32.0 * positive.route_lane_gap + clearance.max(positive.route_lane_gap);
+            assert_eq!(layer_gaps, vec![expected.max(positive.layer_gap)]);
+        }
     }
 
     #[test]
