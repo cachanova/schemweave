@@ -59,9 +59,17 @@ export interface QualityReport {
   split_feedback_nets: number
   feedback_net_count: number
   bends: number
+  scored_route_count: number
+  straight_route_count: number
+  straight_route_ratio: number
+  max_bends_per_route: number
   segments: number
+  minimum_parallel_route_separation: number | null
+  max_crossings_on_segment: number
   route_length: number
   shared_route_ratio: number
+  perimeter_route_length: number
+  perimeter_route_ratio: number
   area: number
   viewport_fit: number
 }

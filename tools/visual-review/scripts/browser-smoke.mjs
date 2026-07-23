@@ -349,7 +349,12 @@ try {
   }
   if (errors.length > 0) throw new Error(`browser console errors: ${errors.join('; ')}`)
   if (status?.includes('INVALID')) throw new Error(status)
-  if (!labels.includes('Contract violations') || labels.length !== 8) {
+  if (
+    !labels.includes('Min track separation') ||
+    !labels.includes('Straight routes') ||
+    !labels.includes('Contract violations') ||
+    labels.length !== 13
+  ) {
     throw new Error(`unexpected metric set: ${labels.join(', ')}`)
   }
 
