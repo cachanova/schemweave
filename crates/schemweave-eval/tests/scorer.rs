@@ -47,6 +47,94 @@ fn graph() -> Graph {
     }
 }
 
+fn constructed_routes(routes: &[(u32, Vec<Point>)]) -> (Graph, Layout) {
+    let mut nodes = Vec::with_capacity(routes.len() * 2);
+    let mut node_geometry = Vec::with_capacity(routes.len() * 2);
+    let mut edges = Vec::with_capacity(routes.len());
+    let mut edge_geometry = Vec::with_capacity(routes.len());
+    let mut width: f64 = 0.0;
+    let mut height: f64 = 0.0;
+
+    for (index, (net, points)) in routes.iter().enumerate() {
+        let source_id = u32::try_from(index * 2).unwrap();
+        let target_id = source_id + 1;
+        let edge_id = u32::try_from(index).unwrap();
+        let source = points[0];
+        let target = points[points.len() - 1];
+        nodes.extend([
+            Node {
+                id: source_id,
+                width: 10.0,
+                height: 10.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 5.0,
+                }],
+            },
+            Node {
+                id: target_id,
+                width: 10.0,
+                height: 10.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 5.0,
+                }],
+            },
+        ]);
+        node_geometry.extend([
+            NodeGeometry {
+                id: source_id,
+                x: source.x - 10.0,
+                y: source.y - 5.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: target_id,
+                x: target.x,
+                y: target.y - 5.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ]);
+        edges.push(Edge {
+            id: edge_id,
+            source: Endpoint {
+                node: source_id,
+                port: 0,
+            },
+            target: Endpoint {
+                node: target_id,
+                port: 0,
+            },
+            net: *net,
+            participates_in_ranking: true,
+        });
+        edge_geometry.push(EdgeGeometry {
+            id: edge_id,
+            points: points.clone(),
+        });
+        for point in points {
+            width = width.max(point.x + 10.0);
+            height = height.max(point.y + 10.0);
+        }
+    }
+
+    (
+        Graph { nodes, edges },
+        Layout {
+            nodes: node_geometry,
+            edges: edge_geometry,
+            width,
+            height,
+        },
+    )
+}
+
 #[test]
 fn new_quality_fields_preserve_default_json_compatibility() {
     let options: ScoreOptions = serde_json::from_str("{}").unwrap();
@@ -54,6 +142,156 @@ fn new_quality_fields_preserve_default_json_compatibility() {
 
     assert_eq!(options, ScoreOptions::default());
     assert_eq!(report, QualityReport::default());
+}
+
+#[test]
+fn measures_straight_route_share_and_maximum_route_bends() {
+    let (graph, layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 180.0, y: 20.0 }],
+        ),
+        (
+            2,
+            vec![
+                Point { x: 20.0, y: 60.0 },
+                Point { x: 40.0, y: 60.0 },
+                Point { x: 40.0, y: 100.0 },
+                Point { x: 80.0, y: 100.0 },
+                Point { x: 80.0, y: 60.0 },
+                Point { x: 180.0, y: 60.0 },
+            ],
+        ),
+    ]);
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.scored_route_count, 2);
+    assert_eq!(report.straight_route_count, 1);
+    assert_eq!(report.straight_route_ratio, 0.5);
+    assert_eq!(report.max_bends_per_route, 4);
+}
+
+#[test]
+fn measures_minimum_parallel_separation_only_for_overlapping_spans() {
+    let (graph, layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 100.0, y: 20.0 }],
+        ),
+        (
+            2,
+            vec![Point { x: 40.0, y: 32.0 }, Point { x: 160.0, y: 32.0 }],
+        ),
+        (
+            3,
+            vec![Point { x: 180.0, y: 21.0 }, Point { x: 260.0, y: 21.0 }],
+        ),
+    ]);
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.minimum_parallel_route_separation, Some(12.0));
+}
+
+#[test]
+fn measures_the_largest_crossing_knot_on_one_physical_segment() {
+    let (graph, layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 180.0, y: 20.0 }],
+        ),
+        (
+            2,
+            vec![Point { x: 20.0, y: 40.0 }, Point { x: 180.0, y: 40.0 }],
+        ),
+        (
+            3,
+            vec![Point { x: 20.0, y: 60.0 }, Point { x: 180.0, y: 60.0 }],
+        ),
+        (
+            4,
+            vec![
+                Point { x: 20.0, y: 80.0 },
+                Point { x: 100.0, y: 80.0 },
+                Point { x: 100.0, y: 10.0 },
+                Point { x: 180.0, y: 10.0 },
+            ],
+        ),
+    ]);
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.crossings, 3);
+    assert_eq!(report.max_crossings_on_segment, 3);
+}
+
+#[test]
+fn attributes_a_crossing_knot_to_the_horizontal_segment() {
+    let (graph, layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 50.0 }, Point { x: 240.0, y: 50.0 }],
+        ),
+        (
+            2,
+            vec![
+                Point { x: 20.0, y: 80.0 },
+                Point { x: 60.0, y: 80.0 },
+                Point { x: 60.0, y: 10.0 },
+                Point { x: 180.0, y: 10.0 },
+            ],
+        ),
+        (
+            3,
+            vec![
+                Point { x: 70.0, y: 90.0 },
+                Point { x: 100.0, y: 90.0 },
+                Point { x: 100.0, y: 20.0 },
+                Point { x: 200.0, y: 20.0 },
+            ],
+        ),
+        (
+            4,
+            vec![
+                Point { x: 120.0, y: 100.0 },
+                Point { x: 140.0, y: 100.0 },
+                Point { x: 140.0, y: 30.0 },
+                Point { x: 220.0, y: 30.0 },
+            ],
+        ),
+    ]);
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.crossings, 3);
+    assert_eq!(report.max_crossings_on_segment, 3);
+}
+
+#[test]
+fn measures_physical_route_usage_outside_the_node_envelope() {
+    let (graph, layout) = constructed_routes(&[(
+        1,
+        vec![
+            Point { x: 20.0, y: 50.0 },
+            Point { x: 40.0, y: 50.0 },
+            Point { x: 40.0, y: 10.0 },
+            Point { x: 160.0, y: 10.0 },
+            Point { x: 160.0, y: 50.0 },
+            Point { x: 180.0, y: 50.0 },
+        ],
+    )]);
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.route_length, 240.0);
+    assert_eq!(report.perimeter_route_length, 190.0);
+    assert_eq!(report.perimeter_route_ratio, 190.0 / 240.0);
 }
 
 #[test]

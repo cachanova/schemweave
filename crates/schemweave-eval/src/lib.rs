@@ -73,12 +73,29 @@ pub struct QualityReport {
     pub feedback_net_count: usize,
     /// Unique direction changes in the physical same-net geometry.
     pub bends: usize,
+    /// Unique known routes whose geometry is finite, nonzero, and orthogonal.
+    pub scored_route_count: usize,
+    /// Scored routes with no direction changes.
+    pub straight_route_count: usize,
+    /// Straight scored routes divided by `scored_route_count`.
+    pub straight_route_ratio: f64,
+    /// Largest number of direction changes on one scored route.
+    pub max_bends_per_route: usize,
     /// Raw route segments, before overlapping same-net geometry is merged.
     pub segments: usize,
+    /// Smallest positive perpendicular distance between overlapping parallel
+    /// physical segments from different electrical nets, in layout units.
+    pub minimum_parallel_route_separation: Option<f64>,
+    /// Largest number of unrelated physical crossings on one physical segment.
+    pub max_crossings_on_segment: usize,
     /// Union length of the physical same-net geometry.
     pub route_length: f64,
     /// Fraction of raw per-edge route length eliminated by same-net physical sharing.
     pub shared_route_ratio: f64,
+    /// Union route length strictly outside the axis-aligned node envelope.
+    pub perimeter_route_length: f64,
+    /// `perimeter_route_length` divided by physical `route_length`.
+    pub perimeter_route_ratio: f64,
     pub area: f64,
     /// Layout spans relative to the configured viewport; lower is easier to fit.
     pub viewport_fit: f64,
@@ -225,7 +242,7 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             );
             continue;
         };
-        validate_route(
+        if let Some(route_bends) = validate_route(
             graph,
             edge,
             route.points.as_slice(),
@@ -235,7 +252,13 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             &mut report,
             &mut segments,
             &mut bend_points,
-        );
+        ) {
+            report.scored_route_count += 1;
+            if route_bends == 0 {
+                report.straight_route_count += 1;
+            }
+            report.max_bends_per_route = report.max_bends_per_route.max(route_bends);
+        }
         if ranking_edges.contains(&edge.id) {
             score_forward_route(
                 route.points.as_slice(),
@@ -256,6 +279,10 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
             ),
         );
     }
+    if report.scored_route_count != 0 {
+        report.straight_route_ratio =
+            report.straight_route_count as f64 / report.scored_route_count as f64;
+    }
     report.segments = segments.len();
     score_node_overlaps(&layout.nodes, &mut report);
     score_node_intersections(&segments, &layout.nodes, options.epsilon, &mut report);
@@ -268,6 +295,13 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         .iter()
         .map(|segment| segment.end - segment.start)
         .sum();
+    report.minimum_parallel_route_separation =
+        minimum_parallel_route_separation(&physical_segments);
+    report.perimeter_route_length =
+        perimeter_route_length(&physical_segments, &layout.nodes, options.epsilon);
+    if report.route_length > options.epsilon {
+        report.perimeter_route_ratio = report.perimeter_route_length / report.route_length;
+    }
     if raw_route_length > options.epsilon {
         report.shared_route_ratio =
             ((raw_route_length - report.route_length) / raw_route_length).clamp(0.0, 1.0);
@@ -493,23 +527,24 @@ fn validate_route(
     report: &mut QualityReport,
     segments: &mut Vec<Segment>,
     bend_points: &mut BTreeSet<(NetId, FloatKey, FloatKey)>,
-) {
+) -> Option<usize> {
     if points.len() < 2 {
         report.violation(
             options,
             ViolationKind::InvalidGeometry,
             format!("route {} has fewer than two points", edge.id),
         );
-        return;
+        return None;
     }
-    if points.iter().any(|point| {
+    let invalid_point = points.iter().any(|point| {
         !point.x.is_finite()
             || !point.y.is_finite()
             || point.x < -options.epsilon
             || point.y < -options.epsilon
             || point.x > layout.width + options.epsilon
             || point.y > layout.height + options.epsilon
-    }) {
+    });
+    if invalid_point {
         report.violation(
             options,
             ViolationKind::InvalidGeometry,
@@ -543,7 +578,9 @@ fn validate_route(
             );
         }
     }
-    let before = segments.len();
+    let mut valid_shape = !invalid_point;
+    let mut previous = None::<Segment>;
+    let mut route_bends = 0;
     for pair in points.windows(2) {
         let dx = (pair[1].x - pair[0].x).abs();
         let dy = (pair[1].y - pair[0].y).abs();
@@ -553,6 +590,8 @@ fn validate_route(
                 ViolationKind::ZeroLengthSegment,
                 format!("route {} contains a zero-length segment", edge.id),
             );
+            valid_shape = false;
+            previous = None;
             continue;
         }
         let orientation = if dx <= options.epsilon {
@@ -565,27 +604,24 @@ fn validate_route(
                 ViolationKind::NonOrthogonal,
                 format!("route {} contains a diagonal segment", edge.id),
             );
+            valid_shape = false;
+            previous = None;
             continue;
         };
-        segments.push(Segment::new(
-            edge.id,
-            edge.net,
-            pair[0],
-            pair[1],
-            orientation,
-        ));
-    }
-    for pair in segments[before..].windows(2) {
-        if pair[0].orientation != pair[1].orientation {
-            let horizontal = if pair[0].orientation == Orientation::Horizontal {
-                pair[0]
+        let segment = Segment::new(edge.id, edge.net, pair[0], pair[1], orientation);
+        if let Some(prior) = previous
+            && prior.orientation != segment.orientation
+        {
+            route_bends += 1;
+            let horizontal = if prior.orientation == Orientation::Horizontal {
+                prior
             } else {
-                pair[1]
+                segment
             };
-            let vertical = if pair[0].orientation == Orientation::Vertical {
-                pair[0]
+            let vertical = if prior.orientation == Orientation::Vertical {
+                prior
             } else {
-                pair[1]
+                segment
             };
             bend_points.insert((
                 edge.net,
@@ -593,7 +629,10 @@ fn validate_route(
                 FloatKey(horizontal.fixed),
             ));
         }
+        segments.push(segment);
+        previous = Some(segment);
     }
+    if valid_shape { Some(route_bends) } else { None }
 }
 
 fn endpoint_point(
@@ -691,6 +730,282 @@ impl Segment {
                 end: a.y.max(b.y),
             },
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NodeEnvelope {
+    left: f64,
+    right: f64,
+    top: f64,
+    bottom: f64,
+}
+
+fn perimeter_route_length(segments: &[Segment], nodes: &[NodeGeometry], epsilon: f64) -> f64 {
+    let mut envelope = None::<NodeEnvelope>;
+    for node in nodes.iter().filter(|node| {
+        [node.x, node.y, node.width, node.height]
+            .iter()
+            .all(|value| value.is_finite())
+            && node.width > 0.0
+            && node.height > 0.0
+    }) {
+        let right = node.x + node.width;
+        let bottom = node.y + node.height;
+        envelope = Some(match envelope {
+            Some(current) => NodeEnvelope {
+                left: current.left.min(node.x),
+                right: current.right.max(right),
+                top: current.top.min(node.y),
+                bottom: current.bottom.max(bottom),
+            },
+            None => NodeEnvelope {
+                left: node.x,
+                right,
+                top: node.y,
+                bottom,
+            },
+        });
+    }
+    let Some(envelope) = envelope else {
+        return 0.0;
+    };
+
+    segments
+        .iter()
+        .map(|segment| match segment.orientation {
+            Orientation::Horizontal
+                if segment.fixed < envelope.top - epsilon
+                    || segment.fixed > envelope.bottom + epsilon =>
+            {
+                segment.end - segment.start
+            }
+            Orientation::Vertical
+                if segment.fixed < envelope.left - epsilon
+                    || segment.fixed > envelope.right + epsilon =>
+            {
+                segment.end - segment.start
+            }
+            Orientation::Horizontal => {
+                outside_interval_length(segment.start, segment.end, envelope.left, envelope.right)
+            }
+            Orientation::Vertical => {
+                outside_interval_length(segment.start, segment.end, envelope.top, envelope.bottom)
+            }
+        })
+        .sum()
+}
+
+fn outside_interval_length(start: f64, end: f64, inside_start: f64, inside_end: f64) -> f64 {
+    let before = (end.min(inside_start) - start).max(0.0);
+    let after = (end - start.max(inside_end)).max(0.0);
+    before + after
+}
+
+fn minimum_parallel_route_separation(segments: &[Segment]) -> Option<f64> {
+    let horizontal = minimum_parallel_separation_for_orientation(
+        segments
+            .iter()
+            .filter(|segment| segment.orientation == Orientation::Horizontal),
+    );
+    let vertical = minimum_parallel_separation_for_orientation(
+        segments
+            .iter()
+            .filter(|segment| segment.orientation == Orientation::Vertical),
+    );
+    match (horizontal, vertical) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn minimum_parallel_separation_for_orientation<'a>(
+    segments: impl Iterator<Item = &'a Segment>,
+) -> Option<f64> {
+    let segments = segments.collect::<Vec<_>>();
+    if segments.len() < 2 {
+        return None;
+    }
+    let mut fixed_values = segments
+        .iter()
+        .map(|segment| FloatKey(segment.fixed))
+        .collect::<Vec<_>>();
+    fixed_values.sort_unstable();
+    fixed_values.dedup();
+    let fixed_indices = segments
+        .iter()
+        .map(|segment| {
+            fixed_values
+                .binary_search(&FloatKey(segment.fixed))
+                .expect("parallel coordinate exists")
+        })
+        .collect::<Vec<_>>();
+    let mut events = Vec::with_capacity(segments.len() * 2);
+    for (index, segment) in segments.iter().enumerate() {
+        // End events precede starts so segments that only meet longitudinally do not count as
+        // parallel runs with positive overlap.
+        events.push((FloatKey(segment.end), 0u8, index));
+        events.push((FloatKey(segment.start), 1u8, index));
+    }
+    events.sort_unstable();
+
+    let mut active = vec![BTreeMap::<NetId, usize>::new(); fixed_values.len()];
+    let mut tree = ActiveNetTree::new(fixed_values.len());
+    let mut minimum = None::<f64>;
+    for (_, event_kind, segment_index) in events {
+        let segment = segments[segment_index];
+        let fixed_index = fixed_indices[segment_index];
+        if event_kind == 0 {
+            let remove_net = {
+                let count = active[fixed_index]
+                    .get_mut(&segment.net)
+                    .expect("active parallel segment exists");
+                *count -= 1;
+                *count == 0
+            };
+            if remove_net {
+                active[fixed_index].remove(&segment.net);
+            }
+            tree.set(
+                fixed_index,
+                NetSummary::from_nets(active[fixed_index].keys().copied()),
+            );
+            continue;
+        }
+
+        for candidate in [
+            tree.rightmost_other(fixed_index, segment.net),
+            tree.leftmost_other(fixed_index + 1, segment.net),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let distance = (fixed_values[candidate].0 - segment.fixed).abs();
+            debug_assert!(distance > 0.0);
+            minimum = Some(minimum.map_or(distance, |current| current.min(distance)));
+        }
+        *active[fixed_index].entry(segment.net).or_default() += 1;
+        tree.set(
+            fixed_index,
+            NetSummary::from_nets(active[fixed_index].keys().copied()),
+        );
+    }
+    minimum
+}
+
+#[derive(Clone, Copy, Default)]
+struct NetSummary {
+    first: Option<NetId>,
+    second: Option<NetId>,
+}
+
+impl NetSummary {
+    fn from_nets(nets: impl Iterator<Item = NetId>) -> Self {
+        let mut summary = Self::default();
+        for net in nets {
+            summary.insert(net);
+            if summary.second.is_some() {
+                break;
+            }
+        }
+        summary
+    }
+
+    fn merged(left: Self, right: Self) -> Self {
+        Self::from_nets(
+            [left.first, left.second, right.first, right.second]
+                .into_iter()
+                .flatten(),
+        )
+    }
+
+    fn insert(&mut self, net: NetId) {
+        if self.first == Some(net) || self.second == Some(net) {
+            return;
+        }
+        if self.first.is_none() {
+            self.first = Some(net);
+        } else if self.second.is_none() {
+            self.second = Some(net);
+        }
+    }
+
+    fn has_other(self, excluded: NetId) -> bool {
+        self.first.is_some_and(|net| net != excluded)
+            || self.second.is_some_and(|net| net != excluded)
+    }
+}
+
+struct ActiveNetTree {
+    leaf_count: usize,
+    summaries: Vec<NetSummary>,
+}
+
+impl ActiveNetTree {
+    fn new(coordinate_count: usize) -> Self {
+        let leaf_count = coordinate_count.next_power_of_two();
+        Self {
+            leaf_count,
+            summaries: vec![NetSummary::default(); leaf_count * 2],
+        }
+    }
+
+    fn set(&mut self, index: usize, summary: NetSummary) {
+        let mut cursor = self.leaf_count + index;
+        self.summaries[cursor] = summary;
+        cursor /= 2;
+        while cursor != 0 {
+            self.summaries[cursor] =
+                NetSummary::merged(self.summaries[cursor * 2], self.summaries[cursor * 2 + 1]);
+            cursor /= 2;
+        }
+    }
+
+    fn rightmost_other(&self, end: usize, excluded: NetId) -> Option<usize> {
+        self.search_rightmost(1, 0, self.leaf_count, end, excluded)
+    }
+
+    fn search_rightmost(
+        &self,
+        node: usize,
+        start: usize,
+        end: usize,
+        query_end: usize,
+        excluded: NetId,
+    ) -> Option<usize> {
+        if start >= query_end || !self.summaries[node].has_other(excluded) {
+            return None;
+        }
+        if end - start == 1 {
+            return Some(start);
+        }
+        let middle = (start + end) / 2;
+        self.search_rightmost(node * 2 + 1, middle, end, query_end, excluded)
+            .or_else(|| self.search_rightmost(node * 2, start, middle, query_end, excluded))
+    }
+
+    fn leftmost_other(&self, start: usize, excluded: NetId) -> Option<usize> {
+        self.search_leftmost(1, 0, self.leaf_count, start, excluded)
+    }
+
+    fn search_leftmost(
+        &self,
+        node: usize,
+        start: usize,
+        end: usize,
+        query_start: usize,
+        excluded: NetId,
+    ) -> Option<usize> {
+        if end <= query_start || !self.summaries[node].has_other(excluded) {
+            return None;
+        }
+        if end - start == 1 {
+            return Some(start);
+        }
+        let middle = (start + end) / 2;
+        self.search_leftmost(node * 2, start, middle, query_start, excluded)
+            .or_else(|| self.search_leftmost(node * 2 + 1, middle, end, query_start, excluded))
     }
 }
 
@@ -846,14 +1161,23 @@ fn score_segment_relationships(
     y_values.sort_unstable();
     y_values.dedup();
     let mut tree = Fenwick::new(y_values.len());
+    // A range-add/point-query sweep attributes the same crossings to horizontal segments without
+    // enumerating every perpendicular pair. Each segment snapshots the accumulator on entry.
+    let mut crossing_accumulator = Fenwick::new(y_values.len());
+    let mut crossing_start = vec![0i64; horizontal.len()];
+    let mut related_crossings = vec![0i64; horizontal.len()];
     let mut active = vec![false; horizontal.len()];
     let related_horizontal = relation_index(&horizontal, edges);
     for group in events.values() {
         for &index in &group.end {
-            active[index] = false;
             let y = y_values
                 .binary_search(&FloatKey(horizontal[index].fixed))
                 .unwrap();
+            let count =
+                crossing_accumulator.point(y) - crossing_start[index] - related_crossings[index];
+            report.max_crossings_on_segment =
+                report.max_crossings_on_segment.max(count.max(0) as usize);
+            active[index] = false;
             tree.add(y, -1);
         }
         for &index in &group.vertical {
@@ -866,16 +1190,24 @@ fn score_segment_relationships(
                     let across = horizontal[candidate];
                     if across.fixed > line.start && across.fixed < line.end {
                         count -= 1;
+                        related_crossings[candidate] += 1;
                     }
                 }
             }
-            report.crossings += count.max(0) as usize;
+            let count = count.max(0) as usize;
+            report.crossings += count;
+            report.max_crossings_on_segment = report.max_crossings_on_segment.max(count);
+            if low < high {
+                crossing_accumulator.add(low, 1);
+                crossing_accumulator.add(high, -1);
+            }
         }
         for &index in &group.start {
             active[index] = true;
             let y = y_values
                 .binary_search(&FloatKey(horizontal[index].fixed))
                 .unwrap();
+            crossing_start[index] = crossing_accumulator.point(y);
             tree.add(y, 1);
         }
     }
@@ -1064,6 +1396,10 @@ impl Fenwick {
 
     fn range(&self, start: usize, end: usize) -> i64 {
         self.prefix(end) - self.prefix(start)
+    }
+
+    fn point(&self, index: usize) -> i64 {
+        self.prefix(index + 1)
     }
 }
 
