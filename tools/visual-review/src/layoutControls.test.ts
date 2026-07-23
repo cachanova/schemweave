@@ -16,6 +16,8 @@ describe('layout controls', () => {
       route_lane_gap: 6,
       minimum_parallel_wire_spacing: 0,
       edge_node_clearance: 20,
+      max_quality_area_factor: 2,
+      max_quality_route_length_factor: 1.25,
       ordering_sweeps: 4,
       quality_effort: 'max',
     })
@@ -29,12 +31,28 @@ describe('layout controls', () => {
     ).toBe(true)
   })
 
-  it('matches presets using quality effort and both hard spacing controls', () => {
+  it('uses elevated budgets only for the slow highest-quality profile', () => {
+    expect(layoutPresets['highest-quality'].max_quality_area_factor).toBe(2)
+    expect(layoutPresets['highest-quality'].max_quality_route_length_factor).toBe(1.25)
+    expect(
+      Object.entries(layoutPresets)
+        .filter(([name]) => name !== 'highest-quality')
+        .every(
+          ([, preset]) =>
+            preset.max_quality_area_factor === 1.2 &&
+            preset.max_quality_route_length_factor === 1.1,
+        ),
+    ).toBe(true)
+  })
+
+  it('matches presets using quality effort, hard spacing, and quality budgets', () => {
     const highestQuality: LayoutOptions = { ...layoutPresets['highest-quality'] }
     expect(matchingPreset(highestQuality)).toBe('highest-quality')
     expect(matchingPreset({ ...highestQuality, quality_effort: 'quality' })).toBeNull()
     expect(matchingPreset({ ...highestQuality, edge_node_clearance: 15 })).toBeNull()
     expect(matchingPreset({ ...highestQuality, minimum_parallel_wire_spacing: 6 })).toBeNull()
+    expect(matchingPreset({ ...highestQuality, max_quality_area_factor: 1.2 })).toBeNull()
+    expect(matchingPreset({ ...highestQuality, max_quality_route_length_factor: 1.1 })).toBeNull()
     expect(matchingPreset({ ...layoutPresets.balanced })).toBe('balanced')
   })
 

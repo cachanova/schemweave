@@ -1664,6 +1664,23 @@ fn horizontal_pitch_edge_clearance_is_satisfied(
     .is_ok_and(|measurement| measurement.violations == 0)
 }
 
+fn horizontal_pitch_parallel_spacing_is_satisfied(
+    plan: &RoutingPlan<'_>,
+    candidate: &[EdgeGeometry],
+    options: LayoutOptions,
+) -> bool {
+    options.minimum_parallel_wire_spacing <= 0.0
+        || route_edges_satisfy_parallel_spacing_bounded(
+            plan.edges.iter().map(|resolved| resolved.edge),
+            candidate,
+            options.minimum_parallel_wire_spacing,
+            crate::outward_obstacle_clearance_stub(options),
+            MAX_COMPLETE_ROUTE_SEGMENTS,
+            MAX_HORIZONTAL_PITCH_CLEARANCE_VISITS,
+        )
+        .is_ok_and(|satisfied| satisfied)
+}
+
 fn horizontal_pitch_candidate_is_admissible(
     plan: &RoutingPlan<'_>,
     baseline_nodes: &[NodeGeometry],
@@ -1675,6 +1692,10 @@ fn horizontal_pitch_candidate_is_admissible(
     let invalid_geometry = baseline == candidate
         || baseline_nodes.len() != candidate_nodes.len()
         || candidate.len() != plan.edges.len()
+        || !sum_within_limit(
+            candidate.iter().map(|route| route.points.len()),
+            MAX_HORIZONTAL_PITCH_PATH_POINTS,
+        )
         || plan.edges.iter().zip(candidate).any(|(resolved, route)| {
             route.id != resolved.edge.id
                 || route.points.first()
@@ -1724,6 +1745,7 @@ fn horizontal_pitch_candidate_is_admissible(
             &candidate_segments,
             options.edge_node_clearance,
         )
+        || !horizontal_pitch_parallel_spacing_is_satisfied(plan, candidate, options)
     {
         return false;
     }
@@ -4820,21 +4842,38 @@ pub(crate) fn route_family_satisfies_parallel_spacing_bounded(
     max_segments: usize,
     max_tree_visits: usize,
 ) -> Result<bool, ParallelWireSpacingError> {
+    route_edges_satisfy_parallel_spacing_bounded(
+        graph.edges.iter().copied(),
+        routes,
+        spacing,
+        mandatory_escape_length,
+        max_segments,
+        max_tree_visits,
+    )
+}
+
+fn route_edges_satisfy_parallel_spacing_bounded<'a>(
+    edges: impl ExactSizeIterator<Item = &'a Edge>,
+    routes: &[EdgeGeometry],
+    spacing: f64,
+    mandatory_escape_length: f64,
+    max_segments: usize,
+    max_tree_visits: usize,
+) -> Result<bool, ParallelWireSpacingError> {
     if !spacing.is_finite() || spacing <= 0.0 {
         return Err(ParallelWireSpacingError::InvalidInput);
     }
-    let raw_segments = raw_route_segments_bounded(
-        graph.edges.iter().copied(),
-        routes,
-        max_segments,
-        mandatory_escape_length,
-    )
-    .map_err(|error| match error {
-        RouteContactError::SegmentLimitExceeded => ParallelWireSpacingError::SegmentLimitExceeded,
-        RouteContactError::InvalidInput | RouteContactError::WorkLimitExceeded => {
-            ParallelWireSpacingError::InvalidInput
-        }
-    })?;
+    let raw_segments =
+        raw_route_segments_bounded(edges, routes, max_segments, mandatory_escape_length).map_err(
+            |error| match error {
+                RouteContactError::SegmentLimitExceeded => {
+                    ParallelWireSpacingError::SegmentLimitExceeded
+                }
+                RouteContactError::InvalidInput | RouteContactError::WorkLimitExceeded => {
+                    ParallelWireSpacingError::InvalidInput
+                }
+            },
+        )?;
     let segments = raw_segments
         .iter()
         .map(|segment| ParallelSegment {
@@ -9772,6 +9811,97 @@ mod tests {
         });
         assert_eq!(selected, Some(("preferred", 6.0)));
         assert_eq!(attempted, vec![6.0]);
+    }
+
+    #[test]
+    fn horizontal_pitch_retains_a_spacing_safe_sibling_before_quality_selection() {
+        let endpoint_node = |id, side| Node {
+            id,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 5.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint_node(1, PortSide::East),
+                endpoint_node(2, PortSide::West),
+                endpoint_node(3, PortSide::East),
+                endpoint_node(4, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 4, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let options = LayoutOptions {
+            minimum_parallel_wire_spacing: 6.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1, 0, 1]);
+        let routes_at = |second_y| {
+            vec![
+                EdgeGeometry {
+                    id: 1,
+                    points: vec![Point { x: 10.0, y: 5.0 }, Point { x: 100.0, y: 5.0 }],
+                },
+                EdgeGeometry {
+                    id: 2,
+                    points: vec![
+                        Point {
+                            x: 20.0,
+                            y: second_y,
+                        },
+                        Point {
+                            x: 90.0,
+                            y: second_y,
+                        },
+                    ],
+                },
+            ]
+        };
+        let unsafe_but_preferred = (
+            RouteQuality {
+                crossings: 0,
+                bends: 0,
+                route_length: 1.0,
+            },
+            routes_at(10.999),
+        );
+        let safe_sibling = (
+            RouteQuality {
+                crossings: 1,
+                bends: 1,
+                route_length: 2.0,
+            },
+            routes_at(11.0),
+        );
+
+        let selected = [unsafe_but_preferred, safe_sibling.clone()]
+            .into_iter()
+            .filter(|(_, routes)| {
+                super::horizontal_pitch_parallel_spacing_is_satisfied(&plan, routes, options)
+            })
+            .min_by(|(left, _), (right, _)| route_quality_cmp(*left, *right));
+
+        assert_eq!(selected, Some(safe_sibling));
     }
 
     #[test]

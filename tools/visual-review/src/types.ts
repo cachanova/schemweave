@@ -29,6 +29,8 @@ export interface LayoutOptions {
   route_lane_gap: number
   minimum_parallel_wire_spacing: number
   edge_node_clearance: number
+  max_quality_area_factor: number
+  max_quality_route_length_factor: number
   ordering_sweeps: number
   quality_effort: 'fast' | 'quality' | 'max'
 }

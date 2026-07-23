@@ -166,6 +166,8 @@ function submission(
       route_lane_gap: 4,
       minimum_parallel_wire_spacing: 6,
       edge_node_clearance: clearance,
+      max_quality_area_factor: 2,
+      max_quality_route_length_factor: 1.25,
       ordering_sweeps: 4,
       quality_effort: effort,
     },

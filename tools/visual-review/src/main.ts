@@ -33,6 +33,8 @@ const nodeGap = query<HTMLInputElement>('#node-gap')
 const laneGap = query<HTMLInputElement>('#lane-gap')
 const minimumParallelWireSpacing = query<HTMLInputElement>('#minimum-parallel-wire-spacing')
 const edgeNodeClearance = query<HTMLInputElement>('#edge-node-clearance')
+const maxQualityAreaFactor = query<HTMLInputElement>('#max-quality-area-factor')
+const maxQualityRouteLengthFactor = query<HTMLInputElement>('#max-quality-route-length-factor')
 const sweeps = query<HTMLInputElement>('#sweeps')
 const qualityEffort = query<HTMLInputElement>('#quality-effort')
 const status = query<HTMLElement>('#status')
@@ -140,6 +142,8 @@ function layoutOptions(): LayoutOptions {
     route_lane_gap: Number(laneGap.value),
     minimum_parallel_wire_spacing: Number(minimumParallelWireSpacing.value),
     edge_node_clearance: Number(edgeNodeClearance.value),
+    max_quality_area_factor: Number(maxQualityAreaFactor.value),
+    max_quality_route_length_factor: Number(maxQualityRouteLengthFactor.value),
     ordering_sweeps: Number(sweeps.value),
     quality_effort: effort[Number(qualityEffort.value)] ?? 'quality',
   }
@@ -246,6 +250,8 @@ function applyPreset(name: PresetName): void {
   laneGap.value = String(preset.route_lane_gap)
   minimumParallelWireSpacing.value = String(preset.minimum_parallel_wire_spacing)
   edgeNodeClearance.value = String(preset.edge_node_clearance)
+  maxQualityAreaFactor.value = String(preset.max_quality_area_factor)
+  maxQualityRouteLengthFactor.value = String(preset.max_quality_route_length_factor)
   sweeps.value = String(preset.ordering_sweeps)
   qualityEffort.value = String(['fast', 'quality', 'max'].indexOf(preset.quality_effort))
   updateControlLabels()
@@ -260,6 +266,10 @@ function updateControlLabels(): void {
     `${minimumParallelWireSpacing.value} px`
   query<HTMLOutputElement>('#edge-node-clearance-value').value =
     `${edgeNodeClearance.value} px`
+  query<HTMLOutputElement>('#max-quality-area-factor-value').value =
+    `${Number(maxQualityAreaFactor.value).toFixed(2)}×`
+  query<HTMLOutputElement>('#max-quality-route-length-factor-value').value =
+    `${Number(maxQualityRouteLengthFactor.value).toFixed(2)}×`
   query<HTMLOutputElement>('#sweeps-value').value = sweeps.value
   query<HTMLOutputElement>('#quality-effort-value').value =
     ['Fast', 'Quality', 'Max'][Number(qualityEffort.value)] ?? 'Quality'
@@ -276,6 +286,8 @@ for (const control of [
   laneGap,
   minimumParallelWireSpacing,
   edgeNodeClearance,
+  maxQualityAreaFactor,
+  maxQualityRouteLengthFactor,
   sweeps,
   qualityEffort,
 ]) {
