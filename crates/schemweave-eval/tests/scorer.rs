@@ -197,6 +197,119 @@ fn measures_minimum_parallel_separation_only_for_overlapping_spans() {
 }
 
 #[test]
+fn parallel_congestion_distinguishes_overlap_sub_lane_gap_and_target_spacing() {
+    let (overlap_graph, overlap_layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 120.0, y: 20.0 }],
+        ),
+        (
+            2,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 120.0, y: 20.0 }],
+        ),
+    ]);
+    let overlap = score(&overlap_graph, &overlap_layout, ScoreOptions::default());
+    assert_eq!(overlap.parallel_congestion_ratio, 1.0);
+
+    let (graph, layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 120.0, y: 20.0 }],
+        ),
+        (
+            2,
+            vec![Point { x: 20.0, y: 20.23 }, Point { x: 120.0, y: 20.23 }],
+        ),
+        (
+            3,
+            vec![Point { x: 20.0, y: 24.23 }, Point { x: 120.0, y: 24.23 }],
+        ),
+    ]);
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert!((report.parallel_congestion_ratio - 2.0 / 3.0).abs() < 1e-12);
+}
+
+#[test]
+fn parallel_congestion_weights_only_the_actual_close_overlap_length() {
+    let (weighted_graph, weighted_layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 120.0, y: 20.0 }],
+        ),
+        (
+            2,
+            vec![Point { x: 60.0, y: 20.23 }, Point { x: 70.0, y: 20.23 }],
+        ),
+        (
+            3,
+            vec![Point { x: 40.0, y: 40.0 }, Point { x: 230.0, y: 40.0 }],
+        ),
+        (
+            4,
+            vec![Point { x: 40.0, y: 48.0 }, Point { x: 230.0, y: 48.0 }],
+        ),
+    ]);
+    let weighted = score(&weighted_graph, &weighted_layout, ScoreOptions::default());
+    // Only the ten-unit shared span on each of the first two routes is
+    // congested. The remaining long route pair is eight units apart.
+    assert!((weighted.parallel_congestion_ratio - 20.0 / 490.0).abs() < 1e-12);
+}
+
+#[test]
+fn parallel_congestion_excludes_same_net_and_disjoint_spans() {
+    let (excluded_graph, excluded_layout) = constructed_routes(&[
+        (
+            7,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 80.0, y: 20.0 }],
+        ),
+        (
+            7,
+            vec![Point { x: 20.0, y: 20.23 }, Point { x: 80.0, y: 20.23 }],
+        ),
+        (
+            8,
+            vec![Point { x: 80.0, y: 20.1 }, Point { x: 140.0, y: 20.1 }],
+        ),
+    ]);
+    let excluded = score(&excluded_graph, &excluded_layout, ScoreOptions::default());
+    assert_eq!(excluded.parallel_congestion_ratio, 0.0);
+}
+
+#[test]
+fn parallel_congestion_is_permutation_deterministic() {
+    let (graph, layout) = constructed_routes(&[
+        (
+            1,
+            vec![Point { x: 20.0, y: 20.0 }, Point { x: 180.0, y: 20.0 }],
+        ),
+        (
+            2,
+            vec![Point { x: 40.0, y: 20.23 }, Point { x: 160.0, y: 20.23 }],
+        ),
+        (
+            3,
+            vec![Point { x: 60.0, y: 24.23 }, Point { x: 140.0, y: 24.23 }],
+        ),
+    ]);
+    let expected = score(&graph, &layout, ScoreOptions::default());
+    let mut permuted_graph = graph;
+    let mut permuted_layout = layout;
+    permuted_graph.nodes.reverse();
+    permuted_graph.edges.reverse();
+    permuted_layout.nodes.reverse();
+    permuted_layout.edges.reverse();
+
+    let actual = score(&permuted_graph, &permuted_layout, ScoreOptions::default());
+
+    assert_eq!(
+        actual.parallel_congestion_ratio,
+        expected.parallel_congestion_ratio
+    );
+}
+
+#[test]
 fn measures_the_largest_crossing_knot_on_one_physical_segment() {
     let (graph, layout) = constructed_routes(&[
         (
@@ -485,6 +598,10 @@ fn viewport_fit_uses_configured_dimensions_and_rejects_invalid_dimensions() {
         },
         ScoreOptions {
             viewport_height: f64::NAN,
+            ..ScoreOptions::default()
+        },
+        ScoreOptions {
+            parallel_congestion_threshold: 0.0,
             ..ScoreOptions::default()
         },
     ] {

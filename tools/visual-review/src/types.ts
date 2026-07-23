@@ -65,6 +65,7 @@ export interface QualityReport {
   max_bends_per_route: number
   segments: number
   minimum_parallel_route_separation: number | null
+  parallel_congestion_ratio: number
   max_crossings_on_segment: number
   route_length: number
   shared_route_ratio: number

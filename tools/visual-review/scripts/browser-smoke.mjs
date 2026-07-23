@@ -351,9 +351,10 @@ try {
   if (status?.includes('INVALID')) throw new Error(status)
   if (
     !labels.includes('Min track separation') ||
+    !labels.includes('Parallel congestion') ||
     !labels.includes('Straight routes') ||
     !labels.includes('Contract violations') ||
-    labels.length !== 13
+    labels.length !== 14
   ) {
     throw new Error(`unexpected metric set: ${labels.join(', ')}`)
   }

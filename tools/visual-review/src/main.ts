@@ -338,6 +338,11 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       higherIsBetter: true,
     },
     {
+      label: 'Parallel congestion',
+      elk: (q) => q.parallel_congestion_ratio,
+      format: percentage,
+    },
+    {
       label: 'Max crossing knot',
       elk: (q) => q.max_crossings_on_segment,
       format: integer,
@@ -373,7 +378,7 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
 
 function metricPlaceholders(): string {
   return Array.from(
-    { length: 13 },
+    { length: 14 },
     () => '<div class="metric"><div class="metric-label">computing</div><div class="metric-values"><span>—</span><span>—</span></div></div>',
   ).join('')
 }
