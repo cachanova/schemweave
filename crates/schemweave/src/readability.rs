@@ -82,30 +82,30 @@ pub fn measure_edge_node_clearance_bounded(
     {
         return Err(EdgeNodeClearanceError::InvalidInput);
     }
-    let required_visits = segments
-        .len()
-        .checked_mul(nodes.len())
-        .ok_or(EdgeNodeClearanceError::WorkLimitExceeded)?;
-    if required_visits > max_pair_visits {
-        return Err(EdgeNodeClearanceError::WorkLimitExceeded);
+    if segments.is_empty() || nodes.is_empty() {
+        return Ok(EdgeNodeClearance::default());
     }
     let related = relations
         .iter()
         .map(|relation| (relation.net, relation.node))
         .collect::<HashSet<_>>();
+    let index = ClearanceIndex::new(nodes);
+    let mut ordered_segments = segments.to_vec();
+    ordered_segments.sort_by(compare_edge_node_segments);
+    let mut remaining_pair_visits = max_pair_visits;
+    let mut stack = Vec::with_capacity(index.height);
     let mut minimum = None::<f64>;
     let mut violations = 0usize;
-    for segment in segments {
-        for node in nodes {
-            if related.contains(&(segment.net, node.id)) {
-                continue;
-            }
-            let distance = segment_node_distance(*segment, node);
-            minimum = Some(minimum.map_or(distance, |current| current.min(distance)));
-            if distance < threshold {
-                violations = violations.saturating_add(1);
-            }
-        }
+    for segment in ordered_segments {
+        index.visit_segment_candidates(
+            segment,
+            threshold,
+            &related,
+            &mut remaining_pair_visits,
+            &mut stack,
+            &mut minimum,
+            &mut violations,
+        )?;
     }
     Ok(EdgeNodeClearance {
         minimum_clearance: minimum,
@@ -113,29 +113,252 @@ pub fn measure_edge_node_clearance_bounded(
     })
 }
 
-fn segment_node_distance(segment: EdgeNodeSegment, node: &NodeGeometry) -> f64 {
-    let (segment_left, segment_top, segment_right, segment_bottom) = if segment.horizontal {
-        (segment.start, segment.fixed, segment.end, segment.fixed)
+fn compare_edge_node_segments(left: &EdgeNodeSegment, right: &EdgeNodeSegment) -> Ordering {
+    left.net
+        .cmp(&right.net)
+        .then(left.horizontal.cmp(&right.horizontal))
+        .then(left.fixed.total_cmp(&right.fixed))
+        .then(left.start.total_cmp(&right.start))
+        .then(left.end.total_cmp(&right.end))
+}
+
+#[derive(Clone, Copy)]
+struct Aabb {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl Aabb {
+    fn from_node(node: &NodeGeometry) -> Self {
+        Self {
+            left: node.x,
+            top: node.y,
+            right: node.x + node.width,
+            bottom: node.y + node.height,
+        }
+    }
+
+    fn from_segment(segment: EdgeNodeSegment) -> Self {
+        if segment.horizontal {
+            Self {
+                left: segment.start,
+                top: segment.fixed,
+                right: segment.end,
+                bottom: segment.fixed,
+            }
+        } else {
+            Self {
+                left: segment.fixed,
+                top: segment.start,
+                right: segment.fixed,
+                bottom: segment.end,
+            }
+        }
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            left: self.left.min(other.left),
+            top: self.top.min(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    fn distance(self, other: Self) -> f64 {
+        let dx = if self.right < other.left {
+            other.left - self.right
+        } else if self.left > other.right {
+            self.left - other.right
+        } else {
+            0.0
+        };
+        let dy = if self.bottom < other.top {
+            other.top - self.bottom
+        } else if self.top > other.bottom {
+            self.top - other.bottom
+        } else {
+            0.0
+        };
+        dx.max(dy)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct IndexedNode {
+    id: NodeId,
+    bounds: Aabb,
+}
+
+#[derive(Clone, Copy)]
+enum ClearanceBvhNode {
+    Leaf {
+        bounds: Aabb,
+        node: usize,
+    },
+    Branch {
+        bounds: Aabb,
+        left: usize,
+        right: usize,
+    },
+}
+
+impl ClearanceBvhNode {
+    fn bounds(self) -> Aabb {
+        match self {
+            Self::Leaf { bounds, .. } | Self::Branch { bounds, .. } => bounds,
+        }
+    }
+}
+
+struct ClearanceIndex {
+    nodes: Vec<IndexedNode>,
+    tree: Vec<ClearanceBvhNode>,
+    root: usize,
+    height: usize,
+}
+
+impl ClearanceIndex {
+    fn new(nodes: &[NodeGeometry]) -> Self {
+        let mut indexed = nodes
+            .iter()
+            .map(|node| IndexedNode {
+                id: node.id,
+                bounds: Aabb::from_node(node),
+            })
+            .collect::<Vec<_>>();
+        let mut tree = Vec::with_capacity(indexed.len().saturating_mul(2).saturating_sub(1));
+        let (root, height) = build_clearance_bvh(&mut indexed, 0, &mut tree);
+        Self {
+            nodes: indexed,
+            tree,
+            root,
+            height,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit_segment_candidates(
+        &self,
+        segment: EdgeNodeSegment,
+        threshold: f64,
+        related: &HashSet<(NetId, NodeId)>,
+        remaining_pair_visits: &mut usize,
+        stack: &mut Vec<usize>,
+        minimum: &mut Option<f64>,
+        violations: &mut usize,
+    ) -> Result<(), EdgeNodeClearanceError> {
+        let segment_bounds = Aabb::from_segment(segment);
+        stack.clear();
+        stack.push(self.root);
+        while let Some(tree_index) = stack.pop() {
+            let tree_node = self.tree[tree_index];
+            let lower_bound = segment_bounds.distance(tree_node.bounds());
+            if !clearance_subtree_can_contribute(lower_bound, threshold, *minimum) {
+                continue;
+            }
+            match tree_node {
+                ClearanceBvhNode::Leaf { node, .. } => {
+                    *remaining_pair_visits = remaining_pair_visits
+                        .checked_sub(1)
+                        .ok_or(EdgeNodeClearanceError::WorkLimitExceeded)?;
+                    let candidate = self.nodes[node];
+                    if related.contains(&(segment.net, candidate.id)) {
+                        continue;
+                    }
+                    let distance = segment_bounds.distance(candidate.bounds);
+                    *minimum = Some(minimum.map_or(distance, |current| current.min(distance)));
+                    if distance < threshold {
+                        *violations = violations.saturating_add(1);
+                    }
+                }
+                ClearanceBvhNode::Branch { left, right, .. } => {
+                    let left_distance = segment_bounds.distance(self.tree[left].bounds());
+                    let right_distance = segment_bounds.distance(self.tree[right].bounds());
+                    let left_key = (FloatKey(left_distance), left);
+                    let right_key = (FloatKey(right_distance), right);
+                    if left_key <= right_key {
+                        stack.push(right);
+                        stack.push(left);
+                    } else {
+                        stack.push(left);
+                        stack.push(right);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn clearance_subtree_can_contribute(
+    lower_bound: f64,
+    threshold: f64,
+    minimum: Option<f64>,
+) -> bool {
+    lower_bound < threshold || minimum.is_none_or(|current| lower_bound < current)
+}
+
+fn build_clearance_bvh(
+    nodes: &mut [IndexedNode],
+    offset: usize,
+    tree: &mut Vec<ClearanceBvhNode>,
+) -> (usize, usize) {
+    debug_assert!(!nodes.is_empty());
+    let bounds = nodes
+        .iter()
+        .skip(1)
+        .fold(nodes[0].bounds, |bounds, node| bounds.union(node.bounds));
+    if nodes.len() == 1 {
+        let index = tree.len();
+        tree.push(ClearanceBvhNode::Leaf {
+            bounds,
+            node: offset,
+        });
+        return (index, 1);
+    }
+
+    let horizontal_span = bounds.right - bounds.left;
+    let vertical_span = bounds.bottom - bounds.top;
+    if horizontal_span.total_cmp(&vertical_span) != Ordering::Less {
+        nodes.sort_by(|left, right| compare_indexed_nodes(left, right, true));
     } else {
-        (segment.fixed, segment.start, segment.fixed, segment.end)
-    };
-    let node_right = node.x + node.width;
-    let node_bottom = node.y + node.height;
-    let dx = if segment_right < node.x {
-        node.x - segment_right
-    } else if segment_left > node_right {
-        segment_left - node_right
+        nodes.sort_by(|left, right| compare_indexed_nodes(left, right, false));
+    }
+    let middle = nodes.len() / 2;
+    let (left_nodes, right_nodes) = nodes.split_at_mut(middle);
+    let (left, left_height) = build_clearance_bvh(left_nodes, offset, tree);
+    let (right, right_height) = build_clearance_bvh(right_nodes, offset + middle, tree);
+    let index = tree.len();
+    tree.push(ClearanceBvhNode::Branch {
+        bounds,
+        left,
+        right,
+    });
+    (index, left_height.max(right_height) + 1)
+}
+
+fn compare_indexed_nodes(left: &IndexedNode, right: &IndexedNode, horizontal: bool) -> Ordering {
+    let left_bounds = left.bounds;
+    let right_bounds = right.bounds;
+    let spatial = if horizontal {
+        left_bounds
+            .left
+            .total_cmp(&right_bounds.left)
+            .then(left_bounds.right.total_cmp(&right_bounds.right))
+            .then(left_bounds.top.total_cmp(&right_bounds.top))
+            .then(left_bounds.bottom.total_cmp(&right_bounds.bottom))
     } else {
-        0.0
+        left_bounds
+            .top
+            .total_cmp(&right_bounds.top)
+            .then(left_bounds.bottom.total_cmp(&right_bounds.bottom))
+            .then(left_bounds.left.total_cmp(&right_bounds.left))
+            .then(left_bounds.right.total_cmp(&right_bounds.right))
     };
-    let dy = if segment_bottom < node.y {
-        node.y - segment_bottom
-    } else if segment_top > node_bottom {
-        segment_top - node_bottom
-    } else {
-        0.0
-    };
-    dx.max(dy)
+    spatial.then(left.id.cmp(&right.id))
 }
 
 /// A same-net-unioned, axis-aligned physical wire segment.
@@ -565,9 +788,10 @@ mod tests {
             Ok(measured)
         );
         assert_eq!(
-            measure_edge_node_clearance_bounded(&[segment], &nodes, &[], 5.0, 1),
+            measure_edge_node_clearance_bounded(&[segment], &nodes, &[], 11.0, 1),
             Err(EdgeNodeClearanceError::WorkLimitExceeded)
         );
+        assert!(measure_edge_node_clearance_bounded(&[segment], &nodes, &[], 11.0, 2).is_ok());
     }
 
     #[test]
@@ -646,29 +870,36 @@ mod tests {
             result
         }
 
-        let nodes = (0..9)
-            .map(|id| placed_node(id, f64::from((id * 17) % 41), f64::from((id * 29) % 47)))
+        let nodes = (0..37)
+            .map(|id| {
+                let mut node =
+                    placed_node(id, f64::from((id * 17) % 83), f64::from((id * 29) % 97));
+                node.width = f64::from(3 + id % 19);
+                node.height = f64::from(4 + (id * 7) % 23);
+                node
+            })
             .collect::<Vec<_>>();
-        let segments = (0..17)
+        let segments = (0..61)
             .map(|id| {
                 let horizontal = id % 2 == 0;
                 EdgeNodeSegment {
-                    net: id % 4,
+                    net: id % 11,
                     horizontal,
-                    fixed: f64::from((id * 13) % 53),
-                    start: f64::from((id * 7) % 19),
-                    end: f64::from((id * 7) % 19 + 5 + id % 11),
+                    fixed: f64::from((id * 13) % 101),
+                    start: f64::from((id * 7) % 43),
+                    end: f64::from((id * 7) % 43 + 5 + id % 53),
                 }
             })
             .collect::<Vec<_>>();
-        let relations = (0..7)
+        let relations = (0..29)
             .map(|id| NetNodeRelation {
-                net: id % 4,
-                node: (id * 3) % 9,
+                net: id % 11,
+                node: (id * 3) % 37,
             })
             .collect::<Vec<_>>();
 
         for threshold in [0.0, 1.0, 7.5, 20.0] {
+            let expected = oracle(&segments, &nodes, &relations, threshold);
             assert_eq!(
                 measure_edge_node_clearance_bounded(
                     &segments,
@@ -677,9 +908,94 @@ mod tests {
                     threshold,
                     segments.len() * nodes.len(),
                 ),
-                Ok(oracle(&segments, &nodes, &relations, threshold))
+                Ok(expected)
+            );
+
+            let mut permuted_segments = segments.clone();
+            let mut permuted_nodes = nodes.clone();
+            let mut permuted_relations = relations.clone();
+            permuted_segments.reverse();
+            permuted_nodes.rotate_left(13);
+            permuted_relations.reverse();
+            assert_eq!(
+                measure_edge_node_clearance_bounded(
+                    &permuted_segments,
+                    &permuted_nodes,
+                    &permuted_relations,
+                    threshold,
+                    segments.len() * nodes.len(),
+                ),
+                Ok(expected)
+            );
+
+            let first_success = (0..=segments.len() * nodes.len())
+                .find(|&budget| {
+                    measure_edge_node_clearance_bounded(
+                        &segments, &nodes, &relations, threshold, budget,
+                    )
+                    .is_ok()
+                })
+                .unwrap();
+            let permuted_first_success = (0..=segments.len() * nodes.len())
+                .find(|&budget| {
+                    measure_edge_node_clearance_bounded(
+                        &permuted_segments,
+                        &permuted_nodes,
+                        &permuted_relations,
+                        threshold,
+                        budget,
+                    )
+                    .is_ok()
+                })
+                .unwrap();
+            assert_eq!(permuted_first_success, first_success);
+            assert_eq!(
+                measure_edge_node_clearance_bounded(
+                    &segments,
+                    &nodes,
+                    &relations,
+                    threshold,
+                    first_success - 1,
+                ),
+                Err(EdgeNodeClearanceError::WorkLimitExceeded)
             );
         }
+    }
+
+    #[test]
+    fn edge_node_clearance_charges_related_candidates_before_exemption() {
+        let nodes = (0..32)
+            .map(|id| placed_node(id, f64::from(id * 20), 0.0))
+            .collect::<Vec<_>>();
+        let segments = [EdgeNodeSegment {
+            net: 7,
+            horizontal: true,
+            fixed: 5.0,
+            start: -10.0,
+            end: 640.0,
+        }];
+        let relations = nodes
+            .iter()
+            .map(|node| NetNodeRelation {
+                net: 7,
+                node: node.id,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            measure_edge_node_clearance_bounded(
+                &segments,
+                &nodes,
+                &relations,
+                20.0,
+                nodes.len() - 1,
+            ),
+            Err(EdgeNodeClearanceError::WorkLimitExceeded)
+        );
+        assert_eq!(
+            measure_edge_node_clearance_bounded(&segments, &nodes, &relations, 20.0, nodes.len(),),
+            Ok(super::EdgeNodeClearance::default())
+        );
     }
 
     fn oracle(segments: &[ParallelSegment], cutoff: f64) -> f64 {
