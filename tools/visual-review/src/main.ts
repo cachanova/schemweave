@@ -324,6 +324,25 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       format: percentage,
       higherIsBetter: true,
     },
+    {
+      label: 'Straight routes',
+      elk: (q) => q.straight_route_ratio,
+      format: percentage,
+      higherIsBetter: true,
+    },
+    { label: 'Max bends / route', elk: (q) => q.max_bends_per_route, format: integer },
+    {
+      label: 'Min track separation',
+      elk: (q) => q.minimum_parallel_route_separation ?? Number.NaN,
+      format: nullableDecimal,
+      higherIsBetter: true,
+    },
+    {
+      label: 'Max crossing knot',
+      elk: (q) => q.max_crossings_on_segment,
+      format: integer,
+    },
+    { label: 'Perimeter routing', elk: (q) => q.perimeter_route_ratio, format: percentage },
     { label: 'Viewport fit', elk: (q) => q.viewport_fit, format: decimal },
     { label: 'Contract violations', elk: contractViolations, format: integer },
   ]
@@ -333,6 +352,7 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       const elkValue = definition.elk(elkQuality)
       const schemweaveValue = definition.elk(schemweaveQuality)
       const delta = relativeDelta(elkValue, schemweaveValue)
+      const comparable = !Number.isNaN(elkValue) && !Number.isNaN(schemweaveValue)
       const better = definition.higherIsBetter
         ? schemweaveValue > elkValue
         : schemweaveValue < elkValue
@@ -344,7 +364,7 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
           <span class="elk-value">${definition.format(elkValue, elkQuality)}</span>
           <span class="schemweave-value">${definition.format(schemweaveValue, schemweaveQuality)}</span>
         </div>
-        <div class="metric-delta ${delta === 0 ? '' : better ? 'better' : 'worse'}">${formatDelta(delta, elkValue, schemweaveValue)}</div>
+        <div class="metric-delta ${!comparable || delta === 0 ? '' : better ? 'better' : 'worse'}">${formatDelta(delta, elkValue, schemweaveValue)}</div>
       `
       return card
     }),
@@ -353,7 +373,7 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
 
 function metricPlaceholders(): string {
   return Array.from(
-    { length: 8 },
+    { length: 13 },
     () => '<div class="metric"><div class="metric-label">computing</div><div class="metric-values"><span>—</span><span>—</span></div></div>',
   ).join('')
 }
@@ -365,6 +385,7 @@ function relativeDelta(reference: number, candidate: number): number {
 }
 
 function formatDelta(delta: number, reference: number, candidate: number): string {
+  if (Number.isNaN(reference) || Number.isNaN(candidate)) return 'n/a'
   if (delta === 0) return 'equal'
   if (!Number.isFinite(delta)) return candidate > reference ? 'ELK 0' : 'SchemWeave 0'
   return `${delta > 0 ? '+' : ''}${delta.toFixed(Math.abs(delta) >= 10 ? 0 : 1)}%`
@@ -376,6 +397,10 @@ function integer(value: number): string {
 
 function decimal(value: number): string {
   return value.toFixed(3)
+}
+
+function nullableDecimal(value: number): string {
+  return Number.isNaN(value) ? '—' : decimal(value)
 }
 
 function percentage(value: number): string {
