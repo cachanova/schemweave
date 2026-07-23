@@ -3,6 +3,10 @@ use crate::{
 };
 
 const PREFERRED_ALIGNMENT_WEIGHT: f64 = 8.0;
+const CHAIN_ALIGNMENT_WEIGHT: f64 = 16.0;
+const CHAIN_ALIGNMENT_EPSILON: f64 = 1e-7;
+pub(crate) const MAX_CHAIN_HEIGHT_FACTOR: f64 = 1.10;
+pub(crate) const MAX_CHAIN_CANDIDATE_NODES: usize = 1_000;
 const MIN_PREFERRED_ALIGNMENT_IMPROVEMENT: f64 = 100_000.0;
 
 #[derive(Clone, Copy)]
@@ -43,6 +47,52 @@ pub(crate) fn place_preferred_nodes(
     options: LayoutOptions,
 ) -> Vec<NodeGeometry> {
     place_nodes_with_alignment(graph, ranks, layers, options, PREFERRED_ALIGNMENT)
+}
+
+pub(crate) fn place_straight_chain_nodes(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    layers: &[Vec<usize>],
+    ordinary: &[NodeGeometry],
+    node_gap: f64,
+) -> Option<Vec<NodeGeometry>> {
+    let chains = preferred_chain_targets(graph, ranks, ordinary)?;
+    let packed_height = layers
+        .iter()
+        .map(|layer| {
+            layer
+                .iter()
+                .map(|&node| graph.nodes[node].height)
+                .sum::<f64>()
+                + node_gap * layer.len().saturating_sub(1) as f64
+        })
+        .fold(0.0, f64::max);
+    let mut nodes = ordinary.to_vec();
+    for layer in layers {
+        let mut offsets = Vec::with_capacity(layer.len());
+        let mut projected_targets = Vec::with_capacity(layer.len());
+        let mut weights = Vec::with_capacity(layer.len());
+        let mut offset = 0.0;
+        for &node in layer {
+            offsets.push(offset);
+            projected_targets.push(chains.targets[node].unwrap_or(nodes[node].y) - offset);
+            weights.push(if chains.targets[node].is_some() {
+                CHAIN_ALIGNMENT_WEIGHT
+            } else {
+                1.0
+            });
+            offset += nodes[node].height + node_gap;
+        }
+        for ((&node, &base), y) in layer
+            .iter()
+            .zip(&offsets)
+            .zip(isotonic_projection(&projected_targets, &weights))
+        {
+            nodes[node].y = base + y;
+        }
+    }
+    straight_chain_is_eligible(graph, ordinary, &nodes, &chains.edges, packed_height)
+        .then_some(nodes)
 }
 
 pub(crate) fn place_baseline_nodes(
@@ -164,6 +214,116 @@ fn preferred_edges(graph: &IndexedGraph<'_>, ranks: &[usize]) -> Vec<bool> {
         }
     }
     edges
+}
+
+struct PreferredChains {
+    targets: Vec<Option<f64>>,
+    edges: Vec<usize>,
+}
+
+fn preferred_chain_targets(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    ordinary: &[NodeGeometry],
+) -> Option<PreferredChains> {
+    let preferred = preferred_edges(graph, ranks);
+    let mut incoming = vec![None; graph.nodes.len()];
+    let mut outgoing = vec![None; graph.nodes.len()];
+    for (edge_index, (&selected, edge)) in preferred.iter().zip(&graph.edges).enumerate() {
+        if !selected {
+            continue;
+        }
+        let source = graph.node_index[&edge.source.node];
+        let target = graph.node_index[&edge.target.node];
+        outgoing[source] = Some(edge_index);
+        incoming[target] = Some(edge_index);
+    }
+
+    let mut targets = vec![None; graph.nodes.len()];
+    let mut chain_edges = Vec::new();
+    for start in 0..graph.nodes.len() {
+        if incoming[start].is_some() || outgoing[start].is_none() {
+            continue;
+        }
+        let mut chain = vec![(start, 0.0)];
+        let mut edges = Vec::new();
+        let mut node = start;
+        while let Some(edge_index) = outgoing[node] {
+            let edge = graph.edges[edge_index];
+            let target = graph.node_index[&edge.target.node];
+            let source_port = graph.ports[node][&edge.source.port];
+            let target_port = graph.ports[target][&edge.target.port];
+            let relative_y = chain.last().unwrap().1 + source_port.offset - target_port.offset;
+            chain.push((target, relative_y));
+            edges.push(edge_index);
+            node = target;
+        }
+        if chain.len() < 3 {
+            continue;
+        }
+        chain_edges.extend(edges);
+        let anchor = chain
+            .iter()
+            .map(|&(node, relative_y)| ordinary[node].y - relative_y)
+            .sum::<f64>()
+            / chain.len() as f64;
+        for (node, relative_y) in chain {
+            targets[node] = Some(anchor + relative_y);
+        }
+    }
+    (!chain_edges.is_empty()).then_some(PreferredChains {
+        targets,
+        edges: chain_edges,
+    })
+}
+
+fn straight_chain_is_eligible(
+    graph: &IndexedGraph<'_>,
+    ordinary: &[NodeGeometry],
+    candidate: &[NodeGeometry],
+    chain_edges: &[usize],
+    packed_height: f64,
+) -> bool {
+    let newly_straight = chain_edges
+        .iter()
+        .filter(|&&edge_index| {
+            let edge = graph.edges[edge_index];
+            let source = graph.node_index[&edge.source.node];
+            let target = graph.node_index[&edge.target.node];
+            let source_offset = graph.ports[source][&edge.source.port].offset;
+            let target_offset = graph.ports[target][&edge.target.port].offset;
+            let error = |nodes: &[NodeGeometry]| {
+                (nodes[source].y + source_offset - nodes[target].y - target_offset).abs()
+            };
+            error(ordinary) > CHAIN_ALIGNMENT_EPSILON && error(candidate) <= CHAIN_ALIGNMENT_EPSILON
+        })
+        .count();
+    straight_chain_scale_is_eligible(graph.nodes.len(), newly_straight, chain_edges.len())
+        && vertical_span(candidate) <= packed_height * MAX_CHAIN_HEIGHT_FACTOR
+}
+
+fn straight_chain_scale_is_eligible(
+    node_count: usize,
+    newly_straight: usize,
+    chain_edge_count: usize,
+) -> bool {
+    newly_straight >= 2
+        && node_count <= MAX_CHAIN_CANDIDATE_NODES
+        // Above the interactive threshold, require the second exact route family to straighten a
+        // substantial share of its matched backbone rather than paying that cost for isolated wins.
+        && (node_count <= 600 || newly_straight.saturating_mul(5) >= chain_edge_count)
+}
+
+pub(crate) fn vertical_span(nodes: &[NodeGeometry]) -> f64 {
+    let top = nodes
+        .iter()
+        .map(|node| node.y)
+        .fold(f64::INFINITY, f64::min);
+    let bottom = nodes
+        .iter()
+        .map(|node| node.y + node.height)
+        .fold(f64::NEG_INFINITY, f64::max);
+    bottom - top
 }
 
 // Avoid specializing the alignment rounds into separate baseline and quality copies in WASM.
@@ -411,8 +571,9 @@ pub fn place(
 mod tests {
     use super::{
         Alignment, align_layer, isotonic_projection, normalize, normalize_owned,
-        preferred_alignment_can_be_significant, preferred_alignment_is_significant,
-        preferred_edges,
+        place_straight_chain_nodes, preferred_alignment_can_be_significant,
+        preferred_alignment_is_significant, preferred_chain_targets, preferred_edges,
+        straight_chain_scale_is_eligible,
     };
     use crate::{
         Edge, EdgeGeometry, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Point, Port,
@@ -659,6 +820,119 @@ mod tests {
 
         assert_eq!(selected(&graph), vec![10]);
         assert_eq!(selected(&permuted), vec![10]);
+    }
+
+    #[test]
+    fn straight_chain_candidate_requires_two_matched_steps_and_is_permutation_invariant() {
+        assert!(!straight_chain_scale_is_eligible(600, 1, 2));
+        assert!(straight_chain_scale_is_eligible(600, 2, 100));
+        assert!(!straight_chain_scale_is_eligible(601, 19, 100));
+        assert!(straight_chain_scale_is_eligible(601, 20, 100));
+        assert!(!straight_chain_scale_is_eligible(1_001, 1_000, 1_000));
+
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 0,
+                    width: 40.0,
+                    height: 40.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 1,
+                        side: PortSide::East,
+                        offset: 20.0,
+                    }],
+                },
+                Node {
+                    id: 1,
+                    width: 40.0,
+                    height: 40.0,
+                    cycle_breaker: false,
+                    ports: vec![
+                        Port {
+                            id: 0,
+                            side: PortSide::West,
+                            offset: 20.0,
+                        },
+                        Port {
+                            id: 1,
+                            side: PortSide::East,
+                            offset: 20.0,
+                        },
+                    ],
+                },
+                Node {
+                    id: 2,
+                    width: 40.0,
+                    height: 40.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 20.0,
+                    }],
+                },
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 0, port: 1 },
+                    target: Endpoint { node: 1, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 20,
+                    source: Endpoint { node: 1, port: 1 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 20,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let ordinary = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                width: 40.0,
+                height: 40.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 100.0,
+                y: 100.0,
+                width: 40.0,
+                height: 40.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 200.0,
+                y: -50.0,
+                width: 40.0,
+                height: 40.0,
+            },
+        ];
+        let layers = vec![vec![0], vec![1], vec![2]];
+        let place_candidate = |graph: &Graph| {
+            let indexed = validate_and_index(graph, LayoutOptions::default()).unwrap();
+            place_straight_chain_nodes(&indexed, &[0, 1, 2], &layers, &ordinary, 30.0).unwrap()
+        };
+
+        let candidate = place_candidate(&graph);
+        assert_eq!(candidate[0].y + 20.0, candidate[1].y + 20.0);
+        assert_eq!(candidate[1].y + 20.0, candidate[2].y + 20.0);
+        let mut permuted = graph.clone();
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(place_candidate(&permuted), candidate);
+
+        let one_edge = Graph {
+            edges: vec![graph.edges[0].clone()],
+            ..graph
+        };
+        let indexed = validate_and_index(&one_edge, LayoutOptions::default()).unwrap();
+        assert!(preferred_chain_targets(&indexed, &[0, 1, 2], &ordinary).is_none());
     }
 
     #[test]
