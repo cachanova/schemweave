@@ -881,6 +881,88 @@ fn regional_fanout_graph() -> Graph {
     Graph { nodes, edges }
 }
 
+fn negotiated_corridor_graph() -> Graph {
+    const LAYERS: u32 = 6;
+    const WIDTH: u32 = 20;
+    let nodes = (0..LAYERS * WIDTH)
+        .map(|id| Node {
+            id,
+            width: 76.0,
+            height: 84.0,
+            cycle_breaker: false,
+            ports: std::iter::once(Port {
+                id: 0,
+                side: PortSide::East,
+                offset: 42.0,
+            })
+            .chain((1..=6).map(|id| Port {
+                id,
+                side: PortSide::West,
+                offset: 12.0 * id as f64,
+            }))
+            .collect(),
+        })
+        .collect();
+    let mut edges = Vec::new();
+    for layer in 0..LAYERS - 1 {
+        for source in 0..WIDTH {
+            edges.push(Edge {
+                id: edges.len() as u32,
+                source: Endpoint {
+                    node: layer * WIDTH + source,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: (layer + 1) * WIDTH + source,
+                    port: 1,
+                },
+                net: layer * WIDTH + source,
+                participates_in_ranking: true,
+            });
+        }
+    }
+    for layer in 0..LAYERS - 3 {
+        for source in 0..WIDTH {
+            for branch in 0..5 {
+                edges.push(Edge {
+                    id: edges.len() as u32,
+                    source: Endpoint {
+                        node: layer * WIDTH + source,
+                        port: 0,
+                    },
+                    target: Endpoint {
+                        node: (layer + 3) * WIDTH + (source * 7 + branch * 11) % WIDTH,
+                        port: branch + 2,
+                    },
+                    net: layer * WIDTH + source,
+                    participates_in_ranking: true,
+                });
+            }
+        }
+    }
+    Graph { nodes, edges }
+}
+
+#[test]
+fn negotiated_corridor_max_candidate_preserves_every_hard_gate() {
+    let graph = negotiated_corridor_graph();
+    let options = LayoutOptions::default();
+    let quality = layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+    let max = layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+    let quality_report = score(&graph, &quality, ScoreOptions::default());
+    let report = score(&graph, &max, ScoreOptions::default());
+
+    assert_ne!(
+        max, quality,
+        "fixture must activate a Max negotiated-corridor candidate"
+    );
+    assert!(
+        report.crossings < quality_report.crossings,
+        "negotiated corridors must improve exact crossings",
+    );
+    assert!(report.passes_hard_gates(), "{report:#?}");
+}
+
 #[test]
 fn regional_fanout_max_candidate_preserves_every_hard_gate() {
     let graph = regional_fanout_graph();

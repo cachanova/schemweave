@@ -20,13 +20,29 @@ const MAX_REGIONAL_FANOUT_ROUTE_POINTS: usize = 100_000;
 const MAX_REGIONAL_FANOUT_ORDINATES: usize = 32_768;
 const MAX_REGIONAL_FANOUT_ARM_RELATIONS: usize = 500_000;
 const MAX_REGIONAL_FANOUT_SCORE_VISITS: usize = 20_000_000;
-const MAX_REGIONAL_FANOUT_SAFETY_VISITS: usize = 10_000_000;
+const MAX_REGIONAL_FANOUT_SAFETY_VISITS: usize = 20_000_000;
 const REGIONAL_FANOUT_EDGES_PER_TRUNK: usize = 128;
 const MAX_REGIONAL_FANOUT_TRUNKS: usize = 4;
 const MIN_REGIONAL_FANOUT_CROSSING_GAIN: usize = 32;
 const MIN_REGIONAL_FANOUT_CROSSING_GAIN_DENOMINATOR: usize = 10;
 const MAX_REGIONAL_FANOUT_BEND_FACTOR: f64 = 1.10;
 const MAX_REGIONAL_FANOUT_LENGTH_FACTOR: f64 = 1.05;
+const MAX_NEGOTIATED_CORRIDOR_NETS: usize = 32;
+const MAX_NEGOTIATED_CORRIDOR_ROUNDS: usize = 1;
+const MAX_NEGOTIATED_CORRIDOR_FALLBACK_NODES: usize = 500;
+const MIN_NEGOTIATED_CORRIDOR_SUPPLEMENTAL_FALLBACK_NODES: usize = 400;
+const MAX_NEGOTIATED_CORRIDOR_PATH_STATES: usize = 500_000;
+const MAX_NEGOTIATED_CORRIDOR_RELAXATIONS: usize = 500_000;
+const MAX_NEGOTIATED_CORRIDOR_RELATIONS: usize = 500_000;
+const MAX_NEGOTIATED_CORRIDOR_SEGMENT_VISITS: usize = 20_000_000;
+const MAX_NEGOTIATED_CORRIDOR_SAFETY_VISITS: usize = 20_000_000;
+const MIN_NEGOTIATED_CORRIDOR_CROSSINGS: usize = 500;
+const MIN_NEGOTIATED_CORRIDOR_GAIN: usize = 32;
+const MIN_NEGOTIATED_CORRIDOR_GAIN_DENOMINATOR: usize = 100;
+const NEGOTIATED_CORRIDOR_BEND_COST: f64 = 64.0;
+const NEGOTIATED_CORRIDOR_CROSSING_COST: f64 = 256.0;
+const NEGOTIATED_CORRIDOR_PARALLEL_COST: f64 = 4.0;
+const MAX_NEGOTIATED_CORRIDOR_LENGTH_FACTOR: f64 = 1.05;
 const CROSSING_TRACK_NUDGE: f64 = 1e-4;
 const CROSSING_ALIGNMENT_WEIGHT: f64 = 4.0;
 const MIN_ROUTE_SEGMENT: f64 = 1e-7;
@@ -135,6 +151,8 @@ pub(crate) struct RoutedEdges {
     #[cfg(test)]
     pub(crate) repair_nets: Vec<NetId>,
     #[cfg(test)]
+    pub(crate) negotiated_candidate_quality: Option<RouteQuality>,
+    #[cfg(test)]
     repair_outer_sides: Vec<(NetId, OuterSide)>,
 }
 
@@ -193,6 +211,7 @@ struct RouteFamily {
 struct CrossingRepair {
     baseline_quality: RouteQuality,
     candidate: Option<(RouteQuality, Vec<EdgeGeometry>)>,
+    negotiated_candidate: Option<(RouteQuality, Vec<EdgeGeometry>)>,
     #[cfg(test)]
     selected_nets: Vec<NetId>,
     #[cfg(test)]
@@ -206,6 +225,18 @@ struct CrossingRepair {
 #[derive(Clone, Copy)]
 struct PhysicalSegment {
     net: u32,
+    source: Endpoint,
+    target: Endpoint,
+    horizontal: bool,
+    fixed: f64,
+    start: f64,
+    end: f64,
+}
+
+#[derive(Clone, Copy)]
+struct RawRouteSegment {
+    edge: EdgeId,
+    net: NetId,
     source: Endpoint,
     target: Endpoint,
     horizontal: bool,
@@ -1037,11 +1068,12 @@ fn route_edges_with_lane_rounds_and_refined_global(
             precomputed_repair_profile,
             gap_spacing,
             MAX_BATCHED_CROSSING_REPAIR_NETS,
+            false,
         ))
     } else {
         None
     };
-    let deeper_crossing_repair_candidate = if deeper_repair_within_budget {
+    let deeper_repair = if deeper_repair_within_budget {
         repair_crossing_heavy_net(
             plan,
             nodes,
@@ -1065,14 +1097,54 @@ fn route_edges_with_lane_rounds_and_refined_global(
             precomputed_repair_profile,
             gap_spacing,
             MAX_DEEP_CROSSING_REPAIR_NETS,
+            !repair_crossings || nodes.len() >= MIN_NEGOTIATED_CORRIDOR_SUPPLEMENTAL_FALLBACK_NODES,
         )
-        .candidate
-        .filter(|candidate| {
-            repair.as_ref().and_then(|item| item.candidate.as_ref()) != Some(candidate)
-        })
     } else {
-        None
+        CrossingRepair {
+            baseline_quality: primary_quality
+                .unwrap_or_else(|| route_quality_for_plan(plan, &routes)),
+            candidate: None,
+            negotiated_candidate: None,
+            #[cfg(test)]
+            selected_nets: Vec::new(),
+            #[cfg(test)]
+            selected_outer_sides: Vec::new(),
+            #[cfg(test)]
+            candidate_lanes_built: false,
+            #[cfg(test)]
+            candidate_emitted: false,
+        }
     };
+    let deeper_crossing_repair_candidate = deeper_repair.candidate.filter(|candidate| {
+        repair.as_ref().and_then(|item| item.candidate.as_ref()) != Some(candidate)
+    });
+    let negotiated_corridor_candidate = deeper_repair.negotiated_candidate.or_else(|| {
+        (deeper_crossing_repair
+            && (!repair_crossings
+                || nodes.len() >= MIN_NEGOTIATED_CORRIDOR_SUPPLEMENTAL_FALLBACK_NODES)
+            && nodes.len() <= MAX_NEGOTIATED_CORRIDOR_FALLBACK_NODES)
+            .then(|| {
+                negotiated_corridor_candidate(
+                    plan,
+                    nodes,
+                    &sparse_spans,
+                    &free_by_rank,
+                    &layer_left,
+                    &layer_right,
+                    &gap_lanes,
+                    &outer_lanes,
+                    top,
+                    bottom,
+                    options,
+                    &routes,
+                    &endpoint_tracks,
+                    &crossing_paths,
+                    gap_spacing,
+                    precomputed_repair_profile,
+                )
+            })
+            .flatten()
+    });
     let selected_quality = repair
         .as_ref()
         .map_or(primary_quality, |repair| Some(repair.baseline_quality));
@@ -1080,6 +1152,10 @@ fn route_edges_with_lane_rounds_and_refined_global(
     let repair_outer_sides = repair
         .as_ref()
         .map_or_else(Vec::new, |repair| repair.selected_outer_sides.clone());
+    #[cfg(test)]
+    let negotiated_candidate_quality = negotiated_corridor_candidate
+        .as_ref()
+        .map(|candidate| candidate.0);
     RoutedEdges {
         primary: routes,
         primary_quality: selected_quality,
@@ -1089,6 +1165,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             .chain(preserved_refined_sparse_alternative)
             .chain(refined_sparse_alternative)
             .chain(deeper_crossing_repair_candidate)
+            .chain(negotiated_corridor_candidate)
             .chain(staircase_alternative)
             .collect(),
         #[cfg(test)]
@@ -1102,6 +1179,8 @@ fn route_edges_with_lane_rounds_and_refined_global(
         },
         #[cfg(test)]
         repair_nets: repair.map_or_else(Vec::new, |repair| repair.selected_nets),
+        #[cfg(test)]
+        negotiated_candidate_quality,
         #[cfg(test)]
         repair_outer_sides,
     }
@@ -1674,6 +1753,8 @@ fn finish_fanout_route_families(
         #[cfg(test)]
         repair_nets: selected.repair_nets,
         #[cfg(test)]
+        negotiated_candidate_quality: None,
+        #[cfg(test)]
         repair_outer_sides: selected.repair_outer_sides,
     }
 }
@@ -1898,6 +1979,7 @@ fn finish_route_family(
             precomputed_repair_profile,
             gap_spacing,
             MAX_BATCHED_CROSSING_REPAIR_NETS,
+            false,
         ))
     } else {
         None
@@ -1926,6 +2008,7 @@ fn finish_route_family(
             precomputed_repair_profile,
             gap_spacing,
             MAX_DEEP_CROSSING_REPAIR_NETS,
+            false,
         )
         .candidate
         .filter(|candidate| {
@@ -2343,6 +2426,7 @@ fn repair_crossing_heavy_net(
     precomputed: Option<(&[PhysicalSegment], &BTreeMap<NetId, usize>, RouteQuality)>,
     gap_spacing: GapTrackSpacing,
     max_repair_nets: usize,
+    allow_negotiated_corridor: bool,
 ) -> CrossingRepair {
     let node_count = plan
         .nodes_by_rank
@@ -2361,6 +2445,7 @@ fn repair_crossing_heavy_net(
         return CrossingRepair {
             baseline_quality: route_quality_for_plan(plan, routes),
             candidate: None,
+            negotiated_candidate: None,
             #[cfg(test)]
             selected_nets: Vec::new(),
             #[cfg(test)]
@@ -2396,6 +2481,7 @@ fn repair_crossing_heavy_net(
         return CrossingRepair {
             baseline_quality: quality,
             candidate: None,
+            negotiated_candidate: None,
             #[cfg(test)]
             selected_nets,
             #[cfg(test)]
@@ -2534,18 +2620,46 @@ fn repair_crossing_heavy_net(
         {
             candidate_emitted = true;
         }
-        Some(candidate)
+        let negotiated_candidate = (allow_negotiated_corridor
+            && max_repair_nets > MAX_BATCHED_CROSSING_REPAIR_NETS)
+            .then(|| {
+                negotiated_corridor_candidate(
+                    plan,
+                    nodes,
+                    sparse_spans,
+                    free_by_rank,
+                    layer_left,
+                    layer_right,
+                    &candidate_lanes,
+                    &candidate_outer_lanes,
+                    top,
+                    bottom,
+                    options,
+                    &candidate,
+                    &candidate_endpoint_tracks,
+                    candidate_crossing_paths,
+                    gap_spacing,
+                    None,
+                )
+            })
+            .flatten();
+        Some((candidate, negotiated_candidate))
     })();
-    let repair = repair.and_then(|routes| {
-        sum_within_limit(
-            routes.iter().map(|route| route.points.len()),
-            MAX_CROSSING_REPAIR_ROUTE_POINTS,
-        )
-        .then(|| (route_quality_for_plan(plan, &routes), routes))
-    });
+    let (repair, negotiated_candidate) =
+        repair.map_or((None, None), |(routes, negotiated_candidate)| {
+            (
+                sum_within_limit(
+                    routes.iter().map(|route| route.points.len()),
+                    MAX_CROSSING_REPAIR_ROUTE_POINTS,
+                )
+                .then(|| (route_quality_for_plan(plan, &routes), routes)),
+                negotiated_candidate,
+            )
+        });
     CrossingRepair {
         baseline_quality: quality,
         candidate: repair,
+        negotiated_candidate,
         #[cfg(test)]
         selected_nets,
         #[cfg(test)]
@@ -2555,6 +2669,513 @@ fn repair_crossing_heavy_net(
         #[cfg(test)]
         candidate_emitted,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn negotiated_corridor_candidate(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    free_by_rank: &[Vec<(f64, f64)>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    outer_lanes: &BTreeMap<EdgeId, OuterLane>,
+    top: f64,
+    bottom: f64,
+    options: LayoutOptions,
+    routes: &[EdgeGeometry],
+    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    crossing_paths: &[Option<Vec<f64>>],
+    gap_spacing: GapTrackSpacing,
+    precomputed: Option<(&[PhysicalSegment], &BTreeMap<NetId, usize>, RouteQuality)>,
+) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
+    if routes.len() != plan.edges.len()
+        || crossing_paths.len() != plan.edges.len()
+        || nodes.len() > MAX_CROSSING_REPAIR_NODES
+        || plan.edges.len() > MAX_CROSSING_REPAIR_EDGES
+        || !sum_within_limit(
+            routes.iter().map(|route| route.points.len()),
+            MAX_CROSSING_REPAIR_ROUTE_POINTS,
+        )
+    {
+        return None;
+    }
+    let computed_profile;
+    let (baseline_segments, crossing_counts, baseline_quality) = match precomputed {
+        Some(profile) => profile,
+        None => {
+            computed_profile = horizontal_crossing_profile_by_net(plan, routes);
+            (
+                computed_profile.0.as_slice(),
+                &computed_profile.1,
+                computed_profile.2,
+            )
+        }
+    };
+    if baseline_quality.crossings < MIN_NEGOTIATED_CORRIDOR_CROSSINGS {
+        return None;
+    }
+    let baseline_congestion = parallel_congestion_ratio(baseline_segments)?;
+    let selected_nets = select_negotiated_corridor_nets(
+        plan,
+        sparse_spans,
+        crossing_paths,
+        crossing_counts,
+        MAX_NEGOTIATED_CORRIDOR_NETS,
+    );
+    if selected_nets.is_empty() {
+        return None;
+    }
+
+    let mut candidate_paths = crossing_paths.to_vec();
+    let mut candidate_routes = routes.to_vec();
+    let mut remaining_relaxations = MAX_NEGOTIATED_CORRIDOR_RELAXATIONS;
+    let mut remaining_path_states = MAX_NEGOTIATED_CORRIDOR_PATH_STATES;
+    let mut remaining_segment_visits = MAX_NEGOTIATED_CORRIDOR_SEGMENT_VISITS;
+    let mut changed = false;
+    let mut changed_nets = BTreeSet::new();
+    for round in 0..MAX_NEGOTIATED_CORRIDOR_ROUNDS {
+        let round_segments;
+        let segments = if round == 0 {
+            baseline_segments
+        } else {
+            round_segments = physical_route_segments(
+                plan.edges.iter().map(|resolved| resolved.edge),
+                &candidate_routes,
+            )
+            .0;
+            &round_segments
+        };
+        let mut round_changed = false;
+        for &net in &selected_nets {
+            let Some(context) = negotiated_net_context(
+                plan,
+                nodes,
+                sparse_spans,
+                endpoint_tracks,
+                &candidate_paths,
+                options.port_stub,
+                net,
+            ) else {
+                continue;
+            };
+            let candidate = piecewise_constant_crossing_path(
+                &free_by_rank[context.source_rank + 1..context.max_target_rank],
+                context.source_y,
+                context.target_y,
+                &context.path,
+                &(context.source_rank + 1..context.max_target_rank)
+                    .map(|rank| {
+                        (
+                            sparse_gap_x(
+                                net,
+                                rank - 1,
+                                layer_left,
+                                layer_right,
+                                gap_lanes,
+                                options,
+                                gap_spacing,
+                            ),
+                            sparse_gap_x(
+                                net,
+                                rank,
+                                layer_left,
+                                layer_right,
+                                gap_lanes,
+                                options,
+                                gap_spacing,
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                net,
+                segments,
+                &mut remaining_path_states,
+                &mut remaining_relaxations,
+                &mut remaining_segment_visits,
+            )?;
+            if candidate == context.path {
+                continue;
+            }
+            changed_nets.insert(net);
+            for edge_index in context.edge_indices {
+                let (source_rank, target_rank) =
+                    sparse_spans[edge_index].expect("negotiated edges are sparse");
+                debug_assert_eq!(source_rank, context.source_rank);
+                candidate_paths[edge_index] =
+                    Some(candidate[..target_rank - source_rank - 1].to_vec());
+            }
+            round_changed = true;
+        }
+        if !round_changed {
+            break;
+        }
+        changed = true;
+        if crossing_paths_have_unrelated_collinear_tracks(
+            plan,
+            sparse_spans,
+            &candidate_paths,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            options,
+            gap_spacing,
+        ) {
+            return None;
+        }
+        candidate_routes = emit_routes(
+            plan,
+            nodes,
+            sparse_spans,
+            &candidate_paths,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            endpoint_tracks,
+            outer_lanes,
+            top,
+            bottom,
+            options,
+            gap_spacing,
+        );
+    }
+    if !changed
+        || !sum_within_limit(
+            candidate_routes.iter().map(|route| route.points.len()),
+            MAX_CROSSING_REPAIR_ROUTE_POINTS,
+        )
+    {
+        return None;
+    }
+    let (candidate_quality, candidate_segments) =
+        route_quality_profile_for_plan(plan, &candidate_routes);
+    let minimum_gain = MIN_NEGOTIATED_CORRIDOR_GAIN.max(
+        baseline_quality
+            .crossings
+            .div_ceil(MIN_NEGOTIATED_CORRIDOR_GAIN_DENOMINATOR),
+    );
+    let candidate_congestion = parallel_congestion_ratio(&candidate_segments)?;
+    if !negotiated_corridor_quality_is_better(
+        baseline_quality,
+        baseline_congestion,
+        candidate_quality,
+        candidate_congestion,
+        minimum_gain,
+    ) || !selected_route_family_is_safe(
+        plan,
+        nodes,
+        &candidate_routes,
+        &candidate_segments,
+        &changed_nets,
+        MAX_NEGOTIATED_CORRIDOR_SAFETY_VISITS,
+    ) {
+        return None;
+    }
+    Some((candidate_quality, candidate_routes))
+}
+
+fn negotiated_corridor_quality_is_better(
+    baseline: RouteQuality,
+    baseline_congestion: f64,
+    candidate: RouteQuality,
+    candidate_congestion: f64,
+    minimum_gain: usize,
+) -> bool {
+    baseline.crossings.saturating_sub(candidate.crossings) >= minimum_gain
+        && candidate.bends <= baseline.bends
+        && candidate.route_length <= baseline.route_length * MAX_NEGOTIATED_CORRIDOR_LENGTH_FACTOR
+        && candidate_congestion <= baseline_congestion + f64::EPSILON
+}
+
+fn select_negotiated_corridor_nets(
+    plan: &RoutingPlan<'_>,
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_paths: &[Option<Vec<f64>>],
+    crossing_counts: &BTreeMap<NetId, usize>,
+    max_nets: usize,
+) -> Vec<NetId> {
+    let mut eligible = BTreeMap::<NetId, (Endpoint, bool, bool)>::new();
+    for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(crossing_paths) {
+        let entry =
+            eligible
+                .entry(resolved.edge.net)
+                .or_insert((resolved.edge.source, true, false));
+        entry.1 &= span.is_some() && resolved.edge.source == entry.0;
+        entry.2 |= path.as_ref().is_some_and(|path| !path.is_empty());
+    }
+    let mut selected = crossing_counts
+        .iter()
+        .filter_map(|(&net, &count)| {
+            eligible
+                .get(&net)
+                .filter(|(_, all_sparse, has_path)| *all_sparse && *has_path)
+                .map(|_| (count, net))
+        })
+        .collect::<Vec<_>>();
+    selected.sort_unstable_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    selected.truncate(max_nets);
+    selected.into_iter().map(|(_, net)| net).collect()
+}
+
+struct NegotiatedNetContext {
+    edge_indices: Vec<usize>,
+    source_rank: usize,
+    max_target_rank: usize,
+    source_y: f64,
+    target_y: f64,
+    path: Vec<f64>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn negotiated_net_context(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    crossing_paths: &[Option<Vec<f64>>],
+    port_stub: f64,
+    net: NetId,
+) -> Option<NegotiatedNetContext> {
+    let edge_indices = plan
+        .edges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, resolved)| (resolved.edge.net == net).then_some(index))
+        .collect::<Vec<_>>();
+    let first_index = *edge_indices.first()?;
+    let first = plan.edges[first_index];
+    let first_source = first.edge.source;
+    let source_rank = sparse_spans[first_index]?.0;
+    if edge_indices.iter().any(|&index| {
+        let resolved = plan.edges[index];
+        sparse_spans[index].is_none()
+            || resolved.edge.source != first_source
+            || sparse_spans[index].is_some_and(|(rank, _)| rank != source_rank)
+    }) {
+        return None;
+    }
+    let max_target_rank = edge_indices
+        .iter()
+        .map(|&index| {
+            sparse_spans[index]
+                .expect("all negotiated spans are sparse")
+                .1
+        })
+        .max()?;
+    let longest_index = *edge_indices
+        .iter()
+        .filter(|&&index| {
+            sparse_spans[index]
+                .expect("all negotiated spans are sparse")
+                .1
+                == max_target_rank
+        })
+        .min_by_key(|&&index| plan.edges[index].edge.id)?;
+    let path = crossing_paths[longest_index].clone()?;
+    if path.len() != max_target_rank - source_rank - 1 {
+        return None;
+    }
+    let source = port_point(&nodes[first.source_index], first.source_port);
+    let source_y = endpoint_escape_y(source, first_source, 0, endpoint_tracks, port_stub);
+    let mut target_ys = edge_indices
+        .iter()
+        .map(|&index| {
+            let resolved = plan.edges[index];
+            let target = port_point(&nodes[resolved.target_index], resolved.target_port);
+            endpoint_escape_y(target, resolved.edge.target, 1, endpoint_tracks, port_stub)
+        })
+        .collect::<Vec<_>>();
+    target_ys.sort_by(f64::total_cmp);
+    let target_y = target_ys[target_ys.len() / 2];
+    Some(NegotiatedNetContext {
+        edge_indices,
+        source_rank,
+        max_target_rank,
+        source_y,
+        target_y,
+        path,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn piecewise_constant_crossing_path(
+    layers: &[Vec<(f64, f64)>],
+    source_y: f64,
+    target_y: f64,
+    baseline: &[f64],
+    gap_x: &[(f64, f64)],
+    net: NetId,
+    segments: &[PhysicalSegment],
+    remaining_path_states: &mut usize,
+    remaining_relaxations: &mut usize,
+    remaining_segment_visits: &mut usize,
+) -> Option<Vec<f64>> {
+    if layers.is_empty() || layers.len() != baseline.len() || layers.len() != gap_x.len() {
+        return None;
+    }
+    let mut anchors = baseline.to_vec();
+    anchors.sort_by(f64::total_cmp);
+    anchors.dedup_by(|left, right| left.total_cmp(right).is_eq());
+    charge_negotiated_work(
+        remaining_path_states,
+        anchors.len().checked_mul(layers.len())?,
+    )?;
+    let valid = layers
+        .iter()
+        .map(|intervals| {
+            anchors
+                .iter()
+                .map(|&anchor| free_interval_containing(intervals, anchor).is_some())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut relation_count = 0usize;
+    let mut relevant_by_layer = Vec::with_capacity(gap_x.len());
+    for &span in gap_x {
+        charge_negotiated_work(remaining_segment_visits, segments.len())?;
+        let low_x = span.0.min(span.1);
+        let high_x = span.0.max(span.1);
+        let relevant = segments
+            .iter()
+            .filter(|segment| {
+                segment.net != net
+                    && if segment.horizontal {
+                        low_x < segment.end && high_x > segment.start
+                    } else {
+                        low_x < segment.fixed && segment.fixed < high_x
+                    }
+            })
+            .collect::<Vec<_>>();
+        charge_negotiated_relations(&mut relation_count, relevant.len())?;
+        relevant_by_layer.push(relevant);
+    }
+    let mut costs = vec![f64::INFINITY; anchors.len()];
+    let mut predecessors = Vec::<Vec<usize>>::with_capacity(layers.len().saturating_sub(1));
+    for (index, &anchor) in anchors.iter().enumerate() {
+        if valid[0][index] {
+            charge_negotiated_work(remaining_relaxations, 1)?;
+            costs[index] = (source_y - anchor).abs()
+                + if source_y != anchor {
+                    NEGOTIATED_CORRIDOR_BEND_COST
+                } else {
+                    0.0
+                }
+                + negotiated_ordinate_cost(
+                    anchor,
+                    gap_x[0],
+                    &relevant_by_layer[0],
+                    remaining_segment_visits,
+                )?;
+        }
+    }
+    for layer in 1..layers.len() {
+        let mut next = vec![f64::INFINITY; anchors.len()];
+        let mut layer_predecessors = vec![0usize; anchors.len()];
+        for (index, &anchor) in anchors.iter().enumerate() {
+            if !valid[layer][index] {
+                continue;
+            }
+            let ordinate_cost = negotiated_ordinate_cost(
+                anchor,
+                gap_x[layer],
+                &relevant_by_layer[layer],
+                remaining_segment_visits,
+            )?;
+            for (previous_index, &previous_cost) in costs.iter().enumerate() {
+                if !previous_cost.is_finite() {
+                    continue;
+                }
+                charge_negotiated_work(remaining_relaxations, 1)?;
+                let transition = (anchors[previous_index] - anchor).abs()
+                    + if previous_index != index {
+                        NEGOTIATED_CORRIDOR_BEND_COST
+                    } else {
+                        0.0
+                    };
+                let candidate = previous_cost + transition + ordinate_cost;
+                if candidate.total_cmp(&next[index]).is_lt()
+                    || (candidate == next[index] && previous_index < layer_predecessors[index])
+                {
+                    next[index] = candidate;
+                    layer_predecessors[index] = previous_index;
+                }
+            }
+        }
+        if next.iter().all(|cost| !cost.is_finite()) {
+            return None;
+        }
+        costs = next;
+        predecessors.push(layer_predecessors);
+    }
+    let mut selected = anchors
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| costs[*index].is_finite())
+        .map(|(index, &anchor)| {
+            (
+                index,
+                costs[index]
+                    + (anchor - target_y).abs()
+                    + if anchor != target_y {
+                        NEGOTIATED_CORRIDOR_BEND_COST
+                    } else {
+                        0.0
+                    },
+            )
+        })
+        .min_by(|(left_index, left), (right_index, right)| {
+            left.total_cmp(right).then(left_index.cmp(right_index))
+        })?
+        .0;
+    let mut result = vec![0.0; layers.len()];
+    for layer in (0..layers.len()).rev() {
+        result[layer] = anchors[selected];
+        if layer > 0 {
+            selected = predecessors[layer - 1][selected];
+        }
+    }
+    Some(result)
+}
+
+fn negotiated_ordinate_cost(
+    y: f64,
+    gap_x: (f64, f64),
+    segments: &[&PhysicalSegment],
+    remaining_visits: &mut usize,
+) -> Option<f64> {
+    charge_negotiated_work(remaining_visits, segments.len())?;
+    let low_x = gap_x.0.min(gap_x.1);
+    let high_x = gap_x.0.max(gap_x.1);
+    let mut crossings = 0usize;
+    let mut parallel = 0.0;
+    for segment in segments {
+        if segment.horizontal {
+            if (segment.fixed - y).abs() < PARALLEL_CONGESTION_CUTOFF {
+                parallel += (high_x.min(segment.end) - low_x.max(segment.start)).max(0.0);
+            }
+        } else if low_x < segment.fixed
+            && segment.fixed < high_x
+            && segment.start < y
+            && y < segment.end
+        {
+            crossings = crossings.saturating_add(1);
+        }
+    }
+    Some(
+        crossings as f64 * NEGOTIATED_CORRIDOR_CROSSING_COST
+            + parallel * NEGOTIATED_CORRIDOR_PARALLEL_COST,
+    )
+}
+
+fn charge_negotiated_work(remaining: &mut usize, work: usize) -> Option<()> {
+    *remaining = remaining.checked_sub(work)?;
+    Some(())
+}
+
+fn charge_negotiated_relations(relations: &mut usize, count: usize) -> Option<()> {
+    *relations = relations.checked_add(count)?;
+    (*relations <= MAX_NEGOTIATED_CORRIDOR_RELATIONS).then_some(())
 }
 
 fn repair_selection_adds_new_nets(max_repair_nets: usize, selected_nets: usize) -> bool {
@@ -3527,9 +4148,41 @@ fn regional_fanout_candidate_is_safe(
         .iter()
         .map(|(net, _)| *net)
         .collect::<BTreeSet<_>>();
+    selected_route_family_is_safe(
+        plan,
+        nodes,
+        routes,
+        segments,
+        &selected_nets,
+        MAX_REGIONAL_FANOUT_SAFETY_VISITS,
+    )
+}
+
+fn selected_route_family_is_safe(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    segments: &[PhysicalSegment],
+    selected_nets: &BTreeSet<NetId>,
+    max_visits: usize,
+) -> bool {
+    if routes.len() != plan.edges.len() {
+        return false;
+    }
     for (resolved, route) in plan.edges.iter().zip(routes) {
         if selected_nets.contains(&resolved.edge.net)
-            && (route.points.len() < 2
+            && (route.id != resolved.edge.id
+                || route.points.first()
+                    != Some(&port_point(
+                        &nodes[resolved.source_index],
+                        resolved.source_port,
+                    ))
+                || route.points.last()
+                    != Some(&port_point(
+                        &nodes[resolved.target_index],
+                        resolved.target_port,
+                    ))
+                || route.points.len() < 2
                 || route
                     .points
                     .iter()
@@ -3547,9 +4200,13 @@ fn regional_fanout_candidate_is_safe(
         .iter()
         .filter(|segment| selected_nets.contains(&segment.net))
         .collect::<Vec<_>>();
-    if !regional_safety_work_within_budget(selected_segments.len(), nodes.len(), segments.len()) {
+    let raw_segments = raw_route_segments(plan, routes);
+    let Some(node_visits) = selected_segments.len().checked_mul(nodes.len()) else {
         return false;
-    }
+    };
+    let Some(mut remaining_visits) = max_visits.checked_sub(node_visits) else {
+        return false;
+    };
     for segment in &selected_segments {
         if nodes
             .iter()
@@ -3557,15 +4214,183 @@ fn regional_fanout_candidate_is_safe(
         {
             return false;
         }
-        if segments.iter().any(|other| {
-            segment.net != other.net && regional_segments_have_unrelated_contact(segment, other)
-        }) {
-            return false;
-        }
     }
-    true
+    raw_route_family_has_unrelated_contact(&raw_segments, selected_nets, &mut remaining_visits)
+        .is_some_and(|has_contact| !has_contact)
 }
 
+fn raw_route_segments(plan: &RoutingPlan<'_>, routes: &[EdgeGeometry]) -> Vec<RawRouteSegment> {
+    let mut segments = Vec::new();
+    for (resolved, route) in plan.edges.iter().zip(routes) {
+        for points in route.points.windows(2) {
+            let horizontal = points[0].y == points[1].y;
+            let (fixed, first, second) = if horizontal {
+                (points[0].y, points[0].x, points[1].x)
+            } else {
+                (points[0].x, points[0].y, points[1].y)
+            };
+            let start = first.min(second);
+            let end = first.max(second);
+            if start != end {
+                segments.push(RawRouteSegment {
+                    edge: resolved.edge.id,
+                    net: resolved.edge.net,
+                    source: resolved.edge.source,
+                    target: resolved.edge.target,
+                    horizontal,
+                    fixed,
+                    start,
+                    end,
+                });
+            }
+        }
+    }
+    segments
+}
+
+fn raw_route_segments_have_unrelated_contact(
+    left: &RawRouteSegment,
+    right: &RawRouteSegment,
+) -> bool {
+    if left.edge == right.edge
+        || left.net == right.net
+        || left.source == right.source
+        || left.source == right.target
+        || left.target == right.source
+        || left.target == right.target
+    {
+        return false;
+    }
+    if left.horizontal == right.horizontal {
+        return left.fixed == right.fixed && left.start <= right.end && right.start <= left.end;
+    }
+    let (horizontal, vertical) = if left.horizontal {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if vertical.fixed < horizontal.start
+        || vertical.fixed > horizontal.end
+        || horizontal.fixed < vertical.start
+        || horizontal.fixed > vertical.end
+    {
+        return false;
+    }
+    vertical.fixed == horizontal.start
+        || vertical.fixed == horizontal.end
+        || horizontal.fixed == vertical.start
+        || horizontal.fixed == vertical.end
+}
+
+fn raw_route_family_has_unrelated_contact(
+    segments: &[RawRouteSegment],
+    selected_nets: &BTreeSet<NetId>,
+    remaining_visits: &mut usize,
+) -> Option<bool> {
+    let mut horizontal = Vec::new();
+    let mut vertical = Vec::new();
+    let mut selected_horizontal = Vec::new();
+    let mut selected_vertical = Vec::new();
+    for segment in segments {
+        let all = if segment.horizontal {
+            &mut horizontal
+        } else {
+            &mut vertical
+        };
+        all.push((indexed_float_key(segment.fixed), segment));
+        if selected_nets.contains(&segment.net) {
+            let selected = if segment.horizontal {
+                &mut selected_horizontal
+            } else {
+                &mut selected_vertical
+            };
+            selected.push((indexed_float_key(segment.fixed), segment));
+        }
+    }
+    for index in [
+        &mut horizontal,
+        &mut vertical,
+        &mut selected_horizontal,
+        &mut selected_vertical,
+    ] {
+        index.sort_unstable_by_key(|(key, _)| *key);
+    }
+
+    for segment in segments
+        .iter()
+        .filter(|segment| selected_nets.contains(&segment.net))
+    {
+        let collinear = if segment.horizontal {
+            indexed_raw_segments(&horizontal, indexed_float_key(segment.fixed))
+        } else {
+            indexed_raw_segments(&vertical, indexed_float_key(segment.fixed))
+        };
+        if !collinear.is_empty() {
+            charge_negotiated_work(remaining_visits, collinear.len())?;
+            if collinear
+                .iter()
+                .any(|(_, other)| raw_route_segments_have_unrelated_contact(segment, other))
+            {
+                return Some(true);
+            }
+        }
+        let perpendicular = if segment.horizontal {
+            &vertical
+        } else {
+            &horizontal
+        };
+        for endpoint in [segment.start, segment.end] {
+            let candidates = indexed_raw_segments(perpendicular, indexed_float_key(endpoint));
+            if !candidates.is_empty() {
+                charge_negotiated_work(remaining_visits, candidates.len())?;
+                if candidates
+                    .iter()
+                    .any(|(_, other)| raw_route_segments_have_unrelated_contact(segment, other))
+                {
+                    return Some(true);
+                }
+            }
+        }
+    }
+
+    // A moved segment can contain an endpoint owned by an unchanged segment. Query the reverse
+    // direction as well; testing only selected endpoints would miss that T-contact.
+    for segment in segments {
+        let perpendicular = if segment.horizontal {
+            &selected_vertical
+        } else {
+            &selected_horizontal
+        };
+        for endpoint in [segment.start, segment.end] {
+            let candidates = indexed_raw_segments(perpendicular, indexed_float_key(endpoint));
+            if !candidates.is_empty() {
+                charge_negotiated_work(remaining_visits, candidates.len())?;
+                if candidates
+                    .iter()
+                    .any(|(_, other)| raw_route_segments_have_unrelated_contact(segment, other))
+                {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+fn indexed_raw_segments<'a>(
+    index: &'a [(u64, &'a RawRouteSegment)],
+    key: u64,
+) -> &'a [(u64, &'a RawRouteSegment)] {
+    let start = index.partition_point(|(candidate, _)| *candidate < key);
+    let end = start + index[start..].partition_point(|(candidate, _)| *candidate == key);
+    &index[start..end]
+}
+
+fn indexed_float_key(value: f64) -> u64 {
+    if value == 0.0 { 0 } else { value.to_bits() }
+}
+
+#[cfg(test)]
 fn regional_safety_work_within_budget(
     selected_segments: usize,
     nodes: usize,
@@ -3598,6 +4423,7 @@ fn regional_segment_intersects_node_interior(
     }
 }
 
+#[cfg(test)]
 fn regional_segments_have_unrelated_contact(
     left: &PhysicalSegment,
     right: &PhysicalSegment,
@@ -6252,26 +7078,30 @@ mod tests {
         MAX_CROSSING_REPAIR_NODES, MAX_CROSSING_REPAIR_PATH_STATES,
         MAX_CROSSING_REPAIR_ROUTE_POINTS, MAX_EXPANDED_GAP_SPACING_EDGES,
         MAX_EXPANDED_GAP_SPACING_MAX_NODES, MAX_EXPANDED_GAP_SPACING_NODES,
+        MAX_NEGOTIATED_CORRIDOR_PATH_STATES, MAX_NEGOTIATED_CORRIDOR_RELATIONS,
+        MAX_NEGOTIATED_CORRIDOR_RELAXATIONS, MAX_NEGOTIATED_CORRIDOR_SEGMENT_VISITS,
         MAX_REGIONAL_FANOUT_ARM_RELATIONS, MAX_REGIONAL_FANOUT_ORDINATES,
         MAX_REGIONAL_FANOUT_ROUTE_POINTS, MAX_REGIONAL_FANOUT_SAFETY_VISITS,
         MAX_REGIONAL_FANOUT_SCORE_VISITS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
         OuterLane, OuterNetAccess, OuterSide, PhysicalSegment, RouteQuality, RoutingPlan,
         align_crossing_path_staircases, build_endpoint_tracks, build_regional_fanout_candidate,
-        candidate_route_points_within_budget, charge_regional_relation, charge_regional_work,
-        common_free_intervals, crossing_aware_gap_lane_indices,
-        crossing_aware_gap_lane_indices_btree_reference, crossing_aware_outer_lane_indices,
-        crossing_paths_have_unrelated_collinear_tracks, crossing_repair_within_budget,
-        crossing_track_y, distance_transform, expanded_gap_spacing_enabled,
-        expanded_spacing_readability_is_better, fanout_outer_channel_lane_indices,
-        free_interval_containing, free_intervals_by_rank, global_gap_candidate_work_within_budget,
-        global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
-        horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
-        large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
-        large_gap_hot_insertion_order_with_rounds, large_gap_hot_nets,
-        large_gap_hot_nets_with_limit, move_nets_to_outer_lanes, outer_lane_assignments,
-        outer_lane_channels_match, physical_crossing_sweep, physical_crossing_sweep_lines,
-        physical_route_segments, physical_route_segments_btree_reference, port_point,
-        push_regional_ordinate, refined_large_gap_candidate_work_within_budget,
+        candidate_route_points_within_budget, charge_negotiated_relations, charge_negotiated_work,
+        charge_regional_relation, charge_regional_work, common_free_intervals,
+        crossing_aware_gap_lane_indices, crossing_aware_gap_lane_indices_btree_reference,
+        crossing_aware_outer_lane_indices, crossing_paths_have_unrelated_collinear_tracks,
+        crossing_repair_within_budget, crossing_track_y, distance_transform,
+        expanded_gap_spacing_enabled, expanded_spacing_readability_is_better,
+        fanout_outer_channel_lane_indices, free_interval_containing, free_intervals_by_rank,
+        global_gap_candidate_work_within_budget, global_gap_lane_indices_with_rounds,
+        global_gap_order_seed, has_split_feedback_net, horizontal_crossing_counts_by_net,
+        lane_indices, large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
+        large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
+        large_gap_hot_nets, large_gap_hot_nets_with_limit, move_nets_to_outer_lanes,
+        negotiated_corridor_quality_is_better, outer_lane_assignments, outer_lane_channels_match,
+        physical_crossing_sweep, physical_crossing_sweep_lines, physical_route_segments,
+        physical_route_segments_btree_reference, piecewise_constant_crossing_path, port_point,
+        push_regional_ordinate, raw_route_family_has_unrelated_contact, raw_route_segments,
+        raw_route_segments_have_unrelated_contact, refined_large_gap_candidate_work_within_budget,
         refined_large_gap_hot_insertion_orders, regional_fanout_edges,
         regional_fanout_quality_is_better, regional_safety_work_within_budget,
         regional_segment_intersects_node_interior, regional_segments_have_unrelated_contact,
@@ -6281,8 +7111,8 @@ mod tests {
         route_planned_candidates_with_sparse_global, route_planned_edges, route_quality,
         route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
         select_crossing_repair_nets, select_gap_spacing_candidate, select_outer_side_repairs,
-        shortest_crossing_path, sparse_channel_route, sparse_gap_x, sum_within_limit,
-        take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
+        selected_route_family_is_safe, shortest_crossing_path, sparse_channel_route, sparse_gap_x,
+        sum_within_limit, take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
     };
 
@@ -8238,6 +9068,7 @@ mod tests {
             None,
             GapTrackSpacing::Compact,
             super::MAX_BATCHED_CROSSING_REPAIR_NETS,
+            false,
         );
         assert_eq!(bounded.selected_nets, vec![17, 12]);
         assert!(bounded.selected_outer_sides.is_empty());
@@ -8270,6 +9101,7 @@ mod tests {
             Some((&empty_physical_segments, &empty_crossing_counts, baseline)),
             GapTrackSpacing::Compact,
             super::MAX_BATCHED_CROSSING_REPAIR_NETS,
+            false,
         );
         assert!(no_selection.selected_nets.is_empty());
         assert!(no_selection.selected_outer_sides.is_empty());
@@ -8528,6 +9360,324 @@ mod tests {
             candidate_quality
         );
         assert_eq!(permuted_candidate, candidate);
+    }
+
+    #[test]
+    fn negotiated_corridor_prefers_a_shared_clear_ordinate_deterministically() {
+        let layers = vec![vec![(0.0, 10.0)]; 2];
+        let gap_x = vec![(0.0, 10.0); 2];
+        let blocking = PhysicalSegment {
+            net: 2,
+            source: Endpoint { node: 2, port: 0 },
+            target: Endpoint { node: 3, port: 0 },
+            horizontal: false,
+            fixed: 5.0,
+            start: 0.0,
+            end: 5.0,
+        };
+        let route = |baseline: &[f64]| {
+            let mut states = MAX_NEGOTIATED_CORRIDOR_PATH_STATES;
+            let mut relaxations = MAX_NEGOTIATED_CORRIDOR_RELAXATIONS;
+            let mut visits = MAX_NEGOTIATED_CORRIDOR_SEGMENT_VISITS;
+            piecewise_constant_crossing_path(
+                &layers,
+                2.0,
+                2.0,
+                baseline,
+                &gap_x,
+                1,
+                &[blocking],
+                &mut states,
+                &mut relaxations,
+                &mut visits,
+            )
+            .expect("bounded corridor has a path")
+        };
+
+        assert_eq!(route(&[2.0, 8.0]), vec![8.0, 8.0]);
+        assert_eq!(route(&[8.0, 2.0]), vec![8.0, 8.0]);
+    }
+
+    #[test]
+    fn negotiated_corridor_work_and_admission_boundaries_are_exact() {
+        let mut states = MAX_NEGOTIATED_CORRIDOR_PATH_STATES;
+        assert_eq!(
+            charge_negotiated_work(&mut states, MAX_NEGOTIATED_CORRIDOR_PATH_STATES),
+            Some(()),
+        );
+        assert_eq!(charge_negotiated_work(&mut states, 1), None);
+
+        let mut relaxations = MAX_NEGOTIATED_CORRIDOR_RELAXATIONS;
+        assert_eq!(
+            charge_negotiated_work(&mut relaxations, MAX_NEGOTIATED_CORRIDOR_RELAXATIONS),
+            Some(()),
+        );
+        assert_eq!(charge_negotiated_work(&mut relaxations, 1), None);
+
+        let mut visits = MAX_NEGOTIATED_CORRIDOR_SEGMENT_VISITS;
+        assert_eq!(
+            charge_negotiated_work(&mut visits, MAX_NEGOTIATED_CORRIDOR_SEGMENT_VISITS),
+            Some(()),
+        );
+        assert_eq!(charge_negotiated_work(&mut visits, 1), None);
+
+        let mut relations = MAX_NEGOTIATED_CORRIDOR_RELATIONS - 1;
+        assert_eq!(charge_negotiated_relations(&mut relations, 1), Some(()));
+        assert_eq!(charge_negotiated_relations(&mut relations, 1), None);
+        let mut overflow = usize::MAX;
+        assert_eq!(charge_negotiated_relations(&mut overflow, 1), None);
+
+        let baseline = RouteQuality {
+            crossings: 1_000,
+            bends: 1_000,
+            route_length: 10_000.0,
+        };
+        let accepted = RouteQuality {
+            crossings: 900,
+            bends: 1_000,
+            route_length: 10_500.0,
+        };
+        assert!(negotiated_corridor_quality_is_better(
+            baseline, 0.2, accepted, 0.2, 100,
+        ));
+        for (candidate, congestion) in [
+            (
+                RouteQuality {
+                    crossings: 901,
+                    ..accepted
+                },
+                0.2,
+            ),
+            (
+                RouteQuality {
+                    bends: 1_001,
+                    ..accepted
+                },
+                0.2,
+            ),
+            (
+                RouteQuality {
+                    route_length: 10_501.0,
+                    ..accepted
+                },
+                0.2,
+            ),
+            (accepted, 0.200_001),
+        ] {
+            assert!(!negotiated_corridor_quality_is_better(
+                baseline, 0.2, candidate, congestion, 100,
+            ));
+        }
+    }
+
+    #[test]
+    fn negotiated_contact_sweep_canonicalizes_signed_zero_keys() {
+        let endpoint = |node| Endpoint { node, port: 0 };
+        let horizontal = |edge, net, fixed, start, end| super::RawRouteSegment {
+            edge,
+            net,
+            source: endpoint(edge * 2),
+            target: endpoint(edge * 2 + 1),
+            horizontal: true,
+            fixed,
+            start,
+            end,
+        };
+        let vertical = |edge, net, fixed, start, end| super::RawRouteSegment {
+            horizontal: false,
+            ..horizontal(edge, net, fixed, start, end)
+        };
+        let selected_nets = BTreeSet::from([1]);
+
+        for segments in [
+            vec![
+                horizontal(0, 1, -0.0, 0.0, 10.0),
+                horizontal(1, 2, 0.0, 5.0, 15.0),
+            ],
+            vec![
+                horizontal(0, 1, 5.0, 0.0, 10.0),
+                vertical(1, 2, -0.0, 5.0, 15.0),
+            ],
+        ] {
+            let mut visits = usize::MAX;
+            assert_eq!(
+                raw_route_family_has_unrelated_contact(&segments, &selected_nets, &mut visits,),
+                Some(true),
+            );
+        }
+    }
+
+    #[test]
+    fn negotiated_contact_sweep_checks_unchanged_endpoints_against_selected_segments() {
+        let segments = vec![
+            super::RawRouteSegment {
+                edge: 0,
+                net: 1,
+                source: Endpoint { node: 0, port: 0 },
+                target: Endpoint { node: 1, port: 0 },
+                horizontal: true,
+                fixed: 5.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            super::RawRouteSegment {
+                edge: 1,
+                net: 2,
+                source: Endpoint { node: 2, port: 0 },
+                target: Endpoint { node: 3, port: 0 },
+                horizontal: false,
+                fixed: 5.0,
+                start: 5.0,
+                end: 15.0,
+            },
+        ];
+        let mut visits = usize::MAX;
+        assert_eq!(
+            raw_route_family_has_unrelated_contact(&segments, &BTreeSet::from([1]), &mut visits,),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn negotiated_corridor_runtime_safety_rejects_perpendicular_endpoint_contact() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 0,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 1,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::North,
+                        offset: 0.0,
+                    }],
+                },
+                Node {
+                    id: 2,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 3,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::South,
+                        offset: 0.0,
+                    }],
+                },
+            ],
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 0,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 0, 1, 1]);
+        let nodes = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 60.0,
+                y: 50.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 60.0,
+                y: -30.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        let routes = vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![
+                    Point { x: 20.0, y: 10.0 },
+                    Point { x: 60.0, y: 10.0 },
+                    Point { x: 100.0, y: 10.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![
+                    Point { x: 60.0, y: 50.0 },
+                    Point { x: 60.0, y: 10.0 },
+                    Point { x: 60.0, y: -10.0 },
+                ],
+            },
+        ];
+        let segments =
+            physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), &routes).0;
+        let raw_segments = raw_route_segments(&plan, &routes);
+        let selected_nets = BTreeSet::from([0, 1]);
+        let mut no_visits = 0;
+        assert_eq!(
+            raw_route_family_has_unrelated_contact(&raw_segments, &selected_nets, &mut no_visits,),
+            None,
+        );
+        let mut visits = usize::MAX;
+        assert_eq!(
+            raw_route_family_has_unrelated_contact(&raw_segments, &selected_nets, &mut visits),
+            Some(true),
+        );
+
+        assert!(!selected_route_family_is_safe(
+            &plan,
+            &nodes,
+            &routes,
+            &segments,
+            &selected_nets,
+            usize::MAX,
+        ));
     }
 
     #[test]
@@ -9906,6 +11056,130 @@ mod tests {
             route_planned_edges(&plan, &candidate_a, options, false),
             full_a
         );
+    }
+
+    fn negotiated_corridor_graph() -> Graph {
+        const LAYERS: u32 = 6;
+        const WIDTH: u32 = 20;
+        let nodes = (0..LAYERS * WIDTH)
+            .map(|id| Node {
+                id,
+                width: 76.0,
+                height: 84.0,
+                cycle_breaker: false,
+                ports: std::iter::once(Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 42.0,
+                })
+                .chain((1..=6).map(|id| Port {
+                    id,
+                    side: PortSide::West,
+                    offset: 12.0 * id as f64,
+                }))
+                .collect(),
+            })
+            .collect();
+        let mut edges = Vec::new();
+        for layer in 0..LAYERS - 1 {
+            for source in 0..WIDTH {
+                edges.push(Edge {
+                    id: edges.len() as u32,
+                    source: Endpoint {
+                        node: layer * WIDTH + source,
+                        port: 0,
+                    },
+                    target: Endpoint {
+                        node: (layer + 1) * WIDTH + source,
+                        port: 1,
+                    },
+                    net: layer * WIDTH + source,
+                    participates_in_ranking: true,
+                });
+            }
+        }
+        for layer in 0..LAYERS - 3 {
+            for source in 0..WIDTH {
+                for branch in 0..5 {
+                    edges.push(Edge {
+                        id: edges.len() as u32,
+                        source: Endpoint {
+                            node: layer * WIDTH + source,
+                            port: 0,
+                        },
+                        target: Endpoint {
+                            node: (layer + 3) * WIDTH + (source * 7 + branch * 11) % WIDTH,
+                            port: branch + 2,
+                        },
+                        net: layer * WIDTH + source,
+                        participates_in_ranking: true,
+                    });
+                }
+            }
+        }
+        Graph { nodes, edges }
+    }
+
+    #[test]
+    fn negotiated_corridor_candidate_activates_and_is_permutation_deterministic() {
+        let options = LayoutOptions::default();
+        let route = |graph: &Graph| {
+            let indexed = validate_and_index(graph, options).unwrap();
+            let ranks = crate::topology::assign_ranks(&indexed);
+            let (forward, reverse, _) = crate::topology::order_layer_candidates(
+                &indexed,
+                &ranks,
+                options.ordering_sweeps,
+                false,
+            );
+            let layers = if reverse.crossings < forward.crossings {
+                &reverse.layers
+            } else {
+                &forward.layers
+            };
+            let nodes = crate::placement::place_nodes(&indexed, &ranks, layers, options);
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            let routed = route_planned_candidates_with_quality_options(
+                &plan, &nodes, options, false, true, false, false, true, true,
+            );
+            let baseline = routed.primary_quality.expect("primary is exactly scored");
+            let candidate_quality = routed
+                .negotiated_candidate_quality
+                .expect("fixture activates negotiated corridor routing");
+            assert!(candidate_quality.crossings < baseline.crossings);
+            assert!(candidate_quality.bends <= baseline.bends);
+            let candidate = routed
+                .alternatives
+                .into_iter()
+                .find(|candidate| candidate.0 == candidate_quality)
+                .expect("activating candidate is retained")
+                .1;
+            let segments = physical_route_segments(
+                plan.edges.iter().map(|resolved| resolved.edge),
+                &candidate,
+            )
+            .0;
+            assert!(segments.iter().all(|segment| {
+                nodes
+                    .iter()
+                    .all(|node| !regional_segment_intersects_node_interior(segment, node))
+            }));
+            let raw_segments = raw_route_segments(&plan, &candidate);
+            for (index, segment) in raw_segments.iter().enumerate() {
+                assert!(
+                    raw_segments[index + 1..]
+                        .iter()
+                        .all(|other| !raw_route_segments_have_unrelated_contact(segment, other))
+                );
+            }
+            (candidate_quality, candidate)
+        };
+        let graph = negotiated_corridor_graph();
+        let expected = route(&graph);
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(route(&permuted), expected);
     }
 
     #[test]
