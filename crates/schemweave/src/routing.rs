@@ -129,6 +129,8 @@ struct RoutedLaneState {
     global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
     preserved_refined_global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
     refined_global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
+    endpoint_tracks: BTreeMap<(u32, u32, u8), (usize, usize)>,
+    crossing_paths_match_endpoint_tracks: bool,
     crossing_paths: Vec<Option<Vec<f64>>>,
 }
 
@@ -602,6 +604,8 @@ fn route_edges_with_lane_rounds_and_refined_global(
         global_gap_lanes,
         preserved_refined_global_gap_lanes,
         refined_global_gap_lanes,
+        mut endpoint_tracks,
+        mut crossing_paths_match_endpoint_tracks,
         crossing_paths,
     } = emit_routes_with_outer_lanes(
         plan,
@@ -661,6 +665,8 @@ fn route_edges_with_lane_rounds_and_refined_global(
             options,
             GapTrackSpacing::Compact,
         );
+        let candidate_crossing_paths_match_endpoint_tracks =
+            crossing_paths_match_endpoint_tracks && candidate_endpoint_tracks == endpoint_tracks;
         let compact_candidate_routes = emit_routes(
             plan,
             nodes,
@@ -717,6 +723,8 @@ fn route_edges_with_lane_rounds_and_refined_global(
                 &layer_right,
                 &candidate_lanes,
                 &crossing_paths,
+                candidate_endpoint_tracks,
+                candidate_crossing_paths_match_endpoint_tracks,
                 &stable_channel_lanes,
                 baseline_outer_lanes.clone(),
                 top,
@@ -769,6 +777,8 @@ fn route_edges_with_lane_rounds_and_refined_global(
             &layer_right,
             &gap_lanes,
             &crossing_paths,
+            endpoint_tracks,
+            crossing_paths_match_endpoint_tracks,
             &stable_channel_lanes,
             adaptive_channel_lanes,
             baseline_outer_lanes,
@@ -825,18 +835,45 @@ fn route_edges_with_lane_rounds_and_refined_global(
             true,
         );
         let baseline_quality = route_quality_for_plan(plan, &routes);
-        let candidate_endpoint_tracks = build_endpoint_tracks(
-            plan,
-            nodes,
-            ranks,
-            &sparse_spans,
-            &layer_left,
-            &layer_right,
-            &gap_lanes,
-            &coherent_outer_lanes,
-            options,
-            gap_spacing,
+        let candidate_endpoint_tracks =
+            (!outer_lane_channels_match(&coherent_outer_lanes, &outer_lanes)).then(|| {
+                build_endpoint_tracks(
+                    plan,
+                    nodes,
+                    ranks,
+                    &sparse_spans,
+                    &layer_left,
+                    &layer_right,
+                    &gap_lanes,
+                    &coherent_outer_lanes,
+                    options,
+                    gap_spacing,
+                )
+            });
+        #[cfg(test)]
+        if candidate_endpoint_tracks.is_none() {
+            update_routing_reuse_counts(|counts| counts.coherent_endpoint_tracks += 1);
+        }
+        debug_assert!(
+            candidate_endpoint_tracks.is_some() || {
+                endpoint_tracks
+                    == build_endpoint_tracks(
+                        plan,
+                        nodes,
+                        ranks,
+                        &sparse_spans,
+                        &layer_left,
+                        &layer_right,
+                        &gap_lanes,
+                        &coherent_outer_lanes,
+                        options,
+                        gap_spacing,
+                    )
+            }
         );
+        let candidate_endpoint_tracks_ref = candidate_endpoint_tracks
+            .as_ref()
+            .unwrap_or(&endpoint_tracks);
         let candidate_routes = emit_routes(
             plan,
             nodes,
@@ -845,7 +882,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             &layer_left,
             &layer_right,
             &gap_lanes,
-            &candidate_endpoint_tracks,
+            candidate_endpoint_tracks_ref,
             &coherent_outer_lanes,
             top,
             bottom,
@@ -861,6 +898,11 @@ fn route_edges_with_lane_rounds_and_refined_global(
         }
         if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
             routes = candidate_routes;
+            if let Some(candidate_endpoint_tracks) = candidate_endpoint_tracks {
+                crossing_paths_match_endpoint_tracks &=
+                    candidate_endpoint_tracks == endpoint_tracks;
+                endpoint_tracks = candidate_endpoint_tracks;
+            }
             outer_lanes = coherent_outer_lanes;
             primary_quality = Some(candidate_quality);
             #[cfg(test)]
@@ -904,6 +946,9 @@ fn route_edges_with_lane_rounds_and_refined_global(
             options,
             outer_lane_rounds,
             &routes,
+            &endpoint_tracks,
+            &crossing_paths,
+            crossing_paths_match_endpoint_tracks,
             precomputed_repair_profile,
             gap_spacing,
             MAX_BATCHED_CROSSING_REPAIR_NETS,
@@ -929,6 +974,9 @@ fn route_edges_with_lane_rounds_and_refined_global(
             options,
             outer_lane_rounds,
             &routes,
+            &endpoint_tracks,
+            &crossing_paths,
+            crossing_paths_match_endpoint_tracks,
             precomputed_repair_profile,
             gap_spacing,
             MAX_DEEP_CROSSING_REPAIR_NETS,
@@ -1341,6 +1389,8 @@ fn finish_fanout_route_families(
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<NetId, usize>],
     crossing_paths: &[Option<Vec<f64>>],
+    stable_endpoint_tracks: BTreeMap<(u32, u32, u8), (usize, usize)>,
+    stable_crossing_paths_match_endpoint_tracks: bool,
     stable_channel_lanes: &BTreeMap<NetId, usize>,
     adaptive_channel_lanes: BTreeMap<NetId, usize>,
     stable_outer_lanes: BTreeMap<NetId, OuterLane>,
@@ -1370,18 +1420,40 @@ fn finish_fanout_route_families(
     );
     // Channel order changes only outer accesses. Preserve the already-refined sparse corridors
     // and rebuild the endpoint escapes plus complete route geometry affected by those accesses.
-    let adaptive_endpoint_tracks = build_endpoint_tracks(
-        plan,
-        nodes,
-        ranks,
-        sparse_spans,
-        layer_left,
-        layer_right,
-        gap_lanes,
-        &adaptive_outer_lanes,
-        options,
-        gap_spacing,
-    );
+    let adaptive_endpoint_tracks =
+        if outer_lane_channels_match(&adaptive_outer_lanes, &stable_outer_lanes) {
+            debug_assert_eq!(
+                stable_endpoint_tracks,
+                build_endpoint_tracks(
+                    plan,
+                    nodes,
+                    ranks,
+                    sparse_spans,
+                    layer_left,
+                    layer_right,
+                    gap_lanes,
+                    &adaptive_outer_lanes,
+                    options,
+                    gap_spacing,
+                ),
+            );
+            stable_endpoint_tracks.clone()
+        } else {
+            build_endpoint_tracks(
+                plan,
+                nodes,
+                ranks,
+                sparse_spans,
+                layer_left,
+                layer_right,
+                gap_lanes,
+                &adaptive_outer_lanes,
+                options,
+                gap_spacing,
+            )
+        };
+    let adaptive_crossing_paths_match_endpoint_tracks = stable_crossing_paths_match_endpoint_tracks
+        && adaptive_endpoint_tracks == stable_endpoint_tracks;
     let adaptive_routes = emit_routes(
         plan,
         nodes,
@@ -1417,6 +1489,8 @@ fn finish_fanout_route_families(
             layer_right,
             gap_lanes,
             crossing_paths,
+            adaptive_endpoint_tracks,
+            adaptive_crossing_paths_match_endpoint_tracks,
             &adaptive_channel_lanes,
             adaptive_outer_lanes,
             top,
@@ -1442,6 +1516,8 @@ fn finish_fanout_route_families(
             layer_right,
             gap_lanes,
             crossing_paths,
+            stable_endpoint_tracks,
+            stable_crossing_paths_match_endpoint_tracks,
             stable_channel_lanes,
             stable_outer_lanes,
             top,
@@ -1477,6 +1553,8 @@ fn finish_fanout_route_families(
                 layer_right,
                 gap_lanes,
                 crossing_paths,
+                stable_endpoint_tracks,
+                stable_crossing_paths_match_endpoint_tracks,
                 stable_channel_lanes,
                 stable_outer_lanes,
                 top,
@@ -1552,6 +1630,8 @@ fn finish_route_family(
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<u32, usize>],
     crossing_paths: &[Option<Vec<f64>>],
+    mut endpoint_tracks: BTreeMap<(u32, u32, u8), (usize, usize)>,
+    mut crossing_paths_match_endpoint_tracks: bool,
     channel_lanes: &BTreeMap<NetId, usize>,
     mut outer_lanes: BTreeMap<u32, OuterLane>,
     top: f64,
@@ -1611,18 +1691,45 @@ fn finish_route_family(
         let baseline_quality = baseline_profile.2;
         // Coherence changes outer side and side-local lane indices, but not the stable per-net
         // channel index. The baseline sparse paths and gap lanes therefore remain valid.
-        let candidate_endpoint_tracks = build_endpoint_tracks(
-            plan,
-            nodes,
-            ranks,
-            sparse_spans,
-            layer_left,
-            layer_right,
-            gap_lanes,
-            &coherent_outer_lanes,
-            options,
-            gap_spacing,
+        let candidate_endpoint_tracks =
+            (!outer_lane_channels_match(&coherent_outer_lanes, &outer_lanes)).then(|| {
+                build_endpoint_tracks(
+                    plan,
+                    nodes,
+                    ranks,
+                    sparse_spans,
+                    layer_left,
+                    layer_right,
+                    gap_lanes,
+                    &coherent_outer_lanes,
+                    options,
+                    gap_spacing,
+                )
+            });
+        #[cfg(test)]
+        if candidate_endpoint_tracks.is_none() {
+            update_routing_reuse_counts(|counts| counts.coherent_endpoint_tracks += 1);
+        }
+        debug_assert!(
+            candidate_endpoint_tracks.is_some() || {
+                endpoint_tracks
+                    == build_endpoint_tracks(
+                        plan,
+                        nodes,
+                        ranks,
+                        sparse_spans,
+                        layer_left,
+                        layer_right,
+                        gap_lanes,
+                        &coherent_outer_lanes,
+                        options,
+                        gap_spacing,
+                    )
+            }
         );
+        let candidate_endpoint_tracks_ref = candidate_endpoint_tracks
+            .as_ref()
+            .unwrap_or(&endpoint_tracks);
         let candidate_routes = emit_routes(
             plan,
             nodes,
@@ -1631,7 +1738,7 @@ fn finish_route_family(
             layer_left,
             layer_right,
             gap_lanes,
-            &candidate_endpoint_tracks,
+            candidate_endpoint_tracks_ref,
             &coherent_outer_lanes,
             top,
             bottom,
@@ -1650,6 +1757,11 @@ fn finish_route_family(
         // for looking tidier when it would increase crossings, bends, or route length.
         if route_quality_cmp(candidate_quality, baseline_quality).is_lt() {
             routes = candidate_routes;
+            if let Some(candidate_endpoint_tracks) = candidate_endpoint_tracks {
+                crossing_paths_match_endpoint_tracks &=
+                    candidate_endpoint_tracks == endpoint_tracks;
+                endpoint_tracks = candidate_endpoint_tracks;
+            }
             outer_lanes = coherent_outer_lanes;
             precomputed_profile = Some(candidate_profile);
             #[cfg(test)]
@@ -1695,6 +1807,9 @@ fn finish_route_family(
             options,
             outer_lane_rounds,
             &routes,
+            &endpoint_tracks,
+            crossing_paths,
+            crossing_paths_match_endpoint_tracks,
             precomputed_repair_profile,
             gap_spacing,
             MAX_BATCHED_CROSSING_REPAIR_NETS,
@@ -1720,6 +1835,9 @@ fn finish_route_family(
             options,
             outer_lane_rounds,
             &routes,
+            &endpoint_tracks,
+            crossing_paths,
+            crossing_paths_match_endpoint_tracks,
             precomputed_repair_profile,
             gap_spacing,
             MAX_DEEP_CROSSING_REPAIR_NETS,
@@ -1791,7 +1909,7 @@ fn emit_routes_with_outer_lanes(
     free_by_rank: &[Vec<(f64, f64)>],
     layer_left: &[f64],
     layer_right: &[f64],
-    gap_lanes: &[BTreeMap<u32, usize>],
+    initial_gap_lanes: &[BTreeMap<u32, usize>],
     outer_lanes: &BTreeMap<u32, OuterLane>,
     top: f64,
     bottom: f64,
@@ -1802,14 +1920,14 @@ fn emit_routes_with_outer_lanes(
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
 ) -> RoutedLaneState {
-    let mut endpoint_tracks = build_endpoint_tracks(
+    let initial_endpoint_tracks = build_endpoint_tracks(
         plan,
         nodes,
         &plan.ranks,
         sparse_spans,
         layer_left,
         layer_right,
-        gap_lanes,
+        initial_gap_lanes,
         outer_lanes,
         options,
         GapTrackSpacing::Compact,
@@ -1822,7 +1940,7 @@ fn emit_routes_with_outer_lanes(
         crossing_tie_lanes,
         crossing_tie_lane_count,
         free_by_rank,
-        &endpoint_tracks,
+        &initial_endpoint_tracks,
         options.port_stub,
     );
     let GapLaneCandidates {
@@ -1835,26 +1953,35 @@ fn emit_routes_with_outer_lanes(
         nodes,
         sparse_spans,
         &crossing_paths,
-        gap_lanes,
-        &endpoint_tracks,
+        initial_gap_lanes,
+        &initial_endpoint_tracks,
         options.port_stub,
         gap_lane_rounds,
         sparse_global && (outer_lanes.is_empty() || large_sparse_global),
         large_sparse_global,
         refined_large_sparse_global,
     );
-    endpoint_tracks = build_endpoint_tracks(
-        plan,
-        nodes,
-        &plan.ranks,
-        sparse_spans,
-        layer_left,
-        layer_right,
-        &gap_lanes,
-        outer_lanes,
-        options,
-        GapTrackSpacing::Compact,
-    );
+    let (endpoint_tracks, crossing_paths_match_endpoint_tracks) = if gap_lanes == initial_gap_lanes
+    {
+        #[cfg(test)]
+        update_routing_reuse_counts(|counts| counts.final_endpoint_tracks += 1);
+        (initial_endpoint_tracks, true)
+    } else {
+        let endpoint_tracks = build_endpoint_tracks(
+            plan,
+            nodes,
+            &plan.ranks,
+            sparse_spans,
+            layer_left,
+            layer_right,
+            &gap_lanes,
+            outer_lanes,
+            options,
+            GapTrackSpacing::Compact,
+        );
+        let matches = endpoint_tracks == initial_endpoint_tracks;
+        (endpoint_tracks, matches)
+    };
     let compact_routes = emit_routes(
         plan,
         nodes,
@@ -1903,6 +2030,8 @@ fn emit_routes_with_outer_lanes(
         global_gap_lanes,
         preserved_refined_global_gap_lanes,
         refined_global_gap_lanes,
+        endpoint_tracks,
+        crossing_paths_match_endpoint_tracks,
         crossing_paths,
     }
 }
@@ -2076,6 +2205,9 @@ fn repair_crossing_heavy_net(
     options: LayoutOptions,
     outer_lane_rounds: usize,
     routes: &[EdgeGeometry],
+    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    crossing_paths: &[Option<Vec<f64>>],
+    crossing_paths_match_endpoint_tracks: bool,
     precomputed: Option<(&[PhysicalSegment], &BTreeMap<NetId, usize>, RouteQuality)>,
     gap_spacing: GapTrackSpacing,
     max_repair_nets: usize,
@@ -2160,6 +2292,7 @@ fn repair_crossing_heavy_net(
             options,
             physical_segments,
             gap_spacing,
+            endpoint_tracks,
         )
     } else {
         Vec::new()
@@ -2212,7 +2345,7 @@ fn repair_crossing_heavy_net(
         {
             candidate_lanes_built = true;
         }
-        let endpoint_tracks = build_endpoint_tracks(
+        let candidate_endpoint_tracks = build_endpoint_tracks(
             plan,
             nodes,
             &plan.ranks,
@@ -2224,26 +2357,41 @@ fn repair_crossing_heavy_net(
             options,
             gap_spacing,
         );
-        let crossing_paths = sparse_crossing_paths(
-            plan,
-            nodes,
-            sparse_spans,
-            crossing_lanes,
-            crossing_tie_lanes,
-            crossing_tie_lane_count,
-            free_by_rank,
-            &endpoint_tracks,
-            options.port_stub,
-        );
+        let reuse_crossing_paths =
+            crossing_paths_match_endpoint_tracks && candidate_endpoint_tracks == *endpoint_tracks;
+        #[cfg(test)]
+        update_routing_reuse_counts(|counts| {
+            if reuse_crossing_paths {
+                counts.repair_crossing_paths += 1;
+            } else {
+                counts.repair_crossing_paths_recomputed += 1;
+            }
+        });
+        let candidate_crossing_paths = (!reuse_crossing_paths).then(|| {
+            sparse_crossing_paths(
+                plan,
+                nodes,
+                sparse_spans,
+                crossing_lanes,
+                crossing_tie_lanes,
+                crossing_tie_lane_count,
+                free_by_rank,
+                &candidate_endpoint_tracks,
+                options.port_stub,
+            )
+        });
+        let candidate_crossing_paths = candidate_crossing_paths
+            .as_deref()
+            .unwrap_or(crossing_paths);
         let candidate = emit_routes(
             plan,
             nodes,
             sparse_spans,
-            &crossing_paths,
+            candidate_crossing_paths,
             layer_left,
             layer_right,
             &candidate_lanes,
-            &endpoint_tracks,
+            &candidate_endpoint_tracks,
             &candidate_outer_lanes,
             top,
             bottom,
@@ -2390,18 +2538,25 @@ fn select_outer_side_repairs(
     options: LayoutOptions,
     physical_segments: &[PhysicalSegment],
     gap_spacing: GapTrackSpacing,
+    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
 ) -> Vec<(NetId, OuterSide)> {
-    let endpoint_tracks = build_endpoint_tracks(
-        plan,
-        nodes,
-        &plan.ranks,
-        sparse_spans,
-        layer_left,
-        layer_right,
-        gap_lanes,
-        outer_lanes,
-        options,
-        gap_spacing,
+    #[cfg(test)]
+    update_routing_reuse_counts(|counts| counts.outer_repair_endpoint_tracks += 1);
+    debug_assert_eq!(
+        endpoint_tracks,
+        &build_endpoint_tracks(
+            plan,
+            nodes,
+            &plan.ranks,
+            sparse_spans,
+            layer_left,
+            layer_right,
+            gap_lanes,
+            outer_lanes,
+            options,
+            gap_spacing,
+        ),
+        "the shared endpoint tracks must describe the baseline repair family",
     );
     let horizontal = physical_segments
         .iter()
@@ -2414,7 +2569,7 @@ fn select_outer_side_repairs(
         layer_left,
         layer_right,
         outer_lanes,
-        &endpoint_tracks,
+        endpoint_tracks,
         top,
         bottom,
         options,
@@ -3099,13 +3254,46 @@ fn horizontal_crossing_profile_by_net(
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RoutingReuseCounts {
+    final_endpoint_tracks: usize,
+    coherent_endpoint_tracks: usize,
+    outer_repair_endpoint_tracks: usize,
+    repair_crossing_paths: usize,
+    repair_crossing_paths_recomputed: usize,
+}
+
+#[cfg(test)]
 thread_local! {
     static HORIZONTAL_CROSSING_PROFILE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTING_REUSE_COUNTS: Cell<RoutingReuseCounts> = const {
+        Cell::new(RoutingReuseCounts {
+            final_endpoint_tracks: 0,
+            coherent_endpoint_tracks: 0,
+            outer_repair_endpoint_tracks: 0,
+            repair_crossing_paths: 0,
+            repair_crossing_paths_recomputed: 0,
+        })
+    };
 }
 
 #[cfg(test)]
 fn take_horizontal_crossing_profile_calls() -> usize {
     HORIZONTAL_CROSSING_PROFILE_CALLS.with(|calls| calls.replace(0))
+}
+
+#[cfg(test)]
+fn update_routing_reuse_counts(update: impl FnOnce(&mut RoutingReuseCounts)) {
+    ROUTING_REUSE_COUNTS.with(|counts| {
+        let mut next = counts.get();
+        update(&mut next);
+        counts.set(next);
+    });
+}
+
+#[cfg(test)]
+fn take_routing_reuse_counts() -> RoutingReuseCounts {
+    ROUTING_REUSE_COUNTS.with(|counts| counts.replace(RoutingReuseCounts::default()))
 }
 
 struct CrossingFenwick {
@@ -3229,6 +3417,19 @@ struct OuterLane {
     side_index: usize,
     channel_index: usize,
     channel_count: usize,
+}
+
+fn outer_lane_channels_match(
+    left: &BTreeMap<EdgeId, OuterLane>,
+    right: &BTreeMap<EdgeId, OuterLane>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(edge, left_lane)| {
+            right.get(edge).is_some_and(|right_lane| {
+                left_lane.channel_index == right_lane.channel_index
+                    && left_lane.channel_count == right_lane.channel_count
+            })
+        })
 }
 
 #[derive(Default)]
@@ -5232,8 +5433,8 @@ mod tests {
         large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
         large_gap_hot_insertion_order_with_rounds, large_gap_hot_nets,
         large_gap_hot_nets_with_limit, move_nets_to_outer_lanes, outer_lane_assignments,
-        physical_crossing_sweep, physical_crossing_sweep_lines, physical_route_segments,
-        physical_route_segments_btree_reference, port_point,
+        outer_lane_channels_match, physical_crossing_sweep, physical_crossing_sweep_lines,
+        physical_route_segments, physical_route_segments_btree_reference, port_point,
         refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
         repair_crossing_heavy_net, repair_selection_adds_new_nets, route_edges,
         route_edges_with_lane_rounds, route_edges_with_lane_rounds_and_global,
@@ -5242,7 +5443,8 @@ mod tests {
         route_quality_cmp, route_quality_for_plan, route_supplemental_edges,
         select_crossing_repair_nets, select_outer_side_repairs, shortest_crossing_path,
         sparse_channel_route, sparse_gap_x, sum_within_limit,
-        take_horizontal_crossing_profile_calls, vertical_horizontal_crossings,
+        take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
+        vertical_horizontal_crossings,
     };
 
     #[test]
@@ -5694,12 +5896,52 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_tracks_depend_only_on_outer_channel_coordinates() {
+        let baseline = BTreeMap::from([(
+            7,
+            OuterLane {
+                side: OuterSide::Top,
+                side_index: 0,
+                channel_index: 3,
+                channel_count: 5,
+            },
+        )]);
+        let side_only = BTreeMap::from([(
+            7,
+            OuterLane {
+                side: OuterSide::Bottom,
+                side_index: 4,
+                channel_index: 3,
+                channel_count: 5,
+            },
+        )]);
+        let different_channel = BTreeMap::from([(
+            7,
+            OuterLane {
+                side: OuterSide::Bottom,
+                side_index: 4,
+                channel_index: 2,
+                channel_count: 5,
+            },
+        )]);
+
+        assert!(outer_lane_channels_match(&baseline, &side_only));
+        assert!(!outer_lane_channels_match(&baseline, &different_channel));
+    }
+
+    #[test]
     fn outer_side_repair_is_exactly_scored_and_deterministic() {
         let (graph, geometry, ranks) = outer_side_route_fixture(256, 70.0, 90.0);
         let options = LayoutOptions::default();
         let indexed = validate_and_index(&graph, options).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
+        take_routing_reuse_counts();
         let routed = route_planned_candidates(&plan, &geometry, options, true);
+        let reuse_counts = take_routing_reuse_counts();
+        assert_eq!(reuse_counts.final_endpoint_tracks, 1);
+        assert_eq!(reuse_counts.outer_repair_endpoint_tracks, 1);
+        assert_eq!(reuse_counts.repair_crossing_paths, 1);
+        assert_eq!(reuse_counts.repair_crossing_paths_recomputed, 0);
         let baseline = routed.primary_quality.unwrap();
         let (candidate, repair) = routed.repair.as_ref().expect("fixture activates repair");
 
@@ -5843,6 +6085,18 @@ mod tests {
                 channel_count: 1,
             },
         )]);
+        let endpoint_tracks = build_endpoint_tracks(
+            &plan,
+            &nodes,
+            &[0, 0],
+            &spans,
+            &[0.0],
+            &[220.0],
+            &[],
+            &outer_lanes,
+            LayoutOptions::default(),
+            GapTrackSpacing::Compact,
+        );
         let select = |crossings: u32| {
             let segments = (0..crossings)
                 .map(|net| PhysicalSegment {
@@ -5874,6 +6128,7 @@ mod tests {
                 LayoutOptions::default(),
                 &segments,
                 GapTrackSpacing::Compact,
+                &endpoint_tracks,
             )
         };
 
@@ -5904,6 +6159,18 @@ mod tests {
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let endpoint_tracks = build_endpoint_tracks(
+            &plan,
+            &nodes,
+            &ranks,
+            &spans,
+            &[0.0],
+            &[220.0],
+            &[],
+            &outer_lanes,
+            options,
+            GapTrackSpacing::Compact,
+        );
         let horizontals = |ys: &[f64]| {
             ys.iter()
                 .enumerate()
@@ -5938,6 +6205,7 @@ mod tests {
                 options,
                 segments,
                 GapTrackSpacing::Compact,
+                &endpoint_tracks,
             )
         };
 
@@ -7059,7 +7327,11 @@ mod tests {
             .collect::<Vec<_>>();
         let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
+        take_routing_reuse_counts();
         let routed = route_planned_candidates(&plan, &nodes, LayoutOptions::default(), true);
+        let reuse_counts = take_routing_reuse_counts();
+        assert_eq!(reuse_counts.repair_crossing_paths, 0);
+        assert_eq!(reuse_counts.repair_crossing_paths_recomputed, 1);
         let baseline = routed.primary_quality.unwrap();
         let (candidate, repair) = routed.repair.as_ref().expect("fixture activates repair");
 
@@ -7121,6 +7393,9 @@ mod tests {
             LayoutOptions::default(),
             FULL_OUTER_LANE_ROUNDS,
             &routed.primary,
+            &BTreeMap::new(),
+            &[],
+            false,
             None,
             GapTrackSpacing::Compact,
             super::MAX_BATCHED_CROSSING_REPAIR_NETS,
@@ -7150,6 +7425,9 @@ mod tests {
             LayoutOptions::default(),
             FULL_OUTER_LANE_ROUNDS,
             &routed.primary,
+            &BTreeMap::new(),
+            &[],
+            false,
             Some((&empty_physical_segments, &empty_crossing_counts, baseline)),
             GapTrackSpacing::Compact,
             super::MAX_BATCHED_CROSSING_REPAIR_NETS,
@@ -8297,7 +8575,10 @@ mod tests {
                 .all(|resolved| !resolved.participates_in_ranking)
         );
 
+        take_routing_reuse_counts();
         let routed = route_planned_candidates(&plan, &geometry, LayoutOptions::default(), false);
+        let reuse_counts = take_routing_reuse_counts();
+        assert_eq!(reuse_counts.coherent_endpoint_tracks, 1);
         let (baseline_quality, baseline) = routed
             .feedback_trace
             .baseline
