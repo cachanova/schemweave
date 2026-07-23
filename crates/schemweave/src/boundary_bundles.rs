@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
     BoundaryBundleGeometry, BoundaryBundleMemberGeometry, BoundaryBundleRole,
@@ -169,6 +169,28 @@ fn rewrite_member_routes(
     Ok(())
 }
 
+pub(crate) fn rewrite_preserved_member_route(
+    route: &mut EdgeGeometry,
+    role: BoundaryBundleRole,
+    tap: Point,
+    tap_lane: usize,
+    pitch: f64,
+) -> Result<(), LayoutError> {
+    if route.points.len() < 2 {
+        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+    }
+    let corridor_depth = (tap_lane + 1) as f64 * pitch;
+    route.points = match role {
+        BoundaryBundleRole::Input => rewrite_input_route(&route.points, tap, corridor_depth),
+        BoundaryBundleRole::Output => rewrite_output_route(&route.points, tap, corridor_depth),
+    }
+    .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
+    if route.points.len() < 2 {
+        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+    }
+    Ok(())
+}
+
 fn rewrite_input_route(points: &[Point], tap: Point, pitch: f64) -> Option<Vec<Point>> {
     let corridor_x = tap.x + pitch;
     let (segment, intersection) = first_vertical_line_intersection(points, corridor_x)?;
@@ -316,11 +338,12 @@ fn translate_point(point: &mut Point, min_x: f64, min_y: f64) {
     point.y -= min_y;
 }
 
-fn verify_geometry(
+pub(crate) fn verify_geometry(
     graph: &IndexedGraph<'_>,
     layout: &Layout,
     options: LayoutOptions,
 ) -> Result<(), LayoutError> {
+    verify_preserved_geometry_structure(graph, layout, options)?;
     let mut segments = Vec::with_capacity(layout.boundary_bundles.len() * 2);
     let mut relations = Vec::with_capacity(layout.boundary_bundles.len());
     for (index, bundle) in layout.boundary_bundles.iter().enumerate() {
@@ -352,6 +375,118 @@ fn verify_geometry(
     }
     verify_rewritten_route_node_interiors(graph, layout)?;
     verify_bundle_route_contacts(graph, layout, options.minimum_parallel_wire_spacing)
+}
+
+pub(crate) fn verify_preserved_geometry_structure(
+    graph: &IndexedGraph<'_>,
+    layout: &Layout,
+    options: LayoutOptions,
+) -> Result<(), LayoutError> {
+    if graph.boundary_bundles.len() != layout.boundary_bundles.len() {
+        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+    }
+    let nodes = layout
+        .nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let routes = layout
+        .edges
+        .iter()
+        .map(|route| (route.id, route))
+        .collect::<BTreeMap<_, _>>();
+    let mut geometries = BTreeMap::new();
+    for geometry in &layout.boundary_bundles {
+        if geometries.insert(geometry.id, geometry).is_some() {
+            return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+        }
+    }
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let rail_depth = crate::boundary_bundle_rail_depth(options);
+    let mut seen_edges = BTreeSet::new();
+    for bundle in &graph.boundary_bundles {
+        let Some(geometry) = geometries.get(&bundle.id).copied() else {
+            return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+        };
+        if geometry.endpoint != bundle.endpoint
+            || geometry.role != bundle.role
+            || geometry.width != bundle.width
+            || geometry.members.len() != bundle.members.len()
+        {
+            return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+        }
+        let Some(node) = nodes.get(&bundle.endpoint.node).copied() else {
+            return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+        };
+        let indexed_node = graph.node_index[&bundle.endpoint.node];
+        let endpoint = port_point(node, graph.ports[indexed_node][&bundle.endpoint.port]);
+        let direction = match bundle.role {
+            BoundaryBundleRole::Input => 1.0,
+            BoundaryBundleRole::Output => -1.0,
+        };
+        let collector_center = Point {
+            x: endpoint.x + direction * rail_depth,
+            y: endpoint.y,
+        };
+        if geometry.spine
+            != (BoundaryBundleSegment {
+                start: endpoint,
+                end: collector_center,
+            })
+        {
+            return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+        }
+        let lane_count = bundle
+            .members
+            .last()
+            .map_or(0, |member| member.tap_lane + 1);
+        let center = lane_count.saturating_sub(1) as f64 / 2.0;
+        let mut expected_taps = Vec::with_capacity(bundle.members.len());
+        for (member, declared) in bundle.members.iter().zip(&geometry.members) {
+            let expected_tap = Point {
+                x: collector_center.x,
+                y: collector_center.y + (member.tap_lane as f64 - center) * pitch,
+            };
+            if declared.edge != member.edge
+                || declared.slots != member.slots
+                || declared.tap != expected_tap
+                || !seen_edges.insert((bundle.role as u8, declared.edge))
+            {
+                return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+            }
+            let Some(route) = routes.get(&declared.edge).copied() else {
+                return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+            };
+            let route_connects = match bundle.role {
+                BoundaryBundleRole::Input => route.points.first() == Some(&expected_tap),
+                BoundaryBundleRole::Output => route.points.last() == Some(&expected_tap),
+            };
+            if !route_connects {
+                return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+            }
+            expected_taps.push(expected_tap);
+        }
+        let expected_collector = BoundaryBundleSegment {
+            start: Point {
+                x: collector_center.x,
+                y: expected_taps
+                    .first()
+                    .map_or(collector_center.y, |tap| tap.y.min(collector_center.y)),
+            },
+            end: Point {
+                x: collector_center.x,
+                y: expected_taps
+                    .last()
+                    .map_or(collector_center.y, |tap| tap.y.max(collector_center.y)),
+            },
+        };
+        if geometry.collector != expected_collector {
+            return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+        }
+    }
+    Ok(())
 }
 
 fn verify_rewritten_route_node_interiors(
