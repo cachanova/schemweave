@@ -608,8 +608,7 @@ fn layout_indexed(
     );
     let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
     let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
-    let straight_chain_nodes = (options.edge_node_clearance == 0.0
-        && quality_effort != QualityEffort::Fast
+    let straight_chain = (quality_effort != QualityEffort::Fast
         && graph.nodes.len() <= placement::MAX_CHAIN_CANDIDATE_NODES)
         .then(|| {
             placement::place_straight_chain_nodes(
@@ -617,7 +616,7 @@ fn layout_indexed(
                 &ranks,
                 quality_layers,
                 &ordinary_nodes,
-                options.node_gap,
+                options,
             )
         })
         .flatten();
@@ -776,9 +775,9 @@ fn layout_indexed(
             }
         }
     }
-    if let Some(straight_chain_nodes) = straight_chain_nodes
-        && best.as_ref().is_some_and(|candidate| {
-            placement::vertical_span(&straight_chain_nodes)
+    if let Some(straight_chain) = straight_chain
+        && best.as_ref().is_none_or(|candidate| {
+            placement::vertical_span(&straight_chain.nodes)
                 <= candidate.raw_layout.height * placement::MAX_CHAIN_HEIGHT_FACTOR
         })
     {
@@ -787,7 +786,7 @@ fn layout_indexed(
             &indexed,
             &routing_plan,
             &mut straight_chain_best,
-            straight_chain_nodes,
+            straight_chain.nodes,
             options,
             CandidateRouting {
                 supplemental: true,
@@ -795,15 +794,16 @@ fn layout_indexed(
             },
             &mut admission_state,
         );
-        let candidate = straight_chain_best.expect("candidate routing produces a layout");
-        if best.as_ref().is_some_and(|current| {
-            straight_chain_cost_is_bounded(
-                candidate.selection_quality,
-                &candidate.raw_layout,
-                current.selection_quality,
-                &current.raw_layout,
-            )
-        }) && retain_better_admitted_candidate(&mut best, candidate)
+        if let Some(candidate) = straight_chain_best
+            && best.as_ref().is_none_or(|current| {
+                straight_chain_cost_is_bounded(
+                    &candidate,
+                    current,
+                    &straight_chain.edge_ids,
+                    graph.nodes.len(),
+                )
+            })
+            && retain_better_admitted_candidate(&mut best, candidate)
         {
             best_uses_primary_ranks = true;
         }
@@ -1083,13 +1083,72 @@ fn demand_aware_quality_is_better(
 }
 
 fn straight_chain_cost_is_bounded(
+    candidate: &AdmittedCandidate,
+    current: &AdmittedCandidate,
+    chain_edge_ids: &[EdgeId],
+    node_count: usize,
+) -> bool {
+    let (newly_straight, lost_straight) =
+        straight_chain_route_gain(&candidate.layout, &current.layout, chain_edge_ids);
+    straight_chain_geometry_cost_is_bounded(
+        candidate.selection_quality,
+        &candidate.raw_layout,
+        current.selection_quality,
+        &current.raw_layout,
+    ) && straight_chain_geometry_cost_is_bounded(
+        candidate.quality,
+        &candidate.layout,
+        current.quality,
+        &current.layout,
+    ) && newly_straight >= 2
+        && newly_straight > lost_straight
+        && (node_count <= 600
+            || straight_chain_large_gain_is_significant(newly_straight, chain_edge_ids.len()))
+}
+
+fn straight_chain_large_gain_is_significant(newly_straight: usize, chain_edges: usize) -> bool {
+    newly_straight.saturating_mul(5).saturating_add(1) >= chain_edges
+}
+
+fn straight_chain_geometry_cost_is_bounded(
     quality: routing::RouteQuality,
     layout: &Layout,
     current_quality: routing::RouteQuality,
     current: &Layout,
 ) -> bool {
     quality.route_length <= current_quality.route_length * 1.05
+        && quality.bends
+            <= current_quality
+                .bends
+                .saturating_add(current_quality.bends / 20)
         && layout.width * layout.height <= current.width * current.height * 1.10
+}
+
+fn straight_chain_route_gain(
+    candidate: &Layout,
+    current: &Layout,
+    chain_edge_ids: &[EdgeId],
+) -> (usize, usize) {
+    let straight_ids = |layout: &Layout| {
+        layout
+            .edges
+            .iter()
+            .filter(|edge| {
+                chain_edge_ids.binary_search(&edge.id).is_ok()
+                    && edge
+                        .points
+                        .first()
+                        .is_some_and(|first| edge.points.iter().all(|point| point.y == first.y))
+            })
+            .map(|edge| edge.id)
+            .collect::<BTreeSet<_>>()
+    };
+    let candidate = straight_ids(candidate);
+    let current = straight_ids(current);
+    (
+        candidate.difference(&current).count(),
+        current.difference(&candidate).count(),
+    )
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1534,15 +1593,17 @@ fn candidate_quality_cmp(
 mod tests {
     use super::{
         AdmittedCandidate, BoundaryBundleConstraint, BoundaryBundleMemberConstraint,
-        CandidateAdmissionState, Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutConstraints,
-        LayoutError, LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS, Node, NodeGeometry, Point,
-        Port, PortSide, QualityEffort, candidate_quality_cmp,
+        CandidateAdmissionState, CandidateRouting, Edge, EdgeGeometry, EdgeId, Endpoint, Graph,
+        Layout, LayoutConstraints, LayoutError, LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+        Node, NodeGeometry, Point, Port, PortSide, QualityEffort, candidate_quality_cmp,
         candidate_satisfies_edge_node_clearance_bounded, composite_pitched_quality_is_admissible,
         demand_aware_quality_is_better, demand_aware_scale_is_eligible, effective_layout_options,
-        effective_ranking_edges, full_family_pitched_spacing_enabled, hard_geometry_failure,
-        layout, outward_obstacle_clearance_stub, placement, retain_better_admitted_candidate,
-        retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
-        routing::RouteQuality, topology, validation,
+        effective_ranking_edges, evaluate_candidate, full_family_pitched_spacing_enabled,
+        hard_geometry_failure, layout, outward_obstacle_clearance_stub, placement,
+        retain_better_admitted_candidate, retain_better_candidate, retain_owned_candidate,
+        retain_owned_candidate_unchecked, routing, routing::RouteQuality,
+        straight_chain_cost_is_bounded, straight_chain_large_gain_is_significant, topology,
+        validation,
     };
 
     mod active_fanout_fixture {
@@ -2936,14 +2997,9 @@ mod tests {
         let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
         let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
         let preferred = placement::place_preferred_nodes(&indexed, &ranks, &layers, options);
-        let straight_chain = placement::place_straight_chain_nodes(
-            &indexed,
-            &ranks,
-            &layers,
-            &ordinary,
-            options.node_gap,
-        )
-        .expect("fixture has matched paths spanning at least two ranks");
+        let straight_chain =
+            placement::place_straight_chain_nodes(&indexed, &ranks, &layers, &ordinary, options)
+                .expect("fixture has matched paths spanning at least two ranks");
         let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary);
         let preferred_alignment = placement::port_alignment_error(&indexed, &ranks, &preferred);
         assert!(
@@ -2963,7 +3019,7 @@ mod tests {
         };
         let ordinary = evaluate(ordinary, false);
         let preferred = evaluate(preferred, true);
-        let straight_chain = evaluate(straight_chain, true);
+        let straight_chain = evaluate(straight_chain.nodes, true);
         let straight_routes = |layout: &Layout| {
             layout
                 .edges
@@ -2996,6 +3052,219 @@ mod tests {
     }
 
     #[test]
+    fn positive_clearance_considers_a_safe_straight_chain_candidate() {
+        let requested = LayoutOptions {
+            edge_node_clearance: 20.0,
+            ordering_sweeps: 0,
+            ..LayoutOptions::default()
+        };
+        let graph = preferred_backbone_graph(26);
+        let indexed = validation::validate_and_index(&graph, requested).unwrap();
+        let options = effective_layout_options(requested);
+        let ranks = topology::assign_ranks(&indexed);
+        let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
+        let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
+        let straight_chain =
+            placement::place_straight_chain_nodes(&indexed, &ranks, &layers, &ordinary, options)
+                .expect("fixture has a safe straight-chain placement");
+        let plan = routing::RoutingPlan::new(&indexed, &ranks);
+        let mut straight_chain_best = None;
+        let mut admission = CandidateAdmissionState::default();
+        evaluate_candidate(
+            &indexed,
+            &plan,
+            &mut straight_chain_best,
+            straight_chain.nodes,
+            options,
+            CandidateRouting {
+                supplemental: true,
+                adaptive_gap_spacing: true,
+                ..CandidateRouting::default()
+            },
+            &mut admission,
+        );
+        let expected = straight_chain_best
+            .expect("at least one straight-chain route satisfies clearance")
+            .layout;
+
+        assert!(admission.contact_satisfied);
+        assert!(admission.clearance_satisfied);
+        assert_eq!(layout(&graph, requested).unwrap(), expected);
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        for node in &mut permuted.nodes {
+            node.ports.reverse();
+        }
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, requested).unwrap(), expected);
+    }
+
+    #[test]
+    fn straight_chain_admission_requires_bounded_cost_and_a_routed_straight_gain() {
+        let route = |id: EdgeId, straight: bool| EdgeGeometry {
+            id,
+            points: if straight {
+                vec![Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 0.0 }]
+            } else {
+                vec![
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: 5.0, y: 0.0 },
+                    Point { x: 5.0, y: 5.0 },
+                    Point { x: 10.0, y: 5.0 },
+                ]
+            },
+        };
+        let layout = |area: f64, routes: &[(EdgeId, bool)]| Layout {
+            nodes: Vec::new(),
+            edges: routes
+                .iter()
+                .map(|&(id, straight)| route(id, straight))
+                .collect(),
+            boundary_bundles: Vec::new(),
+            width: area,
+            height: 1.0,
+        };
+        let baseline = RouteQuality {
+            crossings: 10,
+            bends: 100,
+            route_length: 100.0,
+        };
+        let admitted = |quality: RouteQuality, layout: Layout| AdmittedCandidate {
+            selection_quality: quality,
+            quality,
+            raw_layout: layout.clone(),
+            layout,
+        };
+        let chain_edges = [10, 20];
+        let current = admitted(
+            baseline,
+            layout(100.0, &[(10, false), (20, false), (99, false)]),
+        );
+        let boundary = RouteQuality {
+            crossings: 9,
+            bends: 105,
+            route_length: 105.0,
+        };
+
+        assert!(straight_chain_cost_is_bounded(
+            &admitted(
+                boundary,
+                layout(110.0, &[(10, true), (20, true), (99, false)]),
+            ),
+            &current,
+            &chain_edges,
+            600,
+        ));
+        for (quality, candidate) in [
+            (
+                RouteQuality {
+                    route_length: 105.000_001,
+                    ..boundary
+                },
+                layout(110.0, &[(10, true), (20, true), (99, false)]),
+            ),
+            (
+                RouteQuality {
+                    bends: 106,
+                    ..boundary
+                },
+                layout(110.0, &[(10, true), (20, true), (99, false)]),
+            ),
+            (
+                boundary,
+                layout(110.000_001, &[(10, true), (20, true), (99, false)]),
+            ),
+            (
+                boundary,
+                layout(110.0, &[(10, false), (20, false), (99, true)]),
+            ),
+        ] {
+            assert!(!straight_chain_cost_is_bounded(
+                &admitted(quality, candidate),
+                &current,
+                &chain_edges,
+                600,
+            ));
+        }
+
+        let balanced_loss_current =
+            layout(100.0, &[(10, false), (20, false), (30, true), (40, true)]);
+        let balanced_loss_candidate =
+            layout(100.0, &[(10, true), (20, true), (30, false), (40, false)]);
+        assert!(!straight_chain_cost_is_bounded(
+            &admitted(boundary, balanced_loss_candidate),
+            &admitted(baseline, balanced_loss_current),
+            &[10, 20, 30, 40],
+            600,
+        ));
+
+        let large_candidate = layout(100.0, &[(10, true), (20, true)]);
+        assert!(straight_chain_cost_is_bounded(
+            &admitted(boundary, large_candidate.clone()),
+            &current,
+            &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+            601,
+        ));
+        assert!(straight_chain_cost_is_bounded(
+            &admitted(boundary, large_candidate.clone()),
+            &current,
+            &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110],
+            601,
+        ));
+        assert!(!straight_chain_cost_is_bounded(
+            &admitted(boundary, large_candidate.clone()),
+            &current,
+            &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+            601,
+        ));
+        assert!(straight_chain_large_gain_is_significant(46, 231));
+        assert!(!straight_chain_large_gain_is_significant(45, 231));
+
+        let over_length = RouteQuality {
+            route_length: 105.000_001,
+            ..boundary
+        };
+        let raw_over_budget = AdmittedCandidate {
+            selection_quality: over_length,
+            raw_layout: large_candidate.clone(),
+            quality: boundary,
+            layout: large_candidate.clone(),
+        };
+        assert!(!straight_chain_cost_is_bounded(
+            &raw_over_budget,
+            &current,
+            &chain_edges,
+            600,
+        ));
+
+        let rendered_over_budget = AdmittedCandidate {
+            selection_quality: boundary,
+            raw_layout: large_candidate.clone(),
+            quality: over_length,
+            layout: large_candidate,
+        };
+        assert!(!straight_chain_cost_is_bounded(
+            &rendered_over_budget,
+            &current,
+            &chain_edges,
+            600,
+        ));
+
+        let rendered_without_gain = AdmittedCandidate {
+            selection_quality: boundary,
+            raw_layout: layout(100.0, &[(10, true), (20, true), (99, false)]),
+            quality: boundary,
+            layout: current.layout.clone(),
+        };
+        assert!(!straight_chain_cost_is_bounded(
+            &rendered_without_gain,
+            &current,
+            &chain_edges,
+            600,
+        ));
+    }
+
+    #[test]
     fn exact_scoring_rejects_a_straighter_candidate_with_more_crossings() {
         let options = LayoutOptions {
             ordering_sweeps: 0,
@@ -3006,14 +3275,10 @@ mod tests {
         let ranks = topology::assign_ranks(&indexed);
         let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
         let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
-        let chain = placement::place_straight_chain_nodes(
-            &indexed,
-            &ranks,
-            &layers,
-            &ordinary,
-            options.node_gap,
-        )
-        .unwrap();
+        let chain =
+            placement::place_straight_chain_nodes(&indexed, &ranks, &layers, &ordinary, options)
+                .unwrap()
+                .nodes;
         let plan = routing::RoutingPlan::new(&indexed, &ranks);
         let routed = routing::route_planned_candidates(&plan, &chain, options, true);
         let mut best_chain = None;

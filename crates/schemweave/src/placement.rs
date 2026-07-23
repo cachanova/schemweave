@@ -1,5 +1,6 @@
 use crate::{
-    EdgeGeometry, Layout, LayoutOptions, NetId, NodeGeometry, PortSide, validation::IndexedGraph,
+    EdgeGeometry, EdgeId, Layout, LayoutOptions, NetId, NodeGeometry, PortSide,
+    validation::IndexedGraph,
 };
 use std::collections::BTreeMap;
 
@@ -9,6 +10,11 @@ const CHAIN_ALIGNMENT_EPSILON: f64 = 1e-7;
 pub(crate) const MAX_CHAIN_HEIGHT_FACTOR: f64 = 1.10;
 pub(crate) const MAX_CHAIN_CANDIDATE_NODES: usize = 1_000;
 const MIN_PREFERRED_ALIGNMENT_IMPROVEMENT: f64 = 100_000.0;
+
+pub(crate) struct StraightChainPlacement {
+    pub(crate) nodes: Vec<NodeGeometry>,
+    pub(crate) edge_ids: Vec<EdgeId>,
+}
 
 #[derive(Clone, Copy)]
 struct AlignmentPolicy {
@@ -76,26 +82,29 @@ pub(crate) fn place_straight_chain_nodes(
     ranks: &[usize],
     layers: &[Vec<usize>],
     ordinary: &[NodeGeometry],
-    node_gap: f64,
-) -> Option<Vec<NodeGeometry>> {
+    options: LayoutOptions,
+) -> Option<StraightChainPlacement> {
+    let options = crate::effective_layout_options(options);
     let chains = preferred_chain_targets(graph, ranks, ordinary)?;
+    let node_gaps = clearance_aware_node_gaps(graph, ranks, layers, options);
     let packed_height = layers
         .iter()
-        .map(|layer| {
+        .enumerate()
+        .map(|(rank, layer)| {
             layer
                 .iter()
                 .map(|&node| graph.nodes[node].height)
                 .sum::<f64>()
-                + node_gap * layer.len().saturating_sub(1) as f64
+                + node_gaps[rank].iter().sum::<f64>()
         })
         .fold(0.0, f64::max);
     let mut nodes = ordinary.to_vec();
-    for layer in layers {
+    for (rank, layer) in layers.iter().enumerate() {
         let mut offsets = Vec::with_capacity(layer.len());
         let mut projected_targets = Vec::with_capacity(layer.len());
         let mut weights = Vec::with_capacity(layer.len());
         let mut offset = 0.0;
-        for &node in layer {
+        for (position, &node) in layer.iter().enumerate() {
             offsets.push(offset);
             projected_targets.push(chains.targets[node].unwrap_or(nodes[node].y) - offset);
             weights.push(if chains.targets[node].is_some() {
@@ -103,7 +112,8 @@ pub(crate) fn place_straight_chain_nodes(
             } else {
                 1.0
             });
-            offset += nodes[node].height + node_gap;
+            offset +=
+                nodes[node].height + node_gaps[rank].get(position).copied().unwrap_or_default();
         }
         for ((&node, &base), y) in layer
             .iter()
@@ -113,8 +123,15 @@ pub(crate) fn place_straight_chain_nodes(
             nodes[node].y = base + y;
         }
     }
-    straight_chain_is_eligible(graph, ordinary, &nodes, &chains.edges, packed_height)
-        .then_some(nodes)
+    straight_chain_is_eligible(graph, ordinary, &nodes, &chains.edges, packed_height).then(|| {
+        let mut edge_ids = chains
+            .edges
+            .iter()
+            .map(|&edge| graph.edges[edge].id)
+            .collect::<Vec<_>>();
+        edge_ids.sort_unstable();
+        StraightChainPlacement { nodes, edge_ids }
+    })
 }
 
 pub(crate) fn place_baseline_nodes(
@@ -1186,16 +1203,80 @@ mod tests {
         let layers = vec![vec![0], vec![1], vec![2]];
         let place_candidate = |graph: &Graph| {
             let indexed = validate_and_index(graph, LayoutOptions::default()).unwrap();
-            place_straight_chain_nodes(&indexed, &[0, 1, 2], &layers, &ordinary, 30.0).unwrap()
+            place_straight_chain_nodes(
+                &indexed,
+                &[0, 1, 2],
+                &layers,
+                &ordinary,
+                LayoutOptions::default(),
+            )
+            .unwrap()
         };
 
         let candidate = place_candidate(&graph);
-        assert_eq!(candidate[0].y + 20.0, candidate[1].y + 20.0);
-        assert_eq!(candidate[1].y + 20.0, candidate[2].y + 20.0);
+        assert_eq!(candidate.edge_ids, vec![10, 20]);
+        assert_eq!(candidate.nodes[0].y + 20.0, candidate.nodes[1].y + 20.0);
+        assert_eq!(candidate.nodes[1].y + 20.0, candidate.nodes[2].y + 20.0);
         let mut permuted = graph.clone();
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(place_candidate(&permuted), candidate);
+        let permuted = place_candidate(&permuted);
+        assert_eq!(permuted.edge_ids, candidate.edge_ids);
+        assert_eq!(permuted.nodes, candidate.nodes);
+
+        let mut clearance_graph = graph.clone();
+        clearance_graph.nodes[1].ports.push(Port {
+            id: 2,
+            side: PortSide::South,
+            offset: 20.0,
+        });
+        clearance_graph.nodes.push(Node {
+            id: 3,
+            width: 40.0,
+            height: 40.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: PortSide::North,
+                offset: 20.0,
+            }],
+        });
+        clearance_graph.edges.push(Edge {
+            id: 30,
+            source: Endpoint { node: 1, port: 2 },
+            target: Endpoint { node: 3, port: 0 },
+            net: 30,
+            participates_in_ranking: false,
+        });
+        let clearance_options = LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index(&clearance_graph, clearance_options).unwrap();
+        let clearance_layers = vec![vec![0], vec![1, 3], vec![2]];
+        let mut clearance_ordinary = ordinary.clone();
+        clearance_ordinary.push(NodeGeometry {
+            id: 3,
+            x: 100.0,
+            y: 101.0,
+            width: 40.0,
+            height: 40.0,
+        });
+        let clearance_candidate = place_straight_chain_nodes(
+            &indexed,
+            &[0, 1, 2, 1],
+            &clearance_layers,
+            &clearance_ordinary,
+            clearance_options,
+        )
+        .expect("clearance-aware projection retains the preferred chain");
+        assert!(
+            clearance_candidate.nodes[3].y
+                - clearance_candidate.nodes[1].y
+                - clearance_candidate.nodes[1].height
+                >= 44.0,
+            "south and north endpoint escapes require 2 * clearance + lane gap",
+        );
 
         let one_edge = Graph {
             edges: vec![graph.edges[0].clone()],
