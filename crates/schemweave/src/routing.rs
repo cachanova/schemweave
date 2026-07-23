@@ -5142,34 +5142,37 @@ fn apply_pitched_gap_assignments(
             resolved.target_port,
         )
         .x;
-        if source_rank >= target_rank {
-            continue;
-        }
-        for (point_index, pair) in original_route.points.windows(2).enumerate() {
-            if pair[0].x != pair[1].x || pair[0].y == pair[1].y {
-                continue;
+        if source_rank < target_rank {
+            for (point_index, pair) in original_route.points.windows(2).enumerate() {
+                if pair[0].x != pair[1].x || pair[0].y == pair[1].y {
+                    continue;
+                }
+                let Some(gap) = selected_route_gap(
+                    pair[0].x,
+                    source_rank,
+                    target_rank,
+                    layer_left,
+                    layer_right,
+                ) else {
+                    continue;
+                };
+                let Some(tracks) = assignments[gap].as_ref() else {
+                    continue;
+                };
+                let key = pitched_track_key(resolved.edge.net, pair[0].x)?;
+                let x = pitched_gap_track_x(
+                    tracks,
+                    key,
+                    gap,
+                    &shifted_layer_left,
+                    &shifted_layer_right,
+                    options,
+                )?;
+                changed |= route.points[point_index].x != x;
+                route.points[point_index].x = x;
+                route.points[point_index + 1].x = x;
+                selected_nets.insert(resolved.edge.net);
             }
-            let Some(gap) =
-                selected_route_gap(pair[0].x, source_rank, target_rank, layer_left, layer_right)
-            else {
-                continue;
-            };
-            let Some(tracks) = assignments[gap].as_ref() else {
-                continue;
-            };
-            let key = pitched_track_key(resolved.edge.net, pair[0].x)?;
-            let x = pitched_gap_track_x(
-                tracks,
-                key,
-                gap,
-                &shifted_layer_left,
-                &shifted_layer_right,
-                options,
-            )?;
-            changed |= route.points[point_index].x != x;
-            route.points[point_index].x = x;
-            route.points[point_index + 1].x = x;
-            selected_nets.insert(resolved.edge.net);
         }
         let wrong_length = route.points.len() != original_route.points.len();
         let wrong_source = route
@@ -8510,6 +8513,111 @@ mod tests {
             )
             .unwrap()
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn pitched_gap_application_validates_feedback_topology_fail_closed() {
+        let node = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![
+                Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 10.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::West,
+                    offset: 10.0,
+                },
+            ],
+        };
+        let graph = Graph {
+            nodes: vec![node(0), node(1)],
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 1, port: 1 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 0, port: 1 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1]);
+        let nodes = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        let routes = vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![
+                    Point { x: 20.0, y: 10.0 },
+                    Point { x: 50.0, y: 10.0 },
+                    Point { x: 50.0, y: 20.0 },
+                    Point { x: 100.0, y: 20.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 1,
+                // Deliberately malformed private-helper input: resetting this feedback route to
+                // its fixed East source port reverses the first horizontal arm. The candidate
+                // builder must fail closed even though feedback tracks are not themselves pitched.
+                points: vec![
+                    Point { x: 50.0, y: 30.0 },
+                    Point { x: 100.0, y: 30.0 },
+                    Point { x: 100.0, y: 40.0 },
+                    Point { x: 0.0, y: 40.0 },
+                ],
+            },
+        ];
+        let key = super::pitched_track_key(10, 50.0).unwrap();
+        let assignments = [Some(super::PitchedGapTracks {
+            slots: BTreeMap::from([(key, 2)]),
+            slot_count: 3,
+        })];
+        let options = LayoutOptions {
+            route_lane_gap: 6.0,
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        };
+
+        assert!(
+            super::apply_pitched_gap_assignments(
+                &plan,
+                &nodes,
+                &routes,
+                &assignments,
+                &[0.0, 100.0],
+                &[20.0, 120.0],
+                options,
+            )
+            .is_none()
         );
     }
 
