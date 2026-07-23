@@ -170,6 +170,15 @@ pub(crate) struct RoutedEdges {
     repair_outer_sides: Vec<(NetId, OuterSide)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct EndpointTrack {
+    lane: usize,
+    lane_count: usize,
+    approximate_offset: Option<f64>,
+}
+
+type EndpointTracks = BTreeMap<(u32, u32, u8), EndpointTrack>;
+
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct FeedbackCandidateTrace {
@@ -198,7 +207,7 @@ struct RoutedLaneState {
     global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
     preserved_refined_global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
     refined_global_gap_lanes: Option<Vec<BTreeMap<u32, usize>>>,
-    endpoint_tracks: BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: EndpointTracks,
     crossing_paths_match_endpoint_tracks: bool,
     crossing_paths: Vec<Option<Vec<f64>>>,
 }
@@ -1674,7 +1683,7 @@ fn finish_fanout_route_families(
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<NetId, usize>],
     crossing_paths: &[Option<Vec<f64>>],
-    stable_endpoint_tracks: BTreeMap<(u32, u32, u8), (usize, usize)>,
+    stable_endpoint_tracks: EndpointTracks,
     stable_crossing_paths_match_endpoint_tracks: bool,
     stable_channel_lanes: &BTreeMap<NetId, usize>,
     adaptive_channel_lanes: BTreeMap<NetId, usize>,
@@ -1924,7 +1933,7 @@ fn finish_route_family(
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<u32, usize>],
     crossing_paths: &[Option<Vec<f64>>],
-    mut endpoint_tracks: BTreeMap<(u32, u32, u8), (usize, usize)>,
+    mut endpoint_tracks: EndpointTracks,
     mut crossing_paths_match_endpoint_tracks: bool,
     channel_lanes: &BTreeMap<NetId, usize>,
     mut outer_lanes: BTreeMap<u32, OuterLane>,
@@ -2402,7 +2411,7 @@ fn emit_routes(
     layer_left: &[f64],
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<u32, usize>],
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     outer_lanes: &BTreeMap<u32, OuterLane>,
     top: f64,
     bottom: f64,
@@ -2570,7 +2579,7 @@ fn repair_crossing_heavy_net(
     options: LayoutOptions,
     outer_lane_rounds: usize,
     routes: &[EdgeGeometry],
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     crossing_paths: &[Option<Vec<f64>>],
     crossing_paths_match_endpoint_tracks: bool,
     precomputed: Option<(&[PhysicalSegment], &BTreeMap<NetId, usize>, RouteQuality)>,
@@ -2835,7 +2844,7 @@ fn negotiated_corridor_candidate(
     bottom: f64,
     options: LayoutOptions,
     routes: &[EdgeGeometry],
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     crossing_paths: &[Option<Vec<f64>>],
     gap_spacing: GapTrackSpacing,
     precomputed: Option<(&[PhysicalSegment], &BTreeMap<NetId, usize>, RouteQuality)>,
@@ -3088,7 +3097,7 @@ fn negotiated_net_context(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     sparse_spans: &[Option<(usize, usize)>],
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     crossing_paths: &[Option<Vec<f64>>],
     port_stub: f64,
     net: NetId,
@@ -3447,7 +3456,7 @@ fn select_outer_side_repairs(
     options: LayoutOptions,
     physical_segments: &[PhysicalSegment],
     gap_spacing: GapTrackSpacing,
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
 ) -> Vec<(NetId, OuterSide)> {
     #[cfg(test)]
     update_routing_reuse_counts(|counts| counts.outer_repair_endpoint_tracks += 1);
@@ -3543,7 +3552,7 @@ fn outer_arm_crossing_profiles(
     layer_left: &[f64],
     layer_right: &[f64],
     outer_lanes: &BTreeMap<EdgeId, OuterLane>,
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     top: f64,
     bottom: f64,
     options: LayoutOptions,
@@ -3604,7 +3613,7 @@ fn outer_arm_segments(
     layer_left: &[f64],
     layer_right: &[f64],
     outer_lanes: &BTreeMap<EdgeId, OuterLane>,
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     top: f64,
     bottom: f64,
     options: LayoutOptions,
@@ -6403,13 +6412,16 @@ fn endpoint_escape_y(
     point: Point,
     endpoint: crate::Endpoint,
     role: u8,
-    tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    tracks: &EndpointTracks,
     spread: f64,
 ) -> f64 {
-    let Some(&(lane, lane_count)) = tracks.get(&(endpoint.node, endpoint.port, role)) else {
+    let Some(track) = tracks.get(&(endpoint.node, endpoint.port, role)) else {
         return point.y;
     };
-    let fraction = (lane + 1) as f64 / (lane_count + 1) as f64;
+    if let Some(offset) = track.approximate_offset {
+        return point.y + offset;
+    }
+    let fraction = (track.lane + 1) as f64 / (track.lane_count + 1) as f64;
     point.y + (fraction - 0.5) * spread
 }
 
@@ -6452,10 +6464,66 @@ fn endpoint_y_within_ulps(anchor: f64, candidate: f64, max_ulps: u64) -> bool {
     anchor.abs_diff(candidate) <= max_ulps
 }
 
+fn approximate_component_offsets(
+    component: &[EndpointAccess],
+    route_lane_gap: f64,
+    maximum_offset: f64,
+) -> Option<BTreeMap<(u32, u32, u8), f64>> {
+    if component.len() < 2
+        || !route_lane_gap.is_finite()
+        || route_lane_gap <= 0.0
+        || !maximum_offset.is_finite()
+        || maximum_offset < 0.0
+    {
+        return None;
+    }
+    let last_lane = u32::try_from(component.len().checked_sub(1)?).ok()?;
+    let full_span = f64::from(last_lane) * route_lane_gap;
+    let half_span = full_span / 2.0;
+    if !full_span.is_finite() || !half_span.is_finite() || half_span > maximum_offset {
+        return None;
+    }
+
+    let mut ordered = component.to_vec();
+    ordered.sort_by(|left, right| {
+        left.y
+            .total_cmp(&right.y)
+            .then(left.endpoint.node.cmp(&right.endpoint.node))
+            .then(left.endpoint.port.cmp(&right.endpoint.port))
+            .then(left.role.cmp(&right.role))
+    });
+    let lane_count = f64::from(last_lane) + 1.0;
+    let mut offsets = BTreeMap::new();
+    let mut previous_escape_y: Option<f64> = None;
+    for (lane, access) in ordered.into_iter().enumerate() {
+        let lane = u32::try_from(lane).ok()?;
+        let centered_lane = f64::from(lane) * 2.0 + 1.0 - lane_count;
+        let offset = centered_lane * route_lane_gap / 2.0;
+        let escape_y = access.y + offset;
+        if !offset.is_finite()
+            || !escape_y.is_finite()
+            || previous_escape_y.is_some_and(|previous| {
+                let separation = escape_y - previous;
+                !separation.is_finite() || separation < route_lane_gap
+            })
+        {
+            return None;
+        }
+        previous_escape_y = Some(escape_y);
+        offsets.insert(
+            (access.endpoint.node, access.endpoint.port, access.role),
+            offset,
+        );
+    }
+    Some(offsets)
+}
+
 fn endpoint_tracks_from_accesses(
     mut accesses: Vec<EndpointAccess>,
     max_ulps: u64,
-) -> BTreeMap<(u32, u32, u8), (usize, usize)> {
+    route_lane_gap: f64,
+    maximum_approximate_offset: f64,
+) -> EndpointTracks {
     accesses.sort_by(|left, right| {
         left.y
             .total_cmp(&right.y)
@@ -6484,6 +6552,7 @@ fn endpoint_tracks_from_accesses(
                 .then(left.role.cmp(&right.role))
         });
         let mut conflicts = Vec::new();
+        let mut approximate_offsets = BTreeMap::new();
         let mut component_start = 0;
         while component_start < row.len() {
             let mut component_end = component_start + 1;
@@ -6497,6 +6566,18 @@ fn endpoint_tracks_from_accesses(
                 .iter()
                 .any(|access| access.net != component[0].net)
             {
+                let mixed_y = component
+                    .iter()
+                    .any(|access| access.y.to_bits() != component[0].y.to_bits());
+                if mixed_y
+                    && let Some(offsets) = approximate_component_offsets(
+                        component,
+                        route_lane_gap,
+                        maximum_approximate_offset,
+                    )
+                {
+                    approximate_offsets.extend(offsets);
+                }
                 conflicts.extend_from_slice(component);
             }
             component_start = component_end;
@@ -6510,9 +6591,14 @@ fn endpoint_tracks_from_accesses(
         });
         let lane_count = conflicts.len();
         for (lane, access) in conflicts.into_iter().enumerate() {
+            let key = (access.endpoint.node, access.endpoint.port, access.role);
             tracks.insert(
-                (access.endpoint.node, access.endpoint.port, access.role),
-                (lane, lane_count),
+                key,
+                EndpointTrack {
+                    lane,
+                    lane_count,
+                    approximate_offset: approximate_offsets.remove(&key),
+                },
             );
         }
         row_start = row_end;
@@ -6532,7 +6618,7 @@ fn build_endpoint_tracks(
     outer_lanes: &BTreeMap<u32, OuterLane>,
     options: LayoutOptions,
     gap_spacing: GapTrackSpacing,
-) -> BTreeMap<(u32, u32, u8), (usize, usize)> {
+) -> EndpointTracks {
     let mut accesses = BTreeMap::<(u32, u32, u8), EndpointAccess>::new();
     for (resolved, sparse_span) in plan.edges.iter().zip(sparse_spans) {
         let edge = resolved.edge;
@@ -6651,7 +6737,12 @@ fn build_endpoint_tracks(
     } else {
         0
     };
-    endpoint_tracks_from_accesses(accesses.into_values().collect(), max_ulps)
+    endpoint_tracks_from_accesses(
+        accesses.into_values().collect(),
+        max_ulps,
+        options.route_lane_gap,
+        crate::outward_obstacle_clearance_stub(options),
+    )
 }
 
 fn free_intervals(
@@ -6684,7 +6775,7 @@ fn sparse_crossing_paths(
     crossing_tie_lanes: &BTreeMap<(usize, u32), usize>,
     crossing_tie_lane_count: usize,
     free_by_rank: &[Vec<(f64, f64)>],
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     port_stub: f64,
 ) -> Vec<Option<Vec<f64>>> {
     // A single-driver net uses one obstacle-safe backbone; each sink route receives the prefix
@@ -6850,7 +6941,7 @@ fn crossing_aware_gap_lanes(
     sparse_spans: &[Option<(usize, usize)>],
     crossing_paths: &[Option<Vec<f64>>],
     current_lanes: &[BTreeMap<u32, usize>],
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     port_stub: f64,
     lane_rounds: usize,
     global_candidates: bool,
@@ -6975,7 +7066,7 @@ fn gap_net_accesses(
     sparse_spans: &[Option<(usize, usize)>],
     crossing_paths: &[Option<Vec<f64>>],
     gap_count: usize,
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     port_stub: f64,
 ) -> Vec<BTreeMap<NetId, GapNetAccess>> {
     let mut accesses = (0..gap_count)
@@ -7971,7 +8062,7 @@ fn sparse_channel_route(
     layer_right: &[f64],
     gap_lanes: &[BTreeMap<u32, usize>],
     crossing_path: &[f64],
-    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    endpoint_tracks: &EndpointTracks,
     options: LayoutOptions,
     gap_spacing: GapTrackSpacing,
 ) -> Vec<Point> {
@@ -8448,6 +8539,18 @@ mod tests {
             y,
             low_x,
             high_x,
+        }
+    }
+
+    fn endpoint_track(
+        lane: usize,
+        lane_count: usize,
+        approximate_offset: Option<f64>,
+    ) -> super::EndpointTrack {
+        super::EndpointTrack {
+            lane,
+            lane_count,
+            approximate_offset,
         }
     }
 
@@ -13797,7 +13900,10 @@ mod tests {
         assert_eq!(expanded, compact);
         assert_eq!(
             compact,
-            BTreeMap::from([((1, 0, 0), (0, 2)), ((2, 1, 1), (1, 2))])
+            BTreeMap::from([
+                ((1, 0, 0), endpoint_track(0, 2, None)),
+                ((2, 1, 1), endpoint_track(1, 2, None)),
+            ])
         );
     }
 
@@ -13809,13 +13915,182 @@ mod tests {
             endpoint_access(1, 0, 10, y, 20.0, 80.0),
             endpoint_access(2, 0, 11, next_y, 40.0, 100.0),
         ];
-        let tracks = super::endpoint_tracks_from_accesses(accesses.clone(), 4);
+        let tracks = super::endpoint_tracks_from_accesses(accesses.clone(), 4, 6.0, 20.0);
 
         assert_eq!(
             tracks,
-            BTreeMap::from([((1, 0, 0), (0, 2)), ((2, 0, 0), (1, 2))])
+            BTreeMap::from([
+                ((1, 0, 0), endpoint_track(0, 2, Some(-3.0))),
+                ((2, 0, 0), endpoint_track(1, 2, Some(3.0))),
+            ])
         );
-        assert!(super::endpoint_tracks_from_accesses(accesses, 0).is_empty());
+        assert!(super::endpoint_tracks_from_accesses(accesses, 0, 6.0, 20.0).is_empty());
+    }
+
+    #[test]
+    fn approximate_endpoint_component_escapes_two_lanes_at_route_pitch() {
+        let y = 840.0_f64;
+        let next_y = f64::from_bits(y.to_bits() + 1);
+        let tracks = super::endpoint_tracks_from_accesses(
+            vec![
+                endpoint_access(1, 0, 10, y, 20.0, 100.0),
+                endpoint_access(2, 0, 11, next_y, 20.0, 100.0),
+            ],
+            4,
+            6.0,
+            20.0,
+        );
+        let first = super::endpoint_escape_y(
+            Point { x: 20.0, y },
+            Endpoint { node: 1, port: 0 },
+            0,
+            &tracks,
+            LayoutOptions::default().port_stub,
+        );
+        let second = super::endpoint_escape_y(
+            Point { x: 20.0, y: next_y },
+            Endpoint { node: 2, port: 0 },
+            0,
+            &tracks,
+            LayoutOptions::default().port_stub,
+        );
+
+        assert!(second - first >= LayoutOptions::default().route_lane_gap);
+    }
+
+    #[test]
+    fn approximate_endpoint_component_escapes_three_lanes_at_route_pitch() {
+        let y = 840.0_f64;
+        let tracks = super::endpoint_tracks_from_accesses(
+            (0..3)
+                .map(|lane| {
+                    endpoint_access(
+                        lane + 1,
+                        0,
+                        lane + 10,
+                        f64::from_bits(y.to_bits() + u64::from(lane)),
+                        20.0,
+                        100.0,
+                    )
+                })
+                .collect(),
+            4,
+            6.0,
+            20.0,
+        );
+        let escapes = (0..3)
+            .map(|lane| {
+                let lane_y = f64::from_bits(y.to_bits() + u64::from(lane));
+                super::endpoint_escape_y(
+                    Point { x: 20.0, y: lane_y },
+                    Endpoint {
+                        node: lane + 1,
+                        port: 0,
+                    },
+                    0,
+                    &tracks,
+                    LayoutOptions::default().port_stub,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            escapes
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] >= LayoutOptions::default().route_lane_gap)
+        );
+    }
+
+    #[test]
+    fn exact_endpoint_rows_keep_the_compact_escape_bytes() {
+        let y = 840.0_f64;
+        let accesses = vec![
+            endpoint_access(1, 0, 10, y, 20.0, 100.0),
+            endpoint_access(2, 0, 11, y, 20.0, 100.0),
+        ];
+        let exact = super::endpoint_tracks_from_accesses(accesses.clone(), 0, 6.0, 20.0);
+        let approximate = super::endpoint_tracks_from_accesses(accesses, 4, 6.0, 20.0);
+
+        assert_eq!(approximate, exact);
+        assert_eq!(
+            exact,
+            BTreeMap::from([
+                ((1, 0, 0), endpoint_track(0, 2, None)),
+                ((2, 0, 0), endpoint_track(1, 2, None)),
+            ])
+        );
+        for (node, lane) in [(1, 0), (2, 1)] {
+            let actual = super::endpoint_escape_y(
+                Point { x: 20.0, y },
+                Endpoint { node, port: 0 },
+                0,
+                &exact,
+                10.0,
+            );
+            let fraction = (lane + 1) as f64 / 3.0;
+            let legacy = y + (fraction - 0.5) * 10.0;
+            assert_eq!(actual.to_bits(), legacy.to_bits());
+        }
+    }
+
+    #[test]
+    fn approximate_endpoint_offsets_are_local_to_each_mixed_y_component() {
+        let y = 840.0_f64;
+        let next_y = f64::from_bits(y.to_bits() + 1);
+        let tracks = super::endpoint_tracks_from_accesses(
+            vec![
+                endpoint_access(1, 0, 10, y, 0.0, 30.0),
+                endpoint_access(2, 0, 11, next_y, 0.0, 30.0),
+                endpoint_access(3, 0, 12, y, 40.0, 70.0),
+                endpoint_access(4, 0, 13, y, 40.0, 70.0),
+            ],
+            4,
+            6.0,
+            20.0,
+        );
+
+        assert_eq!(tracks[&(1, 0, 0)].approximate_offset, Some(-3.0));
+        assert_eq!(tracks[&(2, 0, 0)].approximate_offset, Some(3.0));
+        assert_eq!(tracks[&(3, 0, 0)].approximate_offset, None);
+        assert_eq!(tracks[&(4, 0, 0)].approximate_offset, None);
+        assert!(tracks.values().all(|track| track.lane_count == 4));
+    }
+
+    #[test]
+    fn approximate_endpoint_offsets_fail_closed_for_invalid_or_excessive_spreads() {
+        let y = 840.0_f64;
+        let accesses = (0..3)
+            .map(|lane| {
+                endpoint_access(
+                    lane + 1,
+                    0,
+                    lane + 10,
+                    f64::from_bits(y.to_bits() + u64::from(lane)),
+                    20.0,
+                    100.0,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (gap, maximum_offset) in [
+            (0.0, 20.0),
+            (-6.0, 20.0),
+            (f64::INFINITY, 20.0),
+            (f64::NAN, 20.0),
+            (6.0, 5.0),
+            (6.0, f64::INFINITY),
+            (6.0, f64::NAN),
+            (f64::MAX, f64::MAX),
+        ] {
+            let tracks =
+                super::endpoint_tracks_from_accesses(accesses.clone(), 4, gap, maximum_offset);
+            assert_eq!(tracks.len(), 3);
+            assert!(
+                tracks
+                    .values()
+                    .all(|track| track.approximate_offset.is_none())
+            );
+        }
     }
 
     #[test]
@@ -13830,14 +14105,16 @@ mod tests {
                 endpoint_access(3, 0, 12, at_five, 20.0, 100.0),
             ],
             4,
+            6.0,
+            20.0,
         );
 
         assert_eq!(
             tracks,
             BTreeMap::from([
-                ((1, 0, 0), (0, 3)),
-                ((2, 0, 0), (1, 3)),
-                ((3, 0, 0), (2, 3)),
+                ((1, 0, 0), endpoint_track(0, 3, Some(-6.0))),
+                ((2, 0, 0), endpoint_track(1, 3, Some(0.0))),
+                ((3, 0, 0), endpoint_track(2, 3, Some(6.0))),
             ])
         );
     }
@@ -13887,11 +14164,16 @@ mod tests {
                 endpoint_access(3, 0, 12, at_five, 30.0, 60.0),
             ],
             4,
+            6.0,
+            20.0,
         );
 
         assert_eq!(
             tracks,
-            BTreeMap::from([((2, 0, 0), (0, 2)), ((3, 0, 0), (1, 2))])
+            BTreeMap::from([
+                ((2, 0, 0), endpoint_track(0, 2, Some(-3.0))),
+                ((3, 0, 0), endpoint_track(1, 2, Some(3.0))),
+            ])
         );
     }
 
@@ -13907,6 +14189,8 @@ mod tests {
                     endpoint_access(2, 0, 11, next_y, 20.0, 30.0),
                 ],
                 4,
+                6.0,
+                20.0,
             )
             .is_empty()
         );
@@ -13917,6 +14201,8 @@ mod tests {
                     endpoint_access(2, 0, 10, next_y, 10.0, 40.0),
                 ],
                 4,
+                6.0,
+                20.0,
             )
             .is_empty()
         );
@@ -13930,16 +14216,19 @@ mod tests {
             endpoint_access(1, 0, 10, y, 0.0, 100.0),
             endpoint_access(2, 0, 11, f64::from_bits(y.to_bits() + 1), 0.0, 100.0),
         ];
-        let expected = super::endpoint_tracks_from_accesses(accesses.clone(), 4);
+        let expected = super::endpoint_tracks_from_accesses(accesses.clone(), 4, 6.0, 20.0);
         accesses.reverse();
 
-        assert_eq!(super::endpoint_tracks_from_accesses(accesses, 4), expected);
+        assert_eq!(
+            super::endpoint_tracks_from_accesses(accesses, 4, 6.0, 20.0),
+            expected
+        );
         assert_eq!(
             expected,
             BTreeMap::from([
-                ((1, 0, 0), (0, 3)),
-                ((2, 0, 0), (1, 3)),
-                ((3, 0, 0), (2, 3)),
+                ((1, 0, 0), endpoint_track(0, 3, Some(-6.0))),
+                ((2, 0, 0), endpoint_track(1, 3, Some(0.0))),
+                ((3, 0, 0), endpoint_track(2, 3, Some(6.0))),
             ])
         );
     }
@@ -13959,6 +14248,8 @@ mod tests {
                 endpoint_access(4, 1, 8, source.y, 60.0, 100.0),
             ],
             4,
+            6.0,
+            20.0,
         );
         let points = sparse_channel_route(
             7,
