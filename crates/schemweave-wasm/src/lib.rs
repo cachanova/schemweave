@@ -369,6 +369,7 @@ mod tests {
             &schemweave::LayoutConstraints {
                 inputs: vec![1],
                 outputs: vec![9, 10],
+                boundary_bundles: Vec::new(),
             },
         )
         .unwrap();
@@ -589,6 +590,59 @@ mod tests {
         let x = |id| result.nodes.iter().find(|node| node.id == id).unwrap().x;
         assert!(x(1) < x(2));
         assert!(x(2) < x(3));
+    }
+
+    #[test]
+    fn accepts_boundary_bundle_constraints_and_emits_geometry_over_json() {
+        let graph = Graph {
+            nodes: vec![node(1), node(2), node(3)],
+            edges: vec![edge(10, 1, 2, 10), edge(11, 1, 3, 10)],
+        };
+        let options = r#"{
+            "constraints": {
+                "inputs": [1],
+                "outputs": [2, 3],
+                "boundary_bundles": [{
+                    "id": 5,
+                    "endpoint": {"node": 1, "port": 1},
+                    "width": 1,
+                    "members": [
+                        {"edge": 10, "slots": [0]},
+                        {"edge": 11, "slots": [0]}
+                    ]
+                }, {
+                    "id": 6,
+                    "endpoint": {"node": 2, "port": 0},
+                    "width": 1,
+                    "members": [
+                        {"edge": 10, "slots": [0]}
+                    ]
+                }]
+            }
+        }"#;
+        let value: serde_json::Value = serde_json::from_str(
+            &layout_serialized(&serde_json::to_string(&graph).unwrap(), options).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["boundary_bundles"][0]["id"], 5);
+        assert_eq!(value["boundary_bundles"][0]["role"], "input");
+        assert_eq!(value["boundary_bundles"][0]["members"][0]["edge"], 10);
+        assert_eq!(
+            value["boundary_bundles"][0]["members"][0]["tap"],
+            value["boundary_bundles"][0]["members"][1]["tap"]
+        );
+        assert_eq!(
+            value["edges"][0]["points"][0],
+            value["boundary_bundles"][0]["members"][0]["tap"]
+        );
+        assert_eq!(
+            value["edges"][0]["points"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap(),
+            &value["boundary_bundles"][1]["members"][0]["tap"]
+        );
     }
 
     #[test]

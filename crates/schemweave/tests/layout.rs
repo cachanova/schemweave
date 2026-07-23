@@ -1,4 +1,5 @@
 use schemweave::{
+    BoundaryBundleConstraint, BoundaryBundleMemberConstraint, BoundaryBundleRole,
     ConstrainedLayoutError, Edge, EdgeNodeSegment, Endpoint, Graph, Layout, LayoutConfig,
     LayoutConstraintError, LayoutConstraints, LayoutError, LayoutOptions, NetNodeRelation, Node,
     Port, PortSide, QualityEffort, layout, layout_with_config, layout_with_constraints,
@@ -336,6 +337,7 @@ fn positive_clearance_preserves_aligned_input_and_output_boundaries() {
     let constraints = LayoutConstraints {
         inputs: vec![1],
         outputs: vec![3, 4],
+        boundary_bundles: Vec::new(),
     };
     let options = LayoutOptions {
         edge_node_clearance: 20.0,
@@ -1140,7 +1142,9 @@ fn layout_errors_have_deterministic_public_classification() {
             | LayoutError::UnrelatedRouteContactSegmentLimitExceeded { .. }
             | LayoutError::ParallelWireSpacingUnsatisfied { .. }
             | LayoutError::ParallelWireSpacingWorkLimitExceeded { .. }
-            | LayoutError::ParallelWireSpacingSegmentLimitExceeded { .. } => "clearance",
+            | LayoutError::ParallelWireSpacingSegmentLimitExceeded { .. }
+            | LayoutError::BoundaryBundleGeometryUnsatisfied
+            | LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. } => "clearance",
         }
     }
 
@@ -1169,6 +1173,7 @@ fn boundary_constraints_preserve_acyclic_register_dataflow() {
     let constraints = LayoutConstraints {
         inputs: vec![1, 2, 3],
         outputs: vec![30],
+        boundary_bundles: Vec::new(),
     };
 
     let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
@@ -1212,6 +1217,7 @@ fn constrained_outputs_align_right_edges_across_widths_and_depths() {
     let constraints = LayoutConstraints {
         inputs: vec![1],
         outputs: vec![30, 40],
+        boundary_bundles: Vec::new(),
     };
 
     let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
@@ -1254,10 +1260,12 @@ fn constrained_layout_is_deterministic_across_node_port_edge_and_role_permutatio
     let constraints = LayoutConstraints {
         inputs: vec![1, 2],
         outputs: vec![20, 30],
+        boundary_bundles: Vec::new(),
     };
     let permuted_constraints = LayoutConstraints {
         inputs: vec![2, 1],
         outputs: vec![30, 20],
+        boundary_bundles: Vec::new(),
     };
 
     assert_eq!(
@@ -1281,6 +1289,7 @@ fn constrained_internal_sources_do_not_share_the_input_rank() {
     let constraints = LayoutConstraints {
         inputs: vec![1],
         outputs: vec![3, 4],
+        boundary_bundles: Vec::new(),
     };
 
     let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
@@ -1311,6 +1320,7 @@ fn boundary_constraints_handle_empty_and_one_sided_graphs() {
         &LayoutConstraints {
             inputs: vec![1, 2],
             outputs: vec![],
+            boundary_bundles: Vec::new(),
         },
     )
     .unwrap();
@@ -1329,6 +1339,7 @@ fn boundary_constraints_handle_empty_and_one_sided_graphs() {
         &LayoutConstraints {
             inputs: vec![],
             outputs: vec![1, 2],
+            boundary_bundles: Vec::new(),
         },
     )
     .unwrap();
@@ -1353,6 +1364,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
             &LayoutConstraints {
                 inputs: vec![99],
                 outputs: vec![],
+                boundary_bundles: Vec::new(),
             }
         ),
         Err(ConstrainedLayoutError::Constraint(
@@ -1369,6 +1381,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
             &LayoutConstraints {
                 inputs: vec![1, 1],
                 outputs: vec![],
+                boundary_bundles: Vec::new(),
             }
         ),
         Err(ConstrainedLayoutError::Constraint(
@@ -1385,6 +1398,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
             &LayoutConstraints {
                 inputs: vec![1, 2],
                 outputs: vec![2],
+                boundary_bundles: Vec::new(),
             }
         ),
         Err(ConstrainedLayoutError::Constraint(
@@ -1398,6 +1412,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
             &LayoutConstraints {
                 inputs: vec![2],
                 outputs: vec![],
+                boundary_bundles: Vec::new(),
             }
         ),
         Err(ConstrainedLayoutError::Constraint(
@@ -1411,6 +1426,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
             &LayoutConstraints {
                 inputs: vec![],
                 outputs: vec![2],
+                boundary_bundles: Vec::new(),
             }
         ),
         Err(ConstrainedLayoutError::Constraint(
@@ -1433,6 +1449,458 @@ fn empty_constraints_are_byte_identical_to_the_existing_api() {
             &LayoutConstraints::default()
         )
         .unwrap()
+    );
+    assert_eq!(
+        serde_json::to_string(&LayoutConstraints::default()).unwrap(),
+        r#"{"inputs":[],"outputs":[]}"#
+    );
+}
+
+#[test]
+fn input_boundary_bundle_emits_a_pitched_collector_and_unique_horizontal_taps() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(4, false),
+        ],
+        edges: vec![
+            Edge {
+                net: 10,
+                ..edge(10, 1, 2)
+            },
+            Edge {
+                net: 11,
+                ..edge(11, 1, 3)
+            },
+            Edge {
+                net: 12,
+                ..edge(12, 1, 4)
+            },
+        ],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![2, 3, 4],
+        boundary_bundles: vec![BoundaryBundleConstraint {
+            id: 7,
+            endpoint: Endpoint { node: 1, port: 1 },
+            width: 8,
+            members: vec![
+                BoundaryBundleMemberConstraint {
+                    edge: 12,
+                    slots: vec![7],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 10,
+                    slots: vec![0, 1, 2, 3],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 11,
+                    slots: vec![4, 5, 6],
+                },
+            ],
+        }],
+    };
+
+    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let bundle = &result.boundary_bundles[0];
+    assert_eq!(bundle.id, 7);
+    assert_eq!(bundle.role, BoundaryBundleRole::Input);
+    assert_eq!(bundle.width, 8);
+    assert_eq!(
+        bundle
+            .members
+            .iter()
+            .map(|member| member.edge)
+            .collect::<Vec<_>>(),
+        vec![10, 11, 12]
+    );
+    assert_eq!(bundle.collector.start.x, bundle.collector.end.x);
+    assert_eq!(bundle.spine.start.y, bundle.spine.end.y);
+    assert_eq!(
+        bundle.members[1].tap.y - bundle.members[0].tap.y,
+        LayoutOptions::default().route_lane_gap
+    );
+    for member in &bundle.members {
+        let route = result
+            .edges
+            .iter()
+            .find(|route| route.id == member.edge)
+            .unwrap();
+        assert_eq!(route.points[0], member.tap);
+        assert_eq!(route.points[0].y, route.points[1].y);
+        assert!(route.points[1].x > route.points[0].x);
+    }
+    let output_right = result
+        .nodes
+        .iter()
+        .filter(|node| node.id != 1)
+        .map(|node| node.x + node.width)
+        .collect::<Vec<_>>();
+    assert!(output_right.windows(2).all(|pair| pair[0] == pair[1]));
+
+    let mut permuted_graph = graph.clone();
+    permuted_graph.nodes.reverse();
+    permuted_graph.edges.reverse();
+    for node in &mut permuted_graph.nodes {
+        node.ports.reverse();
+    }
+    let mut permuted_constraints = constraints.clone();
+    permuted_constraints.outputs.reverse();
+    permuted_constraints.boundary_bundles[0].members.reverse();
+    for member in &mut permuted_constraints.boundary_bundles[0].members {
+        member.slots.reverse();
+    }
+    assert_eq!(
+        result,
+        layout_with_constraints(
+            &permuted_graph,
+            LayoutOptions::default(),
+            &permuted_constraints,
+        )
+        .unwrap()
+    );
+
+    let wider_pitch = layout_with_constraints(
+        &graph,
+        LayoutOptions {
+            route_lane_gap: 6.0,
+            ..LayoutOptions::default()
+        },
+        &constraints,
+    )
+    .unwrap();
+    assert_eq!(
+        wider_pitch.boundary_bundles[0].members[1].tap.y
+            - wider_pitch.boundary_bundles[0].members[0].tap.y,
+        6.0
+    );
+}
+
+#[test]
+fn output_boundary_bundle_routes_members_horizontally_into_unique_taps() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(4, false),
+        ],
+        edges: vec![edge(10, 1, 4), edge(11, 2, 4), edge(12, 3, 4)],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1, 2, 3],
+        outputs: vec![4],
+        boundary_bundles: vec![BoundaryBundleConstraint {
+            id: 9,
+            endpoint: Endpoint { node: 4, port: 0 },
+            width: 3,
+            members: vec![
+                BoundaryBundleMemberConstraint {
+                    edge: 10,
+                    slots: vec![0],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 11,
+                    slots: vec![1],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 12,
+                    slots: vec![2],
+                },
+            ],
+        }],
+    };
+
+    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let bundle = &result.boundary_bundles[0];
+    assert_eq!(bundle.role, BoundaryBundleRole::Output);
+    for member in &bundle.members {
+        let route = result
+            .edges
+            .iter()
+            .find(|route| route.id == member.edge)
+            .unwrap();
+        assert_eq!(route.points.last(), Some(&member.tap));
+        assert_eq!(
+            route.points[route.points.len() - 2].y,
+            route.points.last().unwrap().y
+        );
+        assert!(route.points[route.points.len() - 2].x < member.tap.x);
+    }
+}
+
+#[test]
+fn same_net_fanout_with_identical_slots_shares_one_visible_tap_deterministically() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(4, false),
+        ],
+        edges: vec![
+            Edge {
+                net: 42,
+                ..edge(10, 1, 2)
+            },
+            Edge {
+                net: 42,
+                ..edge(11, 1, 3)
+            },
+            Edge {
+                net: 43,
+                ..edge(12, 1, 4)
+            },
+        ],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![2, 3, 4],
+        boundary_bundles: vec![BoundaryBundleConstraint {
+            id: 8,
+            endpoint: Endpoint { node: 1, port: 1 },
+            width: 3,
+            members: vec![
+                BoundaryBundleMemberConstraint {
+                    edge: 10,
+                    slots: vec![0, 1],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 11,
+                    slots: vec![0, 1],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 12,
+                    slots: vec![2],
+                },
+            ],
+        }],
+    };
+    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let bundle = &result.boundary_bundles[0];
+    let tap = |edge| {
+        bundle
+            .members
+            .iter()
+            .find(|member| member.edge == edge)
+            .unwrap()
+            .tap
+    };
+    assert_eq!(tap(10), tap(11));
+    assert_ne!(tap(10), tap(12));
+    let distinct_taps = bundle
+        .members
+        .iter()
+        .map(|member| (member.tap.x.to_bits(), member.tap.y.to_bits()))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(distinct_taps.len(), 2);
+    for edge in [10, 11] {
+        assert_eq!(
+            result
+                .edges
+                .iter()
+                .find(|route| route.id == edge)
+                .unwrap()
+                .points[0],
+            tap(edge)
+        );
+    }
+
+    let mut permuted_graph = graph.clone();
+    permuted_graph.nodes.reverse();
+    permuted_graph.edges.reverse();
+    for node in &mut permuted_graph.nodes {
+        node.ports.reverse();
+    }
+    let mut permuted_constraints = constraints.clone();
+    permuted_constraints.outputs.reverse();
+    permuted_constraints.boundary_bundles[0].members.reverse();
+    for member in &mut permuted_constraints.boundary_bundles[0].members {
+        member.slots.reverse();
+    }
+    assert_eq!(
+        result,
+        layout_with_constraints(
+            &permuted_graph,
+            LayoutOptions::default(),
+            &permuted_constraints,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn direct_alias_edge_can_use_input_and_output_bundle_taps_in_any_bundle_order() {
+    let graph = Graph {
+        nodes: vec![node(1, false), node(2, false)],
+        edges: vec![edge(10, 1, 2)],
+    };
+    let input = BoundaryBundleConstraint {
+        id: 3,
+        endpoint: Endpoint { node: 1, port: 1 },
+        width: 1,
+        members: vec![BoundaryBundleMemberConstraint {
+            edge: 10,
+            slots: vec![0],
+        }],
+    };
+    let output = BoundaryBundleConstraint {
+        id: 7,
+        endpoint: Endpoint { node: 2, port: 0 },
+        width: 1,
+        members: vec![BoundaryBundleMemberConstraint {
+            edge: 10,
+            slots: vec![0],
+        }],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![2],
+        boundary_bundles: vec![output.clone(), input.clone()],
+    };
+    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let route = &result.edges[0];
+    let input_tap = result
+        .boundary_bundles
+        .iter()
+        .find(|bundle| bundle.role == BoundaryBundleRole::Input)
+        .unwrap()
+        .members[0]
+        .tap;
+    let output_tap = result
+        .boundary_bundles
+        .iter()
+        .find(|bundle| bundle.role == BoundaryBundleRole::Output)
+        .unwrap()
+        .members[0]
+        .tap;
+    assert_eq!(route.points[0], input_tap);
+    assert_eq!(route.points.last(), Some(&output_tap));
+    assert!(route.points[1].x > input_tap.x);
+    assert!(route.points[route.points.len() - 2].x < output_tap.x);
+
+    let reordered = layout_with_constraints(
+        &graph,
+        LayoutOptions::default(),
+        &LayoutConstraints {
+            inputs: vec![1],
+            outputs: vec![2],
+            boundary_bundles: vec![input.clone(), output.clone()],
+        },
+    )
+    .unwrap();
+    assert_eq!(result, reordered);
+
+    let mut swapped_input = input;
+    swapped_input.id = 7;
+    let mut swapped_output = output;
+    swapped_output.id = 3;
+    let swapped = layout_with_constraints(
+        &graph,
+        LayoutOptions::default(),
+        &LayoutConstraints {
+            inputs: vec![1],
+            outputs: vec![2],
+            boundary_bundles: vec![swapped_input, swapped_output],
+        },
+    )
+    .unwrap();
+    assert_eq!(result.nodes, swapped.nodes);
+    assert_eq!(result.edges, swapped.edges);
+    assert_eq!(result.width, swapped.width);
+    assert_eq!(result.height, swapped.height);
+}
+
+#[test]
+fn invalid_boundary_bundle_contracts_return_typed_deterministic_errors() {
+    let mut graph = Graph {
+        nodes: vec![node(1, false), node(2, false), node(3, false)],
+        edges: vec![
+            Edge {
+                net: 10,
+                ..edge(10, 1, 2)
+            },
+            Edge {
+                net: 11,
+                ..edge(11, 1, 3)
+            },
+        ],
+    };
+    let mut constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![2, 3],
+        boundary_bundles: vec![BoundaryBundleConstraint {
+            id: 4,
+            endpoint: Endpoint { node: 1, port: 1 },
+            width: 2,
+            members: vec![
+                BoundaryBundleMemberConstraint {
+                    edge: 10,
+                    slots: vec![0],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 11,
+                    slots: vec![0],
+                },
+            ],
+        }],
+    };
+    assert_eq!(
+        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::BoundaryBundleSlotConflict {
+                bundle: 4,
+                first_edge: 10,
+                second_edge: 11,
+                slot: 0,
+            }
+        ))
+    );
+
+    graph.edges[0].net = 42;
+    graph.edges[1].net = 42;
+    constraints.boundary_bundles[0].width = 3;
+    constraints.boundary_bundles[0].members[0].slots = vec![0, 1];
+    constraints.boundary_bundles[0].members[1].slots = vec![1, 2];
+    assert_eq!(
+        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::BoundaryBundleSlotConflict {
+                bundle: 4,
+                first_edge: 10,
+                second_edge: 11,
+                slot: 1,
+            }
+        ))
+    );
+
+    constraints.boundary_bundles[0].width = 2;
+    constraints.boundary_bundles[0].members[0].slots = vec![0];
+    constraints.boundary_bundles[0].members[1].slots = vec![2];
+    assert_eq!(
+        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::BoundaryBundleSlotOutOfRange {
+                bundle: 4,
+                edge: 11,
+                slot: 2,
+                width: 2,
+            }
+        ))
+    );
+
+    constraints.boundary_bundles[0].width = 1_000_001;
+    assert_eq!(
+        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::InvalidBoundaryBundleWidth {
+                bundle: 4,
+                width: 1_000_001,
+            }
+        ))
     );
 }
 
