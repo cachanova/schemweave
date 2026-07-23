@@ -159,6 +159,10 @@ pub struct LayoutOptions {
     /// parallel route segments that belong to different nets, except their
     /// mandatory shared escape from one fixed endpoint.
     pub minimum_parallel_wire_spacing: f64,
+    /// Maximum area multiple a quality refinement may consume relative to its baseline.
+    pub max_quality_area_factor: f64,
+    /// Maximum route-length multiple a quality refinement may consume relative to its baseline.
+    pub max_quality_route_length_factor: f64,
     pub ordering_sweeps: usize,
 }
 
@@ -205,6 +209,8 @@ impl LayoutConfig {
             layout: LayoutOptions {
                 route_lane_gap: 6.0,
                 edge_node_clearance: 20.0,
+                max_quality_area_factor: 2.0,
+                max_quality_route_length_factor: 1.25,
                 ..LayoutOptions::default()
             },
             quality_effort: QualityEffort::Max,
@@ -232,6 +238,8 @@ impl Default for LayoutOptions {
             route_lane_gap: 4.0,
             edge_node_clearance: 0.0,
             minimum_parallel_wire_spacing: 0.0,
+            max_quality_area_factor: 1.2,
+            max_quality_route_length_factor: 1.1,
             ordering_sweeps: 4,
         }
     }
@@ -679,6 +687,7 @@ fn layout_indexed(
     }
     let (mut quality, mut layout) =
         best.ok_or_else(|| hard_geometry_failure(options, &admission_state))?;
+    let mut horizontal_pitch_applied = None;
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && demand_aware_scale_is_eligible(graph.nodes.len(), graph.edges.len())
@@ -740,6 +749,44 @@ fn layout_indexed(
             layout = candidate;
         }
     }
+    let full_family_pitch = full_family_pitched_spacing_enabled(options);
+    let pitched_baseline = (quality_effort == QualityEffort::Max
+        && best_uses_primary_ranks
+        && options.edge_node_clearance > 0.0)
+        .then(|| {
+            (
+                routing::route_quality(&indexed, &layout.edges),
+                layout.clone(),
+            )
+        });
+    let mut pitched_refinement_applied = false;
+    if quality_effort == QualityEffort::Max
+        && best_uses_primary_ranks
+        && options.edge_node_clearance > 0.0
+        && full_family_pitch
+        && let Some((_candidate_quality, nodes, edges, pitch)) =
+            routing::selected_layout_horizontal_pitch_candidate(
+                &routing_plan,
+                &layout.nodes,
+                &layout.edges,
+                options,
+            )
+    {
+        let candidate = placement::normalize_owned(nodes, edges);
+        if candidate.width * candidate.height
+            <= layout.width * layout.height * options.max_quality_area_factor
+            && candidate_satisfies_hard_geometry_contract(
+                &indexed,
+                &candidate,
+                options,
+                &mut admission_state,
+            )
+        {
+            layout = candidate;
+            horizontal_pitch_applied = Some(pitch);
+            pitched_refinement_applied = true;
+        }
+    }
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && options.edge_node_clearance > 0.0
@@ -752,7 +799,24 @@ fn layout_indexed(
             )
     {
         let candidate = placement::normalize_owned(nodes, edges);
-        if candidate.width * candidate.height <= layout.width * layout.height * 1.20
+        if candidate.width * candidate.height
+            <= layout.width * layout.height * options.max_quality_area_factor
+            && (!full_family_pitch
+                || routing::layout_vertical_gap_pitch_is_satisfied(
+                    &routing_plan,
+                    &candidate.nodes,
+                    &candidate.edges,
+                    options.route_lane_gap,
+                ))
+            && horizontal_pitch_applied.is_none_or(|pitch| {
+                routing::layout_horizontal_crossing_pitch_is_satisfied(
+                    &routing_plan,
+                    &candidate.nodes,
+                    &candidate.edges,
+                    options,
+                    pitch,
+                )
+            })
             && candidate_satisfies_hard_geometry_contract(
                 &indexed,
                 &candidate,
@@ -761,9 +825,37 @@ fn layout_indexed(
             )
         {
             layout = candidate;
+            pitched_refinement_applied = true;
         }
     }
+    if pitched_refinement_applied
+        && let Some((baseline_quality, baseline)) = pitched_baseline
+        && !composite_pitched_quality_is_admissible(
+            baseline_quality,
+            baseline.width * baseline.height,
+            routing::route_quality(&indexed, &layout.edges),
+            layout.width * layout.height,
+            options,
+        )
+    {
+        layout = baseline;
+    }
     Ok(layout)
+}
+
+fn composite_pitched_quality_is_admissible(
+    baseline: routing::RouteQuality,
+    baseline_area: f64,
+    candidate: routing::RouteQuality,
+    candidate_area: f64,
+    options: LayoutOptions,
+) -> bool {
+    let crossing_allowance = baseline.crossings / 100;
+    let bend_allowance = (baseline.bends / 100).max(2);
+    candidate.crossings <= baseline.crossings.saturating_add(crossing_allowance)
+        && candidate.bends <= baseline.bends.saturating_add(bend_allowance)
+        && candidate.route_length <= baseline.route_length * options.max_quality_route_length_factor
+        && candidate_area <= baseline_area * options.max_quality_area_factor
 }
 
 fn demand_aware_readability_is_better(
@@ -1026,6 +1118,12 @@ pub(crate) fn effective_layout_options(mut options: LayoutOptions) -> LayoutOpti
     options
 }
 
+pub(crate) fn full_family_pitched_spacing_enabled(options: LayoutOptions) -> bool {
+    let defaults = LayoutOptions::default();
+    options.max_quality_area_factor > defaults.max_quality_area_factor
+        && options.max_quality_route_length_factor > defaults.max_quality_route_length_factor
+}
+
 /// Distance used only where a route must move outward beyond endpoint-node obstacles.
 ///
 /// Track planning continues to use the requested `port_stub`; widening every planning margin
@@ -1170,11 +1268,12 @@ mod tests {
         CandidateAdmissionState, Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutError,
         LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS, Node, NodeGeometry, Point, Port,
         PortSide, QualityEffort, candidate_quality_cmp,
-        candidate_satisfies_edge_node_clearance_bounded, demand_aware_quality_is_better,
-        demand_aware_scale_is_eligible, effective_layout_options, effective_ranking_edges,
-        hard_geometry_failure, layout, outward_obstacle_clearance_stub, placement,
-        retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
-        routing::RouteQuality, topology, validation,
+        candidate_satisfies_edge_node_clearance_bounded, composite_pitched_quality_is_admissible,
+        demand_aware_quality_is_better, demand_aware_scale_is_eligible, effective_layout_options,
+        effective_ranking_edges, full_family_pitched_spacing_enabled, hard_geometry_failure,
+        layout, outward_obstacle_clearance_stub, placement, retain_better_candidate,
+        retain_owned_candidate, retain_owned_candidate_unchecked, routing, routing::RouteQuality,
+        topology, validation,
     };
 
     mod active_fanout_fixture {
@@ -1229,6 +1328,25 @@ mod tests {
         assert_eq!(parallel_spacing.route_lane_gap, 6.0);
         assert_eq!(parallel_spacing.minimum_parallel_wire_spacing, 6.0);
         assert_eq!(effective_layout_options(parallel_spacing), parallel_spacing);
+    }
+
+    #[test]
+    fn full_family_pitched_spacing_requires_both_quality_budgets() {
+        let defaults = LayoutOptions::default();
+        assert!(!full_family_pitched_spacing_enabled(defaults));
+        assert!(!full_family_pitched_spacing_enabled(LayoutOptions {
+            max_quality_area_factor: 2.0,
+            ..defaults
+        }));
+        assert!(!full_family_pitched_spacing_enabled(LayoutOptions {
+            max_quality_route_length_factor: 1.25,
+            ..defaults
+        }));
+        assert!(full_family_pitched_spacing_enabled(LayoutOptions {
+            max_quality_area_factor: 2.0,
+            max_quality_route_length_factor: 1.25,
+            ..defaults
+        }));
     }
 
     #[test]
@@ -2703,6 +2821,56 @@ mod tests {
         permuted.nodes.reverse();
         permuted.edges.reverse();
         assert_eq!(layout(&permuted, options).unwrap(), selected);
+    }
+
+    #[test]
+    fn composite_pitched_quality_budget_has_exact_inclusive_boundaries() {
+        let baseline = RouteQuality {
+            crossings: 100,
+            bends: 100,
+            route_length: 100.0,
+        };
+        let options = LayoutOptions {
+            max_quality_area_factor: 2.0,
+            max_quality_route_length_factor: 1.25,
+            ..LayoutOptions::default()
+        };
+        let boundary = RouteQuality {
+            crossings: 101,
+            bends: 102,
+            route_length: 125.0,
+        };
+        assert!(composite_pitched_quality_is_admissible(
+            baseline, 100.0, boundary, 200.0, options,
+        ));
+        for (candidate, area) in [
+            (
+                RouteQuality {
+                    crossings: 102,
+                    ..boundary
+                },
+                200.0,
+            ),
+            (
+                RouteQuality {
+                    bends: 103,
+                    ..boundary
+                },
+                200.0,
+            ),
+            (
+                RouteQuality {
+                    route_length: 125.000_001,
+                    ..boundary
+                },
+                200.0,
+            ),
+            (boundary, 200.000_001),
+        ] {
+            assert!(!composite_pitched_quality_is_admissible(
+                baseline, 100.0, candidate, area, options,
+            ));
+        }
     }
 
     #[test]

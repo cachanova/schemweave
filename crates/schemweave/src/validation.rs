@@ -264,10 +264,27 @@ fn validate_options(options: LayoutOptions) -> Result<(), LayoutError> {
         ("node_gap", options.node_gap),
         ("port_stub", options.port_stub),
         ("route_lane_gap", options.route_lane_gap),
+        ("max_quality_area_factor", options.max_quality_area_factor),
+        (
+            "max_quality_route_length_factor",
+            options.max_quality_route_length_factor,
+        ),
     ] {
         if !value.is_finite() || value <= 0.0 || value > 1_000_000.0 {
             return Err(LayoutError::InvalidOption { field, value });
         }
+    }
+    if options.max_quality_area_factor < 1.0 {
+        return Err(LayoutError::InvalidOption {
+            field: "max_quality_area_factor",
+            value: options.max_quality_area_factor,
+        });
+    }
+    if options.max_quality_route_length_factor < 1.0 {
+        return Err(LayoutError::InvalidOption {
+            field: "max_quality_route_length_factor",
+            value: options.max_quality_route_length_factor,
+        });
     }
     if !options.edge_node_clearance.is_finite()
         || options.edge_node_clearance < 0.0
