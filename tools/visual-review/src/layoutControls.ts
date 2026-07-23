@@ -52,7 +52,7 @@ export const layoutPresets = {
     layer_gap: 66,
     node_gap: 30,
     port_stub: 10,
-    route_lane_gap: 4,
+    route_lane_gap: 6,
     edge_node_clearance: 20,
     ordering_sweeps: 4,
     quality_effort: 'max',

@@ -27,12 +27,14 @@ pub use incremental::{
     expand_group_in_place,
 };
 pub use placement::place;
-pub(crate) use readability::measure_parallel_congestion_bounded;
 #[doc(hidden)]
 pub use readability::{
     EdgeNodeClearance, EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation,
     ParallelCongestion, ParallelSegment, measure_edge_node_clearance_bounded,
     measure_parallel_congestion,
+};
+pub(crate) use readability::{
+    measure_parallel_congestion_bounded, measure_parallel_congestion_profile_bounded,
 };
 
 pub type NodeId = u32;
@@ -193,6 +195,7 @@ impl LayoutConfig {
     pub fn highest_quality() -> Self {
         Self {
             layout: LayoutOptions {
+                route_lane_gap: 6.0,
                 edge_node_clearance: 20.0,
                 ..LayoutOptions::default()
             },
@@ -715,7 +718,30 @@ fn layout_indexed(
             )
         {
             debug_assert!(route_quality_cmp(candidate_quality, quality).is_lt());
-            return Ok(candidate);
+            layout = candidate;
+        }
+    }
+    if quality_effort == QualityEffort::Max
+        && best_uses_primary_ranks
+        && options.edge_node_clearance > 0.0
+        && let Some((_candidate_quality, nodes, edges)) =
+            routing::selected_layout_pitched_gap_candidate(
+                &routing_plan,
+                &layout.nodes,
+                &layout.edges,
+                options,
+            )
+    {
+        let candidate = placement::normalize_owned(nodes, edges);
+        if candidate.width * candidate.height <= layout.width * layout.height * 1.20
+            && candidate_satisfies_positive_clearance_contract(
+                &indexed,
+                &candidate,
+                options,
+                &mut admission_state,
+            )
+        {
+            layout = candidate;
         }
     }
     Ok(layout)
