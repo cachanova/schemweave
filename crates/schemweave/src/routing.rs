@@ -3173,6 +3173,36 @@ struct GapLaneCandidates {
 type GapPairCosts = BTreeMap<(u32, u32), usize>;
 type GapLaneOrder = (BTreeMap<u32, usize>, usize);
 
+#[cfg(test)]
+static USE_BTREE_GAP_PAIR_COSTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+struct DenseGapPairCosts<'a> {
+    accesses: Vec<&'a GapNetAccess>,
+    values: Vec<Option<usize>>,
+}
+
+impl<'a> DenseGapPairCosts<'a> {
+    fn new(ordered: &[NetId], accesses: &'a BTreeMap<NetId, GapNetAccess>) -> Self {
+        debug_assert!(ordered.len() <= MAX_GLOBAL_GAP_LANES);
+        let accesses = ordered.iter().map(|net| &accesses[net]).collect::<Vec<_>>();
+        Self {
+            values: vec![None; ordered.len() * ordered.len()],
+            accesses,
+        }
+    }
+
+    fn cost(&mut self, left: usize, right: usize) -> usize {
+        let index = left * self.accesses.len() + right;
+        if let Some(cost) = self.values[index] {
+            return cost;
+        }
+        let cost = gap_pair_crossings(self.accesses[left], self.accesses[right]);
+        self.values[index] = Some(cost);
+        cost
+    }
+}
+
 struct GapLaneOrderCandidates {
     global: Option<GapLaneOrder>,
     preserved_refined: Option<GapLaneOrder>,
@@ -3481,6 +3511,31 @@ fn crossing_aware_gap_lane_indices(
     crossing_aware_gap_lane_indices_with_rounds(current, accesses, FULL_GAP_LANE_ROUNDS)
 }
 
+#[cfg(test)]
+fn crossing_aware_gap_lane_indices_btree_reference(
+    current: &BTreeMap<NetId, usize>,
+    accesses: &BTreeMap<NetId, GapNetAccess>,
+    lane_rounds: usize,
+) -> BTreeMap<NetId, usize> {
+    let mut ordered = current
+        .iter()
+        .map(|(&net, &lane)| (lane, net))
+        .collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let mut ordered = ordered.into_iter().map(|(_, net)| net).collect::<Vec<_>>();
+    let mut costs = GapPairCosts::new();
+    refine_gap_lane_order(&mut ordered, lane_rounds, |left, right| {
+        *costs
+            .entry((left, right))
+            .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]))
+    });
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(lane, net)| (net, lane))
+        .collect()
+}
+
 fn crossing_aware_gap_lane_indices_with_rounds(
     current: &BTreeMap<u32, usize>,
     accesses: &BTreeMap<u32, GapNetAccess>,
@@ -3489,9 +3544,35 @@ fn crossing_aware_gap_lane_indices_with_rounds(
     let mut ordered: Vec<_> = current.iter().map(|(&net, &lane)| (lane, net)).collect();
     ordered.sort_unstable();
     let seed: Vec<_> = ordered.into_iter().map(|(_, net)| net).collect();
-    let mut costs = BTreeMap::new();
     let mut ordered = seed;
-    refine_gap_lane_order(&mut ordered, accesses, lane_rounds, &mut costs);
+    let use_dense = ordered.len() <= MAX_GLOBAL_GAP_LANES && {
+        #[cfg(test)]
+        {
+            !USE_BTREE_GAP_PAIR_COSTS.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    };
+    if use_dense {
+        let mut costs = DenseGapPairCosts::new(&ordered, accesses);
+        let mut dense_order = (0..ordered.len()).collect::<Vec<_>>();
+        refine_gap_lane_order(&mut dense_order, lane_rounds, |left, right| {
+            costs.cost(left, right)
+        });
+        ordered = dense_order
+            .into_iter()
+            .map(|index| ordered[index])
+            .collect();
+    } else {
+        let mut costs = BTreeMap::new();
+        refine_gap_lane_order(&mut ordered, lane_rounds, |left, right| {
+            *costs
+                .entry((left, right))
+                .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]))
+        });
+    }
     ordered
         .into_iter()
         .enumerate()
@@ -3512,12 +3593,24 @@ fn global_gap_lane_indices_with_rounds(
             .flatten();
     }
     let (mut global, mut costs) = global_gap_order_seed(current, accesses)?;
-    refine_gap_lane_order(&mut global, accesses, lane_rounds, &mut costs);
+    refine_gap_lane_order(&mut global, lane_rounds, |left, right| {
+        *costs
+            .entry((left, right))
+            .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]))
+    });
     let mut baseline_order: Vec<_> = baseline.iter().map(|(&net, &lane)| (lane, net)).collect();
     baseline_order.sort_unstable();
     let baseline_order: Vec<_> = baseline_order.into_iter().map(|(_, net)| net).collect();
-    let global_cost = gap_lane_order_cost(&global, accesses, &mut costs);
-    let baseline_cost = gap_lane_order_cost(&baseline_order, accesses, &mut costs);
+    let global_cost = gap_lane_order_cost(&global, |left, right| {
+        *costs
+            .entry((left, right))
+            .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]))
+    });
+    let baseline_cost = gap_lane_order_cost(&baseline_order, |left, right| {
+        *costs
+            .entry((left, right))
+            .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]))
+    });
     if global_cost >= baseline_cost {
         return None;
     }
@@ -4001,23 +4094,18 @@ fn global_gap_order_seed(
     Some((global, costs))
 }
 
-fn refine_gap_lane_order(
-    ordered: &mut [u32],
-    accesses: &BTreeMap<u32, GapNetAccess>,
+fn refine_gap_lane_order<T: Copy>(
+    ordered: &mut [T],
     lane_rounds: usize,
-    costs: &mut GapPairCosts,
+    mut pair_cost: impl FnMut(T, T) -> usize,
 ) {
     for _ in 0..lane_rounds {
         let mut changed = false;
         for index in 0..ordered.len().saturating_sub(1) {
             let left = ordered[index];
             let right = ordered[index + 1];
-            let current_cost = *costs
-                .entry((left, right))
-                .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]));
-            let swapped_cost = *costs
-                .entry((right, left))
-                .or_insert_with(|| gap_pair_crossings(&accesses[&right], &accesses[&left]));
+            let current_cost = pair_cost(left, right);
+            let swapped_cost = pair_cost(right, left);
             if swapped_cost < current_cost {
                 ordered.swap(index, index + 1);
                 changed = true;
@@ -4029,18 +4117,11 @@ fn refine_gap_lane_order(
     }
 }
 
-fn gap_lane_order_cost(
-    ordered: &[u32],
-    accesses: &BTreeMap<u32, GapNetAccess>,
-    costs: &mut GapPairCosts,
-) -> usize {
+fn gap_lane_order_cost(ordered: &[u32], mut pair_cost: impl FnMut(NetId, NetId) -> usize) -> usize {
     let mut total = 0usize;
     for (index, &left) in ordered.iter().enumerate() {
         for &right in &ordered[index + 1..] {
-            let cost = *costs
-                .entry((left, right))
-                .or_insert_with(|| gap_pair_crossings(&accesses[&left], &accesses[&right]));
-            total = total.saturating_add(cost);
+            total = total.saturating_add(pair_cost(left, right));
         }
     }
     total
@@ -4419,15 +4500,16 @@ mod tests {
         MAX_CROSSING_REPAIR_PATH_STATES, MAX_CROSSING_REPAIR_ROUTE_POINTS, MIN_CROSSING_REPAIR_NET,
         MIN_CROSSING_REPAIR_TOTAL, OuterLane, OuterNetAccess, OuterSide, PhysicalSegment,
         RoutingPlan, candidate_route_points_within_budget, crossing_aware_gap_lane_indices,
-        crossing_aware_outer_lane_indices, crossing_repair_within_budget, crossing_track_y,
-        distance_transform, fanout_outer_channel_lane_indices,
-        global_gap_candidate_work_within_budget, global_gap_lane_indices_with_rounds,
-        global_gap_order_seed, has_split_feedback_net, horizontal_crossing_counts_by_net,
-        lane_indices, large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
-        large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
-        large_gap_hot_nets, large_gap_hot_nets_with_limit, move_nets_to_outer_lanes,
-        outer_lane_assignments, physical_crossing_sweep, physical_crossing_sweep_lines,
-        physical_route_segments, physical_route_segments_btree_reference, port_point,
+        crossing_aware_gap_lane_indices_btree_reference, crossing_aware_outer_lane_indices,
+        crossing_repair_within_budget, crossing_track_y, distance_transform,
+        fanout_outer_channel_lane_indices, global_gap_candidate_work_within_budget,
+        global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
+        horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
+        large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
+        large_gap_hot_insertion_order_with_rounds, large_gap_hot_nets,
+        large_gap_hot_nets_with_limit, move_nets_to_outer_lanes, outer_lane_assignments,
+        physical_crossing_sweep, physical_crossing_sweep_lines, physical_route_segments,
+        physical_route_segments_btree_reference, port_point,
         refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
         repair_crossing_heavy_net, route_edges, route_edges_with_lane_rounds,
         route_edges_with_lane_rounds_and_global, route_planned_candidates,
@@ -5591,7 +5673,7 @@ mod tests {
         );
         assert_eq!(
             select_crossing_repair_nets(MIN_CROSSING_REPAIR_TOTAL - 1, &counts, &lanes),
-            Vec::new()
+            Vec::<u32>::new()
         );
         assert_eq!(
             select_crossing_repair_nets(
@@ -5599,7 +5681,7 @@ mod tests {
                 &BTreeMap::from([(2, MIN_CROSSING_REPAIR_NET - 1)]),
                 &lanes,
             ),
-            Vec::new()
+            Vec::<u32>::new()
         );
     }
 
@@ -6484,6 +6566,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dense_gap_pair_costs_match_btree_reference_under_randomized_permutations() {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let mut state = 0xd3_45e_u64;
+        for case in 0..128u32 {
+            let count = 1 + (next(&mut state) % 32) as usize;
+            let nets = (0..count)
+                .map(|index| 10_000 + case * 10_000 + index as u32 * 97)
+                .collect::<Vec<_>>();
+            let mut lane_order = nets.clone();
+            for index in (1..lane_order.len()).rev() {
+                let other = (next(&mut state) % (index + 1) as u64) as usize;
+                lane_order.swap(index, other);
+            }
+            let current = lane_order
+                .iter()
+                .enumerate()
+                .map(|(lane, &net)| (net, lane))
+                .collect::<BTreeMap<_, _>>();
+            let mut accesses = BTreeMap::new();
+            for &net in &nets {
+                let mut access = GapNetAccess::default();
+                for _ in 0..next(&mut state) % 9 {
+                    let first = (next(&mut state) % 101) as f64;
+                    let second = (next(&mut state) % 101) as f64;
+                    access.vertical.push((first.min(second), first.max(second)));
+                }
+                for _ in 0..next(&mut state) % 9 {
+                    access.left_y.push((next(&mut state) % 101) as f64);
+                }
+                for _ in 0..next(&mut state) % 9 {
+                    access.right_y.push((next(&mut state) % 101) as f64);
+                }
+                access.left_y.sort_by(f64::total_cmp);
+                access.right_y.sort_by(f64::total_cmp);
+                accesses.insert(net, access);
+            }
+            let permuted_accesses = accesses
+                .iter()
+                .rev()
+                .map(|(&net, access)| (net, access.clone()))
+                .collect::<BTreeMap<_, _>>();
+
+            for rounds in [0, 1, 4, super::FULL_GAP_LANE_ROUNDS] {
+                let expected =
+                    crossing_aware_gap_lane_indices_btree_reference(&current, &accesses, rounds);
+                let actual =
+                    super::crossing_aware_gap_lane_indices_with_rounds(&current, &accesses, rounds);
+                let permuted = super::crossing_aware_gap_lane_indices_with_rounds(
+                    &current,
+                    &permuted_accesses,
+                    rounds,
+                );
+                assert_eq!(actual, expected, "case={case} rounds={rounds}");
+                assert_eq!(permuted, expected, "case={case} rounds={rounds}");
+            }
+        }
+    }
+
     fn supplemental_round_route_fixture() -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
         let mut nodes = Vec::new();
         let mut geometry = Vec::new();
@@ -7283,7 +7430,7 @@ mod tests {
             let mut actual = BTreeMap::new();
             let crossings =
                 physical_crossing_sweep(&shared_endpoints, &segments, transpose, Some(&mut actual));
-            assert_eq!(crossings, expected.values().sum());
+            assert_eq!(crossings, expected.values().sum::<usize>());
             assert_eq!(actual, expected);
         }
 
@@ -7522,5 +7669,133 @@ mod tests {
         assert_eq!(planned.crossings, quality.crossings);
         assert_eq!(planned.bends, quality.bends);
         assert_eq!(planned.route_length, quality.route_length);
+    }
+
+    #[test]
+    #[ignore = "manual release-mode end-to-end benchmark"]
+    fn benchmark_dense_gap_end_to_end() {
+        use std::{hint::black_box, sync::atomic::Ordering as AtomicOrdering, time::Instant};
+
+        fn fixture(node_count: u32, layers: u32, width: u32) -> Graph {
+            let nodes = (0..node_count)
+                .map(|id| Node {
+                    id,
+                    width: 80.0,
+                    height: 60.0,
+                    cycle_breaker: false,
+                    ports: std::iter::once(Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 30.0,
+                    })
+                    .chain((0..5).map(|branch| Port {
+                        id: branch + 1,
+                        side: PortSide::West,
+                        offset: 10.0 * f64::from(branch + 1),
+                    }))
+                    .collect(),
+                })
+                .collect();
+            let mut edges = Vec::new();
+            for layer in 0..layers - 1 {
+                for source in 0..width {
+                    for branch in 0..5 {
+                        edges.push(Edge {
+                            id: edges.len() as u32,
+                            source: Endpoint {
+                                node: layer * width + source,
+                                port: 0,
+                            },
+                            target: Endpoint {
+                                node: (layer + 1) * width
+                                    + (source * 7 + branch * 11 + layer * 13) % width,
+                                port: branch + 1,
+                            },
+                            net: layer * width + source,
+                            participates_in_ranking: true,
+                        });
+                    }
+                }
+            }
+            Graph { nodes, edges }
+        }
+
+        fn checksum(bytes: &[u8]) -> u64 {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+            })
+        }
+
+        for (node_count, layers) in [(600, 18), (1_000, 31), (2_000, 62)] {
+            let graph = fixture(node_count, layers, 32);
+            for effort in [
+                crate::QualityEffort::Fast,
+                crate::QualityEffort::Quality,
+                crate::QualityEffort::Max,
+            ] {
+                super::USE_BTREE_GAP_PAIR_COSTS.store(false, AtomicOrdering::Relaxed);
+                let expected = crate::layout_with_quality_effort(
+                    black_box(&graph),
+                    LayoutOptions::default(),
+                    effort,
+                )
+                .unwrap();
+                let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+                let quality = route_quality(&indexed, &expected.edges);
+                let bytes = serde_json::to_vec(&expected).unwrap();
+                let measure = |use_btree| {
+                    super::USE_BTREE_GAP_PAIR_COSTS.store(use_btree, AtomicOrdering::Relaxed);
+                    let start = Instant::now();
+                    let actual = crate::layout_with_quality_effort(
+                        black_box(&graph),
+                        LayoutOptions::default(),
+                        effort,
+                    )
+                    .unwrap();
+                    let elapsed = start.elapsed().as_micros();
+                    assert_eq!(actual, expected);
+                    elapsed
+                };
+                let mut btree_samples = Vec::new();
+                let mut dense_samples = Vec::new();
+                for iteration in 0..5 {
+                    if iteration % 2 == 0 {
+                        btree_samples.push(measure(true));
+                        dense_samples.push(measure(false));
+                    } else {
+                        dense_samples.push(measure(false));
+                        btree_samples.push(measure(true));
+                    }
+                }
+                super::USE_BTREE_GAP_PAIR_COSTS.store(false, AtomicOrdering::Relaxed);
+                let mut permuted = graph.clone();
+                permuted.nodes.reverse();
+                permuted.edges.reverse();
+                assert_eq!(
+                    crate::layout_with_quality_effort(&permuted, LayoutOptions::default(), effort,)
+                        .unwrap(),
+                    expected
+                );
+                btree_samples.sort_unstable();
+                dense_samples.sort_unstable();
+                let btree_median = btree_samples[btree_samples.len() / 2];
+                let dense_median = dense_samples[dense_samples.len() / 2];
+                eprintln!(
+                    "nodes={} effort={effort:?} btree_median_us={} btree_tail_us={} dense_median_us={} dense_tail_us={} speedup={:.2}x bytes={} checksum={:016x} quality=({},{},{:016x})",
+                    graph.nodes.len(),
+                    btree_median,
+                    btree_samples[btree_samples.len() - 1],
+                    dense_median,
+                    dense_samples[dense_samples.len() - 1],
+                    btree_median as f64 / dense_median as f64,
+                    bytes.len(),
+                    checksum(&bytes),
+                    quality.crossings,
+                    quality.bends,
+                    quality.route_length.to_bits(),
+                );
+            }
+        }
+        super::USE_BTREE_GAP_PAIR_COSTS.store(false, AtomicOrdering::Relaxed);
     }
 }
