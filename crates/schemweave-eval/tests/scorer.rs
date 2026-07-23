@@ -1055,6 +1055,23 @@ fn negotiated_corridor_max_candidate_preserves_every_hard_gate() {
 }
 
 #[test]
+fn positive_clearance_covers_negotiated_corridor_candidates() {
+    let graph = negotiated_corridor_graph();
+    let layout = layout_with_quality_effort(
+        &graph,
+        LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        },
+        QualityEffort::Max,
+    )
+    .unwrap();
+    let report = score(&graph, &layout, ScoreOptions::default());
+    assert!(!report.edge_node_clearance_exhausted);
+    assert_eq!(report.edge_node_clearance_violations, 0, "{report:#?}");
+}
+
+#[test]
 fn regional_fanout_max_candidate_preserves_every_hard_gate() {
     let graph = regional_fanout_graph();
     let options = LayoutOptions::default();
@@ -1130,6 +1147,42 @@ fn regional_fanout_max_candidate_preserves_every_hard_gate() {
     assert_eq!(report.unrelated_contacts, 0);
     assert_eq!(report.ranking_direction_violations, 0);
     assert_eq!(report.reverse_x_length, 0.0);
+}
+
+#[test]
+fn positive_clearance_covers_regional_fanout_and_boundary_constraints() {
+    let graph = regional_fanout_graph();
+    let constraints = LayoutConstraints {
+        inputs: vec![0],
+        outputs: (492..500).collect(),
+    };
+    let layout = layout_with_quality_effort_and_constraints(
+        &graph,
+        LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        },
+        QualityEffort::Max,
+        &constraints,
+    )
+    .unwrap();
+    let report = score(&graph, &layout, ScoreOptions::default());
+    assert!(!report.edge_node_clearance_exhausted);
+    assert_eq!(report.edge_node_clearance_violations, 0, "{report:#?}");
+    let input_x = layout.nodes.iter().find(|node| node.id == 0).unwrap().x;
+    assert!(
+        layout
+            .nodes
+            .iter()
+            .all(|node| node.id == 0 || node.x >= input_x)
+    );
+    let right = layout
+        .nodes
+        .iter()
+        .filter(|node| constraints.outputs.contains(&node.id))
+        .map(|node| node.x + node.width)
+        .collect::<Vec<_>>();
+    assert!(right.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 #[test]

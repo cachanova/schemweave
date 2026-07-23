@@ -223,6 +223,9 @@ pub fn expand_group_in_place(
         &options.constraints,
     )
     .map_err(GroupExpansionError::InvalidExpandedGraph)?;
+    if options.layout.edge_node_clearance > 0.0 {
+        return Err(GroupExpansionError::NeedsFullRelayout);
+    }
     if expanded_graph.edges.len() > MAX_EXPANSION_EDGES {
         return Err(GroupExpansionError::TooManyEdges {
             actual: expanded_graph.edges.len(),
@@ -2390,6 +2393,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn positive_clearance_requires_a_full_group_relayout() {
+        let (compact, expanded, expansion) = fixture();
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        assert_eq!(
+            expand_group_in_place(
+                &compact,
+                &compact_layout,
+                &expanded,
+                &expansion,
+                &GroupExpansionOptions {
+                    layout: LayoutOptions {
+                        edge_node_clearance: 20.0,
+                        ..LayoutOptions::default()
+                    },
+                    ..GroupExpansionOptions::default()
+                },
+            ),
+            Err(GroupExpansionError::NeedsFullRelayout)
+        );
     }
 
     #[test]

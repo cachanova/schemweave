@@ -269,6 +269,25 @@ fn validate_options(options: LayoutOptions) -> Result<(), LayoutError> {
             return Err(LayoutError::InvalidOption { field, value });
         }
     }
+    if !options.edge_node_clearance.is_finite()
+        || options.edge_node_clearance < 0.0
+        || options.edge_node_clearance > 1_000_000.0
+    {
+        return Err(LayoutError::InvalidOption {
+            field: "edge_node_clearance",
+            value: options.edge_node_clearance,
+        });
+    }
+    if !options
+        .edge_node_clearance
+        .mul_add(2.0, options.route_lane_gap)
+        .is_finite()
+    {
+        return Err(LayoutError::InvalidOption {
+            field: "edge_node_clearance",
+            value: options.edge_node_clearance,
+        });
+    }
     if options.node_gap < options.port_stub * 2.0 {
         return Err(LayoutError::InvalidOption {
             field: "node_gap",
