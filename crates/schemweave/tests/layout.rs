@@ -1,7 +1,7 @@
 use schemweave::{
-    ConstrainedLayoutError, Edge, Endpoint, Graph, Layout, LayoutConstraintError,
-    LayoutConstraints, LayoutError, LayoutOptions, Node, Port, PortSide, layout,
-    layout_with_constraints,
+    ConstrainedLayoutError, Edge, Endpoint, Graph, Layout, LayoutConfig, LayoutConstraintError,
+    LayoutConstraints, LayoutError, LayoutOptions, Node, Port, PortSide, QualityEffort, layout,
+    layout_with_config, layout_with_constraints,
 };
 
 fn node(id: u32, cycle_breaker: bool) -> Node {
@@ -61,6 +61,44 @@ fn assert_routes_avoid_node_interiors(result: &Layout) {
             }
         }
     }
+}
+
+#[test]
+fn canonical_config_exposes_the_highest_quality_profile() {
+    let config = LayoutConfig::highest_quality();
+
+    assert_eq!(config.layout, LayoutOptions::default());
+    assert_eq!(config.quality_effort, QualityEffort::Max);
+    assert_eq!(config.constraints, LayoutConstraints::default());
+}
+
+#[test]
+fn canonical_config_matches_the_explicit_layout_api() {
+    let graph = Graph {
+        nodes: vec![node(1, false), node(2, false), node(3, false)],
+        edges: vec![edge(10, 1, 2), edge(11, 1, 3), edge(12, 2, 3)],
+    };
+    let config = LayoutConfig {
+        layout: LayoutOptions {
+            layer_gap: 72.0,
+            node_gap: 36.0,
+            ordering_sweeps: 6,
+            ..LayoutOptions::default()
+        },
+        quality_effort: QualityEffort::Max,
+        constraints: LayoutConstraints::default(),
+    };
+
+    assert_eq!(
+        layout_with_config(&graph, &config).unwrap(),
+        schemweave::layout_with_quality_effort_and_constraints(
+            &graph,
+            config.layout,
+            config.quality_effort,
+            &config.constraints,
+        )
+        .unwrap()
+    );
 }
 
 #[test]

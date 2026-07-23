@@ -160,6 +160,40 @@ pub struct LayoutConstraints {
     pub outputs: Vec<NodeId>,
 }
 
+/// Complete, serializable policy for one layout request.
+///
+/// The quality effort acts as the coarse quality-versus-latency control while
+/// [`LayoutOptions`] remains available for applications that need explicit
+/// spacing and ordering overrides.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct LayoutConfig {
+    #[serde(flatten)]
+    pub layout: LayoutOptions,
+    pub quality_effort: QualityEffort,
+    pub constraints: LayoutConstraints,
+}
+
+impl LayoutConfig {
+    /// Use every bounded quality refinement enabled by the engine.
+    pub fn highest_quality() -> Self {
+        Self {
+            quality_effort: QualityEffort::Max,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for LayoutConfig {
+    fn default() -> Self {
+        Self {
+            layout: LayoutOptions::default(),
+            quality_effort: QualityEffort::Quality,
+            constraints: LayoutConstraints::default(),
+        }
+    }
+}
+
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
@@ -301,6 +335,19 @@ pub fn layout_with_quality_effort_and_constraints(
 ) -> Result<Layout, ConstrainedLayoutError> {
     let indexed = validation::validate_and_index_with_constraints(graph, options, constraints)?;
     Ok(layout_indexed(graph, options, quality_effort, indexed))
+}
+
+/// Lay out a graph using one canonical request configuration.
+pub fn layout_with_config(
+    graph: &Graph,
+    config: &LayoutConfig,
+) -> Result<Layout, ConstrainedLayoutError> {
+    layout_with_quality_effort_and_constraints(
+        graph,
+        config.layout,
+        config.quality_effort,
+        &config.constraints,
+    )
 }
 
 fn layout_indexed(
