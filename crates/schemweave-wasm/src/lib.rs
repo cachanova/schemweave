@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use schemweave::{Graph, LayoutOptions, QualityEffort};
+use schemweave::{Graph, LayoutConstraints, LayoutOptions, QualityEffort};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
@@ -20,9 +20,13 @@ pub fn layout_serialized(graph_json: &str, options_json: &str) -> Result<String,
         serde_json::from_str(options_json)
             .map_err(|error| format!("invalid options JSON: {error}"))?
     };
-    let result =
-        schemweave::layout_with_quality_effort(&graph, options.layout, options.quality_effort)
-            .map_err(|error| error.to_string())?;
+    let result = schemweave::layout_with_quality_effort_and_constraints(
+        &graph,
+        options.layout,
+        options.quality_effort,
+        &options.constraints,
+    )
+    .map_err(|error| error.to_string())?;
     serde_json::to_string(&result).map_err(|error| format!("failed to encode layout: {error}"))
 }
 
@@ -32,6 +36,8 @@ struct SerializedLayoutOptions {
     #[serde(flatten)]
     layout: LayoutOptions,
     quality_effort: QualityEffort,
+    #[serde(default)]
+    constraints: LayoutConstraints,
 }
 
 impl Default for SerializedLayoutOptions {
@@ -39,6 +45,7 @@ impl Default for SerializedLayoutOptions {
         Self {
             layout: LayoutOptions::default(),
             quality_effort: QualityEffort::Quality,
+            constraints: LayoutConstraints::default(),
         }
     }
 }
@@ -50,7 +57,7 @@ fn js_error(message: impl AsRef<str>) -> JsValue {
 #[cfg(test)]
 mod tests {
     use super::{layout_json, layout_serialized};
-    use schemweave::{Edge, Endpoint, Graph, Node, Port, PortSide};
+    use schemweave::{Edge, Endpoint, Graph, Layout, Node, Port, PortSide};
 
     fn activating_graph_json() -> String {
         fn next(state: &mut u64) -> u64 {
@@ -197,6 +204,69 @@ mod tests {
                 r#"{"nodes":[],"edges":[],"width":0.0,"height":0.0}"#
             );
         }
+    }
+
+    #[test]
+    fn prior_nonempty_options_payloads_do_not_require_constraints() {
+        let graph = r#"{"nodes":[],"edges":[]}"#;
+        let options = r#"{"layer_gap":70.0,"node_gap":30.0,"port_stub":10.0,"route_lane_gap":4.0,"ordering_sweeps":2,"quality_effort":"fast"}"#;
+        assert_eq!(
+            layout_serialized(graph, options).unwrap(),
+            r#"{"nodes":[],"edges":[],"width":0.0,"height":0.0}"#
+        );
+    }
+
+    #[test]
+    fn accepts_boundary_constraints_over_the_json_boundary() {
+        let graph = Graph {
+            nodes: (1..=3)
+                .map(|id| Node {
+                    id,
+                    width: 80.0,
+                    height: 50.0,
+                    cycle_breaker: false,
+                    ports: vec![
+                        Port {
+                            id: 0,
+                            side: PortSide::West,
+                            offset: 25.0,
+                        },
+                        Port {
+                            id: 1,
+                            side: PortSide::East,
+                            offset: 25.0,
+                        },
+                    ],
+                })
+                .collect(),
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 1 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 2, port: 1 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let result: Layout = serde_json::from_str(
+            &layout_serialized(
+                &serde_json::to_string(&graph).unwrap(),
+                r#"{"constraints":{"inputs":[1],"outputs":[3]}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let x = |id| result.nodes.iter().find(|node| node.id == id).unwrap().x;
+        assert!(x(1) < x(2));
+        assert!(x(2) < x(3));
     }
 
     #[test]
