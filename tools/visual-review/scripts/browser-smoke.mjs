@@ -270,7 +270,9 @@ try {
   )
   if (
     initialRequest?.options?.quality_effort !== 'max' ||
-    initialRequest?.options?.edge_node_clearance !== 20
+    initialRequest?.options?.edge_node_clearance !== 20 ||
+    initialRequest?.options?.max_quality_area_factor !== 2 ||
+    initialRequest?.options?.max_quality_route_length_factor !== 1.25
   ) {
     throw new Error(`highest-quality request mismatch: ${JSON.stringify(initialRequest?.options)}`)
   }
@@ -283,6 +285,42 @@ try {
   if (!(await page.locator('#status').textContent())?.includes('clearance ≥ 20 px')) {
     throw new Error('completed layout did not report its active clearance threshold')
   }
+
+  const areaBudgetSlider = page.getByRole('slider', { name: 'Maximum quality area factor' })
+  const routeBudgetSlider = page.getByRole('slider', {
+    name: 'Maximum quality route length factor',
+  })
+  if ((await areaBudgetSlider.count()) !== 1 || (await routeBudgetSlider.count()) !== 1) {
+    throw new Error('quality budget sliders do not have unique accessible names')
+  }
+  const requestCountBeforeBudgetChange = await workerRequestCount(page)
+  await areaBudgetSlider.fill('1.95')
+  await routeBudgetSlider.fill('1.24')
+  await page.waitForFunction(
+    ({ previousCount }) => {
+      const requests = window.__schemweaveWorkerRequests
+      const latest = requests.at(-1)
+      return (
+        requests.length > previousCount &&
+        latest?.type === 'layout' &&
+        latest.options.max_quality_area_factor === 1.95 &&
+        latest.options.max_quality_route_length_factor === 1.24
+      )
+    },
+    { previousCount: requestCountBeforeBudgetChange },
+  )
+  await waitForCompletedLayout(page, nodeCount, 'Max')
+  if (await page.locator('#preset').inputValue() !== 'custom') {
+    throw new Error('non-preset quality budgets did not select Custom')
+  }
+  if (
+    (await page.locator('#max-quality-area-factor-value').textContent()) !== '1.95×' ||
+    (await page.locator('#max-quality-route-length-factor-value').textContent()) !== '1.24×'
+  ) {
+    throw new Error('quality budget sliders did not retain their newest values')
+  }
+  await page.locator('#preset').selectOption('highest-quality')
+  await waitForCompletedLayout(page, nodeCount, 'Max')
 
   const clearanceSlider = page.getByRole('slider', { name: 'Wire-to-gate clearance' })
   if ((await clearanceSlider.count()) !== 1) {
