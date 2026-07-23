@@ -221,11 +221,12 @@ pub(crate) fn rewrite_preserved_member_route(
     tap: Point,
     tap_lane: usize,
     pitch: f64,
+    corridor_offset: f64,
 ) -> Result<(), LayoutError> {
     if route.points.len() < 2 {
         return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
     }
-    let corridor_depth = (tap_lane + 1) as f64 * pitch;
+    let corridor_depth = corridor_offset + (tap_lane + 1) as f64 * pitch;
     route.points = match role {
         BoundaryBundleRole::Input => rewrite_input_route(&route.points, tap, corridor_depth),
         BoundaryBundleRole::Output => rewrite_output_route(&route.points, tap, corridor_depth),

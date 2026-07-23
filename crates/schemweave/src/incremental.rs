@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    BoundaryBundleConstraint, BoundaryBundleGeometry, BoundaryBundleMemberConstraint,
-    BoundaryBundleMemberGeometry, BoundaryBundleRole, ConstrainedLayoutError, Edge, EdgeGeometry,
-    EdgeId, Endpoint, Graph, Layout, LayoutConstraints, LayoutError, LayoutOptions, NetId, Node,
-    NodeGeometry, NodeId, Point, Port, PortSide, QualityEffort, boundary_bundles,
-    layout_with_quality_effort_and_constraints, routing, validation,
+    BoundaryBundleConstraint, BoundaryBundleGeometry, BoundaryBundleId,
+    BoundaryBundleMemberConstraint, BoundaryBundleMemberGeometry, BoundaryBundleRole,
+    ConstrainedLayoutError, Edge, EdgeGeometry, EdgeId, Endpoint, Graph, Layout, LayoutConstraints,
+    LayoutError, LayoutOptions, NetId, Node, NodeGeometry, NodeId, Point, Port, PortSide,
+    QualityEffort, boundary_bundles, layout_with_quality_effort_and_constraints, routing,
+    validation,
 };
 
 const MAX_EXPANSION_MEMBERS: usize = 4_096;
@@ -143,6 +144,7 @@ struct ExpansionContract<'a> {
     expanded_nodes: BTreeMap<NodeId, &'a Node>,
     compact_node_geometry: BTreeMap<NodeId, &'a NodeGeometry>,
     compact_edge_geometry: BTreeMap<EdgeId, &'a EdgeGeometry>,
+    compact_boundary_bundle_offsets: BTreeMap<BoundaryBundleId, f64>,
     boundary_trunks: BTreeMap<EdgeId, EdgeId>,
 }
 
@@ -162,6 +164,7 @@ struct BoundaryBundleRetap {
     role: BoundaryBundleRole,
     tap: Point,
     tap_lane: usize,
+    corridor_offset: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -690,7 +693,8 @@ fn validate_contract<'a>(
         }
     }
 
-    validate_compact_boundary_bundles(compact_graph, compact_layout, options)?;
+    let compact_boundary_bundle_offsets =
+        validate_compact_boundary_bundles(compact_graph, compact_layout, options)?;
     let compact_node_geometry = index_node_geometry(compact_graph, compact_layout)?;
     let compact_edge_geometry = index_edge_geometry(compact_graph, compact_layout)?;
     validate_layout_bounds(compact_layout)?;
@@ -807,6 +811,7 @@ fn validate_contract<'a>(
         expanded_nodes,
         compact_node_geometry,
         compact_edge_geometry,
+        compact_boundary_bundle_offsets,
         boundary_trunks,
     })
 }
@@ -815,9 +820,9 @@ fn validate_compact_boundary_bundles(
     compact_graph: &Graph,
     compact_layout: &Layout,
     options: LayoutOptions,
-) -> Result<(), GroupExpansionError> {
+) -> Result<BTreeMap<BoundaryBundleId, f64>, GroupExpansionError> {
     if compact_layout.boundary_bundles.is_empty() {
-        return Ok(());
+        return Ok(BTreeMap::new());
     }
     let mut inputs = BTreeSet::new();
     let mut outputs = BTreeSet::new();
@@ -857,7 +862,13 @@ fn validate_compact_boundary_bundles(
         validation::validate_and_index_with_constraints(compact_graph, options, &constraints)
             .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
     boundary_bundles::verify_preserved_geometry_structure(&indexed, compact_layout, options)
-        .map_err(|_| GroupExpansionError::NeedsFullRelayout)
+        .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
+    Ok(indexed
+        .boundary_bundles
+        .iter()
+        .zip(boundary_bundles::corridor_depth_offsets(&indexed, options))
+        .map(|(bundle, offset)| (bundle.id, offset))
+        .collect())
 }
 
 fn remap_boundary_bundles(
@@ -885,6 +896,15 @@ fn remap_boundary_bundles(
             return Err(GroupExpansionError::NeedsFullRelayout);
         }
     }
+    let expanded_corridor_offsets = expanded_indexed
+        .boundary_bundles
+        .iter()
+        .zip(boundary_bundles::corridor_depth_offsets(
+            expanded_indexed,
+            options,
+        ))
+        .map(|(bundle, offset)| (bundle.id, offset))
+        .collect::<BTreeMap<_, _>>();
     let expanded_edges = expanded_graph
         .edges
         .iter()
@@ -909,6 +929,16 @@ fn remap_boundary_bundles(
         {
             return Err(GroupExpansionError::NeedsFullRelayout);
         }
+        let Some(&compact_corridor_offset) = contract
+            .compact_boundary_bundle_offsets
+            .get(&compact_bundle.id)
+        else {
+            return Err(GroupExpansionError::NeedsFullRelayout);
+        };
+        let Some(&expanded_corridor_offset) = expanded_corridor_offsets.get(&expanded_bundle.id)
+        else {
+            return Err(GroupExpansionError::NeedsFullRelayout);
+        };
 
         let mut compact_members = BTreeMap::new();
         for member in &compact_bundle.members {
@@ -968,10 +998,13 @@ fn remap_boundary_bundles(
                 x: compact_bundle.spine.end.x,
                 y: compact_bundle.spine.end.y + (expanded_member.tap_lane as f64 - center) * pitch,
             };
-            if expanded_member.edge == compact_edge && tap != compact_member.tap {
+            let retained_member = expanded_member.edge == compact_edge;
+            let corridor_changed = expanded_corridor_offset != compact_corridor_offset;
+            if retained_member && (tap != compact_member.tap || corridor_changed) {
                 return Err(GroupExpansionError::NeedsFullRelayout);
             }
-            if tap != compact_member.tap
+            if !retained_member
+                && (tap != compact_member.tap || corridor_changed)
                 && retaps
                     .insert(
                         expanded_member.edge,
@@ -979,6 +1012,7 @@ fn remap_boundary_bundles(
                             role: compact_bundle.role,
                             tap,
                             tap_lane: expanded_member.tap_lane,
+                            corridor_offset: expanded_corridor_offset,
                         },
                     )
                     .is_some()
@@ -2153,6 +2187,7 @@ fn compose_candidate(
                 options
                     .route_lane_gap
                     .max(options.minimum_parallel_wire_spacing),
+                retap.corridor_offset,
             )
             .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
         }
@@ -3379,6 +3414,187 @@ mod tests {
         assert_eq!(
             result.edges.iter().find(|edge| edge.id == 3),
             compact_layout.edges.iter().find(|edge| edge.id == 3)
+        );
+    }
+
+    #[test]
+    fn changed_bundle_lane_count_fails_closed_before_moving_a_later_same_role_bundle() {
+        let mut anchor = node(10);
+        anchor.width = 260.0;
+        let compact = Graph {
+            nodes: vec![node(1), node(6), anchor, node(7)],
+            edges: vec![edge(1, 1, 10, 100), edge(2, 6, 7, 200)],
+        };
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), node(3), node(6), node(7)],
+            edges: vec![edge(11, 1, 2, 100), edge(12, 1, 3, 100), edge(2, 6, 7, 200)],
+        };
+        let compact_constraints = LayoutConstraints {
+            inputs: vec![1, 6],
+            outputs: Vec::new(),
+            boundary_bundles: vec![
+                BoundaryBundleConstraint {
+                    id: 7,
+                    endpoint: Endpoint { node: 1, port: 1 },
+                    width: 4,
+                    members: vec![BoundaryBundleMemberConstraint {
+                        edge: 1,
+                        slots: vec![0, 1, 2, 3],
+                    }],
+                },
+                BoundaryBundleConstraint {
+                    id: 8,
+                    endpoint: Endpoint { node: 6, port: 1 },
+                    width: 1,
+                    members: vec![BoundaryBundleMemberConstraint {
+                        edge: 2,
+                        slots: vec![0],
+                    }],
+                },
+            ],
+        };
+        let unchanged_lane_constraints = LayoutConstraints {
+            inputs: vec![1, 6],
+            outputs: Vec::new(),
+            boundary_bundles: vec![
+                BoundaryBundleConstraint {
+                    id: 7,
+                    endpoint: Endpoint { node: 1, port: 1 },
+                    width: 4,
+                    members: vec![
+                        BoundaryBundleMemberConstraint {
+                            edge: 11,
+                            slots: vec![0, 1, 2, 3],
+                        },
+                        BoundaryBundleMemberConstraint {
+                            edge: 12,
+                            slots: vec![0, 1, 2, 3],
+                        },
+                    ],
+                },
+                compact_constraints.boundary_bundles[1].clone(),
+            ],
+        };
+        let split_lane_constraints = LayoutConstraints {
+            inputs: vec![1, 6],
+            outputs: Vec::new(),
+            boundary_bundles: vec![
+                BoundaryBundleConstraint {
+                    id: 7,
+                    endpoint: Endpoint { node: 1, port: 1 },
+                    width: 4,
+                    members: vec![
+                        BoundaryBundleMemberConstraint {
+                            edge: 11,
+                            slots: vec![0, 1],
+                        },
+                        BoundaryBundleMemberConstraint {
+                            edge: 12,
+                            slots: vec![2, 3],
+                        },
+                    ],
+                },
+                compact_constraints.boundary_bundles[1].clone(),
+            ],
+        };
+        let options = LayoutOptions::default();
+        let compact_layout =
+            layout_with_constraints(&compact, options, &compact_constraints).unwrap();
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: vec![2, 3],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 11,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 12,
+                    compact_edge: 1,
+                },
+            ],
+        };
+
+        let unchanged = expand_group_in_place(
+            &compact,
+            &compact_layout,
+            &expanded,
+            &expansion,
+            &GroupExpansionOptions {
+                layout: options,
+                quality_effort: QualityEffort::Max,
+                constraints: unchanged_lane_constraints,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            unchanged
+                .boundary_bundles
+                .iter()
+                .find(|bundle| bundle.id == 8),
+            compact_layout
+                .boundary_bundles
+                .iter()
+                .find(|bundle| bundle.id == 8)
+        );
+        assert_eq!(
+            unchanged.edges.iter().find(|route| route.id == 2),
+            compact_layout.edges.iter().find(|route| route.id == 2)
+        );
+
+        let expected_error = Err(GroupExpansionError::NeedsFullRelayout);
+        assert_eq!(
+            expand_group_in_place(
+                &compact,
+                &compact_layout,
+                &expanded,
+                &expansion,
+                &GroupExpansionOptions {
+                    layout: options,
+                    quality_effort: QualityEffort::Max,
+                    constraints: split_lane_constraints.clone(),
+                },
+            ),
+            expected_error
+        );
+        let mut permuted_graph = expanded.clone();
+        permuted_graph.nodes.reverse();
+        permuted_graph.edges.reverse();
+        let mut permuted_constraints = split_lane_constraints;
+        permuted_constraints.inputs.reverse();
+        permuted_constraints.boundary_bundles.reverse();
+        for bundle in &mut permuted_constraints.boundary_bundles {
+            bundle.members.reverse();
+            for member in &mut bundle.members {
+                member.slots.reverse();
+            }
+        }
+        assert_eq!(
+            expand_group_in_place(
+                &compact,
+                &compact_layout,
+                &permuted_graph,
+                &GroupExpansion {
+                    anchor: 10,
+                    members: vec![3, 2],
+                    boundary_trunks: vec![
+                        BoundaryTrunk {
+                            expanded_edge: 12,
+                            compact_edge: 1,
+                        },
+                        BoundaryTrunk {
+                            expanded_edge: 11,
+                            compact_edge: 1,
+                        },
+                    ],
+                },
+                &GroupExpansionOptions {
+                    layout: options,
+                    quality_effort: QualityEffort::Max,
+                    constraints: permuted_constraints,
+                },
+            ),
+            Err(GroupExpansionError::NeedsFullRelayout)
         );
     }
 
