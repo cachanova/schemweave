@@ -194,48 +194,56 @@ pub fn layout_with_quality_effort(
     let baseline_order_crossings = forward.crossings.min(reverse.crossings);
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
-    let mut retain = |nodes: Vec<NodeGeometry>,
-                      edges: Vec<EdgeGeometry>,
-                      quality: Option<routing::RouteQuality>| {
-        let quality = quality.unwrap_or_else(|| routing::route_quality(&indexed, &edges));
-        retain_owned_candidate(&mut best, quality, nodes, edges);
-    };
-    let mut evaluate = |nodes: Vec<NodeGeometry>,
-                        supplemental: bool,
-                        sparse_global: bool,
-                        large_sparse_global: bool| {
-        let routed = routing::route_planned_candidates_with_sparse_global(
-            &routing_plan,
-            &nodes,
-            options,
-            supplemental,
-            sparse_global,
-            large_sparse_global,
-        );
-        retain(nodes.clone(), routed.primary, routed.primary_quality);
-        if let Some((repair_quality, repair)) = routed.repair {
-            retain(nodes.clone(), repair, Some(repair_quality));
-        }
-        for (quality, alternative) in routed.alternatives {
-            retain(nodes.clone(), alternative, Some(quality));
-        }
-    };
-    evaluate(
+    evaluate_candidate(
+        &indexed,
+        &routing_plan,
+        &mut best,
         placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
-        false,
-        false,
-        false,
+        options,
+        CandidateRouting::default(),
     );
     let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
     let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
-    evaluate(ordinary_nodes, false, true, false);
+    let straight_chain_nodes = (quality_effort != QualityEffort::Fast
+        && graph.nodes.len() <= placement::MAX_CHAIN_CANDIDATE_NODES)
+        .then(|| {
+            placement::place_straight_chain_nodes(
+                &indexed,
+                &ranks,
+                quality_layers,
+                &ordinary_nodes,
+                options.node_gap,
+            )
+        })
+        .flatten();
+    evaluate_candidate(
+        &indexed,
+        &routing_plan,
+        &mut best,
+        ordinary_nodes,
+        options,
+        CandidateRouting {
+            sparse_global: true,
+            ..CandidateRouting::default()
+        },
+    );
     if placement::preferred_alignment_can_be_significant(ordinary_alignment) {
         let preferred_nodes =
             placement::place_preferred_nodes(&indexed, &ranks, quality_layers, options);
         let preferred_alignment =
             placement::port_alignment_error(&indexed, &ranks, &preferred_nodes);
         if placement::preferred_alignment_is_significant(ordinary_alignment, preferred_alignment) {
-            evaluate(preferred_nodes, true, false, false);
+            evaluate_candidate(
+                &indexed,
+                &routing_plan,
+                &mut best,
+                preferred_nodes,
+                options,
+                CandidateRouting {
+                    supplemental: true,
+                    ..CandidateRouting::default()
+                },
+            );
         }
     }
     if let Some(net_representative) = net_representative
@@ -255,19 +263,19 @@ pub fn layout_with_quality_effort(
                 large_sparse_global,
                 true,
             );
-            retain(nodes.clone(), routed.primary, routed.primary_quality);
-            if let Some((repair_quality, repair)) = routed.repair {
-                retain(nodes.clone(), repair, Some(repair_quality));
-            }
-            for (quality, alternative) in routed.alternatives {
-                retain(nodes.clone(), alternative, Some(quality));
-            }
+            retain_routed_candidates(&indexed, &mut best, nodes, routed);
         } else {
-            evaluate(
+            evaluate_candidate(
+                &indexed,
+                &routing_plan,
+                &mut best,
                 placement::place_nodes(&indexed, &ranks, &net_representative.layers, options),
-                false,
-                sparse_global,
-                large_sparse_global,
+                options,
+                CandidateRouting {
+                    sparse_global,
+                    large_sparse_global,
+                    ..CandidateRouting::default()
+                },
             );
         }
     }
@@ -299,7 +307,86 @@ pub fn layout_with_quality_effort(
             retain_owned_candidate(&mut best, quality, nodes, edges);
         }
     }
+    if let Some(straight_chain_nodes) = straight_chain_nodes
+        && best.as_ref().is_some_and(|(_, layout)| {
+            placement::vertical_span(&straight_chain_nodes)
+                <= layout.height * placement::MAX_CHAIN_HEIGHT_FACTOR
+        })
+    {
+        let mut straight_chain_best = None;
+        evaluate_candidate(
+            &indexed,
+            &routing_plan,
+            &mut straight_chain_best,
+            straight_chain_nodes,
+            options,
+            CandidateRouting {
+                supplemental: true,
+                ..CandidateRouting::default()
+            },
+        );
+        let (quality, layout) = straight_chain_best.expect("candidate routing produces a layout");
+        if best.as_ref().is_some_and(|(current_quality, current)| {
+            straight_chain_cost_is_bounded(quality, &layout, *current_quality, current)
+        }) {
+            retain_better_candidate(&mut best, quality, layout);
+        }
+    }
     Ok(best.expect("layout has deterministic candidates").1)
+}
+
+fn straight_chain_cost_is_bounded(
+    quality: routing::RouteQuality,
+    layout: &Layout,
+    current_quality: routing::RouteQuality,
+    current: &Layout,
+) -> bool {
+    quality.route_length <= current_quality.route_length * 1.05
+        && layout.width * layout.height <= current.width * current.height * 1.10
+}
+
+#[derive(Clone, Copy, Default)]
+struct CandidateRouting {
+    supplemental: bool,
+    sparse_global: bool,
+    large_sparse_global: bool,
+}
+
+fn evaluate_candidate(
+    indexed: &validation::IndexedGraph<'_>,
+    routing_plan: &routing::RoutingPlan<'_>,
+    best: &mut Option<(routing::RouteQuality, Layout)>,
+    nodes: Vec<NodeGeometry>,
+    options: LayoutOptions,
+    routing: CandidateRouting,
+) {
+    let routed = routing::route_planned_candidates_with_sparse_global(
+        routing_plan,
+        &nodes,
+        options,
+        routing.supplemental,
+        routing.sparse_global,
+        routing.large_sparse_global,
+    );
+    retain_routed_candidates(indexed, best, nodes, routed);
+}
+
+fn retain_routed_candidates(
+    indexed: &validation::IndexedGraph<'_>,
+    best: &mut Option<(routing::RouteQuality, Layout)>,
+    nodes: Vec<NodeGeometry>,
+    routed: routing::RoutedEdges,
+) {
+    let quality = routed
+        .primary_quality
+        .unwrap_or_else(|| routing::route_quality(indexed, &routed.primary));
+    retain_owned_candidate(best, quality, nodes.clone(), routed.primary);
+    if let Some((quality, edges)) = routed.repair {
+        retain_owned_candidate(best, quality, nodes.clone(), edges);
+    }
+    for (quality, edges) in routed.alternatives {
+        retain_owned_candidate(best, quality, nodes.clone(), edges);
+    }
 }
 
 fn net_representative_sparse_global_flags(
@@ -888,6 +975,14 @@ mod tests {
         let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
         let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
         let preferred = placement::place_preferred_nodes(&indexed, &ranks, &layers, options);
+        let straight_chain = placement::place_straight_chain_nodes(
+            &indexed,
+            &ranks,
+            &layers,
+            &ordinary,
+            options.node_gap,
+        )
+        .expect("fixture has matched paths spanning at least two ranks");
         let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary);
         let preferred_alignment = placement::port_alignment_error(&indexed, &ranks, &preferred);
         assert!(
@@ -907,10 +1002,81 @@ mod tests {
         };
         let ordinary = evaluate(ordinary, false);
         let preferred = evaluate(preferred, true);
+        let straight_chain = evaluate(straight_chain, true);
+        let straight_routes = |layout: &Layout| {
+            layout
+                .edges
+                .iter()
+                .filter(|edge| {
+                    edge.points
+                        .first()
+                        .is_some_and(|first| edge.points.iter().all(|point| point.y == first.y))
+                })
+                .count()
+        };
         assert!(candidate_quality_cmp(preferred.0, &preferred.1, ordinary.0, &ordinary.1).is_lt());
+        assert!(
+            candidate_quality_cmp(
+                straight_chain.0,
+                &straight_chain.1,
+                preferred.0,
+                &preferred.1,
+            )
+            .is_lt()
+        );
+        assert!(straight_routes(&straight_chain.1) > straight_routes(&preferred.1));
 
         let selected = layout(&graph, options).unwrap();
-        assert_eq!(selected, preferred.1);
+        assert_eq!(selected, straight_chain.1);
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        assert_eq!(layout(&permuted, options).unwrap(), selected);
+    }
+
+    #[test]
+    fn exact_scoring_rejects_a_straighter_candidate_with_more_crossings() {
+        let options = LayoutOptions {
+            ordering_sweeps: 0,
+            ..LayoutOptions::default()
+        };
+        let graph = preferred_backbone_graph(3);
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let ranks = topology::assign_ranks(&indexed);
+        let layers = topology::order_layers(&indexed, &ranks, options.ordering_sweeps);
+        let ordinary = placement::place_nodes(&indexed, &ranks, &layers, options);
+        let chain = placement::place_straight_chain_nodes(
+            &indexed,
+            &ranks,
+            &layers,
+            &ordinary,
+            options.node_gap,
+        )
+        .unwrap();
+        let plan = routing::RoutingPlan::new(&indexed, &ranks);
+        let routed = routing::route_planned_candidates(&plan, &chain, options, true);
+        let mut best_chain = None;
+        retain_owned_candidate(
+            &mut best_chain,
+            routed.primary_quality.unwrap(),
+            chain.clone(),
+            routed.primary,
+        );
+        if let Some((quality, edges)) = routed.repair {
+            retain_owned_candidate(&mut best_chain, quality, chain.clone(), edges);
+        }
+        for (quality, edges) in routed.alternatives {
+            retain_owned_candidate(&mut best_chain, quality, chain.clone(), edges);
+        }
+        let best_chain = best_chain.unwrap();
+        let selected = layout(&graph, options).unwrap();
+        let selected_quality = routing::route_quality(&indexed, &selected.edges);
+
+        assert!(
+            candidate_quality_cmp(best_chain.0, &best_chain.1, selected_quality, &selected).is_gt()
+        );
+        assert_ne!(selected, best_chain.1);
+
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
