@@ -408,6 +408,8 @@ fn parallel_congestion_distinguishes_overlap_sub_lane_gap_and_target_spacing() {
     let report = score(&graph, &layout, ScoreOptions::default());
 
     assert!((report.parallel_congestion_ratio - 2.0 / 3.0).abs() < 1e-12);
+    assert_eq!(report.parallel_pair_overlap_length, 100.0);
+    assert_eq!(report.peak_parallel_close_neighbors, 1);
 }
 
 #[test]
@@ -434,6 +436,36 @@ fn parallel_congestion_weights_only_the_actual_close_overlap_length() {
     // Only the ten-unit shared span on each of the first two routes is
     // congested. The remaining long route pair is eight units apart.
     assert!((weighted.parallel_congestion_ratio - 20.0 / 490.0).abs() < 1e-12);
+    assert_eq!(weighted.parallel_pair_overlap_length, 10.0);
+    assert_eq!(weighted.peak_parallel_close_neighbors, 1);
+}
+
+#[test]
+fn parallel_density_distinguishes_a_multi_net_wire_slab() {
+    let routes = (0..4)
+        .map(|index| {
+            (
+                index + 1,
+                vec![
+                    Point {
+                        x: 20.0,
+                        y: 20.0 + f64::from(index),
+                    },
+                    Point {
+                        x: 120.0,
+                        y: 20.0 + f64::from(index),
+                    },
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+    let (graph, layout) = constructed_routes(&routes);
+
+    let report = score(&graph, &layout, ScoreOptions::default());
+
+    assert_eq!(report.parallel_congestion_ratio, 1.0);
+    assert_eq!(report.parallel_pair_overlap_length, 600.0);
+    assert_eq!(report.peak_parallel_close_neighbors, 3);
 }
 
 #[test]
@@ -485,6 +517,14 @@ fn parallel_congestion_is_permutation_deterministic() {
     assert_eq!(
         actual.parallel_congestion_ratio,
         expected.parallel_congestion_ratio
+    );
+    assert_eq!(
+        actual.parallel_pair_overlap_length,
+        expected.parallel_pair_overlap_length
+    );
+    assert_eq!(
+        actual.peak_parallel_close_neighbors,
+        expected.peak_parallel_close_neighbors
     );
 }
 

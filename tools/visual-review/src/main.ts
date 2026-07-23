@@ -369,6 +369,16 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       format: percentage,
     },
     {
+      label: 'Pair-overlap length',
+      elk: (q) => q.parallel_pair_overlap_length,
+      format: integer,
+    },
+    {
+      label: 'Peak close neighbors',
+      elk: (q) => q.peak_parallel_close_neighbors,
+      format: integer,
+    },
+    {
       label: 'Edge-node clearance',
       elk: (q) =>
         q.edge_node_clearance_exhausted
