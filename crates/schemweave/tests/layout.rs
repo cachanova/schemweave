@@ -1457,6 +1457,184 @@ fn empty_constraints_are_byte_identical_to_the_existing_api() {
 }
 
 #[test]
+fn highest_quality_routes_captured_reg_mux_boundary_bundles_with_positive_clearance() {
+    let ports = |entries: &[(u32, PortSide, f64)]| {
+        entries
+            .iter()
+            .map(|&(id, side, offset)| Port { id, side, offset })
+            .collect()
+    };
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: 26,
+                width: 74.0,
+                height: 34.0,
+                cycle_breaker: false,
+                ports: ports(&[(0, PortSide::East, 17.0)]),
+            },
+            Node {
+                id: 27,
+                width: 78.0,
+                height: 56.0,
+                cycle_breaker: false,
+                ports: ports(&[
+                    (0, PortSide::West, 14.0),
+                    (1, PortSide::West, 28.0),
+                    (2, PortSide::West, 42.0),
+                    (3, PortSide::East, 28.0),
+                ]),
+            },
+            Node {
+                id: 45,
+                width: 92.0,
+                height: 84.0,
+                cycle_breaker: true,
+                ports: ports(&[(0, PortSide::West, 18.56), (1, PortSide::East, 29.0)]),
+            },
+            Node {
+                id: 46,
+                width: 78.0,
+                height: 56.0,
+                cycle_breaker: false,
+                ports: ports(&[
+                    (0, PortSide::West, 14.0),
+                    (1, PortSide::West, 28.0),
+                    (2, PortSide::West, 42.0),
+                    (3, PortSide::East, 28.0),
+                ]),
+            },
+            Node {
+                id: 47,
+                width: 74.0,
+                height: 34.0,
+                cycle_breaker: false,
+                ports: ports(&[(0, PortSide::East, 17.0)]),
+            },
+            Node {
+                id: 48,
+                width: 74.0,
+                height: 34.0,
+                cycle_breaker: false,
+                ports: ports(&[(0, PortSide::East, 17.0)]),
+            },
+            Node {
+                id: 49,
+                width: 74.0,
+                height: 34.0,
+                cycle_breaker: false,
+                ports: ports(&[(0, PortSide::West, 17.0)]),
+            },
+        ],
+        edges: [
+            (0, 26, 0, 27, 2, 0),
+            (1, 26, 0, 46, 2, 0),
+            (2, 27, 3, 45, 0, 1),
+            (3, 45, 1, 49, 0, 2),
+            (4, 46, 3, 45, 0, 3),
+            (5, 47, 0, 27, 1, 4),
+            (6, 47, 0, 46, 0, 5),
+            (7, 48, 0, 27, 0, 6),
+            (8, 48, 0, 46, 1, 7),
+        ]
+        .into_iter()
+        .map(
+            |(id, source_node, source_port, target_node, target_port, net)| Edge {
+                id,
+                source: Endpoint {
+                    node: source_node,
+                    port: source_port,
+                },
+                target: Endpoint {
+                    node: target_node,
+                    port: target_port,
+                },
+                net,
+                participates_in_ranking: true,
+            },
+        )
+        .collect(),
+    };
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints.inputs = vec![26, 47, 48];
+    config.constraints.outputs = vec![49];
+
+    assert!(layout_with_config(&graph, &config).is_ok());
+
+    config.constraints.boundary_bundles = vec![
+        BoundaryBundleConstraint {
+            id: 0,
+            endpoint: Endpoint { node: 47, port: 0 },
+            width: 8,
+            members: vec![
+                BoundaryBundleMemberConstraint {
+                    edge: 5,
+                    slots: vec![5],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 6,
+                    slots: vec![0, 1, 2, 3, 4, 6, 7],
+                },
+            ],
+        },
+        BoundaryBundleConstraint {
+            id: 1,
+            endpoint: Endpoint { node: 48, port: 0 },
+            width: 8,
+            members: vec![
+                BoundaryBundleMemberConstraint {
+                    edge: 7,
+                    slots: vec![5],
+                },
+                BoundaryBundleMemberConstraint {
+                    edge: 8,
+                    slots: vec![0, 1, 2, 3, 4, 6, 7],
+                },
+            ],
+        },
+        BoundaryBundleConstraint {
+            id: 2,
+            endpoint: Endpoint { node: 49, port: 0 },
+            width: 8,
+            members: vec![BoundaryBundleMemberConstraint {
+                edge: 3,
+                slots: (0..8).collect(),
+            }],
+        },
+    ];
+
+    let strict = layout_with_config(&graph, &config).unwrap();
+    assert_eq!(strict.boundary_bundles.len(), 3);
+    assert_edge_node_clearance(&graph, &strict, config.layout.edge_node_clearance);
+    let input_corridors = strict
+        .edges
+        .iter()
+        .filter(|route| (5..=8).contains(&route.id))
+        .map(|route| route.points[1].x.to_bits())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(input_corridors.len(), 4);
+
+    let permuted_graph = Graph {
+        nodes: graph.nodes.iter().cloned().rev().collect(),
+        edges: graph.edges.iter().cloned().rev().collect(),
+    };
+    let mut permuted_config = config.clone();
+    permuted_config.constraints.inputs.reverse();
+    permuted_config.constraints.outputs.reverse();
+    permuted_config.constraints.boundary_bundles.reverse();
+    for bundle in &mut permuted_config.constraints.boundary_bundles {
+        bundle.members.reverse();
+        for member in &mut bundle.members {
+            member.slots.reverse();
+        }
+    }
+    assert_eq!(
+        layout_with_config(&permuted_graph, &permuted_config).unwrap(),
+        strict
+    );
+}
+
+#[test]
 fn input_boundary_bundle_emits_a_pitched_collector_and_unique_horizontal_taps() {
     let graph = Graph {
         nodes: vec![

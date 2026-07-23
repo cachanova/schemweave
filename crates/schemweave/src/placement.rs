@@ -313,7 +313,8 @@ fn reserve_boundary_bundle_corridors(
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
     let rail_depth = crate::boundary_bundle_rail_depth(options);
-    for bundle in &graph.boundary_bundles {
+    let corridor_offsets = crate::boundary_bundles::corridor_depth_offsets(graph, options);
+    for (bundle, corridor_offset) in graph.boundary_bundles.iter().zip(corridor_offsets) {
         let node = graph.node_index[&bundle.endpoint.node];
         let rank = ranks[node];
         let lane_count = bundle
@@ -322,6 +323,7 @@ fn reserve_boundary_bundle_corridors(
             .map_or(0, |member| member.tap_lane + 1);
         let node_inset = layer_widths[rank] - graph.nodes[node].width;
         let required = (rail_depth
+            + corridor_offset
             + lane_count as f64 * pitch
             + options
                 .edge_node_clearance
@@ -981,7 +983,7 @@ mod tests {
             options,
             &mut layer_gaps,
         );
-        assert_eq!(layer_gaps, vec![146.0]);
+        assert_eq!(layer_gaps, vec![150.0]);
 
         let highest = crate::LayoutConfig::highest_quality().layout;
         let layer_gap_clearance_boundary = (options.layer_gap - highest.route_lane_gap) / 2.0;
@@ -1007,7 +1009,7 @@ mod tests {
                 &mut layer_gaps,
             );
             let expected =
-                clearance + 32.0 * positive.route_lane_gap + clearance.max(positive.route_lane_gap);
+                clearance + 33.0 * positive.route_lane_gap + clearance.max(positive.route_lane_gap);
             assert_eq!(layer_gaps, vec![expected.max(positive.layer_gap)]);
         }
     }
