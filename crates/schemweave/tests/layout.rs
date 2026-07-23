@@ -137,6 +137,7 @@ fn canonical_config_exposes_the_highest_quality_profile() {
     let config = LayoutConfig::highest_quality();
 
     assert_eq!(config.layout.edge_node_clearance, 20.0);
+    assert_eq!(config.layout.minimum_parallel_wire_spacing, 0.0);
     assert_eq!(
         config.layout,
         LayoutOptions {
@@ -202,6 +203,49 @@ fn edge_node_clearance_defaults_to_disabled_and_rejects_invalid_values() {
             &graph,
             LayoutOptions {
                 edge_node_clearance: 1_000_000.0,
+                ..LayoutOptions::default()
+            },
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn parallel_wire_spacing_defaults_to_disabled_and_rejects_invalid_values() {
+    let options: LayoutOptions = serde_json::from_str("{}").unwrap();
+    assert_eq!(options.minimum_parallel_wire_spacing, 0.0);
+    let graph = Graph {
+        nodes: vec![node(1, false)],
+        edges: vec![],
+    };
+    for value in [
+        f64::NAN,
+        f64::INFINITY,
+        -1.0,
+        1_000_000.0 + f64::EPSILON * 1_000_000.0,
+        f64::MAX,
+    ] {
+        let error = layout(
+            &graph,
+            LayoutOptions {
+                minimum_parallel_wire_spacing: value,
+                ..LayoutOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LayoutError::InvalidOption {
+                field: "minimum_parallel_wire_spacing",
+                value: invalid,
+            } if (value.is_nan() && invalid.is_nan()) || value == invalid
+        ));
+    }
+    assert!(
+        layout(
+            &graph,
+            LayoutOptions {
+                minimum_parallel_wire_spacing: 1_000_000.0,
                 ..LayoutOptions::default()
             },
         )
@@ -1056,7 +1100,10 @@ fn layout_errors_have_deterministic_public_classification() {
             | LayoutError::EdgeNodeClearanceWorkLimitExceeded { .. }
             | LayoutError::UnrelatedRouteContactUnsatisfied
             | LayoutError::UnrelatedRouteContactWorkLimitExceeded { .. }
-            | LayoutError::UnrelatedRouteContactSegmentLimitExceeded { .. } => "clearance",
+            | LayoutError::UnrelatedRouteContactSegmentLimitExceeded { .. }
+            | LayoutError::ParallelWireSpacingUnsatisfied { .. }
+            | LayoutError::ParallelWireSpacingWorkLimitExceeded { .. }
+            | LayoutError::ParallelWireSpacingSegmentLimitExceeded { .. } => "clearance",
         }
     }
 

@@ -9,6 +9,7 @@ use schemweave::{
     Edge, EdgeId, EdgeNodeClearanceError, EdgeNodeSegment, Endpoint, Graph, Layout, NetId,
     NetNodeRelation, NodeGeometry, ParallelSegment, Point, PortSide,
     measure_edge_node_clearance_bounded, measure_parallel_congestion,
+    measure_parallel_separation_bounded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -367,20 +368,23 @@ pub fn score(graph: &Graph, layout: &Layout, options: ScoreOptions) -> QualityRe
         .iter()
         .map(|segment| segment.end - segment.start)
         .sum();
+    let parallel_segments = physical_segments
+        .iter()
+        .map(|segment| ParallelSegment {
+            net: segment.net,
+            horizontal: segment.orientation == Orientation::Horizontal,
+            fixed: segment.fixed,
+            start: segment.start,
+            end: segment.end,
+        })
+        .collect::<Vec<_>>();
     report.minimum_parallel_route_separation =
-        minimum_parallel_route_separation(&physical_segments);
+        measure_parallel_separation_bounded(&parallel_segments, usize::MAX)
+            .expect("validated physical segments have a finite exact separation sweep")
+            .minimum_positive;
     report.parallel_congestion_ratio = if report.route_length > options.epsilon {
         measure_parallel_congestion(
-            &physical_segments
-                .iter()
-                .map(|segment| ParallelSegment {
-                    net: segment.net,
-                    horizontal: segment.orientation == Orientation::Horizontal,
-                    fixed: segment.fixed,
-                    start: segment.start,
-                    end: segment.end,
-                })
-                .collect::<Vec<_>>(),
+            &parallel_segments,
             options.parallel_congestion_threshold - options.epsilon,
         )
         .ratio()
@@ -791,213 +795,6 @@ fn outside_interval_length(start: f64, end: f64, inside_start: f64, inside_end: 
     let before = (end.min(inside_start) - start).max(0.0);
     let after = (end - start.max(inside_end)).max(0.0);
     before + after
-}
-
-fn minimum_parallel_route_separation(segments: &[Segment]) -> Option<f64> {
-    let horizontal = minimum_parallel_separation_for_orientation(
-        segments
-            .iter()
-            .filter(|segment| segment.orientation == Orientation::Horizontal),
-    );
-    let vertical = minimum_parallel_separation_for_orientation(
-        segments
-            .iter()
-            .filter(|segment| segment.orientation == Orientation::Vertical),
-    );
-    match (horizontal, vertical) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
-    }
-}
-
-fn minimum_parallel_separation_for_orientation<'a>(
-    segments: impl Iterator<Item = &'a Segment>,
-) -> Option<f64> {
-    let segments = segments.collect::<Vec<_>>();
-    if segments.len() < 2 {
-        return None;
-    }
-    let mut fixed_values = segments
-        .iter()
-        .map(|segment| FloatKey(segment.fixed))
-        .collect::<Vec<_>>();
-    fixed_values.sort_unstable();
-    fixed_values.dedup();
-    let fixed_indices = segments
-        .iter()
-        .map(|segment| {
-            fixed_values
-                .binary_search(&FloatKey(segment.fixed))
-                .expect("parallel coordinate exists")
-        })
-        .collect::<Vec<_>>();
-    let mut events = Vec::with_capacity(segments.len() * 2);
-    for (index, segment) in segments.iter().enumerate() {
-        // End events precede starts so segments that only meet longitudinally do not count as
-        // parallel runs with positive overlap.
-        events.push((FloatKey(segment.end), 0u8, index));
-        events.push((FloatKey(segment.start), 1u8, index));
-    }
-    events.sort_unstable();
-
-    let mut active = vec![BTreeMap::<NetId, usize>::new(); fixed_values.len()];
-    let mut tree = ActiveNetTree::new(fixed_values.len());
-    let mut minimum = None::<f64>;
-    for (_, event_kind, segment_index) in events {
-        let segment = segments[segment_index];
-        let fixed_index = fixed_indices[segment_index];
-        if event_kind == 0 {
-            let remove_net = {
-                let count = active[fixed_index]
-                    .get_mut(&segment.net)
-                    .expect("active parallel segment exists");
-                *count -= 1;
-                *count == 0
-            };
-            if remove_net {
-                active[fixed_index].remove(&segment.net);
-            }
-            tree.set(
-                fixed_index,
-                NetSummary::from_nets(active[fixed_index].keys().copied()),
-            );
-            continue;
-        }
-
-        for candidate in [
-            tree.rightmost_other(fixed_index, segment.net),
-            tree.leftmost_other(fixed_index + 1, segment.net),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let distance = (fixed_values[candidate].0 - segment.fixed).abs();
-            debug_assert!(distance > 0.0);
-            minimum = Some(minimum.map_or(distance, |current| current.min(distance)));
-        }
-        *active[fixed_index].entry(segment.net).or_default() += 1;
-        tree.set(
-            fixed_index,
-            NetSummary::from_nets(active[fixed_index].keys().copied()),
-        );
-    }
-    minimum
-}
-
-#[derive(Clone, Copy, Default)]
-struct NetSummary {
-    first: Option<NetId>,
-    second: Option<NetId>,
-}
-
-impl NetSummary {
-    fn from_nets(nets: impl Iterator<Item = NetId>) -> Self {
-        let mut summary = Self::default();
-        for net in nets {
-            summary.insert(net);
-            if summary.second.is_some() {
-                break;
-            }
-        }
-        summary
-    }
-
-    fn merged(left: Self, right: Self) -> Self {
-        Self::from_nets(
-            [left.first, left.second, right.first, right.second]
-                .into_iter()
-                .flatten(),
-        )
-    }
-
-    fn insert(&mut self, net: NetId) {
-        if self.first == Some(net) || self.second == Some(net) {
-            return;
-        }
-        if self.first.is_none() {
-            self.first = Some(net);
-        } else if self.second.is_none() {
-            self.second = Some(net);
-        }
-    }
-
-    fn has_other(self, excluded: NetId) -> bool {
-        self.first.is_some_and(|net| net != excluded)
-            || self.second.is_some_and(|net| net != excluded)
-    }
-}
-
-struct ActiveNetTree {
-    leaf_count: usize,
-    summaries: Vec<NetSummary>,
-}
-
-impl ActiveNetTree {
-    fn new(coordinate_count: usize) -> Self {
-        let leaf_count = coordinate_count.next_power_of_two();
-        Self {
-            leaf_count,
-            summaries: vec![NetSummary::default(); leaf_count * 2],
-        }
-    }
-
-    fn set(&mut self, index: usize, summary: NetSummary) {
-        let mut cursor = self.leaf_count + index;
-        self.summaries[cursor] = summary;
-        cursor /= 2;
-        while cursor != 0 {
-            self.summaries[cursor] =
-                NetSummary::merged(self.summaries[cursor * 2], self.summaries[cursor * 2 + 1]);
-            cursor /= 2;
-        }
-    }
-
-    fn rightmost_other(&self, end: usize, excluded: NetId) -> Option<usize> {
-        self.search_rightmost(1, 0, self.leaf_count, end, excluded)
-    }
-
-    fn search_rightmost(
-        &self,
-        node: usize,
-        start: usize,
-        end: usize,
-        query_end: usize,
-        excluded: NetId,
-    ) -> Option<usize> {
-        if start >= query_end || !self.summaries[node].has_other(excluded) {
-            return None;
-        }
-        if end - start == 1 {
-            return Some(start);
-        }
-        let middle = (start + end) / 2;
-        self.search_rightmost(node * 2 + 1, middle, end, query_end, excluded)
-            .or_else(|| self.search_rightmost(node * 2, start, middle, query_end, excluded))
-    }
-
-    fn leftmost_other(&self, start: usize, excluded: NetId) -> Option<usize> {
-        self.search_leftmost(1, 0, self.leaf_count, start, excluded)
-    }
-
-    fn search_leftmost(
-        &self,
-        node: usize,
-        start: usize,
-        end: usize,
-        query_start: usize,
-        excluded: NetId,
-    ) -> Option<usize> {
-        if end <= query_start || !self.summaries[node].has_other(excluded) {
-            return None;
-        }
-        if end - start == 1 {
-            return Some(start);
-        }
-        let middle = (start + end) / 2;
-        self.search_leftmost(node * 2, start, middle, query_start, excluded)
-            .or_else(|| self.search_leftmost(node * 2 + 1, middle, end, query_start, excluded))
-    }
 }
 
 fn score_node_intersections(

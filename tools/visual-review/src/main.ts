@@ -3,7 +3,12 @@ import './style.css'
 import { CanvasView } from './canvasView'
 import { prepareDataset, type PreparedDataset } from './dataset'
 import { elkAsLayout } from './graph'
-import { layoutPresets, matchingPreset, type PresetName } from './layoutControls'
+import {
+  layoutPresets,
+  matchingPreset,
+  parallelWireSpacingStatus,
+  type PresetName,
+} from './layoutControls'
 import { StagedLayoutRequests } from './latestRequest'
 import type {
   Corpus,
@@ -26,6 +31,7 @@ const presetSelect = query<HTMLSelectElement>('#preset')
 const layerGap = query<HTMLInputElement>('#layer-gap')
 const nodeGap = query<HTMLInputElement>('#node-gap')
 const laneGap = query<HTMLInputElement>('#lane-gap')
+const minimumParallelWireSpacing = query<HTMLInputElement>('#minimum-parallel-wire-spacing')
 const edgeNodeClearance = query<HTMLInputElement>('#edge-node-clearance')
 const sweeps = query<HTMLInputElement>('#sweeps')
 const qualityEffort = query<HTMLInputElement>('#quality-effort')
@@ -108,9 +114,11 @@ function displayLayout(response: Exclude<WorkerResponse, { error: string }>): vo
   const refinement = response.final
     ? ''
     : ` · refining to ${capitalize(response.requestedEffort)}…`
-  const clearance = layoutOptions().edge_node_clearance
+  const options = layoutOptions()
+  const clearance = options.edge_node_clearance
   const clearanceStatus = clearance > 0 ? ` · clearance ≥ ${clearance} px` : ' · clearance off'
-  status.textContent = `${invalid > 0 ? `INVALID: ELK ${elkInvalid}, SchemWeave ${schemweaveInvalid} · ` : ''}${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${capitalize(response.effort)} ${response.elapsedMs.toFixed(1)} ms${clearanceStatus}${refinement}`
+  const wireSpacingStatus = ` · ${parallelWireSpacingStatus(options)}`
+  status.textContent = `${invalid > 0 ? `INVALID: ELK ${elkInvalid}, SchemWeave ${schemweaveInvalid} · ` : ''}${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${capitalize(response.effort)} ${response.elapsedMs.toFixed(1)} ms${clearanceStatus}${wireSpacingStatus}${refinement}`
   lastFixtureName = fixture.name
 }
 
@@ -130,6 +138,7 @@ function layoutOptions(): LayoutOptions {
     node_gap: Number(nodeGap.value),
     port_stub: 10,
     route_lane_gap: Number(laneGap.value),
+    minimum_parallel_wire_spacing: Number(minimumParallelWireSpacing.value),
     edge_node_clearance: Number(edgeNodeClearance.value),
     ordering_sweeps: Number(sweeps.value),
     quality_effort: effort[Number(qualityEffort.value)] ?? 'quality',
@@ -235,6 +244,7 @@ function applyPreset(name: PresetName): void {
   layerGap.value = String(preset.layer_gap)
   nodeGap.value = String(preset.node_gap)
   laneGap.value = String(preset.route_lane_gap)
+  minimumParallelWireSpacing.value = String(preset.minimum_parallel_wire_spacing)
   edgeNodeClearance.value = String(preset.edge_node_clearance)
   sweeps.value = String(preset.ordering_sweeps)
   qualityEffort.value = String(['fast', 'quality', 'max'].indexOf(preset.quality_effort))
@@ -246,6 +256,8 @@ function updateControlLabels(): void {
   query<HTMLOutputElement>('#layer-gap-value').value = layerGap.value
   query<HTMLOutputElement>('#node-gap-value').value = nodeGap.value
   query<HTMLOutputElement>('#lane-gap-value').value = laneGap.value
+  query<HTMLOutputElement>('#minimum-parallel-wire-spacing-value').value =
+    `${minimumParallelWireSpacing.value} px`
   query<HTMLOutputElement>('#edge-node-clearance-value').value =
     `${edgeNodeClearance.value} px`
   query<HTMLOutputElement>('#sweeps-value').value = sweeps.value
@@ -262,6 +274,7 @@ for (const control of [
   layerGap,
   nodeGap,
   laneGap,
+  minimumParallelWireSpacing,
   edgeNodeClearance,
   sweeps,
   qualityEffort,

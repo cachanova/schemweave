@@ -47,6 +47,7 @@ it('refines a large Max request directly to Max without a Quality phase', () => 
   const initial = harness.sent[0] as WorkerLayoutRequest
   expect(initial.options.quality_effort).toBe('max')
   expect(initial.options.edge_node_clearance).toBe(20)
+  expect(initial.options.minimum_parallel_wire_spacing).toBe(6)
 
   harness.requests.receive(result(initial, 'fast', 'fast', false))
   vi.advanceTimersByTime(REFINE_QUIESCENCE_MS)
@@ -163,6 +164,7 @@ function submission(
       node_gap: 30,
       port_stub: 10,
       route_lane_gap: 4,
+      minimum_parallel_wire_spacing: 6,
       edge_node_clearance: clearance,
       ordering_sweeps: 4,
       quality_effort: effort,

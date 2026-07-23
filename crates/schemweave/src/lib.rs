@@ -14,6 +14,8 @@ const MAX_DEMAND_AWARE_SPACING_NODES: usize = 400;
 const MIN_DEMAND_AWARE_SPACING_EDGES: usize = 250;
 const MAX_DEMAND_AWARE_SPACING_EDGES: usize = 400;
 const MAX_LAYOUT_CLEARANCE_PAIR_VISITS: usize = 20_000_000;
+const MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS: usize = 100_000;
+const MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS: usize = 20_000_000;
 const MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS: usize = 100_000;
 const MAX_LAYOUT_ROUTE_CONTACT_VISITS: usize = 20_000_000;
 
@@ -30,8 +32,9 @@ pub use placement::place;
 #[doc(hidden)]
 pub use readability::{
     EdgeNodeClearance, EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation,
-    ParallelCongestion, ParallelSegment, measure_edge_node_clearance_bounded,
-    measure_parallel_congestion,
+    ParallelCongestion, ParallelSegment, ParallelSeparation, ParallelSeparationError,
+    measure_edge_node_clearance_bounded, measure_parallel_congestion,
+    measure_parallel_separation_bounded,
 };
 pub(crate) use readability::{
     measure_parallel_congestion_bounded, measure_parallel_congestion_profile_bounded,
@@ -148,9 +151,14 @@ pub struct LayoutOptions {
     pub layer_gap: f64,
     pub node_gap: f64,
     pub port_stub: f64,
+    /// Preferred construction pitch for route lanes; not a hard guarantee.
     pub route_lane_gap: f64,
     /// Minimum axis-aligned distance between a route and every unrelated node.
     pub edge_node_clearance: f64,
+    /// Minimum perpendicular distance between longitudinally overlapping
+    /// parallel route segments that belong to different nets, except their
+    /// mandatory shared escape from one fixed endpoint.
+    pub minimum_parallel_wire_spacing: f64,
     pub ordering_sweeps: usize,
 }
 
@@ -223,6 +231,7 @@ impl Default for LayoutOptions {
             port_stub: 10.0,
             route_lane_gap: 4.0,
             edge_node_clearance: 0.0,
+            minimum_parallel_wire_spacing: 0.0,
             ordering_sweeps: 4,
         }
     }
@@ -314,6 +323,16 @@ pub enum LayoutError {
         "unrelated-route contact verification exceeded its deterministic route-segment limit of {maximum}"
     )]
     UnrelatedRouteContactSegmentLimitExceeded { maximum: usize },
+    #[error("no complete layout satisfies minimum_parallel_wire_spacing={spacing}")]
+    ParallelWireSpacingUnsatisfied { spacing: f64 },
+    #[error(
+        "parallel-wire spacing verification exceeded its deterministic work limit of {maximum} tree-node visits"
+    )]
+    ParallelWireSpacingWorkLimitExceeded { maximum: usize },
+    #[error(
+        "parallel-wire spacing verification exceeded its deterministic route-segment limit of {maximum}"
+    )]
+    ParallelWireSpacingSegmentLimitExceeded { maximum: usize },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -576,7 +595,7 @@ fn layout_indexed(
                 adaptive_gap_spacing,
                 false,
             );
-            if options.edge_node_clearance == 0.0 {
+            if options.edge_node_clearance == 0.0 && options.minimum_parallel_wire_spacing == 0.0 {
                 let quality = routed
                     .primary_quality
                     .expect("planned candidates include exact primary quality");
@@ -659,7 +678,7 @@ fn layout_indexed(
         );
     }
     let (mut quality, mut layout) =
-        best.ok_or_else(|| positive_clearance_failure(options, &admission_state))?;
+        best.ok_or_else(|| hard_geometry_failure(options, &admission_state))?;
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && demand_aware_scale_is_eligible(graph.nodes.len(), graph.edges.len())
@@ -710,7 +729,7 @@ fn layout_indexed(
     {
         let candidate = placement::normalize_owned(layout.nodes.clone(), edges);
         if candidate.width * candidate.height <= layout.width * layout.height * 1.05
-            && candidate_satisfies_positive_clearance_contract(
+            && candidate_satisfies_hard_geometry_contract(
                 &indexed,
                 &candidate,
                 options,
@@ -734,7 +753,7 @@ fn layout_indexed(
     {
         let candidate = placement::normalize_owned(nodes, edges);
         if candidate.width * candidate.height <= layout.width * layout.height * 1.20
-            && candidate_satisfies_positive_clearance_contract(
+            && candidate_satisfies_hard_geometry_contract(
                 &indexed,
                 &candidate,
                 options,
@@ -812,13 +831,18 @@ struct CandidateRouting {
 #[derive(Default)]
 struct CandidateAdmissionState {
     clearance_work_exhausted: bool,
+    clearance_satisfied: bool,
     contact_segment_exhausted: bool,
     contact_work_exhausted: bool,
     contact_rejected: bool,
     contact_satisfied: bool,
+    parallel_spacing_segment_exhausted: bool,
+    parallel_spacing_work_exhausted: bool,
+    parallel_spacing_rejected: bool,
+    parallel_spacing_satisfied: bool,
 }
 
-fn positive_clearance_failure(
+fn hard_geometry_failure(
     options: LayoutOptions,
     admission_state: &CandidateAdmissionState,
 ) -> LayoutError {
@@ -834,8 +858,23 @@ fn positive_clearance_failure(
         LayoutError::EdgeNodeClearanceWorkLimitExceeded {
             maximum: MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
         }
+    } else if admission_state.parallel_spacing_segment_exhausted {
+        LayoutError::ParallelWireSpacingSegmentLimitExceeded {
+            maximum: MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
+        }
+    } else if admission_state.parallel_spacing_work_exhausted {
+        LayoutError::ParallelWireSpacingWorkLimitExceeded {
+            maximum: MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
+        }
     } else if admission_state.contact_rejected && !admission_state.contact_satisfied {
         LayoutError::UnrelatedRouteContactUnsatisfied
+    } else if admission_state.clearance_satisfied
+        && admission_state.parallel_spacing_rejected
+        && !admission_state.parallel_spacing_satisfied
+    {
+        LayoutError::ParallelWireSpacingUnsatisfied {
+            spacing: options.minimum_parallel_wire_spacing,
+        }
     } else {
         LayoutError::EdgeNodeClearanceUnsatisfied {
             clearance: options.edge_node_clearance,
@@ -953,12 +992,7 @@ fn retain_owned_candidate(
         return false;
     }
     let candidate = placement::normalize_owned(nodes, edges);
-    if !candidate_satisfies_positive_clearance_contract(
-        indexed,
-        &candidate,
-        options,
-        admission_state,
-    ) {
+    if !candidate_satisfies_hard_geometry_contract(indexed, &candidate, options, admission_state) {
         return false;
     }
     retain_better_candidate(best, quality, candidate)
@@ -981,6 +1015,9 @@ fn retain_owned_candidate_unchecked(
 }
 
 pub(crate) fn effective_layout_options(mut options: LayoutOptions) -> LayoutOptions {
+    options.route_lane_gap = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
     if options.edge_node_clearance > 0.0 {
         options.layer_gap = options
             .layer_gap
@@ -998,41 +1035,70 @@ pub(crate) fn outward_obstacle_clearance_stub(options: LayoutOptions) -> f64 {
     options.port_stub.max(options.edge_node_clearance)
 }
 
-fn candidate_satisfies_positive_clearance_contract(
+fn candidate_satisfies_hard_geometry_contract(
     indexed: &validation::IndexedGraph<'_>,
     candidate: &Layout,
     options: LayoutOptions,
     admission_state: &mut CandidateAdmissionState,
 ) -> bool {
-    if options.edge_node_clearance == 0.0 {
-        return true;
+    if options.edge_node_clearance > 0.0 {
+        match routing::route_family_has_unrelated_contact_bounded(
+            indexed,
+            &candidate.edges,
+            MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+            MAX_LAYOUT_ROUTE_CONTACT_VISITS,
+        ) {
+            Ok(false) => admission_state.contact_satisfied = true,
+            Ok(true) | Err(routing::RouteContactError::InvalidInput) => {
+                admission_state.contact_rejected = true;
+                return false;
+            }
+            Err(routing::RouteContactError::WorkLimitExceeded) => {
+                admission_state.contact_work_exhausted = true;
+                return false;
+            }
+            Err(routing::RouteContactError::SegmentLimitExceeded) => {
+                admission_state.contact_segment_exhausted = true;
+                return false;
+            }
+        }
+        if !candidate_satisfies_edge_node_clearance(
+            indexed,
+            candidate,
+            options,
+            &mut admission_state.clearance_work_exhausted,
+        ) {
+            return false;
+        }
+        admission_state.clearance_satisfied = true;
+    } else {
+        admission_state.clearance_satisfied = true;
     }
-    match routing::route_family_has_unrelated_contact_bounded(
-        indexed,
-        &candidate.edges,
-        MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
-        MAX_LAYOUT_ROUTE_CONTACT_VISITS,
-    ) {
-        Ok(false) => admission_state.contact_satisfied = true,
-        Ok(true) | Err(routing::RouteContactError::InvalidInput) => {
-            admission_state.contact_rejected = true;
-            return false;
-        }
-        Err(routing::RouteContactError::WorkLimitExceeded) => {
-            admission_state.contact_work_exhausted = true;
-            return false;
-        }
-        Err(routing::RouteContactError::SegmentLimitExceeded) => {
-            admission_state.contact_segment_exhausted = true;
-            return false;
+    if options.minimum_parallel_wire_spacing > 0.0 {
+        match routing::route_family_satisfies_parallel_spacing_bounded(
+            indexed,
+            &candidate.edges,
+            options.minimum_parallel_wire_spacing,
+            outward_obstacle_clearance_stub(options),
+            MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
+            MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
+        ) {
+            Ok(true) => admission_state.parallel_spacing_satisfied = true,
+            Ok(false) | Err(routing::ParallelWireSpacingError::InvalidInput) => {
+                admission_state.parallel_spacing_rejected = true;
+                return false;
+            }
+            Err(routing::ParallelWireSpacingError::WorkLimitExceeded) => {
+                admission_state.parallel_spacing_work_exhausted = true;
+                return false;
+            }
+            Err(routing::ParallelWireSpacingError::SegmentLimitExceeded) => {
+                admission_state.parallel_spacing_segment_exhausted = true;
+                return false;
+            }
         }
     }
-    candidate_satisfies_edge_node_clearance(
-        indexed,
-        candidate,
-        options,
-        &mut admission_state.clearance_work_exhausted,
-    )
+    true
 }
 
 fn candidate_satisfies_edge_node_clearance(
@@ -1105,8 +1171,8 @@ mod tests {
         LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS, Node, NodeGeometry, Point, Port,
         PortSide, QualityEffort, candidate_quality_cmp,
         candidate_satisfies_edge_node_clearance_bounded, demand_aware_quality_is_better,
-        demand_aware_scale_is_eligible, effective_layout_options, effective_ranking_edges, layout,
-        outward_obstacle_clearance_stub, placement, positive_clearance_failure,
+        demand_aware_scale_is_eligible, effective_layout_options, effective_ranking_edges,
+        hard_geometry_failure, layout, outward_obstacle_clearance_stub, placement,
         retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
         routing::RouteQuality, topology, validation,
     };
@@ -1155,6 +1221,14 @@ mod tests {
         assert_eq!(effective.layer_gap, 84.0);
         assert_eq!(effective_layout_options(effective), effective);
         assert_eq!(outward_obstacle_clearance_stub(effective), 40.0);
+
+        let parallel_spacing = effective_layout_options(LayoutOptions {
+            minimum_parallel_wire_spacing: 6.0,
+            ..defaults
+        });
+        assert_eq!(parallel_spacing.route_lane_gap, 6.0);
+        assert_eq!(parallel_spacing.minimum_parallel_wire_spacing, 6.0);
+        assert_eq!(effective_layout_options(parallel_spacing), parallel_spacing);
     }
 
     #[test]
@@ -1745,6 +1819,148 @@ mod tests {
     }
 
     #[test]
+    fn parallel_spacing_admission_rejects_a_close_quality_winner_and_keeps_a_safe_sibling() {
+        let endpoint_node = |id, side| Node {
+            id,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 5.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint_node(1, PortSide::East),
+                endpoint_node(2, PortSide::West),
+                endpoint_node(3, PortSide::East),
+                endpoint_node(4, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 4, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let options = LayoutOptions {
+            minimum_parallel_wire_spacing: 6.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let nodes = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 0.0,
+                y: 100.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 4,
+                x: 100.0,
+                y: 100.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ];
+        let routes_at = |second_track| {
+            vec![
+                EdgeGeometry {
+                    id: 1,
+                    points: vec![
+                        Point { x: 10.0, y: 5.0 },
+                        Point { x: 20.0, y: 5.0 },
+                        Point { x: 20.0, y: 50.0 },
+                        Point { x: 100.0, y: 50.0 },
+                        Point { x: 100.0, y: 5.0 },
+                    ],
+                },
+                EdgeGeometry {
+                    id: 2,
+                    points: vec![
+                        Point { x: 10.0, y: 105.0 },
+                        Point { x: 20.0, y: 105.0 },
+                        Point {
+                            x: 20.0,
+                            y: second_track,
+                        },
+                        Point {
+                            x: 100.0,
+                            y: second_track,
+                        },
+                        Point { x: 100.0, y: 105.0 },
+                    ],
+                },
+            ]
+        };
+        let close_quality = RouteQuality {
+            crossings: 0,
+            bends: 6,
+            route_length: 300.0,
+        };
+        let safe_quality = RouteQuality {
+            crossings: 1,
+            bends: 6,
+            route_length: 302.0,
+        };
+        let mut best = None;
+        let mut admission_state = CandidateAdmissionState::default();
+
+        assert!(!retain_owned_candidate(
+            &indexed,
+            &mut best,
+            close_quality,
+            nodes.clone(),
+            routes_at(55.999),
+            options,
+            &mut admission_state,
+        ));
+        assert_eq!(
+            hard_geometry_failure(options, &admission_state),
+            LayoutError::ParallelWireSpacingUnsatisfied { spacing: 6.0 },
+        );
+        assert!(retain_owned_candidate(
+            &indexed,
+            &mut best,
+            safe_quality,
+            nodes,
+            routes_at(56.0),
+            options,
+            &mut admission_state,
+        ));
+        assert_eq!(best.unwrap().0, safe_quality);
+        assert!(admission_state.parallel_spacing_rejected);
+        assert!(admission_state.parallel_spacing_satisfied);
+    }
+
+    #[test]
     fn contact_clean_candidate_preserves_clearance_failure_classification() {
         let state = CandidateAdmissionState {
             contact_rejected: true,
@@ -1752,7 +1968,7 @@ mod tests {
             ..CandidateAdmissionState::default()
         };
         assert_eq!(
-            positive_clearance_failure(
+            hard_geometry_failure(
                 LayoutOptions {
                     edge_node_clearance: 20.0,
                     ..LayoutOptions::default()
@@ -1762,7 +1978,7 @@ mod tests {
             LayoutError::EdgeNodeClearanceUnsatisfied { clearance: 20.0 },
         );
         assert_eq!(
-            positive_clearance_failure(
+            hard_geometry_failure(
                 LayoutOptions::default(),
                 &CandidateAdmissionState {
                     contact_segment_exhausted: true,

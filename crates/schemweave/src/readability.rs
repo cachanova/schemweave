@@ -375,6 +375,365 @@ pub struct ParallelSegment {
     pub end: f64,
 }
 
+/// Exact minimum separation between longitudinally overlapping parallel routes.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ParallelSeparation {
+    /// Minimum separation, including collinear different-net overlap at zero.
+    pub minimum: Option<f64>,
+    /// Minimum strictly positive separation, preserving the development scorer metric.
+    pub minimum_positive: Option<f64>,
+}
+
+/// Why bounded parallel-route separation measurement could not complete.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ParallelSeparationError {
+    InvalidInput,
+    WorkLimitExceeded,
+}
+
+/// Measure exact different-net parallel-route separation with deterministic work.
+///
+/// Only same-orientation segments with positive longitudinal overlap are comparable.
+/// Perpendicular crossings and longitudinal endpoint-only contact are ignored. Same-net
+/// segments are electrically related and therefore exempt. Callers must provide finite,
+/// positive-length segments.
+#[doc(hidden)]
+pub fn measure_parallel_separation_bounded(
+    segments: &[ParallelSegment],
+    max_tree_visits: usize,
+) -> Result<ParallelSeparation, ParallelSeparationError> {
+    if segments.iter().any(|segment| {
+        !segment.fixed.is_finite()
+            || !segment.start.is_finite()
+            || !segment.end.is_finite()
+            || segment.start >= segment.end
+    }) {
+        return Err(ParallelSeparationError::InvalidInput);
+    }
+
+    let mut remaining_tree_visits = max_tree_visits;
+    let mut result = ParallelSeparation::default();
+    for horizontal in [true, false] {
+        let mut oriented = segments
+            .iter()
+            .filter(|segment| segment.horizontal == horizontal)
+            .map(|segment| ParallelSegment {
+                fixed: canonical_zero(segment.fixed),
+                start: canonical_zero(segment.start),
+                end: canonical_zero(segment.end),
+                ..*segment
+            })
+            .collect::<Vec<_>>();
+        oriented.sort_unstable_by(|left, right| {
+            left.fixed
+                .total_cmp(&right.fixed)
+                .then(left.start.total_cmp(&right.start))
+                .then(left.end.total_cmp(&right.end))
+                .then(left.net.cmp(&right.net))
+        });
+        if oriented.len() < 2 {
+            continue;
+        }
+        if oriented.len() > remaining_tree_visits {
+            return Err(ParallelSeparationError::WorkLimitExceeded);
+        }
+        let measured = parallel_separation_for_orientation(&oriented, &mut remaining_tree_visits)?;
+        result.minimum = minimum_option(result.minimum, measured.minimum);
+        result.minimum_positive =
+            minimum_option(result.minimum_positive, measured.minimum_positive);
+    }
+    Ok(result)
+}
+
+fn parallel_separation_for_orientation(
+    segments: &[ParallelSegment],
+    remaining_tree_visits: &mut usize,
+) -> Result<ParallelSeparation, ParallelSeparationError> {
+    let mut fixed_values = segments
+        .iter()
+        .map(|segment| FloatKey(segment.fixed))
+        .collect::<Vec<_>>();
+    fixed_values.sort_unstable();
+    fixed_values.dedup();
+    let fixed_indices = segments
+        .iter()
+        .map(|segment| {
+            fixed_values
+                .binary_search(&FloatKey(segment.fixed))
+                .expect("parallel coordinate exists")
+        })
+        .collect::<Vec<_>>();
+    let mut events = Vec::with_capacity(segments.len() * 2);
+    for (index, segment) in segments.iter().enumerate() {
+        // End events precede starts so longitudinal endpoint-only contact is ignored.
+        events.push((FloatKey(segment.end), 0u8, index));
+        events.push((FloatKey(segment.start), 1u8, index));
+    }
+    events.sort_unstable();
+
+    let mut active = vec![BTreeMap::<NetId, usize>::new(); fixed_values.len()];
+    let mut tree = ActiveNetTree::new(fixed_values.len())?;
+    let mut result = ParallelSeparation::default();
+    for (_, event_kind, segment_index) in events {
+        let segment = segments[segment_index];
+        let fixed_index = fixed_indices[segment_index];
+        if event_kind == 0 {
+            let remove_net = {
+                let count = active[fixed_index]
+                    .get_mut(&segment.net)
+                    .expect("ending parallel segment is active");
+                *count -= 1;
+                *count == 0
+            };
+            if remove_net {
+                active[fixed_index].remove(&segment.net);
+            }
+            tree.set(
+                fixed_index,
+                NetSummary::from_nets(active[fixed_index].keys().copied()),
+                remaining_tree_visits,
+            )?;
+            continue;
+        }
+
+        if tree.has_other_at(fixed_index, segment.net, remaining_tree_visits)? {
+            result.minimum = Some(0.0);
+        }
+        for candidate in [
+            tree.rightmost_other(fixed_index, segment.net, remaining_tree_visits)?,
+            tree.leftmost_other(fixed_index + 1, segment.net, remaining_tree_visits)?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let distance = (fixed_values[candidate].0 - segment.fixed).abs();
+            debug_assert!(distance > 0.0);
+            result.minimum = minimum_option(result.minimum, Some(distance));
+            result.minimum_positive = minimum_option(result.minimum_positive, Some(distance));
+        }
+        *active[fixed_index].entry(segment.net).or_default() += 1;
+        tree.set(
+            fixed_index,
+            NetSummary::from_nets(active[fixed_index].keys().copied()),
+            remaining_tree_visits,
+        )?;
+    }
+    Ok(result)
+}
+
+fn minimum_option(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn canonical_zero(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
+#[derive(Clone, Copy, Default)]
+struct NetSummary {
+    first: Option<NetId>,
+    second: Option<NetId>,
+}
+
+impl NetSummary {
+    fn from_nets(nets: impl Iterator<Item = NetId>) -> Self {
+        let mut summary = Self::default();
+        for net in nets {
+            summary.insert(net);
+            if summary.second.is_some() {
+                break;
+            }
+        }
+        summary
+    }
+
+    fn merged(left: Self, right: Self) -> Self {
+        Self::from_nets(
+            [left.first, left.second, right.first, right.second]
+                .into_iter()
+                .flatten(),
+        )
+    }
+
+    fn insert(&mut self, net: NetId) {
+        if self.first == Some(net) || self.second == Some(net) {
+            return;
+        }
+        if self.first.is_none() {
+            self.first = Some(net);
+        } else if self.second.is_none() {
+            self.second = Some(net);
+        }
+    }
+
+    fn has_other(self, excluded: NetId) -> bool {
+        self.first.is_some_and(|net| net != excluded)
+            || self.second.is_some_and(|net| net != excluded)
+    }
+}
+
+struct ActiveNetTree {
+    leaf_count: usize,
+    summaries: Vec<NetSummary>,
+}
+
+impl ActiveNetTree {
+    fn new(coordinate_count: usize) -> Result<Self, ParallelSeparationError> {
+        let leaf_count = coordinate_count
+            .checked_next_power_of_two()
+            .ok_or(ParallelSeparationError::WorkLimitExceeded)?;
+        let tree_size = leaf_count
+            .checked_mul(2)
+            .ok_or(ParallelSeparationError::WorkLimitExceeded)?;
+        Ok(Self {
+            leaf_count,
+            summaries: vec![NetSummary::default(); tree_size],
+        })
+    }
+
+    fn set(
+        &mut self,
+        index: usize,
+        summary: NetSummary,
+        remaining_tree_visits: &mut usize,
+    ) -> Result<(), ParallelSeparationError> {
+        let mut cursor = self.leaf_count + index;
+        charge_tree_visit(remaining_tree_visits)?;
+        self.summaries[cursor] = summary;
+        cursor /= 2;
+        while cursor != 0 {
+            charge_tree_visit(remaining_tree_visits)?;
+            self.summaries[cursor] =
+                NetSummary::merged(self.summaries[cursor * 2], self.summaries[cursor * 2 + 1]);
+            cursor /= 2;
+        }
+        Ok(())
+    }
+
+    fn has_other_at(
+        &self,
+        index: usize,
+        excluded: NetId,
+        remaining_tree_visits: &mut usize,
+    ) -> Result<bool, ParallelSeparationError> {
+        charge_tree_visit(remaining_tree_visits)?;
+        Ok(self.summaries[self.leaf_count + index].has_other(excluded))
+    }
+
+    fn rightmost_other(
+        &self,
+        end: usize,
+        excluded: NetId,
+        remaining_tree_visits: &mut usize,
+    ) -> Result<Option<usize>, ParallelSeparationError> {
+        self.search_rightmost(1, 0, self.leaf_count, end, excluded, remaining_tree_visits)
+    }
+
+    fn search_rightmost(
+        &self,
+        node: usize,
+        start: usize,
+        end: usize,
+        query_end: usize,
+        excluded: NetId,
+        remaining_tree_visits: &mut usize,
+    ) -> Result<Option<usize>, ParallelSeparationError> {
+        charge_tree_visit(remaining_tree_visits)?;
+        if start >= query_end || !self.summaries[node].has_other(excluded) {
+            return Ok(None);
+        }
+        if end - start == 1 {
+            return Ok(Some(start));
+        }
+        let middle = (start + end) / 2;
+        if let Some(found) = self.search_rightmost(
+            node * 2 + 1,
+            middle,
+            end,
+            query_end,
+            excluded,
+            remaining_tree_visits,
+        )? {
+            return Ok(Some(found));
+        }
+        self.search_rightmost(
+            node * 2,
+            start,
+            middle,
+            query_end,
+            excluded,
+            remaining_tree_visits,
+        )
+    }
+
+    fn leftmost_other(
+        &self,
+        start: usize,
+        excluded: NetId,
+        remaining_tree_visits: &mut usize,
+    ) -> Result<Option<usize>, ParallelSeparationError> {
+        self.search_leftmost(
+            1,
+            0,
+            self.leaf_count,
+            start,
+            excluded,
+            remaining_tree_visits,
+        )
+    }
+
+    fn search_leftmost(
+        &self,
+        node: usize,
+        start: usize,
+        end: usize,
+        query_start: usize,
+        excluded: NetId,
+        remaining_tree_visits: &mut usize,
+    ) -> Result<Option<usize>, ParallelSeparationError> {
+        charge_tree_visit(remaining_tree_visits)?;
+        if end <= query_start || !self.summaries[node].has_other(excluded) {
+            return Ok(None);
+        }
+        if end - start == 1 {
+            return Ok(Some(start));
+        }
+        let middle = (start + end) / 2;
+        if let Some(found) = self.search_leftmost(
+            node * 2,
+            start,
+            middle,
+            query_start,
+            excluded,
+            remaining_tree_visits,
+        )? {
+            return Ok(Some(found));
+        }
+        self.search_leftmost(
+            node * 2 + 1,
+            middle,
+            end,
+            query_start,
+            excluded,
+            remaining_tree_visits,
+        )
+    }
+}
+
+fn charge_tree_visit(remaining_tree_visits: &mut usize) -> Result<(), ParallelSeparationError> {
+    *remaining_tree_visits = remaining_tree_visits
+        .checked_sub(1)
+        .ok_or(ParallelSeparationError::WorkLimitExceeded)?;
+    Ok(())
+}
+
 /// Exact physical wire-length accounting for nearby parallel routes.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -612,8 +971,9 @@ impl PartialOrd for FloatKey {
 mod tests {
     use super::{
         EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation, ParallelSegment,
-        measure_edge_node_clearance_bounded, measure_parallel_congestion,
-        measure_parallel_congestion_bounded, measure_parallel_congestion_profile_bounded,
+        ParallelSeparation, ParallelSeparationError, measure_edge_node_clearance_bounded,
+        measure_parallel_congestion, measure_parallel_congestion_bounded,
+        measure_parallel_congestion_profile_bounded, measure_parallel_separation_bounded,
     };
     use crate::NodeGeometry;
 
@@ -1178,6 +1538,229 @@ mod tests {
         assert_eq!(
             measure_parallel_congestion_bounded(&segments, 4.0, 4_096),
             Some(measure_parallel_congestion(&segments, 4.0))
+        );
+    }
+
+    #[test]
+    fn parallel_separation_reports_zero_and_nearest_positive_distance() {
+        let segments = [
+            ParallelSegment {
+                net: 1,
+                horizontal: true,
+                fixed: 0.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            ParallelSegment {
+                net: 2,
+                horizontal: true,
+                fixed: -0.0,
+                start: 2.0,
+                end: 8.0,
+            },
+            ParallelSegment {
+                net: 3,
+                horizontal: true,
+                fixed: 5.0,
+                start: 4.0,
+                end: 6.0,
+            },
+            ParallelSegment {
+                net: 4,
+                horizontal: false,
+                fixed: 20.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            ParallelSegment {
+                net: 5,
+                horizontal: false,
+                fixed: 27.0,
+                start: 5.0,
+                end: 15.0,
+            },
+        ];
+
+        assert_eq!(
+            measure_parallel_separation_bounded(&segments, usize::MAX),
+            Ok(ParallelSeparation {
+                minimum: Some(0.0),
+                minimum_positive: Some(5.0),
+            })
+        );
+    }
+
+    #[test]
+    fn parallel_separation_ignores_same_net_perpendicular_and_endpoint_only_pairs() {
+        let segments = [
+            ParallelSegment {
+                net: 1,
+                horizontal: true,
+                fixed: 0.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            ParallelSegment {
+                net: 1,
+                horizontal: true,
+                fixed: 1.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            ParallelSegment {
+                net: 2,
+                horizontal: true,
+                fixed: 2.0,
+                start: 10.0,
+                end: 20.0,
+            },
+            ParallelSegment {
+                net: 3,
+                horizontal: false,
+                fixed: 5.0,
+                start: -5.0,
+                end: 5.0,
+            },
+        ];
+
+        assert_eq!(
+            measure_parallel_separation_bounded(&segments, usize::MAX),
+            Ok(ParallelSeparation::default())
+        );
+    }
+
+    #[test]
+    fn parallel_separation_is_permutation_deterministic_and_fails_closed_on_work() {
+        let mut segments = [
+            ParallelSegment {
+                net: 9,
+                horizontal: true,
+                fixed: 12.0,
+                start: 0.0,
+                end: 30.0,
+            },
+            ParallelSegment {
+                net: 7,
+                horizontal: true,
+                fixed: 3.0,
+                start: 4.0,
+                end: 20.0,
+            },
+            ParallelSegment {
+                net: 8,
+                horizontal: true,
+                fixed: 7.0,
+                start: 2.0,
+                end: 24.0,
+            },
+        ];
+        let expected = measure_parallel_separation_bounded(&segments, usize::MAX).unwrap();
+        assert_eq!(expected.minimum, Some(4.0));
+        assert_eq!(expected.minimum_positive, Some(4.0));
+        assert_eq!(
+            measure_parallel_separation_bounded(&segments, 1),
+            Err(ParallelSeparationError::WorkLimitExceeded)
+        );
+
+        segments.reverse();
+        assert_eq!(
+            measure_parallel_separation_bounded(&segments, usize::MAX),
+            Ok(expected)
+        );
+        assert_eq!(
+            measure_parallel_separation_bounded(&segments, 1),
+            Err(ParallelSeparationError::WorkLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn parallel_separation_rejects_malformed_segments() {
+        for segment in [
+            ParallelSegment {
+                net: 1,
+                horizontal: true,
+                fixed: f64::NAN,
+                start: 0.0,
+                end: 1.0,
+            },
+            ParallelSegment {
+                net: 1,
+                horizontal: true,
+                fixed: 0.0,
+                start: 1.0,
+                end: 1.0,
+            },
+            ParallelSegment {
+                net: 1,
+                horizontal: false,
+                fixed: 0.0,
+                start: 2.0,
+                end: 1.0,
+            },
+        ] {
+            assert_eq!(
+                measure_parallel_separation_bounded(&[segment], usize::MAX),
+                Err(ParallelSeparationError::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_separation_matches_a_brute_force_oracle() {
+        fn oracle(segments: &[ParallelSegment]) -> ParallelSeparation {
+            let mut result = ParallelSeparation::default();
+            for (index, left) in segments.iter().enumerate() {
+                for right in &segments[index + 1..] {
+                    if left.horizontal != right.horizontal
+                        || left.net == right.net
+                        || left.start.max(right.start) >= left.end.min(right.end)
+                    {
+                        continue;
+                    }
+                    let distance = (left.fixed - right.fixed).abs();
+                    result.minimum = super::minimum_option(result.minimum, Some(distance));
+                    if distance > 0.0 {
+                        result.minimum_positive =
+                            super::minimum_option(result.minimum_positive, Some(distance));
+                    }
+                }
+            }
+            result
+        }
+
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let mut state = 91_u64;
+        let mut segments = (0..256)
+            .map(|index| {
+                let net = (next(&mut state) % 13) as u32;
+                let fixed = (next(&mut state) % 31) as f64 - 15.0;
+                let start = (next(&mut state) % 80) as f64 - 40.0;
+                let length = (next(&mut state) % 20 + 1) as f64;
+                ParallelSegment {
+                    net,
+                    horizontal: index % 2 == 0,
+                    fixed,
+                    start,
+                    end: start + length,
+                }
+            })
+            .collect::<Vec<_>>();
+        let expected = oracle(&segments);
+
+        assert_eq!(
+            measure_parallel_separation_bounded(&segments, usize::MAX),
+            Ok(expected)
+        );
+        segments.rotate_left(73);
+        assert_eq!(
+            measure_parallel_separation_bounded(&segments, usize::MAX),
+            Ok(expected)
         );
     }
 }

@@ -278,6 +278,15 @@ fn validate_options(options: LayoutOptions) -> Result<(), LayoutError> {
             value: options.edge_node_clearance,
         });
     }
+    if !options.minimum_parallel_wire_spacing.is_finite()
+        || options.minimum_parallel_wire_spacing < 0.0
+        || options.minimum_parallel_wire_spacing > 1_000_000.0
+    {
+        return Err(LayoutError::InvalidOption {
+            field: "minimum_parallel_wire_spacing",
+            value: options.minimum_parallel_wire_spacing,
+        });
+    }
     if !options
         .edge_node_clearance
         .mul_add(2.0, options.route_lane_gap)
