@@ -83,17 +83,22 @@ const PARALLEL_CONGESTION_CUTOFF: f64 = 4.0;
 const MAX_ADAPTIVE_SPACING_LENGTH_FACTOR: f64 = 1.05;
 const MAX_ADAPTIVE_SPACING_CONGESTION_FACTOR: f64 = 0.94;
 const MAX_EXPANDED_GAP_SPACING_NODES: usize = 400;
+const MAX_EXPANDED_GAP_SPACING_MAX_NODES: usize = 2_000;
+const MAX_EXPANDED_GAP_SPACING_EDGES: usize = 10_000;
 const MAX_PARALLEL_CONGESTION_ACTIVE_VISITS: usize = 100_000;
 
 fn expanded_gap_spacing_enabled(
     adaptive_gap_spacing: bool,
     max_quality_effort: bool,
     node_count: usize,
+    edge_count: usize,
     outer_lanes_are_empty: bool,
 ) -> bool {
     adaptive_gap_spacing
         && outer_lanes_are_empty
-        && (max_quality_effort || node_count <= MAX_EXPANDED_GAP_SPACING_NODES)
+        && edge_count <= MAX_EXPANDED_GAP_SPACING_EDGES
+        && (node_count <= MAX_EXPANDED_GAP_SPACING_NODES
+            || (max_quality_effort && node_count <= MAX_EXPANDED_GAP_SPACING_MAX_NODES))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -733,6 +738,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             adaptive_gap_spacing,
             deeper_crossing_repair,
             node_count,
+            plan.edges.len(),
             baseline_outer_lanes.is_empty(),
         ) && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
         .then(|| {
@@ -2099,6 +2105,7 @@ fn emit_routes_with_outer_lanes(
         adaptive_gap_spacing,
         max_quality_effort,
         node_count,
+        plan.edges.len(),
         outer_lanes.is_empty(),
     ) && gap_lanes.iter().any(|lanes| lanes.len() > 1))
     .then(|| {
@@ -5610,9 +5617,10 @@ mod tests {
     use super::{
         FULL_OUTER_LANE_ROUNDS, GapNetAccess, GapTrackSpacing, MAX_CROSSING_REPAIR_EDGES,
         MAX_CROSSING_REPAIR_NODES, MAX_CROSSING_REPAIR_PATH_STATES,
-        MAX_CROSSING_REPAIR_ROUTE_POINTS, MAX_EXPANDED_GAP_SPACING_NODES, MIN_CROSSING_REPAIR_NET,
-        MIN_CROSSING_REPAIR_TOTAL, OuterLane, OuterNetAccess, OuterSide, PhysicalSegment,
-        RoutingPlan, align_crossing_path_staircases, build_endpoint_tracks,
+        MAX_CROSSING_REPAIR_ROUTE_POINTS, MAX_EXPANDED_GAP_SPACING_EDGES,
+        MAX_EXPANDED_GAP_SPACING_MAX_NODES, MAX_EXPANDED_GAP_SPACING_NODES,
+        MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL, OuterLane, OuterNetAccess, OuterSide,
+        PhysicalSegment, RoutingPlan, align_crossing_path_staircases, build_endpoint_tracks,
         candidate_route_points_within_budget, crossing_aware_gap_lane_indices,
         crossing_aware_gap_lane_indices_btree_reference, crossing_aware_outer_lane_indices,
         crossing_paths_have_unrelated_collinear_tracks, crossing_repair_within_budget,
@@ -9087,26 +9095,43 @@ mod tests {
 
     #[test]
     fn expanded_gap_spacing_has_an_explicit_small_graph_budget() {
-        assert!(!expanded_gap_spacing_enabled(false, false, 1, true));
+        assert!(!expanded_gap_spacing_enabled(false, false, 1, 1, true));
         assert!(expanded_gap_spacing_enabled(
             true,
             false,
             MAX_EXPANDED_GAP_SPACING_NODES,
+            MAX_EXPANDED_GAP_SPACING_EDGES,
             true
         ));
         assert!(!expanded_gap_spacing_enabled(
             true,
             false,
             MAX_EXPANDED_GAP_SPACING_NODES + 1,
+            1,
             true
         ));
         assert!(expanded_gap_spacing_enabled(
             true,
             true,
-            MAX_EXPANDED_GAP_SPACING_NODES + 1,
+            MAX_EXPANDED_GAP_SPACING_MAX_NODES,
+            MAX_EXPANDED_GAP_SPACING_EDGES,
             true
         ));
-        assert!(!expanded_gap_spacing_enabled(true, true, 1, false));
+        assert!(!expanded_gap_spacing_enabled(
+            true,
+            true,
+            MAX_EXPANDED_GAP_SPACING_MAX_NODES + 1,
+            1,
+            true
+        ));
+        assert!(!expanded_gap_spacing_enabled(
+            true,
+            true,
+            1,
+            MAX_EXPANDED_GAP_SPACING_EDGES + 1,
+            true
+        ));
+        assert!(!expanded_gap_spacing_enabled(true, true, 1, 1, false));
     }
 
     #[test]
