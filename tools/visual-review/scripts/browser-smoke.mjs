@@ -352,9 +352,11 @@ try {
   if (
     !labels.includes('Min track separation') ||
     !labels.includes('Parallel congestion') ||
+    !labels.includes('Edge-node clearance') ||
+    !labels.includes('Clearance violations') ||
     !labels.includes('Straight routes') ||
     !labels.includes('Contract violations') ||
-    labels.length !== 14
+    labels.length !== 16
   ) {
     throw new Error(`unexpected metric set: ${labels.join(', ')}`)
   }

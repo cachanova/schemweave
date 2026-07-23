@@ -343,6 +343,21 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
       format: percentage,
     },
     {
+      label: 'Edge-node clearance',
+      elk: (q) =>
+        q.edge_node_clearance_exhausted
+          ? Number.NaN
+          : (q.minimum_edge_node_clearance ?? Number.NaN),
+      format: nullableDecimal,
+      higherIsBetter: true,
+    },
+    {
+      label: 'Clearance violations',
+      elk: (q) =>
+        q.edge_node_clearance_exhausted ? Number.NaN : q.edge_node_clearance_violations,
+      format: nullableInteger,
+    },
+    {
       label: 'Max crossing knot',
       elk: (q) => q.max_crossings_on_segment,
       format: integer,
@@ -378,7 +393,7 @@ function updateMetrics(elkQuality: QualityReport, schemweaveQuality: QualityRepo
 
 function metricPlaceholders(): string {
   return Array.from(
-    { length: 14 },
+    { length: 16 },
     () => '<div class="metric"><div class="metric-label">computing</div><div class="metric-values"><span>—</span><span>—</span></div></div>',
   ).join('')
 }
@@ -406,6 +421,10 @@ function decimal(value: number): string {
 
 function nullableDecimal(value: number): string {
   return Number.isNaN(value) ? '—' : decimal(value)
+}
+
+function nullableInteger(value: number): string {
+  return Number.isNaN(value) ? '—' : integer(value)
 }
 
 function percentage(value: number): string {
