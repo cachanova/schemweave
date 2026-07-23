@@ -9,6 +9,11 @@ mod routing;
 mod topology;
 mod validation;
 
+const MIN_DEMAND_AWARE_SPACING_NODES: usize = 150;
+const MAX_DEMAND_AWARE_SPACING_NODES: usize = 400;
+const MIN_DEMAND_AWARE_SPACING_EDGES: usize = 250;
+const MAX_DEMAND_AWARE_SPACING_EDGES: usize = 400;
+
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
@@ -558,7 +563,44 @@ fn layout_indexed(
             best_uses_primary_ranks = true;
         }
     }
-    let (quality, layout) = best.expect("layout has deterministic candidates");
+    let (mut quality, mut layout) = best.expect("layout has deterministic candidates");
+    if quality_effort == QualityEffort::Max
+        && best_uses_primary_ranks
+        && demand_aware_scale_is_eligible(graph.nodes.len(), graph.edges.len())
+        && placement::demand_aware_spacing_is_relevant(
+            &indexed,
+            &ranks,
+            quality_layers.len(),
+            options,
+        )
+        && routing::route_parallel_congestion(&routing_plan, &layout.edges)
+            .is_some_and(|congestion| congestion >= 0.30)
+    {
+        let mut demand_aware_best = None;
+        evaluate_candidate(
+            &indexed,
+            &routing_plan,
+            &mut demand_aware_best,
+            placement::place_demand_aware_nodes(&indexed, &ranks, quality_layers, options),
+            options,
+            CandidateRouting {
+                sparse_global: true,
+                ..candidate_routing
+            },
+        );
+        if let Some((demand_quality, demand_layout)) = demand_aware_best
+            && demand_aware_readability_is_better(
+                &routing_plan,
+                quality,
+                &layout,
+                demand_quality,
+                &demand_layout,
+            )
+        {
+            quality = demand_quality;
+            layout = demand_layout;
+        }
+    }
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && let Some((candidate_quality, edges)) = routing::regional_fanout_candidate(
@@ -576,6 +618,49 @@ fn layout_indexed(
         }
     }
     layout
+}
+
+fn demand_aware_readability_is_better(
+    plan: &routing::RoutingPlan<'_>,
+    baseline_quality: routing::RouteQuality,
+    baseline: &Layout,
+    candidate_quality: routing::RouteQuality,
+    candidate: &Layout,
+) -> bool {
+    routing::route_parallel_congestion(plan, &baseline.edges)
+        .zip(routing::route_parallel_congestion(plan, &candidate.edges))
+        .is_some_and(|(baseline_congestion, candidate_congestion)| {
+            demand_aware_quality_is_better(
+                baseline_quality,
+                baseline.width * baseline.height,
+                baseline_congestion,
+                candidate_quality,
+                candidate.width * candidate.height,
+                candidate_congestion,
+            )
+        })
+}
+
+fn demand_aware_scale_is_eligible(nodes: usize, edges: usize) -> bool {
+    (MIN_DEMAND_AWARE_SPACING_NODES..=MAX_DEMAND_AWARE_SPACING_NODES).contains(&nodes)
+        && (MIN_DEMAND_AWARE_SPACING_EDGES..=MAX_DEMAND_AWARE_SPACING_EDGES).contains(&edges)
+}
+
+fn demand_aware_quality_is_better(
+    baseline: routing::RouteQuality,
+    baseline_area: f64,
+    baseline_congestion: f64,
+    candidate: routing::RouteQuality,
+    candidate_area: f64,
+    candidate_congestion: f64,
+) -> bool {
+    let allowed_crossings = baseline.crossings.saturating_add(baseline.crossings / 20);
+    candidate.crossings <= allowed_crossings
+        && candidate.bends as f64 <= baseline.bends as f64 * 1.05
+        && candidate.route_length <= baseline.route_length * 1.65
+        && candidate_area <= baseline_area * 1.85
+        && baseline_congestion >= 0.30
+        && candidate_congestion <= baseline_congestion * 0.35
 }
 
 fn straight_chain_cost_is_bounded(
@@ -705,7 +790,8 @@ fn candidate_quality_cmp(
 mod tests {
     use super::{
         Edge, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Port, PortSide,
-        QualityEffort, candidate_quality_cmp, effective_ranking_edges, layout, placement,
+        QualityEffort, candidate_quality_cmp, demand_aware_quality_is_better,
+        demand_aware_scale_is_eligible, effective_ranking_edges, layout, placement,
         retain_better_candidate, retain_owned_candidate, routing, routing::RouteQuality, topology,
         validation,
     };
@@ -738,6 +824,107 @@ mod tests {
                 height: 1.0,
             },
         )
+    }
+
+    #[test]
+    fn demand_aware_spacing_requires_material_congestion_relief_with_bounded_cost() {
+        for (nodes, edges, eligible) in [
+            (149, 250, false),
+            (150, 249, false),
+            (150, 250, true),
+            (400, 400, true),
+            (401, 400, false),
+            (400, 401, false),
+        ] {
+            assert_eq!(
+                demand_aware_scale_is_eligible(nodes, edges),
+                eligible,
+                "nodes={nodes}, edges={edges}",
+            );
+        }
+        let baseline = RouteQuality {
+            crossings: 800,
+            bends: 1_200,
+            route_length: 140_000.0,
+        };
+        let candidate = RouteQuality {
+            crossings: 840,
+            bends: 1_260,
+            route_length: 231_000.0,
+        };
+        assert!(demand_aware_quality_is_better(
+            baseline,
+            5_600_000.0,
+            0.43,
+            candidate,
+            10_360_000.0,
+            0.15,
+        ));
+        for rejected in [
+            RouteQuality {
+                crossings: 841,
+                ..candidate
+            },
+            RouteQuality {
+                bends: 1_261,
+                ..candidate
+            },
+            RouteQuality {
+                route_length: 231_000.01,
+                ..candidate
+            },
+        ] {
+            assert!(!demand_aware_quality_is_better(
+                baseline,
+                5_600_000.0,
+                0.43,
+                rejected,
+                10_360_000.0,
+                0.15,
+            ));
+        }
+        for crossings in [0, 1, 19] {
+            let baseline = RouteQuality {
+                crossings,
+                ..baseline
+            };
+            let candidate = RouteQuality {
+                crossings: crossings + 1,
+                ..candidate
+            };
+            assert!(!demand_aware_quality_is_better(
+                baseline,
+                5_600_000.0,
+                0.43,
+                candidate,
+                10_360_000.0,
+                0.15,
+            ));
+        }
+        assert!(!demand_aware_quality_is_better(
+            baseline,
+            5_600_000.0,
+            0.29,
+            candidate,
+            10_360_000.0,
+            0.10,
+        ));
+        assert!(!demand_aware_quality_is_better(
+            baseline,
+            5_600_000.0,
+            0.43,
+            candidate,
+            10_360_000.01,
+            0.15,
+        ));
+        assert!(!demand_aware_quality_is_better(
+            baseline,
+            5_600_000.0,
+            0.43,
+            candidate,
+            10_360_000.0,
+            0.150_500_000_1,
+        ));
     }
 
     #[test]

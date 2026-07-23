@@ -4467,6 +4467,15 @@ fn parallel_congestion_ratio(segments: &[PhysicalSegment]) -> Option<f64> {
     .map(|congestion| congestion.ratio())
 }
 
+pub(crate) fn route_parallel_congestion(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+) -> Option<f64> {
+    let segments =
+        physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), routes).0;
+    parallel_congestion_ratio(&segments)
+}
+
 fn route_quality_cmp(left: RouteQuality, right: RouteQuality) -> Ordering {
     left.crossings
         .cmp(&right.crossings)
@@ -6793,7 +6802,18 @@ fn sparse_gap_x(
     let gap_left = layer_right[gap];
     let gap_right = layer_left[gap + 1];
     let gap_width = gap_right - gap_left;
-    let compact_x = gap_left + gap_width * (0.55 + 0.15 * lane_fraction);
+    let demand_aware = gap_width > options.layer_gap + f64::EPSILON;
+    let compact_x = if demand_aware {
+        let available_left = gap_left + options.port_stub;
+        let available_right = gap_right - options.port_stub;
+        let desired_width = options.route_lane_gap * (lanes.len() + 1) as f64;
+        let width = desired_width.min((available_right - available_left).max(0.0));
+        let preferred_left = gap_left + gap_width * 0.625 - width / 2.0;
+        let left = preferred_left.clamp(available_left, available_right - width);
+        left + width * lane_fraction
+    } else {
+        gap_left + gap_width * (0.55 + 0.15 * lane_fraction)
+    };
     if gap_spacing == GapTrackSpacing::Compact {
         return compact_x;
     }

@@ -1133,6 +1133,57 @@ fn regional_fanout_max_candidate_preserves_every_hard_gate() {
 }
 
 #[test]
+fn demand_aware_max_candidate_is_selected_safely_and_deterministically() {
+    let (graph, constraints): (Graph, LayoutConstraints) =
+        serde_json::from_str(include_str!("fixtures/demand_aware_priority.json")).unwrap();
+    let options = LayoutOptions::default();
+    let quality = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Quality,
+        &constraints,
+    )
+    .unwrap();
+    let selected = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Max,
+        &constraints,
+    )
+    .unwrap();
+    let quality_report = score(&graph, &quality, ScoreOptions::default());
+    let selected_report = score(&graph, &selected, ScoreOptions::default());
+
+    assert!(selected_report.passes_hard_gates(), "{selected_report:#?}");
+    assert_eq!(selected_report.crossings, 823);
+    assert_eq!(selected_report.bends, 1_226);
+    assert!(selected_report.area > quality_report.area * 1.75);
+    assert!(
+        selected_report.parallel_congestion_ratio < quality_report.parallel_congestion_ratio * 0.20
+    );
+
+    let mut permuted = graph.clone();
+    permuted.nodes.reverse();
+    for node in &mut permuted.nodes {
+        node.ports.reverse();
+    }
+    permuted.edges.reverse();
+    let mut permuted_constraints = constraints;
+    permuted_constraints.inputs.reverse();
+    permuted_constraints.outputs.reverse();
+    assert_eq!(
+        layout_with_quality_effort_and_constraints(
+            &permuted,
+            options,
+            QualityEffort::Max,
+            &permuted_constraints,
+        )
+        .unwrap(),
+        selected
+    );
+}
+
+#[test]
 fn viewport_fit_uses_configured_dimensions_and_rejects_invalid_dimensions() {
     let graph = graph();
     let layout = layout(&graph, LayoutOptions::default()).unwrap();
