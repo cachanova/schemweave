@@ -140,6 +140,7 @@ fn canonical_config_exposes_the_highest_quality_profile() {
     assert_eq!(
         config.layout,
         LayoutOptions {
+            route_lane_gap: 6.0,
             edge_node_clearance: 20.0,
             ..LayoutOptions::default()
         }

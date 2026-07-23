@@ -1186,10 +1186,14 @@ fn positive_clearance_covers_regional_fanout_and_boundary_constraints() {
 }
 
 #[test]
-fn demand_aware_max_candidate_is_selected_safely_and_deterministically() {
+fn demand_aware_and_pitched_max_candidates_are_selected_safely_and_deterministically() {
     let (graph, constraints): (Graph, LayoutConstraints) =
         serde_json::from_str(include_str!("fixtures/demand_aware_priority.json")).unwrap();
-    let options = LayoutOptions::default();
+    let options = LayoutOptions {
+        route_lane_gap: 6.0,
+        edge_node_clearance: 20.0,
+        ..LayoutOptions::default()
+    };
     let quality = layout_with_quality_effort_and_constraints(
         &graph,
         options,
@@ -1206,14 +1210,51 @@ fn demand_aware_max_candidate_is_selected_safely_and_deterministically() {
     .unwrap();
     let quality_report = score(&graph, &quality, ScoreOptions::default());
     let selected_report = score(&graph, &selected, ScoreOptions::default());
+    let fast = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Fast,
+        &constraints,
+    )
+    .unwrap();
+    let fast_report = score(&graph, &fast, ScoreOptions::default());
 
     assert!(selected_report.passes_hard_gates(), "{selected_report:#?}");
-    assert_eq!(selected_report.crossings, 823);
+    assert_eq!(fast_report.crossings, 860);
+    assert_eq!(fast_report.bends, 1_368);
+    assert_eq!(fast_report.area, 5_750_000.180_571_682);
+    assert_eq!(quality_report.crossings, 860);
+    assert_eq!(quality_report.bends, 1_368);
+    assert_eq!(quality_report.area, 5_750_000.180_571_682);
+    assert_eq!(selected_report.crossings, 816);
     assert_eq!(selected_report.bends, 1_226);
-    assert!(selected_report.area > quality_report.area * 1.75);
-    assert!(
-        selected_report.parallel_congestion_ratio < quality_report.parallel_congestion_ratio * 0.20
+    assert_eq!(selected_report.route_length, 150_047.589_694_203_02);
+    assert_eq!(selected_report.area, 5_846_383.068_468_34);
+    assert_eq!(
+        selected_report.minimum_parallel_route_separation,
+        Some(0.153_847_077_633_599_84)
     );
+    assert_eq!(
+        selected_report.parallel_congestion_ratio,
+        0.297_335_049_197_400_45
+    );
+    assert!(selected_report.area > quality_report.area * 1.01);
+    assert!(
+        selected_report.parallel_congestion_ratio < quality_report.parallel_congestion_ratio * 0.55
+    );
+    let node = |id| selected.nodes.iter().find(|node| node.id == id).unwrap();
+    let input_x = constraints
+        .inputs
+        .iter()
+        .map(|&id| node(id).x)
+        .collect::<Vec<_>>();
+    let output_right = constraints
+        .outputs
+        .iter()
+        .map(|&id| node(id).x + node(id).width)
+        .collect::<Vec<_>>();
+    assert!(input_x.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(output_right.windows(2).all(|pair| pair[0] == pair[1]));
 
     let mut permuted = graph.clone();
     permuted.nodes.reverse();
