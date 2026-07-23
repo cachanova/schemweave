@@ -1,7 +1,8 @@
 use schemweave::{
-    ConstrainedLayoutError, Edge, Endpoint, Graph, Layout, LayoutConfig, LayoutConstraintError,
-    LayoutConstraints, LayoutError, LayoutOptions, Node, Port, PortSide, QualityEffort, layout,
-    layout_with_config, layout_with_constraints,
+    ConstrainedLayoutError, Edge, EdgeNodeSegment, Endpoint, Graph, Layout, LayoutConfig,
+    LayoutConstraintError, LayoutConstraints, LayoutError, LayoutOptions, NetNodeRelation, Node,
+    Port, PortSide, QualityEffort, layout, layout_with_config, layout_with_constraints,
+    measure_edge_node_clearance_bounded, place,
 };
 
 fn node(id: u32, cycle_breaker: bool) -> Node {
@@ -63,13 +64,548 @@ fn assert_routes_avoid_node_interiors(result: &Layout) {
     }
 }
 
+fn assert_edge_node_clearance(graph: &Graph, result: &Layout, threshold: f64) {
+    let nets = graph
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge.net))
+        .collect::<std::collections::HashMap<_, _>>();
+    let segments = result
+        .edges
+        .iter()
+        .flat_map(|edge| {
+            edge.points.windows(2).filter_map(|points| {
+                let horizontal = points[0].y == points[1].y;
+                let (start, end, fixed) = if horizontal {
+                    (
+                        points[0].x.min(points[1].x),
+                        points[0].x.max(points[1].x),
+                        points[0].y,
+                    )
+                } else {
+                    (
+                        points[0].y.min(points[1].y),
+                        points[0].y.max(points[1].y),
+                        points[0].x,
+                    )
+                };
+                (start < end).then_some(EdgeNodeSegment {
+                    net: nets[&edge.id],
+                    horizontal,
+                    fixed,
+                    start,
+                    end,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let relations = graph
+        .edges
+        .iter()
+        .flat_map(|edge| {
+            [
+                NetNodeRelation {
+                    net: edge.net,
+                    node: edge.source.node,
+                },
+                NetNodeRelation {
+                    net: edge.net,
+                    node: edge.target.node,
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    let measured = measure_edge_node_clearance_bounded(
+        &segments,
+        &result.nodes,
+        &relations,
+        threshold,
+        1_000_000,
+    )
+    .unwrap();
+    assert_eq!(measured.violations, 0);
+    assert!(
+        measured
+            .minimum_clearance
+            .is_none_or(|minimum| minimum >= threshold),
+        "{measured:?}"
+    );
+}
+
 #[test]
 fn canonical_config_exposes_the_highest_quality_profile() {
     let config = LayoutConfig::highest_quality();
 
-    assert_eq!(config.layout, LayoutOptions::default());
+    assert_eq!(config.layout.edge_node_clearance, 20.0);
+    assert_eq!(
+        config.layout,
+        LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        }
+    );
     assert_eq!(config.quality_effort, QualityEffort::Max);
     assert_eq!(config.constraints, LayoutConstraints::default());
+}
+
+#[test]
+fn public_placement_uses_the_same_effective_positive_clearance_spacing() {
+    let graph = Graph {
+        nodes: vec![node(1, false), node(2, false)],
+        edges: vec![edge(1, 1, 2)],
+    };
+    let options = LayoutOptions {
+        edge_node_clearance: 40.0,
+        ..LayoutOptions::default()
+    };
+    let placed = place(&graph, options).unwrap();
+    let source = placed.iter().find(|node| node.id == 1).unwrap();
+    let target = placed.iter().find(|node| node.id == 2).unwrap();
+
+    assert_eq!(target.x - (source.x + source.width), 84.0);
+}
+
+#[test]
+fn edge_node_clearance_defaults_to_disabled_and_rejects_invalid_values() {
+    let options: LayoutOptions = serde_json::from_str("{}").unwrap();
+    assert_eq!(options.edge_node_clearance, 0.0);
+    let graph = Graph {
+        nodes: vec![node(1, false)],
+        edges: vec![],
+    };
+    for value in [
+        f64::NAN,
+        f64::INFINITY,
+        -1.0,
+        1_000_000.0 + f64::EPSILON * 1_000_000.0,
+        f64::MAX,
+    ] {
+        let error = layout(
+            &graph,
+            LayoutOptions {
+                edge_node_clearance: value,
+                ..LayoutOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            LayoutError::InvalidOption {
+                field: "edge_node_clearance",
+                value: invalid,
+            } if (value.is_nan() && invalid.is_nan()) || value == invalid
+        ));
+    }
+    assert!(
+        layout(
+            &graph,
+            LayoutOptions {
+                edge_node_clearance: 1_000_000.0,
+                ..LayoutOptions::default()
+            },
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn positive_edge_node_clearance_is_exact_and_permutation_deterministic() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(4, false),
+            node(5, false),
+        ],
+        edges: vec![
+            edge(10, 1, 2),
+            edge(11, 1, 3),
+            edge(12, 2, 4),
+            edge(13, 3, 4),
+            edge(14, 1, 5),
+            edge(15, 5, 4),
+        ],
+    };
+    let options = LayoutOptions {
+        edge_node_clearance: 20.0,
+        ..LayoutOptions::default()
+    };
+    let selected = layout(&graph, options).unwrap();
+    assert_edge_node_clearance(&graph, &selected, 20.0);
+    let highest = layout_with_config(&graph, &LayoutConfig::highest_quality()).unwrap();
+    assert_edge_node_clearance(&graph, &highest, 20.0);
+
+    let permuted = Graph {
+        nodes: graph.nodes.iter().cloned().rev().collect(),
+        edges: graph.edges.iter().cloned().rev().collect(),
+    };
+    assert_eq!(layout(&permuted, options).unwrap(), selected);
+}
+
+#[test]
+fn positive_clearance_preserves_aligned_input_and_output_boundaries() {
+    let mut wide_output = node(4, false);
+    wide_output.width = 120.0;
+    let graph = Graph {
+        nodes: vec![node(1, false), node(2, false), node(3, false), wide_output],
+        edges: vec![edge(10, 1, 2), edge(11, 2, 3), edge(12, 2, 4)],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![3, 4],
+    };
+    let options = LayoutOptions {
+        edge_node_clearance: 20.0,
+        ..LayoutOptions::default()
+    };
+    let result = layout_with_constraints(&graph, options, &constraints).unwrap();
+    assert_edge_node_clearance(&graph, &result, 20.0);
+    let input = result.nodes.iter().find(|node| node.id == 1).unwrap();
+    assert!(result.nodes.iter().all(|node| node.x >= input.x));
+    let output_right = result
+        .nodes
+        .iter()
+        .filter(|node| constraints.outputs.contains(&node.id))
+        .map(|node| node.x + node.width)
+        .collect::<Vec<_>>();
+    assert!(output_right.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn highest_quality_clears_opposing_north_south_endpoint_escapes() {
+    let source = |id| Node {
+        id,
+        width: 80.0,
+        height: 50.0,
+        cycle_breaker: false,
+        ports: vec![
+            Port {
+                id: 0,
+                side: PortSide::North,
+                offset: 20.0,
+            },
+            Port {
+                id: 1,
+                side: PortSide::South,
+                offset: 60.0,
+            },
+        ],
+    };
+    let sink = |id| Node {
+        id,
+        width: 80.0,
+        height: 50.0,
+        cycle_breaker: false,
+        ports: vec![Port {
+            id: 0,
+            side: PortSide::West,
+            offset: 25.0,
+        }],
+    };
+    let route = |id, from, port, to| Edge {
+        id,
+        source: Endpoint { node: from, port },
+        target: Endpoint { node: to, port: 0 },
+        net: id,
+        participates_in_ranking: true,
+    };
+    let graph = Graph {
+        nodes: vec![source(1), source(2), sink(3), sink(4), sink(5), sink(6)],
+        edges: vec![
+            route(10, 1, 0, 3),
+            route(11, 1, 1, 4),
+            route(12, 2, 0, 5),
+            route(13, 2, 1, 6),
+        ],
+    };
+    let result = layout_with_config(&graph, &LayoutConfig::highest_quality()).unwrap();
+    assert_edge_node_clearance(&graph, &result, 20.0);
+}
+
+#[test]
+fn configurable_clearance_expands_ordinary_same_rank_gaps() {
+    let source = |id| Node {
+        id,
+        width: 80.0,
+        height: 50.0,
+        cycle_breaker: false,
+        ports: vec![Port {
+            id: 0,
+            side: PortSide::East,
+            offset: 0.0,
+        }],
+    };
+    let sink = |id| Node {
+        id,
+        width: 80.0,
+        height: 50.0,
+        cycle_breaker: false,
+        ports: vec![Port {
+            id: 0,
+            side: PortSide::West,
+            offset: 0.0,
+        }],
+    };
+    let graph = Graph {
+        nodes: vec![source(1), source(2), sink(3), sink(4)],
+        edges: vec![
+            Edge {
+                id: 10,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 3, port: 0 },
+                net: 10,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 11,
+                source: Endpoint { node: 2, port: 0 },
+                target: Endpoint { node: 4, port: 0 },
+                net: 11,
+                participates_in_ranking: true,
+            },
+        ],
+    };
+    let options = LayoutOptions {
+        edge_node_clearance: 40.0,
+        ..LayoutOptions::default()
+    };
+    let result = layout(&graph, options).unwrap();
+    assert_edge_node_clearance(&graph, &result, 40.0);
+}
+
+#[test]
+fn collapsed_outer_access_never_panics_or_loses_clearance() {
+    let isolated = |id| Node {
+        id,
+        width: 80.0,
+        height: 60.0,
+        cycle_breaker: false,
+        ports: vec![],
+    };
+    let graph = Graph {
+        nodes: vec![
+            isolated(10),
+            isolated(11),
+            isolated(12),
+            isolated(13),
+            isolated(14),
+            Node {
+                id: 15,
+                width: 80.0,
+                height: 60.0,
+                cycle_breaker: false,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 60.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::South,
+                        offset: 80.0,
+                    },
+                ],
+            },
+            Node {
+                id: 16,
+                width: 80.0,
+                height: 60.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::East,
+                    offset: 0.0,
+                }],
+            },
+            Node {
+                id: 19,
+                width: 80.0,
+                height: 60.0,
+                cycle_breaker: false,
+                ports: vec![Port {
+                    id: 0,
+                    side: PortSide::South,
+                    offset: 0.0,
+                }],
+            },
+        ],
+        edges: vec![
+            Edge {
+                id: 1,
+                source: Endpoint { node: 15, port: 0 },
+                target: Endpoint { node: 19, port: 0 },
+                net: 1,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 2,
+                source: Endpoint { node: 15, port: 1 },
+                target: Endpoint { node: 16, port: 0 },
+                net: 2,
+                participates_in_ranking: true,
+            },
+        ],
+    };
+    let options = LayoutOptions {
+        edge_node_clearance: 40.0,
+        ..LayoutOptions::default()
+    };
+    let result = std::panic::catch_unwind(|| {
+        schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max)
+    })
+    .expect("positive-clearance layout must not panic")
+    .unwrap();
+    assert_edge_node_clearance(&graph, &result, 40.0);
+}
+
+#[test]
+fn positive_clearance_self_loop_exempts_only_its_endpoint_node() {
+    let graph = Graph {
+        nodes: vec![
+            Node {
+                id: 1,
+                width: 80.0,
+                height: 60.0,
+                cycle_breaker: true,
+                ports: vec![
+                    Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 20.0,
+                    },
+                    Port {
+                        id: 1,
+                        side: PortSide::West,
+                        offset: 40.0,
+                    },
+                ],
+            },
+            Node {
+                id: 2,
+                width: 80.0,
+                height: 60.0,
+                cycle_breaker: false,
+                ports: Vec::new(),
+            },
+        ],
+        edges: vec![Edge {
+            id: 1,
+            source: Endpoint { node: 1, port: 0 },
+            target: Endpoint { node: 1, port: 1 },
+            net: 1,
+            participates_in_ranking: false,
+        }],
+    };
+    let options = LayoutOptions {
+        edge_node_clearance: 20.0,
+        ..LayoutOptions::default()
+    };
+    let result =
+        schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+
+    assert_edge_node_clearance(&graph, &result, 20.0);
+    assert_eq!(result.edges.len(), 1);
+    assert!(result.edges[0].points.len() >= 4);
+}
+
+#[test]
+fn mixed_side_seeds_17_and_25_have_complete_clearance_layouts() {
+    fn rng(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state
+    }
+    let node = |id| Node {
+        id,
+        width: 80.0,
+        height: 60.0,
+        cycle_breaker: false,
+        ports: vec![
+            Port {
+                id: 0,
+                side: PortSide::West,
+                offset: 0.0,
+            },
+            Port {
+                id: 1,
+                side: PortSide::West,
+                offset: 60.0,
+            },
+            Port {
+                id: 2,
+                side: PortSide::East,
+                offset: 0.0,
+            },
+            Port {
+                id: 3,
+                side: PortSide::East,
+                offset: 60.0,
+            },
+            Port {
+                id: 4,
+                side: PortSide::North,
+                offset: 0.0,
+            },
+            Port {
+                id: 5,
+                side: PortSide::North,
+                offset: 80.0,
+            },
+            Port {
+                id: 6,
+                side: PortSide::South,
+                offset: 0.0,
+            },
+            Port {
+                id: 7,
+                side: PortSide::South,
+                offset: 80.0,
+            },
+        ],
+    };
+    let per = 5u32;
+    let ranks = 4u32;
+    for seed in [17u64, 25] {
+        let nodes = (0..per * ranks).map(|index| node(index + 1)).collect();
+        let mut state = seed;
+        let mut id = 1u32;
+        let mut edges = Vec::new();
+        for rank in 0..ranks - 1 {
+            for index in 0..per {
+                for _ in 0..2 {
+                    let jump = 1 + (rng(&mut state) % (ranks - 1 - rank) as u64) as u32;
+                    let target = (rank + jump) * per + (rng(&mut state) % per as u64) as u32 + 1;
+                    let source_port = (rng(&mut state) % 8) as u32;
+                    let target_port = (rng(&mut state) % 8) as u32;
+                    edges.push(Edge {
+                        id,
+                        source: Endpoint {
+                            node: rank * per + index + 1,
+                            port: source_port,
+                        },
+                        target: Endpoint {
+                            node: target,
+                            port: target_port,
+                        },
+                        net: id,
+                        participates_in_ranking: true,
+                    });
+                    id += 1;
+                }
+            }
+        }
+        let graph = Graph { nodes, edges };
+        let options = LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        };
+        let result =
+            schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+        assert_edge_node_clearance(&graph, &result, 20.0);
+    }
 }
 
 #[test]
@@ -506,7 +1042,7 @@ fn rejects_invalid_graphs_before_layout() {
 }
 
 #[test]
-fn unconstrained_layout_error_remains_exhaustively_source_compatible() {
+fn layout_errors_have_deterministic_public_classification() {
     fn classify(error: LayoutError) -> &'static str {
         match error {
             LayoutError::DuplicateNode(_)
@@ -517,6 +1053,8 @@ fn unconstrained_layout_error_remains_exhaustively_source_compatible() {
             | LayoutError::UnknownEndpointNode { .. }
             | LayoutError::UnknownEndpointPort { .. } => "graph",
             LayoutError::InvalidOption { .. } | LayoutError::TooManyOrderingSweeps(_) => "option",
+            LayoutError::EdgeNodeClearanceUnsatisfied { .. }
+            | LayoutError::EdgeNodeClearanceWorkLimitExceeded { .. } => "clearance",
         }
     }
 

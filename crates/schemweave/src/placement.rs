@@ -56,6 +56,7 @@ pub(crate) fn demand_aware_spacing_is_relevant(
     rank_count: usize,
     options: LayoutOptions,
 ) -> bool {
+    let options = crate::effective_layout_options(options);
     demand_aware_layer_gaps(graph, ranks, rank_count, options)
         .into_iter()
         .any(|gap| gap >= options.layer_gap * 1.5)
@@ -135,6 +136,7 @@ fn place_nodes_with_alignment(
     policy: AlignmentPolicy,
     demand_aware_spacing: bool,
 ) -> Vec<NodeGeometry> {
+    let options = crate::effective_layout_options(options);
     let widths: Vec<f64> = layers
         .iter()
         .map(|layer| {
@@ -144,14 +146,16 @@ fn place_nodes_with_alignment(
                 .fold(0.0, f64::max)
         })
         .collect();
+    let node_gaps = clearance_aware_node_gaps(graph, ranks, layers, options);
     let heights: Vec<f64> = layers
         .iter()
-        .map(|layer| {
+        .enumerate()
+        .map(|(rank, layer)| {
             layer
                 .iter()
                 .map(|&node| graph.nodes[node].height)
                 .sum::<f64>()
-                + options.node_gap * layer.len().saturating_sub(1) as f64
+                + node_gaps[rank].iter().sum::<f64>()
         })
         .collect();
     let canvas_height = heights.iter().copied().fold(0.0, f64::max);
@@ -168,7 +172,7 @@ fn place_nodes_with_alignment(
     let mut positioned = vec![None; graph.nodes.len()];
     for (rank, layer) in layers.iter().enumerate() {
         let mut y = (canvas_height - heights[rank]) / 2.0;
-        for &node_index in layer {
+        for (position, &node_index) in layer.iter().enumerate() {
             let node = graph.nodes[node_index];
             positioned[node_index] = Some(NodeGeometry {
                 id: node.id,
@@ -182,19 +186,101 @@ fn place_nodes_with_alignment(
                 width: node.width,
                 height: node.height,
             });
-            y += node.height + options.node_gap;
+            y += node.height + node_gaps[rank].get(position).copied().unwrap_or(0.0);
         }
     }
     let mut positioned: Vec<_> = positioned.into_iter().map(Option::unwrap).collect();
-    align_connected_ports(
-        graph,
-        ranks,
-        layers,
-        &mut positioned,
-        options.node_gap,
-        policy,
-    );
+    align_connected_ports(graph, ranks, layers, &mut positioned, &node_gaps, policy);
     positioned
+}
+
+fn clearance_aware_node_gaps(
+    graph: &IndexedGraph<'_>,
+    ranks: &[usize],
+    layers: &[Vec<usize>],
+    options: LayoutOptions,
+) -> Vec<Vec<f64>> {
+    let base_gap = options
+        .node_gap
+        .max(options.edge_node_clearance + options.route_lane_gap);
+    let mut gaps = layers
+        .iter()
+        .map(|layer| vec![base_gap; layer.len().saturating_sub(1)])
+        .collect::<Vec<_>>();
+    if options.edge_node_clearance == 0.0 {
+        return gaps;
+    }
+    let transit_gap =
+        (options.edge_node_clearance * 2.0 + options.route_lane_gap).max(options.node_gap);
+    let endpoint_gap =
+        (options.edge_node_clearance * 2.0 + options.route_lane_gap).max(options.node_gap);
+    let mut north_escape = vec![false; graph.nodes.len()];
+    let mut south_escape = vec![false; graph.nodes.len()];
+    for edge in &graph.edges {
+        for (endpoint, node) in [
+            (edge.source, graph.node_index[&edge.source.node]),
+            (edge.target, graph.node_index[&edge.target.node]),
+        ] {
+            match graph.ports[node][&endpoint.port].side {
+                PortSide::North => north_escape[node] = true,
+                PortSide::South => south_escape[node] = true,
+                PortSide::East | PortSide::West => {}
+            }
+        }
+    }
+    for (rank, layer) in layers.iter().enumerate() {
+        for (position, pair) in layer.windows(2).enumerate() {
+            if south_escape[pair[0]] || north_escape[pair[1]] {
+                gaps[rank][position] = endpoint_gap;
+            }
+        }
+    }
+    let mut layer_position = vec![0usize; graph.nodes.len()];
+    for layer in layers {
+        for (position, &node) in layer.iter().enumerate() {
+            layer_position[node] = position;
+        }
+    }
+    let mut demand = layers
+        .iter()
+        .map(|layer| vec![0usize; layer.len().saturating_sub(1)])
+        .collect::<Vec<_>>();
+    for edge in &graph.edges {
+        let source = graph.node_index[&edge.source.node];
+        let target = graph.node_index[&edge.target.node];
+        let source_rank = ranks[source];
+        let target_rank = ranks[target];
+        if source_rank >= target_rank
+            || graph.ports[source][&edge.source.port].side != PortSide::East
+            || graph.ports[target][&edge.target.port].side != PortSide::West
+        {
+            continue;
+        }
+        for rank in source_rank + 1..target_rank {
+            if demand[rank].is_empty() {
+                continue;
+            }
+            let source_fraction =
+                (layer_position[source] as f64 + 0.5) / layers[source_rank].len() as f64;
+            let target_fraction =
+                (layer_position[target] as f64 + 0.5) / layers[target_rank].len() as f64;
+            let progress = (rank - source_rank) as f64 / (target_rank - source_rank) as f64;
+            let projected = source_fraction + (target_fraction - source_fraction) * progress;
+            let boundary = (projected * layers[rank].len() as f64)
+                .round()
+                .clamp(1.0, layers[rank].len().saturating_sub(1) as f64)
+                as usize;
+            demand[rank][boundary - 1] = demand[rank][boundary - 1].saturating_add(1);
+        }
+    }
+    for rank in 0..layers.len() {
+        for (gap, &count) in demand[rank].iter().enumerate() {
+            if count > 0 {
+                gaps[rank][gap] = transit_gap;
+            }
+        }
+    }
+    gaps
 }
 
 fn demand_aware_layer_gaps(
@@ -424,7 +510,7 @@ fn align_connected_ports(
     ranks: &[usize],
     layers: &[Vec<usize>],
     nodes: &mut [NodeGeometry],
-    node_gap: f64,
+    node_gaps: &[Vec<f64>],
     policy: AlignmentPolicy,
 ) {
     let preferred = policy
@@ -472,11 +558,28 @@ fn align_connected_ports(
     }
 
     for _ in 0..policy.rounds {
-        for layer in layers.iter().skip(1) {
-            align_layer(layer, &alignments, nodes, node_gap, policy.stability_weight);
+        for (rank, layer) in layers.iter().enumerate().skip(1) {
+            align_layer_with_gaps(
+                layer,
+                &alignments,
+                nodes,
+                &node_gaps[rank],
+                policy.stability_weight,
+            );
         }
-        for layer in layers.iter().take(layers.len().saturating_sub(1)).rev() {
-            align_layer(layer, &alignments, nodes, node_gap, policy.stability_weight);
+        for (rank, layer) in layers
+            .iter()
+            .enumerate()
+            .take(layers.len().saturating_sub(1))
+            .rev()
+        {
+            align_layer_with_gaps(
+                layer,
+                &alignments,
+                nodes,
+                &node_gaps[rank],
+                policy.stability_weight,
+            );
         }
     }
 }
@@ -513,11 +616,23 @@ pub(crate) fn preferred_alignment_can_be_significant(ordinary: f64) -> bool {
     ordinary >= MIN_PREFERRED_ALIGNMENT_IMPROVEMENT
 }
 
+#[cfg(test)]
 fn align_layer(
     layer: &[usize],
     alignments: &[Vec<Alignment>],
     nodes: &mut [NodeGeometry],
     node_gap: f64,
+    stability_weight: f64,
+) {
+    let gaps = vec![node_gap; layer.len().saturating_sub(1)];
+    align_layer_with_gaps(layer, alignments, nodes, &gaps, stability_weight);
+}
+
+fn align_layer_with_gaps(
+    layer: &[usize],
+    alignments: &[Vec<Alignment>],
+    nodes: &mut [NodeGeometry],
+    node_gaps: &[f64],
     stability_weight: f64,
 ) {
     if layer.is_empty() {
@@ -527,7 +642,7 @@ fn align_layer(
     let mut offset = 0.0;
     let mut targets = Vec::with_capacity(layer.len());
     let mut weights = Vec::with_capacity(layer.len());
-    for &node in layer {
+    for (position, &node) in layer.iter().enumerate() {
         offsets.push(offset);
         let mut weighted_y = stability_weight * nodes[node].y;
         let mut weight = stability_weight;
@@ -538,7 +653,7 @@ fn align_layer(
         }
         targets.push(weighted_y / weight - offset);
         weights.push(weight);
-        offset += nodes[node].height + node_gap;
+        offset += nodes[node].height + node_gaps.get(position).copied().unwrap_or(0.0);
     }
     let projected = isotonic_projection(&targets, &weights);
     for ((&node, &base), y) in layer.iter().zip(&offsets).zip(projected) {

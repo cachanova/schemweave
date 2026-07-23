@@ -13,6 +13,7 @@ const MIN_DEMAND_AWARE_SPACING_NODES: usize = 150;
 const MAX_DEMAND_AWARE_SPACING_NODES: usize = 400;
 const MIN_DEMAND_AWARE_SPACING_EDGES: usize = 250;
 const MAX_DEMAND_AWARE_SPACING_EDGES: usize = 400;
+const MAX_LAYOUT_CLEARANCE_PAIR_VISITS: usize = 20_000_000;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -144,6 +145,8 @@ pub struct LayoutOptions {
     pub node_gap: f64,
     pub port_stub: f64,
     pub route_lane_gap: f64,
+    /// Minimum axis-aligned distance between a route and every unrelated node.
+    pub edge_node_clearance: f64,
     pub ordering_sweeps: usize,
 }
 
@@ -187,6 +190,10 @@ impl LayoutConfig {
     /// Use every bounded quality refinement enabled by the engine.
     pub fn highest_quality() -> Self {
         Self {
+            layout: LayoutOptions {
+                edge_node_clearance: 20.0,
+                ..LayoutOptions::default()
+            },
             quality_effort: QualityEffort::Max,
             ..Self::default()
         }
@@ -210,6 +217,7 @@ impl Default for LayoutOptions {
             node_gap: 30.0,
             port_stub: 10.0,
             route_lane_gap: 4.0,
+            edge_node_clearance: 0.0,
             ordering_sweeps: 4,
         }
     }
@@ -281,6 +289,14 @@ pub enum LayoutError {
     InvalidOption { field: &'static str, value: f64 },
     #[error("ordering_sweeps must be at most 16, got {0}")]
     TooManyOrderingSweeps(usize),
+    #[error(
+        "no complete layout satisfies edge_node_clearance={clearance}; every candidate intersects an unrelated node"
+    )]
+    EdgeNodeClearanceUnsatisfied { clearance: f64 },
+    #[error(
+        "edge-to-node clearance verification exceeded its deterministic work limit of {maximum} candidate visits"
+    )]
+    EdgeNodeClearanceWorkLimitExceeded { maximum: usize },
 }
 
 #[derive(Clone, Debug, Error, PartialEq)]
@@ -332,7 +348,7 @@ pub fn layout_with_quality_effort(
     quality_effort: QualityEffort,
 ) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
-    Ok(layout_indexed(graph, options, quality_effort, indexed))
+    layout_indexed(graph, options, quality_effort, indexed)
 }
 
 /// Lay out a graph with explicit boundary constraints and quality policy.
@@ -343,7 +359,7 @@ pub fn layout_with_quality_effort_and_constraints(
     constraints: &LayoutConstraints,
 ) -> Result<Layout, ConstrainedLayoutError> {
     let indexed = validation::validate_and_index_with_constraints(graph, options, constraints)?;
-    Ok(layout_indexed(graph, options, quality_effort, indexed))
+    Ok(layout_indexed(graph, options, quality_effort, indexed)?)
 }
 
 /// Lay out a graph using one canonical request configuration.
@@ -364,7 +380,8 @@ fn layout_indexed(
     options: LayoutOptions,
     quality_effort: QualityEffort,
     indexed: validation::IndexedGraph<'_>,
-) -> Layout {
+) -> Result<Layout, LayoutError> {
+    let options = effective_layout_options(options);
     let (ranks, latest_ranks) = topology::rank_candidates(&indexed);
     let (forward, reverse, net_representative, max_sifted) = if quality_effort == QualityEffort::Max
     {
@@ -389,6 +406,7 @@ fn layout_indexed(
     let routing_plan = routing::RoutingPlan::new(&indexed, &ranks);
     let adaptive_gap_spacing = quality_effort != QualityEffort::Fast;
     let mut best: Option<(routing::RouteQuality, Layout)> = None;
+    let mut clearance_work_exhausted = false;
     let mut best_uses_primary_ranks = true;
     let candidate_routing = CandidateRouting {
         adaptive_gap_spacing,
@@ -402,10 +420,12 @@ fn layout_indexed(
         placement::place_baseline_nodes(&indexed, &ranks, &forward.layers, options),
         options,
         candidate_routing,
+        &mut clearance_work_exhausted,
     );
     let ordinary_nodes = placement::place_nodes(&indexed, &ranks, quality_layers, options);
     let ordinary_alignment = placement::port_alignment_error(&indexed, &ranks, &ordinary_nodes);
-    let straight_chain_nodes = (quality_effort != QualityEffort::Fast
+    let straight_chain_nodes = (options.edge_node_clearance == 0.0
+        && quality_effort != QualityEffort::Fast
         && graph.nodes.len() <= placement::MAX_CHAIN_CANDIDATE_NODES)
         .then(|| {
             placement::place_straight_chain_nodes(
@@ -427,6 +447,7 @@ fn layout_indexed(
             sparse_global: true,
             ..candidate_routing
         },
+        &mut clearance_work_exhausted,
     );
     if placement::preferred_alignment_can_be_significant(ordinary_alignment) {
         let preferred_nodes =
@@ -444,6 +465,7 @@ fn layout_indexed(
                     supplemental: true,
                     ..candidate_routing
                 },
+                &mut clearance_work_exhausted,
             );
         }
     }
@@ -461,6 +483,7 @@ fn layout_indexed(
                 sparse_global,
                 ..candidate_routing
             },
+            &mut clearance_work_exhausted,
         );
     }
     if let Some(net_representative) = net_representative
@@ -482,7 +505,14 @@ fn layout_indexed(
                 adaptive_gap_spacing,
                 true,
             );
-            retain_routed_candidates(&indexed, &mut best, nodes, routed);
+            retain_routed_candidates(
+                &indexed,
+                &mut best,
+                nodes,
+                routed,
+                options,
+                &mut clearance_work_exhausted,
+            );
         } else {
             evaluate_candidate(
                 &indexed,
@@ -495,6 +525,7 @@ fn layout_indexed(
                     large_sparse_global,
                     ..candidate_routing
                 },
+                &mut clearance_work_exhausted,
             );
         }
     }
@@ -528,12 +559,36 @@ fn layout_indexed(
                 adaptive_gap_spacing,
                 false,
             );
-            let edges = routed.primary;
-            let quality = routed
-                .primary_quality
-                .expect("planned candidates include exact primary quality");
-            if retain_owned_candidate(&mut best, quality, nodes, edges) {
-                best_uses_primary_ranks = false;
+            if options.edge_node_clearance == 0.0 {
+                let quality = routed
+                    .primary_quality
+                    .expect("planned candidates include exact primary quality");
+                if retain_owned_candidate(
+                    &indexed,
+                    &mut best,
+                    quality,
+                    nodes,
+                    routed.primary,
+                    options,
+                    &mut clearance_work_exhausted,
+                ) {
+                    best_uses_primary_ranks = false;
+                }
+            } else {
+                let mut alternative_best = None;
+                retain_routed_candidates(
+                    &indexed,
+                    &mut alternative_best,
+                    nodes,
+                    routed,
+                    options,
+                    &mut clearance_work_exhausted,
+                );
+                if let Some((quality, layout)) = alternative_best
+                    && retain_better_candidate(&mut best, quality, layout)
+                {
+                    best_uses_primary_ranks = false;
+                }
             }
         }
     }
@@ -554,6 +609,7 @@ fn layout_indexed(
                 supplemental: true,
                 ..candidate_routing
             },
+            &mut clearance_work_exhausted,
         );
         let (quality, layout) = straight_chain_best.expect("candidate routing produces a layout");
         if best.as_ref().is_some_and(|(current_quality, current)| {
@@ -563,7 +619,17 @@ fn layout_indexed(
             best_uses_primary_ranks = true;
         }
     }
-    let (mut quality, mut layout) = best.expect("layout has deterministic candidates");
+    let (mut quality, mut layout) = best.ok_or({
+        if clearance_work_exhausted {
+            LayoutError::EdgeNodeClearanceWorkLimitExceeded {
+                maximum: MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
+            }
+        } else {
+            LayoutError::EdgeNodeClearanceUnsatisfied {
+                clearance: options.edge_node_clearance,
+            }
+        }
+    })?;
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && demand_aware_scale_is_eligible(graph.nodes.len(), graph.edges.len())
@@ -587,6 +653,7 @@ fn layout_indexed(
                 sparse_global: true,
                 ..candidate_routing
             },
+            &mut clearance_work_exhausted,
         );
         if let Some((demand_quality, demand_layout)) = demand_aware_best
             && demand_aware_readability_is_better(
@@ -612,12 +679,19 @@ fn layout_indexed(
         )
     {
         let candidate = placement::normalize_owned(layout.nodes.clone(), edges);
-        if candidate.width * candidate.height <= layout.width * layout.height * 1.05 {
+        if candidate.width * candidate.height <= layout.width * layout.height * 1.05
+            && candidate_satisfies_edge_node_clearance(
+                &indexed,
+                &candidate,
+                options,
+                &mut clearance_work_exhausted,
+            )
+        {
             debug_assert!(route_quality_cmp(candidate_quality, quality).is_lt());
-            return candidate;
+            return Ok(candidate);
         }
     }
-    layout
+    Ok(layout)
 }
 
 fn demand_aware_readability_is_better(
@@ -689,6 +763,7 @@ fn evaluate_candidate(
     nodes: Vec<NodeGeometry>,
     options: LayoutOptions,
     routing: CandidateRouting,
+    clearance_work_exhausted: &mut bool,
 ) {
     let routed = routing::route_planned_candidates_with_quality_options(
         routing_plan,
@@ -701,7 +776,14 @@ fn evaluate_candidate(
         routing.adaptive_gap_spacing,
         routing.deeper_crossing_repair,
     );
-    retain_routed_candidates(indexed, best, nodes, routed);
+    retain_routed_candidates(
+        indexed,
+        best,
+        nodes,
+        routed,
+        options,
+        clearance_work_exhausted,
+    );
 }
 
 fn retain_routed_candidates(
@@ -709,16 +791,42 @@ fn retain_routed_candidates(
     best: &mut Option<(routing::RouteQuality, Layout)>,
     nodes: Vec<NodeGeometry>,
     routed: routing::RoutedEdges,
+    options: LayoutOptions,
+    clearance_work_exhausted: &mut bool,
 ) {
     let quality = routed
         .primary_quality
         .unwrap_or_else(|| routing::route_quality(indexed, &routed.primary));
-    retain_owned_candidate(best, quality, nodes.clone(), routed.primary);
+    retain_owned_candidate(
+        indexed,
+        best,
+        quality,
+        nodes.clone(),
+        routed.primary,
+        options,
+        clearance_work_exhausted,
+    );
     if let Some((quality, edges)) = routed.repair {
-        retain_owned_candidate(best, quality, nodes.clone(), edges);
+        retain_owned_candidate(
+            indexed,
+            best,
+            quality,
+            nodes.clone(),
+            edges,
+            options,
+            clearance_work_exhausted,
+        );
     }
     for (quality, edges) in routed.alternatives {
-        retain_owned_candidate(best, quality, nodes.clone(), edges);
+        retain_owned_candidate(
+            indexed,
+            best,
+            quality,
+            nodes.clone(),
+            edges,
+            options,
+            clearance_work_exhausted,
+        );
     }
 }
 
@@ -750,6 +858,34 @@ fn retain_better_candidate(
 }
 
 fn retain_owned_candidate(
+    indexed: &validation::IndexedGraph<'_>,
+    best: &mut Option<(routing::RouteQuality, Layout)>,
+    quality: routing::RouteQuality,
+    nodes: Vec<NodeGeometry>,
+    edges: Vec<EdgeGeometry>,
+    options: LayoutOptions,
+    clearance_work_exhausted: &mut bool,
+) -> bool {
+    if best
+        .as_ref()
+        .is_some_and(|(current_quality, _)| route_quality_cmp(quality, *current_quality).is_gt())
+    {
+        return false;
+    }
+    let candidate = placement::normalize_owned(nodes, edges);
+    if !candidate_satisfies_edge_node_clearance(
+        indexed,
+        &candidate,
+        options,
+        clearance_work_exhausted,
+    ) {
+        return false;
+    }
+    retain_better_candidate(best, quality, candidate)
+}
+
+#[cfg(test)]
+fn retain_owned_candidate_unchecked(
     best: &mut Option<(routing::RouteQuality, Layout)>,
     quality: routing::RouteQuality,
     nodes: Vec<NodeGeometry>,
@@ -762,6 +898,65 @@ fn retain_owned_candidate(
         return false;
     }
     retain_better_candidate(best, quality, placement::normalize_owned(nodes, edges))
+}
+
+pub(crate) fn effective_layout_options(mut options: LayoutOptions) -> LayoutOptions {
+    if options.edge_node_clearance > 0.0 {
+        options.layer_gap = options
+            .layer_gap
+            .max(options.edge_node_clearance * 2.0 + options.route_lane_gap);
+    }
+    options
+}
+
+/// Distance used only where a route must move outward beyond endpoint-node obstacles.
+///
+/// Track planning continues to use the requested `port_stub`; widening every planning margin
+/// for semantic clearance needlessly concentrates dense routing. The exact final admission gate
+/// remains authoritative.
+pub(crate) fn outward_obstacle_clearance_stub(options: LayoutOptions) -> f64 {
+    options.port_stub.max(options.edge_node_clearance)
+}
+
+fn candidate_satisfies_edge_node_clearance(
+    indexed: &validation::IndexedGraph<'_>,
+    candidate: &Layout,
+    options: LayoutOptions,
+    clearance_work_exhausted: &mut bool,
+) -> bool {
+    candidate_satisfies_edge_node_clearance_bounded(
+        indexed,
+        candidate,
+        options,
+        MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
+        clearance_work_exhausted,
+    )
+}
+
+fn candidate_satisfies_edge_node_clearance_bounded(
+    indexed: &validation::IndexedGraph<'_>,
+    candidate: &Layout,
+    options: LayoutOptions,
+    max_pair_visits: usize,
+    clearance_work_exhausted: &mut bool,
+) -> bool {
+    if options.edge_node_clearance == 0.0 {
+        return true;
+    }
+    match routing::route_edge_node_clearance(
+        indexed,
+        &candidate.nodes,
+        &candidate.edges,
+        options.edge_node_clearance,
+        max_pair_visits,
+    ) {
+        Ok(clearance) => clearance.violations == 0,
+        Err(EdgeNodeClearanceError::WorkLimitExceeded) => {
+            *clearance_work_exhausted = true;
+            false
+        }
+        Err(EdgeNodeClearanceError::InvalidInput) => false,
+    }
 }
 
 fn route_quality_cmp(
@@ -789,11 +984,13 @@ fn candidate_quality_cmp(
 #[cfg(test)]
 mod tests {
     use super::{
-        Edge, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Port, PortSide,
-        QualityEffort, candidate_quality_cmp, demand_aware_quality_is_better,
-        demand_aware_scale_is_eligible, effective_ranking_edges, layout, placement,
-        retain_better_candidate, retain_owned_candidate, routing, routing::RouteQuality, topology,
-        validation,
+        Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutOptions, Node, NodeGeometry, Point,
+        Port, PortSide, QualityEffort, candidate_quality_cmp,
+        candidate_satisfies_edge_node_clearance_bounded, demand_aware_quality_is_better,
+        demand_aware_scale_is_eligible, effective_layout_options, effective_ranking_edges, layout,
+        outward_obstacle_clearance_stub, placement, retain_better_candidate,
+        retain_owned_candidate, retain_owned_candidate_unchecked, routing, routing::RouteQuality,
+        topology, validation,
     };
 
     mod active_fanout_fixture {
@@ -824,6 +1021,22 @@ mod tests {
                 height: 1.0,
             },
         )
+    }
+
+    #[test]
+    fn effective_spacing_options_are_canonical_idempotent_and_zero_identity() {
+        let defaults = LayoutOptions::default();
+        assert_eq!(effective_layout_options(defaults), defaults);
+
+        let requested = LayoutOptions {
+            edge_node_clearance: 40.0,
+            ..defaults
+        };
+        let effective = effective_layout_options(requested);
+        assert_eq!(effective.port_stub, defaults.port_stub);
+        assert_eq!(effective.layer_gap, 84.0);
+        assert_eq!(effective_layout_options(effective), effective);
+        assert_eq!(outward_obstacle_clearance_stub(effective), 40.0);
     }
 
     #[test]
@@ -1060,6 +1273,211 @@ mod tests {
             super::net_representative_sparse_global_flags(855, QualityEffort::Max),
             (true, true)
         );
+    }
+
+    #[test]
+    fn clearance_admission_fails_closed_at_the_exact_work_limit() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 1,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 2,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+                Node {
+                    id: 3,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![],
+                },
+            ],
+            edges: vec![Edge {
+                id: 1,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 1,
+                participates_in_ranking: true,
+            }],
+        };
+        let options = LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let candidate = Layout {
+            nodes: vec![
+                NodeGeometry {
+                    id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                NodeGeometry {
+                    id: 2,
+                    x: 100.0,
+                    y: 0.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                NodeGeometry {
+                    id: 3,
+                    x: 50.0,
+                    y: 20.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+            ],
+            edges: vec![EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 20.0, y: 10.0 }, Point { x: 100.0, y: 10.0 }],
+            }],
+            width: 120.0,
+            height: 40.0,
+        };
+        let mut exhausted = false;
+        assert!(!candidate_satisfies_edge_node_clearance_bounded(
+            &indexed,
+            &candidate,
+            options,
+            0,
+            &mut exhausted,
+        ));
+        assert!(exhausted);
+    }
+
+    #[test]
+    fn exact_admission_keeps_a_safe_route_family_after_rejecting_the_quality_winner() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: 1,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 5.0,
+                    }],
+                },
+                Node {
+                    id: 2,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 5.0,
+                    }],
+                },
+                Node {
+                    id: 3,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: Vec::new(),
+                },
+            ],
+            edges: vec![Edge {
+                id: 1,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 1,
+                participates_in_ranking: true,
+            }],
+        };
+        let options = LayoutOptions {
+            edge_node_clearance: 10.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validation::validate_and_index(&graph, options).unwrap();
+        let nodes = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 45.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        ];
+        let winning_quality = RouteQuality {
+            crossings: 0,
+            bends: 0,
+            route_length: 90.0,
+        };
+        let safe_quality = RouteQuality {
+            crossings: 0,
+            bends: 2,
+            route_length: 140.0,
+        };
+        let mut best = None;
+        let mut exhausted = false;
+        assert!(!retain_owned_candidate(
+            &indexed,
+            &mut best,
+            winning_quality,
+            nodes.clone(),
+            vec![EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 10.0, y: 5.0 }, Point { x: 100.0, y: 5.0 }],
+            }],
+            options,
+            &mut exhausted,
+        ));
+        assert!(best.is_none());
+        assert!(retain_owned_candidate(
+            &indexed,
+            &mut best,
+            safe_quality,
+            nodes,
+            vec![EdgeGeometry {
+                id: 1,
+                points: vec![
+                    Point { x: 10.0, y: 5.0 },
+                    Point { x: 10.0, y: 30.0 },
+                    Point { x: 100.0, y: 30.0 },
+                    Point { x: 100.0, y: 5.0 },
+                ],
+            }],
+            options,
+            &mut exhausted,
+        ));
+        assert_eq!(best.unwrap().0, safe_quality);
+        assert!(!exhausted);
     }
 
     fn sparse_global_layered_graph(
@@ -1539,17 +1957,17 @@ mod tests {
         let plan = routing::RoutingPlan::new(&indexed, &ranks);
         let routed = routing::route_planned_candidates(&plan, &chain, options, true);
         let mut best_chain = None;
-        retain_owned_candidate(
+        retain_owned_candidate_unchecked(
             &mut best_chain,
             routed.primary_quality.unwrap(),
             chain.clone(),
             routed.primary,
         );
         if let Some((quality, edges)) = routed.repair {
-            retain_owned_candidate(&mut best_chain, quality, chain.clone(), edges);
+            retain_owned_candidate_unchecked(&mut best_chain, quality, chain.clone(), edges);
         }
         for (quality, edges) in routed.alternatives {
-            retain_owned_candidate(&mut best_chain, quality, chain.clone(), edges);
+            retain_owned_candidate_unchecked(&mut best_chain, quality, chain.clone(), edges);
         }
         let best_chain = best_chain.unwrap();
         let selected = layout(&graph, options).unwrap();
@@ -1810,7 +2228,7 @@ mod tests {
     fn owned_candidate_selection_keeps_the_exact_quality_and_area_ordering() {
         let baseline = candidate(1, 3, 20.0, 100.0);
         let mut best = Some(baseline.clone());
-        retain_owned_candidate(
+        retain_owned_candidate_unchecked(
             &mut best,
             candidate(2, 0, 1.0, 1.0).0,
             vec![NodeGeometry {
@@ -1824,7 +2242,7 @@ mod tests {
         );
         assert_eq!(best, Some(baseline.clone()));
 
-        retain_owned_candidate(
+        retain_owned_candidate_unchecked(
             &mut best,
             baseline.0,
             vec![NodeGeometry {
