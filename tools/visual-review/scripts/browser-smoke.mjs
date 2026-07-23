@@ -266,14 +266,20 @@ try {
   await page.locator('#preset').selectOption('compact')
   await page.locator('#preset').selectOption('roomy')
   await page.locator('#preset').selectOption('balanced')
+  const stagedStarted = performance.now()
   await page.locator('#fixture').selectOption(effortFixtureName)
-  await waitForCompletedLayout(page, effortNodeCount)
+  await waitForRefiningLayout(page, effortNodeCount, 'Quality')
+  const fastPhaseMs = performance.now() - stagedStarted
+  await waitForCompletedLayout(page, effortNodeCount, 'Quality')
+  const finalPhaseMs = performance.now() - stagedStarted
   const qualityCrossings = await schemweaveCrossings(page)
   await page.locator('#fixture').selectOption(maxEffortFixtureName)
-  await waitForCompletedLayout(page, effortNodeCount)
+  await waitForRefiningLayout(page, effortNodeCount, 'Quality')
+  await waitForCompletedLayout(page, effortNodeCount, 'Quality')
   const maxFixtureQualityCrossings = await schemweaveCrossings(page)
   await page.locator('#quality-effort').fill('2')
-  await waitForCompletedLayout(page, effortNodeCount)
+  await waitForRefiningLayout(page, effortNodeCount, 'Max')
+  await waitForCompletedLayout(page, effortNodeCount, 'Max')
   const maxCrossings = await schemweaveCrossings(page)
   if (maxCrossings >= maxFixtureQualityCrossings) {
     throw new Error(
@@ -284,14 +290,16 @@ try {
     throw new Error('routing quality slider did not display Max')
   }
   await page.locator('#quality-effort').fill('1')
-  await waitForCompletedLayout(page, effortNodeCount)
+  await waitForRefiningLayout(page, effortNodeCount, 'Quality')
+  await waitForCompletedLayout(page, effortNodeCount, 'Quality')
   await page.locator('#fixture').selectOption(effortFixtureName)
-  await waitForCompletedLayout(page, effortNodeCount)
+  await waitForRefiningLayout(page, effortNodeCount, 'Quality')
+  await waitForCompletedLayout(page, effortNodeCount, 'Quality')
   if ((await schemweaveCrossings(page)) !== qualityCrossings) {
     throw new Error('Quality output changed after exercising Max')
   }
   await page.locator('#quality-effort').fill('0')
-  await waitForCompletedLayout(page, effortNodeCount)
+  await waitForCompletedLayout(page, effortNodeCount, 'Fast')
   const fastCrossings = await schemweaveCrossings(page)
   if (fastCrossings <= qualityCrossings) {
     throw new Error(`Fast did not expose its quality tradeoff: ${fastCrossings} <= ${qualityCrossings}`)
@@ -320,10 +328,11 @@ try {
       slider.dispatchEvent(new Event('input', { bubbles: true }))
     })
   })
-  if (!String(queuedStatus).includes('newest settings queued')) {
-    throw new Error(`Quality request was not queued behind active Fast: ${queuedStatus}`)
+  if (!String(queuedStatus).includes('Layout queued')) {
+    throw new Error(`Quality request did not supersede active large Fast: ${queuedStatus}`)
   }
-  await waitForCompletedLayout(page, effortNodeCount)
+  await waitForRefiningLayout(page, effortNodeCount, 'Quality')
+  await waitForCompletedLayout(page, effortNodeCount, 'Quality')
   if ((await schemweaveCrossings(page)) !== qualityCrossings) {
     throw new Error('latest Quality request did not replace the queued Fast request')
   }
@@ -356,7 +365,7 @@ try {
   await waitForCompletedLayout(fallback)
 
   process.stdout.write(
-    `PASS: ${nodeCount} nodes, Max ${maxFixtureQualityCrossings}->${maxCrossings} crossings, latest-only presets, ${mainThreadResponseMs.toFixed(1)} ms control response, synchronized worker scoring, file fallback\n`,
+    `PASS: ${nodeCount} nodes, 600-node Quality Fast ${fastPhaseMs.toFixed(1)} ms / final ${finalPhaseMs.toFixed(1)} ms, Max ${maxFixtureQualityCrossings}->${maxCrossings} crossings, latest-only presets, ${mainThreadResponseMs.toFixed(1)} ms control response, synchronized worker scoring, file fallback\n`,
   )
 } finally {
   await browser?.close()
@@ -376,13 +385,32 @@ async function waitForServer(url) {
   throw new Error('Vite did not start within 10 seconds')
 }
 
-async function waitForCompletedLayout(page, expectedNodeCount = nodeCount) {
+async function waitForCompletedLayout(page, expectedNodeCount = nodeCount, effort = 'Quality') {
   await page.waitForFunction(
-    (expectedNodes) => {
+    ({ expectedNodes, expectedEffort }) => {
       const value = document.querySelector('#status')?.textContent ?? ''
-      return value.includes(`${expectedNodes.toLocaleString()} nodes`) && value.includes('SchemWeave')
+      return (
+        value.includes(`${expectedNodes.toLocaleString()} nodes`) &&
+        value.includes(`SchemWeave ${expectedEffort}`) &&
+        !value.includes('refining')
+      )
     },
-    expectedNodeCount,
+    { expectedNodes: expectedNodeCount, expectedEffort: effort },
+    { timeout: 90_000 },
+  )
+}
+
+async function waitForRefiningLayout(page, expectedNodeCount, effort) {
+  await page.waitForFunction(
+    ({ expectedNodes, expectedEffort }) => {
+      const value = document.querySelector('#status')?.textContent ?? ''
+      return (
+        value.includes(`${expectedNodes.toLocaleString()} nodes`) &&
+        value.includes('SchemWeave Fast') &&
+        value.includes(`refining to ${expectedEffort}`)
+      )
+    },
+    { expectedNodes: expectedNodeCount, expectedEffort: effort },
     { timeout: 90_000 },
   )
 }

@@ -3,14 +3,14 @@ import './style.css'
 import { CanvasView } from './canvasView'
 import { prepareDataset, type PreparedDataset } from './dataset'
 import { elkAsLayout } from './graph'
-import { LatestRequest } from './latestRequest'
+import { StagedLayoutRequests } from './latestRequest'
 import type {
   Corpus,
   ElkRows,
   Fixture,
+  LayoutSubmission,
   LayoutOptions,
   QualityReport,
-  WorkerRequest,
   WorkerResponse,
 } from './types'
 
@@ -62,24 +62,42 @@ let requestSequence = 0
 let debounce: number | null = null
 let lastFixtureName: string | null = null
 
-const worker = new Worker(new URL('./layout.worker.ts', import.meta.url), { type: 'module' })
-const requests = new LatestRequest<WorkerRequest>((request) => {
-  status.textContent = `Laying out ${request.fixtureName}…`
-  worker.postMessage(request)
+let workerEpoch = 0
+let worker = createWorker()
+const requests = new StagedLayoutRequests({
+  send: (request) => worker.postMessage(request),
+  restartWorker: () => {
+    worker.terminate()
+    worker = createWorker()
+  },
+  onStarted: (request) => {
+    status.textContent = `Laying out ${request.fixtureName}…`
+  },
+  onResult: displayLayout,
+  onError: (error) => {
+    if (!layoutDirty) status.textContent = `Layout failed: ${error}`
+  },
 })
-worker.addEventListener('message', (event: MessageEvent<WorkerResponse>) => {
-  const response = event.data
+
+function createWorker(): Worker {
+  const epoch = ++workerEpoch
+  const nextWorker = new Worker(new URL('./layout.worker.ts', import.meta.url), { type: 'module' })
+  nextWorker.addEventListener('message', (event: MessageEvent<WorkerResponse>) => {
+    if (epoch === workerEpoch) requests.receive(event.data)
+  })
+  nextWorker.addEventListener('error', (event) => {
+    if (epoch === workerEpoch) requests.workerFailed(event.message)
+  })
+  return nextWorker
+}
+
+function displayLayout(response: Exclude<WorkerResponse, { error: string }>): void {
   const superseded =
     layoutDirty ||
     requests.hasPending ||
     response.datasetId !== datasetId ||
     response.fixtureName !== currentFixture()?.name
-  requests.complete()
   if (superseded) return
-  if ('error' in response) {
-    status.textContent = `Layout failed: ${response.error}`
-    return
-  }
   const fixture = currentFixture()
   const elk = currentElk()
   if (!fixture || !elk) return
@@ -94,14 +112,12 @@ worker.addEventListener('message', (event: MessageEvent<WorkerResponse>) => {
   const elkInvalid = contractViolations(response.elkQuality)
   const schemweaveInvalid = contractViolations(response.quality)
   const invalid = elkInvalid + schemweaveInvalid
-  status.textContent = `${invalid > 0 ? `INVALID: ELK ${elkInvalid}, SchemWeave ${schemweaveInvalid} · ` : ''}${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${response.elapsedMs.toFixed(1)} ms`
+  const refinement = response.final
+    ? ''
+    : ` · refining to ${capitalize(response.requestedEffort)}…`
+  status.textContent = `${invalid > 0 ? `INVALID: ELK ${elkInvalid}, SchemWeave ${schemweaveInvalid} · ` : ''}${fixture.nodeCount.toLocaleString()} nodes · ${fixture.edgeCount.toLocaleString()} edges · SchemWeave ${capitalize(response.effort)} ${response.elapsedMs.toFixed(1)} ms${refinement}`
   lastFixtureName = fixture.name
-})
-
-worker.addEventListener('error', (event) => {
-  if (requests.busy) requests.complete()
-  status.textContent = `Worker failed: ${event.message}`
-})
+}
 
 function currentFixture(): Fixture | null {
   return dataset?.fixtures[currentIndex] ?? null
@@ -126,6 +142,7 @@ function layoutOptions(): LayoutOptions {
 
 function scheduleLayout(delay = 100): void {
   layoutDirty = true
+  requests.supersedeActiveLarge()
   status.textContent = requests.busy
     ? 'Finishing current layout; newest settings queued…'
     : 'Layout queued…'
@@ -143,7 +160,7 @@ function dispatchLayout(): void {
   const graph = fixture ? dataset?.graphByName.get(fixture.name) : null
   if (!fixture || !elk || !graph) return
   layoutDirty = false
-  const request: WorkerRequest = {
+  const request: LayoutSubmission = {
     id: ++requestSequence,
     datasetId,
     fixtureName: fixture.name,
@@ -363,6 +380,10 @@ function decimal(value: number): string {
 
 function percentage(value: number): string {
   return `${(value * 100).toFixed(1)}%`
+}
+
+function capitalize(value: string): string {
+  return value.charAt(0).toUpperCase() + value.slice(1)
 }
 
 function contractViolations(quality: QualityReport): number {

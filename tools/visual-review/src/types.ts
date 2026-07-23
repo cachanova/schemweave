@@ -115,7 +115,11 @@ export interface ElkGeometry {
   height: number
 }
 
-export interface WorkerRequest {
+export type LayoutPhase = 'direct' | 'fast' | 'final'
+
+export interface WorkerLayoutRequest {
+  type: 'layout'
+  generation: number
   id: number
   datasetId: number
   fixtureName: string
@@ -124,14 +128,37 @@ export interface WorkerRequest {
   options: LayoutOptions
 }
 
+export interface WorkerRefineRequest {
+  type: 'refine'
+  generation: number
+  id: number
+  datasetId: number
+  fixtureName: string
+}
+
+export type WorkerRequest = WorkerLayoutRequest | WorkerRefineRequest
+export type LayoutSubmission = Omit<WorkerLayoutRequest, 'type' | 'generation'>
+
 export type WorkerResponse =
   | {
+      generation: number
       id: number
       datasetId: number
       fixtureName: string
+      phase: LayoutPhase
+      effort: LayoutOptions['quality_effort']
+      requestedEffort: LayoutOptions['quality_effort']
+      final: boolean
       elapsedMs: number
       layout: Layout
       quality: QualityReport
       elkQuality: QualityReport
     }
-  | { id: number; datasetId: number; fixtureName: string; error: string }
+  | {
+      generation: number
+      id: number
+      datasetId: number
+      fixtureName: string
+      phase: LayoutPhase
+      error: string
+    }
