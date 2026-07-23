@@ -143,6 +143,8 @@ fn canonical_config_exposes_the_highest_quality_profile() {
         LayoutOptions {
             route_lane_gap: 6.0,
             edge_node_clearance: 20.0,
+            max_quality_area_factor: 2.0,
+            max_quality_route_length_factor: 1.25,
             ..LayoutOptions::default()
         }
     );
@@ -251,6 +253,41 @@ fn parallel_wire_spacing_defaults_to_disabled_and_rejects_invalid_values() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn quality_budget_factors_have_stable_defaults_and_validate_their_lower_bound() {
+    let options: LayoutOptions = serde_json::from_str("{}").unwrap();
+    assert_eq!(options.max_quality_area_factor, 1.2);
+    assert_eq!(options.max_quality_route_length_factor, 1.1);
+    let graph = Graph {
+        nodes: vec![node(1, false)],
+        edges: vec![],
+    };
+    for (field, options) in [
+        (
+            "max_quality_area_factor",
+            LayoutOptions {
+                max_quality_area_factor: 0.99,
+                ..LayoutOptions::default()
+            },
+        ),
+        (
+            "max_quality_route_length_factor",
+            LayoutOptions {
+                max_quality_route_length_factor: 0.99,
+                ..LayoutOptions::default()
+            },
+        ),
+    ] {
+        assert!(matches!(
+            layout(&graph, options),
+            Err(LayoutError::InvalidOption {
+                field: invalid,
+                value: 0.99,
+            }) if invalid == field
+        ));
+    }
 }
 
 #[test]

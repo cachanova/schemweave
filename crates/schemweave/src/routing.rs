@@ -134,8 +134,19 @@ const MAX_PITCHED_GAP_ROUTE_POINTS: usize = 100_000;
 const MAX_PITCHED_GAP_SUBSET_CANDIDATES: usize = 32;
 const MAX_PITCHED_GAP_SUBSET_ROUTE_POINT_VISITS: usize = 1_000_000;
 const MAX_PITCHED_GAP_CROSSING_FACTOR_DENOMINATOR: usize = 100;
-const MAX_PITCHED_GAP_LENGTH_FACTOR: f64 = 1.10;
 const MAX_PITCHED_GAP_CONGESTION_FACTOR: f64 = 0.95;
+const MAX_HORIZONTAL_PITCH_PATH_POINTS: usize = 100_000;
+const MAX_HORIZONTAL_PITCH_CONTACT_VISITS: usize = 20_000_000;
+const MAX_HORIZONTAL_PITCH_CLEARANCE_VISITS: usize = 20_000_000;
+const MAX_HORIZONTAL_PITCH_NODES: usize = 2_000;
+const MAX_HORIZONTAL_PITCH_EDGES: usize = 10_000;
+const MAX_HORIZONTAL_PITCH_RANK_VISITS: usize = 4_000_000;
+const MAX_HORIZONTAL_PITCH_TRACK_KEYS: usize = 100_000;
+const MAX_HORIZONTAL_PITCH_TRACK_MEMBERSHIPS: usize = 100_000;
+const MAX_HORIZONTAL_PITCH_OVERRIDES: usize = 100_000;
+const MAX_HORIZONTAL_PITCH_PASSES: usize = 2;
+const PREFERRED_HORIZONTAL_TRACK_PITCH: f64 = 6.0;
+const MINIMUM_HORIZONTAL_TRACK_PITCH: f64 = 4.0;
 
 fn expanded_gap_spacing_enabled(
     adaptive_gap_spacing: bool,
@@ -227,6 +238,15 @@ type PitchedTrackKey = (NetId, u64);
 type PitchedGapLaneMaps = Vec<BTreeMap<PitchedTrackKey, usize>>;
 type PitchedGapAccessMaps = Vec<BTreeMap<PitchedTrackKey, GapNetAccess>>;
 type PitchedGapTrackXMaps = Vec<BTreeMap<PitchedTrackKey, f64>>;
+type HorizontalCrossingOverrides = BTreeMap<(usize, EdgeId), f64>;
+type HorizontalTrackKey = (NetId, FloatKey);
+type HorizontalBandTracks =
+    BTreeMap<(usize, usize), BTreeMap<HorizontalTrackKey, BTreeSet<EdgeId>>>;
+type HorizontalPitchExpansion = (
+    Vec<NodeGeometry>,
+    BTreeSet<(usize, usize)>,
+    HorizontalCrossingOverrides,
+);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PitchedGapReadability {
@@ -522,6 +542,33 @@ pub(crate) fn route_planned_candidates_with_quality_options(
     adaptive_gap_spacing: bool,
     deeper_crossing_repair: bool,
 ) -> RoutedEdges {
+    route_planned_candidates_with_horizontal_overrides(
+        plan,
+        nodes,
+        options,
+        supplemental,
+        sparse_global,
+        large_sparse_global,
+        refined_large_sparse_global,
+        adaptive_gap_spacing,
+        deeper_crossing_repair,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_planned_candidates_with_horizontal_overrides(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    options: LayoutOptions,
+    supplemental: bool,
+    sparse_global: bool,
+    large_sparse_global: bool,
+    refined_large_sparse_global: bool,
+    adaptive_gap_spacing: bool,
+    deeper_crossing_repair: bool,
+    horizontal_overrides: Option<&HorizontalCrossingOverrides>,
+) -> RoutedEdges {
     let (outer_rounds, gap_rounds) = if supplemental {
         (SUPPLEMENTAL_OUTER_LANE_ROUNDS, SUPPLEMENTAL_GAP_LANE_ROUNDS)
     } else {
@@ -540,6 +587,7 @@ pub(crate) fn route_planned_candidates_with_quality_options(
         refined_large_sparse_global,
         adaptive_gap_spacing,
         deeper_crossing_repair,
+        horizontal_overrides,
     );
     if routed.primary_quality.is_none() {
         routed.primary_quality = Some(route_quality_for_plan(plan, &routed.primary));
@@ -609,6 +657,7 @@ fn route_edges_with_lane_rounds_and_global(
         false,
         false,
         false,
+        None,
     )
 }
 
@@ -627,6 +676,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
     deeper_crossing_repair: bool,
+    horizontal_overrides: Option<&HorizontalCrossingOverrides>,
 ) -> RoutedEdges {
     let options = crate::effective_layout_options(options);
     let ranks = &plan.ranks;
@@ -793,6 +843,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         refined_large_sparse_global,
         adaptive_gap_spacing,
         deeper_crossing_repair,
+        horizontal_overrides,
     );
     let staircase_alternative = align_staircases
         .then(|| {
@@ -953,6 +1004,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
                 outer_lane_rounds,
                 repair_crossings,
                 false,
+                horizontal_overrides,
                 None,
                 candidate_routes,
                 candidate_gap_spacing,
@@ -1032,6 +1084,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             outer_lane_rounds,
             repair_crossings,
             deeper_crossing_repair,
+            horizontal_overrides,
             routes,
             sparse_alternatives,
             gap_spacing,
@@ -1202,6 +1255,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             &endpoint_tracks,
             &crossing_paths,
             crossing_paths_match_endpoint_tracks,
+            horizontal_overrides,
             precomputed_repair_profile,
             gap_spacing,
             MAX_BATCHED_CROSSING_REPAIR_NETS,
@@ -1231,6 +1285,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             &endpoint_tracks,
             &crossing_paths,
             crossing_paths_match_endpoint_tracks,
+            horizontal_overrides,
             precomputed_repair_profile,
             gap_spacing,
             MAX_DEEP_CROSSING_REPAIR_NETS,
@@ -1567,6 +1622,160 @@ fn free_interval_containing(intervals: &[(f64, f64)], y: f64) -> Option<(f64, f6
         .filter(|&(low, high)| low <= y && y <= high)
 }
 
+fn horizontal_pitch_edge_clearance_is_satisfied(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    segments: &[PhysicalSegment],
+    clearance: f64,
+) -> bool {
+    let segments = segments
+        .iter()
+        .map(|segment| EdgeNodeSegment {
+            net: segment.net,
+            horizontal: segment.horizontal,
+            fixed: segment.fixed,
+            start: segment.start,
+            end: segment.end,
+        })
+        .collect::<Vec<_>>();
+    let relations = plan
+        .edges
+        .iter()
+        .flat_map(|resolved| {
+            [
+                NetNodeRelation {
+                    net: resolved.edge.net,
+                    node: resolved.edge.source.node,
+                },
+                NetNodeRelation {
+                    net: resolved.edge.net,
+                    node: resolved.edge.target.node,
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    measure_edge_node_clearance_bounded(
+        &segments,
+        nodes,
+        &relations,
+        clearance,
+        MAX_HORIZONTAL_PITCH_CLEARANCE_VISITS,
+    )
+    .is_ok_and(|measurement| measurement.violations == 0)
+}
+
+fn horizontal_pitch_candidate_is_admissible(
+    plan: &RoutingPlan<'_>,
+    baseline_nodes: &[NodeGeometry],
+    baseline: &[EdgeGeometry],
+    candidate_nodes: &[NodeGeometry],
+    candidate: &[EdgeGeometry],
+    options: LayoutOptions,
+) -> bool {
+    let invalid_geometry = baseline == candidate
+        || baseline_nodes.len() != candidate_nodes.len()
+        || candidate.len() != plan.edges.len()
+        || plan.edges.iter().zip(candidate).any(|(resolved, route)| {
+            route.id != resolved.edge.id
+                || route.points.first()
+                    != Some(&port_point(
+                        &candidate_nodes[resolved.source_index],
+                        resolved.source_port,
+                    ))
+                || route.points.last()
+                    != Some(&port_point(
+                        &candidate_nodes[resolved.target_index],
+                        resolved.target_port,
+                    ))
+                || route.points.len() < 2
+                || route.points.windows(2).any(|pair| {
+                    let horizontal = pair[0].y == pair[1].y;
+                    let vertical = pair[0].x == pair[1].x;
+                    horizontal == vertical
+                })
+        });
+    let areas = pitched_geometry_area(candidate_nodes, candidate)
+        .zip(pitched_geometry_area(baseline_nodes, baseline));
+    let area_rejected = areas
+        .is_none_or(|(candidate, baseline)| candidate > baseline * options.max_quality_area_factor);
+    if invalid_geometry || area_rejected {
+        return false;
+    }
+    let (baseline_quality, baseline_segments) = route_quality_profile_for_plan(plan, baseline);
+    let (candidate_quality, candidate_segments) = route_quality_profile_for_plan(plan, candidate);
+    let crossing_allowance = baseline_quality.crossings / 100;
+    let bend_allowance = (baseline_quality.bends / 100).max(2);
+    let baseline_maximum_knot =
+        maximum_crossings_on_physical_segment(&plan.shared_endpoints, &baseline_segments);
+    let candidate_maximum_knot =
+        maximum_crossings_on_physical_segment(&plan.shared_endpoints, &candidate_segments);
+    let knot_allowance = (baseline_maximum_knot / 20).max(3);
+    if candidate_quality.crossings
+        > baseline_quality
+            .crossings
+            .saturating_add(crossing_allowance)
+        || candidate_quality.bends > baseline_quality.bends.saturating_add(bend_allowance)
+        || candidate_quality.route_length
+            > baseline_quality.route_length * options.max_quality_route_length_factor
+        || candidate_maximum_knot > baseline_maximum_knot.saturating_add(knot_allowance)
+        || !horizontal_pitch_edge_clearance_is_satisfied(
+            plan,
+            candidate_nodes,
+            &candidate_segments,
+            options.edge_node_clearance,
+        )
+    {
+        return false;
+    }
+    let Ok(raw_segments) = raw_route_segments(plan, candidate, MAX_COMPLETE_ROUTE_SEGMENTS) else {
+        return false;
+    };
+    let selected_nets = plan
+        .net_edge_counts
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut contact_visits = MAX_HORIZONTAL_PITCH_CONTACT_VISITS;
+    if raw_route_family_has_unrelated_contact(&raw_segments, &selected_nets, &mut contact_visits)
+        != Some(false)
+    {
+        return false;
+    }
+    let Some((baseline_congestion, baseline_minimum)) =
+        parallel_congestion_profile_at(&baseline_segments, options.route_lane_gap)
+    else {
+        return false;
+    };
+    let Some((candidate_congestion, candidate_minimum)) =
+        parallel_congestion_profile_at(&candidate_segments, options.route_lane_gap)
+    else {
+        return false;
+    };
+    if candidate_congestion > baseline_congestion
+        || !minimum_parallel_route_separation_does_not_regress(baseline_minimum, candidate_minimum)
+    {
+        return false;
+    }
+    let baseline_horizontal = baseline_segments
+        .iter()
+        .copied()
+        .filter(|segment| segment.horizontal)
+        .collect::<Vec<_>>();
+    let candidate_horizontal = candidate_segments
+        .iter()
+        .copied()
+        .filter(|segment| segment.horizontal)
+        .collect::<Vec<_>>();
+    let horizontal_profiles =
+        parallel_congestion_profile_at(&baseline_horizontal, options.route_lane_gap)
+            .map(|profile| profile.0)
+            .zip(
+                parallel_congestion_profile_at(&candidate_horizontal, options.route_lane_gap)
+                    .map(|profile| profile.0),
+            );
+    horizontal_profiles.is_some_and(|(baseline, candidate)| candidate < baseline)
+}
+
 fn removed_staircase_transitions(original: &[f64], aligned: &[f64]) -> usize {
     original
         .windows(2)
@@ -1708,6 +1917,7 @@ fn finish_fanout_route_families(
     outer_lane_rounds: usize,
     repair_crossings: bool,
     deeper_crossing_repair: bool,
+    horizontal_overrides: Option<&HorizontalCrossingOverrides>,
     stable_routes: Vec<EdgeGeometry>,
     sparse_alternatives: Vec<(RouteQuality, Vec<EdgeGeometry>)>,
     gap_spacing: GapTrackSpacing,
@@ -1807,6 +2017,7 @@ fn finish_fanout_route_families(
             outer_lane_rounds,
             repair_crossings,
             deeper_crossing_repair,
+            horizontal_overrides,
             Some(candidate_profile),
             adaptive_routes,
             gap_spacing,
@@ -1834,6 +2045,7 @@ fn finish_fanout_route_families(
             outer_lane_rounds,
             repair_crossings,
             deeper_crossing_repair,
+            horizontal_overrides,
             Some(baseline_profile),
             stable_routes,
             gap_spacing,
@@ -1871,6 +2083,7 @@ fn finish_fanout_route_families(
             outer_lane_rounds,
             repair_crossings,
             deeper_crossing_repair,
+            horizontal_overrides,
             Some(baseline_profile),
             stable_routes,
             gap_spacing,
@@ -1957,6 +2170,7 @@ fn finish_route_family(
     outer_lane_rounds: usize,
     repair_crossings: bool,
     deeper_crossing_repair: bool,
+    horizontal_overrides: Option<&HorizontalCrossingOverrides>,
     mut precomputed_profile: Option<(Vec<PhysicalSegment>, BTreeMap<NetId, usize>, RouteQuality)>,
     mut routes: Vec<EdgeGeometry>,
     gap_spacing: GapTrackSpacing,
@@ -2134,6 +2348,7 @@ fn finish_route_family(
             &endpoint_tracks,
             crossing_paths,
             crossing_paths_match_endpoint_tracks,
+            horizontal_overrides,
             precomputed_repair_profile,
             gap_spacing,
             MAX_BATCHED_CROSSING_REPAIR_NETS,
@@ -2163,6 +2378,7 @@ fn finish_route_family(
             &endpoint_tracks,
             crossing_paths,
             crossing_paths_match_endpoint_tracks,
+            horizontal_overrides,
             precomputed_repair_profile,
             gap_spacing,
             MAX_DEEP_CROSSING_REPAIR_NETS,
@@ -2247,6 +2463,7 @@ fn emit_routes_with_outer_lanes(
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
     max_quality_effort: bool,
+    horizontal_overrides: Option<&HorizontalCrossingOverrides>,
 ) -> RoutedLaneState {
     let initial_endpoint_tracks = build_endpoint_tracks(
         plan,
@@ -2270,6 +2487,7 @@ fn emit_routes_with_outer_lanes(
         free_by_rank,
         &initial_endpoint_tracks,
         options.port_stub,
+        horizontal_overrides,
     );
     let GapLaneCandidates {
         baseline: gap_lanes,
@@ -2596,6 +2814,7 @@ fn repair_crossing_heavy_net(
     endpoint_tracks: &EndpointTracks,
     crossing_paths: &[Option<Vec<f64>>],
     crossing_paths_match_endpoint_tracks: bool,
+    horizontal_overrides: Option<&HorizontalCrossingOverrides>,
     precomputed: Option<(&[PhysicalSegment], &BTreeMap<NetId, usize>, RouteQuality)>,
     gap_spacing: GapTrackSpacing,
     max_repair_nets: usize,
@@ -2769,6 +2988,7 @@ fn repair_crossing_heavy_net(
                 free_by_rank,
                 &candidate_endpoint_tracks,
                 options.port_stub,
+                horizontal_overrides,
             )
         });
         let candidate_crossing_paths = candidate_crossing_paths
@@ -4981,6 +5201,632 @@ pub(crate) fn route_parallel_congestion(
     parallel_congestion_ratio(&segments)
 }
 
+fn charge_horizontal_pitch_work(visits: &mut usize, amount: usize) -> Option<()> {
+    *visits = visits.checked_add(amount)?;
+    (*visits <= MAX_HORIZONTAL_PITCH_RANK_VISITS).then_some(())
+}
+
+fn horizontal_pitch_ordered_lookup_work(entries: usize) -> usize {
+    usize::BITS as usize - entries.saturating_add(1).leading_zeros() as usize
+}
+
+fn horizontal_pitch_retained_counts_within_bounds(
+    track_keys: usize,
+    track_memberships: usize,
+    overrides: usize,
+) -> bool {
+    track_keys <= MAX_HORIZONTAL_PITCH_TRACK_KEYS
+        && track_memberships <= MAX_HORIZONTAL_PITCH_TRACK_MEMBERSHIPS
+        && overrides <= MAX_HORIZONTAL_PITCH_OVERRIDES
+}
+
+fn horizontal_pitch_shape_counts_within_bounds(
+    nodes: usize,
+    edges: usize,
+    route_points: usize,
+) -> bool {
+    nodes <= MAX_HORIZONTAL_PITCH_NODES
+        && edges <= MAX_HORIZONTAL_PITCH_EDGES
+        && route_points <= MAX_HORIZONTAL_PITCH_PATH_POINTS
+}
+
+fn horizontal_crossing_band_tracks(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    clearance: f64,
+) -> Option<(Vec<Vec<usize>>, HorizontalBandTracks)> {
+    if nodes.len() != plan.ranks.len() || routes.len() != plan.edges.len() {
+        return None;
+    }
+    let route_points = routes
+        .iter()
+        .try_fold(0usize, |total, route| total.checked_add(route.points.len()))?;
+    if !horizontal_pitch_shape_counts_within_bounds(nodes.len(), routes.len(), route_points) {
+        return None;
+    }
+    let rank_count = plan.nodes_by_rank.len();
+    let mut layer_left = vec![f64::INFINITY; rank_count];
+    let mut layer_right = vec![f64::NEG_INFINITY; rank_count];
+    let mut ordered_nodes = plan.nodes_by_rank.clone();
+    for (node, &rank) in nodes.iter().zip(&plan.ranks) {
+        layer_left[rank] = layer_left[rank].min(node.x);
+        layer_right[rank] = layer_right[rank].max(node.x + node.width);
+    }
+    for indices in &mut ordered_nodes {
+        indices.sort_unstable_by(|&left, &right| {
+            nodes[left]
+                .y
+                .total_cmp(&nodes[right].y)
+                .then(nodes[left].id.cmp(&nodes[right].id))
+        });
+    }
+    let mut visits = 0usize;
+    charge_horizontal_pitch_work(&mut visits, nodes.len())?;
+    let bands_by_rank = ordered_nodes
+        .iter()
+        .map(|indices| {
+            indices
+                .windows(2)
+                .enumerate()
+                .try_fold(Vec::new(), |mut bands, (gap, pair)| {
+                    charge_horizontal_pitch_work(&mut visits, 1)?;
+                    let upper = &nodes[pair[0]];
+                    let lower = &nodes[pair[1]];
+                    let low = upper.y + upper.height + clearance;
+                    let high = lower.y - clearance;
+                    if low <= high {
+                        bands.push((gap, low, high));
+                    }
+                    Some(bands)
+                })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut tracks = HorizontalBandTracks::new();
+    let mut track_key_count = 0usize;
+    let mut membership_count = 0usize;
+    for (resolved, route) in plan.edges.iter().zip(routes) {
+        if route.id != resolved.edge.id || route.points.len() < 2 {
+            return None;
+        }
+        let source_rank = plan.ranks[resolved.source_index];
+        let target_rank = plan.ranks[resolved.target_index];
+        if source_rank >= target_rank {
+            continue;
+        }
+        for pair in route.points.windows(2) {
+            let horizontal = pair[0].y == pair[1].y;
+            let vertical = pair[0].x == pair[1].x;
+            if horizontal == vertical {
+                return None;
+            }
+            if !horizontal {
+                continue;
+            }
+            let start = pair[0].x.min(pair[1].x);
+            let end = pair[0].x.max(pair[1].x);
+            let y = pair[0].y;
+            for rank in source_rank + 1..target_rank {
+                let bands = bands_by_rank.get(rank)?;
+                let search_visits = horizontal_pitch_ordered_lookup_work(bands.len());
+                charge_horizontal_pitch_work(&mut visits, search_visits.saturating_add(1))?;
+                if start > layer_left[rank] || end < layer_right[rank] {
+                    continue;
+                }
+                let band_index = bands.partition_point(|&(_, _, high)| high < y);
+                if let Some(&(gap, low, high)) = bands.get(band_index)
+                    && low <= y
+                    && y <= high
+                {
+                    let band = tracks.entry((rank, gap)).or_default();
+                    let track_key = (resolved.edge.net, FloatKey(if y == 0.0 { 0.0 } else { y }));
+                    let members = match band.entry(track_key) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            track_key_count = track_key_count.checked_add(1)?;
+                            if track_key_count > MAX_HORIZONTAL_PITCH_TRACK_KEYS {
+                                return None;
+                            }
+                            entry.insert(BTreeSet::new())
+                        }
+                        std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    };
+                    if members.insert(resolved.edge.id) {
+                        membership_count = membership_count.checked_add(1)?;
+                        if membership_count > MAX_HORIZONTAL_PITCH_TRACK_MEMBERSHIPS {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    horizontal_pitch_retained_counts_within_bounds(track_key_count, membership_count, 0)
+        .then_some((ordered_nodes, tracks))
+}
+
+fn horizontal_crossing_close_pairs(tracks: &HorizontalBandTracks, pitch: f64) -> Option<usize> {
+    horizontal_crossing_close_pairs_filtered(tracks, None, pitch)
+}
+
+fn horizontal_crossing_close_pairs_filtered(
+    tracks: &HorizontalBandTracks,
+    bands: Option<&BTreeSet<(usize, usize)>>,
+    pitch: f64,
+) -> Option<usize> {
+    let mut visits = 0usize;
+    let mut close_pairs = 0usize;
+    for (band, tracks) in tracks {
+        if bands.is_some_and(|bands| !bands.contains(band)) {
+            continue;
+        }
+        close_pairs =
+            close_pairs.checked_add(horizontal_band_close_pairs(tracks, pitch, &mut visits)?)?;
+    }
+    Some(close_pairs)
+}
+
+fn horizontal_band_close_pairs(
+    tracks: &BTreeMap<HorizontalTrackKey, BTreeSet<EdgeId>>,
+    pitch: f64,
+    visits: &mut usize,
+) -> Option<usize> {
+    if tracks.len() > MAX_HORIZONTAL_PITCH_TRACK_KEYS {
+        return None;
+    }
+    let mut ordered = tracks.keys().copied().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
+    let mut close_pairs = 0usize;
+    for (left_index, &(left_net, left_y)) in ordered.iter().enumerate() {
+        for &(right_net, right_y) in &ordered[left_index + 1..] {
+            charge_horizontal_pitch_work(visits, 1)?;
+            let separation = right_y.0 - left_y.0;
+            if separation >= pitch {
+                break;
+            }
+            if left_net != right_net {
+                close_pairs = close_pairs.saturating_add(1);
+            }
+        }
+    }
+    Some(close_pairs)
+}
+
+fn horizontal_crossing_close_pairs_in_bands(
+    tracks: &HorizontalBandTracks,
+    bands: &BTreeSet<(usize, usize)>,
+    pitch: f64,
+) -> Option<usize> {
+    horizontal_crossing_close_pairs_filtered(tracks, Some(bands), pitch)
+}
+
+pub(crate) fn layout_horizontal_crossing_pitch_is_satisfied(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    options: LayoutOptions,
+    pitch: f64,
+) -> bool {
+    layout_horizontal_crossing_close_pairs(plan, nodes, routes, options, pitch) == Some(0)
+}
+
+pub(crate) fn layout_horizontal_crossing_close_pairs(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    options: LayoutOptions,
+    pitch: f64,
+) -> Option<usize> {
+    (pitch.is_finite() && pitch > 0.0)
+        .then(|| {
+            horizontal_crossing_band_tracks(plan, nodes, routes, options.edge_node_clearance)
+                .and_then(|(_, tracks)| horizontal_crossing_close_pairs(&tracks, pitch))
+        })
+        .flatten()
+}
+
+fn expanded_horizontal_crossing_band_nodes(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    options: LayoutOptions,
+    pitch: f64,
+    existing_overrides: &HorizontalCrossingOverrides,
+) -> Option<HorizontalPitchExpansion> {
+    if existing_overrides.len() > MAX_HORIZONTAL_PITCH_OVERRIDES {
+        return None;
+    }
+    let (ordered_nodes, tracks) =
+        horizontal_crossing_band_tracks(plan, nodes, routes, options.edge_node_clearance)?;
+    if !pitch.is_finite() || pitch <= 0.0 || horizontal_crossing_close_pairs(&tracks, pitch)? == 0 {
+        return None;
+    }
+    let mut deficits = vec![Vec::<(usize, f64)>::new(); ordered_nodes.len()];
+    let mut selected_bands = BTreeSet::new();
+    let mut selected_band_visits = 0usize;
+    for (&(rank, gap), tracks) in &tracks {
+        if tracks.len() < 2 {
+            continue;
+        }
+        if horizontal_band_close_pairs(tracks, pitch, &mut selected_band_visits)? == 0 {
+            continue;
+        }
+        let indices = ordered_nodes.get(rank)?;
+        let upper = nodes.get(*indices.get(gap)?)?;
+        let lower = nodes.get(*indices.get(gap + 1)?)?;
+        let low = upper.y + upper.height + options.edge_node_clearance;
+        let high = lower.y - options.edge_node_clearance;
+        let required = pitch * tracks.len().saturating_sub(1) as f64;
+        let deficit = (required - (high - low)).max(0.0);
+        if !deficit.is_finite() {
+            return None;
+        }
+        selected_bands.insert((rank, gap));
+        if deficit > 0.0 {
+            deficits[rank].push((gap, deficit));
+        }
+    }
+    if selected_bands.is_empty() {
+        return None;
+    }
+    let mut candidate = nodes.to_vec();
+    for (rank, gaps) in deficits.iter_mut().enumerate() {
+        if gaps.is_empty() {
+            continue;
+        }
+        gaps.sort_unstable_by_key(|&(gap, _)| gap);
+        let original_top = ordered_nodes[rank]
+            .iter()
+            .map(|&node| nodes[node].y)
+            .min_by(f64::total_cmp)?;
+        let original_bottom = ordered_nodes[rank]
+            .iter()
+            .map(|&node| nodes[node].y + nodes[node].height)
+            .max_by(f64::total_cmp)?;
+        let mut cumulative = 0.0;
+        let mut next_gap = 0usize;
+        for (position, &node) in ordered_nodes[rank].iter().enumerate() {
+            while next_gap < gaps.len() && gaps[next_gap].0 < position {
+                cumulative += gaps[next_gap].1;
+                next_gap += 1;
+            }
+            candidate[node].y += cumulative;
+            if !candidate[node].y.is_finite() {
+                return None;
+            }
+        }
+        let candidate_top = ordered_nodes[rank]
+            .iter()
+            .map(|&node| candidate[node].y)
+            .min_by(f64::total_cmp)?;
+        let candidate_bottom = ordered_nodes[rank]
+            .iter()
+            .map(|&node| candidate[node].y + candidate[node].height)
+            .max_by(f64::total_cmp)?;
+        let recenter = (original_top + original_bottom - candidate_top - candidate_bottom) / 2.0;
+        for &node in &ordered_nodes[rank] {
+            candidate[node].y += recenter;
+            if !candidate[node].y.is_finite() {
+                return None;
+            }
+        }
+    }
+    let mut overrides = remap_horizontal_crossing_overrides(
+        plan,
+        nodes,
+        &candidate,
+        options.edge_node_clearance,
+        existing_overrides,
+    )?;
+    let mut newly_overridden = BTreeSet::new();
+    for &(rank, gap) in &selected_bands {
+        let indices = ordered_nodes.get(rank)?;
+        let upper = candidate.get(*indices.get(gap)?)?;
+        let lower = candidate.get(*indices.get(gap + 1)?)?;
+        let low = upper.y + upper.height + options.edge_node_clearance;
+        let high = lower.y - options.edge_node_clearance;
+        let mut ordered = tracks
+            .get(&(rank, gap))?
+            .keys()
+            .map(|&(net, y)| (net, y.0))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+        let span = pitch * ordered.len().saturating_sub(1) as f64;
+        let origin = low + (high - low - span) / 2.0;
+        let mut ordinate = origin;
+        for (slot, &(net, y)) in ordered.iter().enumerate() {
+            if slot > 0 {
+                let previous = ordinate;
+                ordinate = previous + pitch;
+                if ordinate - previous < pitch {
+                    ordinate = ordinate.next_up();
+                }
+            }
+            if ordinate > high {
+                return None;
+            }
+            for &edge in tracks.get(&(rank, gap))?.get(&(net, FloatKey(y)))? {
+                let key = (rank, edge);
+                if !newly_overridden.insert(key)
+                    && overrides
+                        .get(&key)
+                        .is_some_and(|&current| current != ordinate)
+                {
+                    return None;
+                }
+                overrides.insert(key, ordinate);
+                if newly_overridden.len() > MAX_HORIZONTAL_PITCH_OVERRIDES
+                    || overrides.len() > MAX_HORIZONTAL_PITCH_OVERRIDES
+                {
+                    return None;
+                }
+            }
+        }
+    }
+    (!selected_bands.is_empty()
+        && !overrides.is_empty()
+        && horizontal_pitch_retained_counts_within_bounds(0, 0, overrides.len()))
+    .then_some((candidate, selected_bands, overrides))
+}
+
+fn remap_horizontal_crossing_overrides(
+    plan: &RoutingPlan<'_>,
+    baseline_nodes: &[NodeGeometry],
+    candidate_nodes: &[NodeGeometry],
+    clearance: f64,
+    overrides: &HorizontalCrossingOverrides,
+) -> Option<HorizontalCrossingOverrides> {
+    if overrides.is_empty() {
+        return Some(HorizontalCrossingOverrides::new());
+    }
+    if overrides.len() > MAX_HORIZONTAL_PITCH_OVERRIDES
+        || baseline_nodes.len() != plan.ranks.len()
+        || candidate_nodes.len() != baseline_nodes.len()
+        || baseline_nodes.len() > MAX_HORIZONTAL_PITCH_NODES
+        || plan.edges.len() > MAX_HORIZONTAL_PITCH_EDGES
+    {
+        return None;
+    }
+    let mut visits = 0usize;
+    let edge_ids = plan
+        .edges
+        .iter()
+        .try_fold(BTreeSet::new(), |mut edge_ids, resolved| {
+            charge_horizontal_pitch_work(
+                &mut visits,
+                horizontal_pitch_ordered_lookup_work(edge_ids.len()),
+            )?;
+            edge_ids.insert(resolved.edge.id);
+            Some(edge_ids)
+        })?;
+    let mut ordered_nodes = plan.nodes_by_rank.clone();
+    for indices in &mut ordered_nodes {
+        let sort_work = indices
+            .len()
+            .checked_mul(horizontal_pitch_ordered_lookup_work(indices.len()))?;
+        charge_horizontal_pitch_work(&mut visits, sort_work)?;
+        indices.sort_unstable_by(|&left, &right| {
+            baseline_nodes[left]
+                .y
+                .total_cmp(&baseline_nodes[right].y)
+                .then(baseline_nodes[left].id.cmp(&baseline_nodes[right].id))
+        });
+    }
+    let bands_by_rank = ordered_nodes
+        .iter()
+        .map(|indices| {
+            indices.windows(2).try_fold(Vec::new(), |mut bands, pair| {
+                charge_horizontal_pitch_work(&mut visits, 1)?;
+                let upper = &baseline_nodes[pair[0]];
+                let lower = &baseline_nodes[pair[1]];
+                let low = upper.y + upper.height + clearance;
+                let high = lower.y - clearance;
+                if low <= high {
+                    bands.push((low, high, pair[0], pair[1]));
+                }
+                Some(bands)
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let mut remapped = HorizontalCrossingOverrides::new();
+    for (&(rank, edge), &y) in overrides {
+        charge_horizontal_pitch_work(
+            &mut visits,
+            horizontal_pitch_ordered_lookup_work(edge_ids.len()),
+        )?;
+        if !edge_ids.contains(&edge) || !y.is_finite() {
+            return None;
+        }
+        let bands = bands_by_rank.get(rank)?;
+        let search_visits = horizontal_pitch_ordered_lookup_work(bands.len());
+        charge_horizontal_pitch_work(&mut visits, search_visits.saturating_add(1))?;
+        let band_index = bands.partition_point(|&(_, high, _, _)| high < y);
+        let &(low, high, upper, lower) = bands.get(band_index)?;
+        if y < low || y > high {
+            return None;
+        }
+        let candidate_upper = &candidate_nodes[upper];
+        let candidate_lower = &candidate_nodes[lower];
+        let candidate_low = candidate_upper.y + candidate_upper.height + clearance;
+        let candidate_high = candidate_lower.y - clearance;
+        if candidate_low > candidate_high {
+            return None;
+        }
+        let fraction = if high > low {
+            (y - low) / (high - low)
+        } else {
+            0.5
+        };
+        let mapped = candidate_low + fraction * (candidate_high - candidate_low);
+        if !mapped.is_finite() {
+            return None;
+        }
+        charge_horizontal_pitch_work(
+            &mut visits,
+            horizontal_pitch_ordered_lookup_work(remapped.len()),
+        )?;
+        remapped.insert((rank, edge), mapped);
+        if remapped.len() > MAX_HORIZONTAL_PITCH_OVERRIDES {
+            return None;
+        }
+    }
+    horizontal_pitch_retained_counts_within_bounds(0, 0, remapped.len()).then_some(remapped)
+}
+
+pub(crate) fn selected_layout_horizontal_pitch_candidate(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline_routes: &[EdgeGeometry],
+    options: LayoutOptions,
+) -> Option<(RouteQuality, Vec<NodeGeometry>, Vec<EdgeGeometry>, f64)> {
+    let preferred = options.route_lane_gap.max(PREFERRED_HORIZONTAL_TRACK_PITCH);
+    let fallback = MINIMUM_HORIZONTAL_TRACK_PITCH;
+    select_horizontal_pitch_candidate(preferred, fallback, |pitch| {
+        selected_layout_horizontal_pitch_candidate_at_pitch(
+            plan,
+            nodes,
+            baseline_routes,
+            options,
+            pitch,
+        )
+    })
+    .map(|((quality, nodes, routes), pitch)| (quality, nodes, routes, pitch))
+}
+
+fn select_horizontal_pitch_candidate<T>(
+    preferred: f64,
+    fallback: f64,
+    mut candidate_at_pitch: impl FnMut(f64) -> Option<T>,
+) -> Option<(T, f64)> {
+    candidate_at_pitch(preferred)
+        .map(|candidate| (candidate, preferred))
+        .or_else(|| {
+            (fallback < preferred)
+                .then(|| candidate_at_pitch(fallback).map(|candidate| (candidate, fallback)))
+                .flatten()
+        })
+}
+
+fn selected_layout_horizontal_pitch_candidate_at_pitch(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline_routes: &[EdgeGeometry],
+    options: LayoutOptions,
+    pitch: f64,
+) -> Option<(RouteQuality, Vec<NodeGeometry>, Vec<EdgeGeometry>)> {
+    if options.edge_node_clearance <= 0.0
+        || !pitch.is_finite()
+        || pitch < MINIMUM_HORIZONTAL_TRACK_PITCH
+        || nodes.len() != plan.ranks.len()
+        || baseline_routes.len() != plan.edges.len()
+    {
+        return None;
+    }
+    let route_points = baseline_routes
+        .iter()
+        .try_fold(0usize, |total, route| total.checked_add(route.points.len()))?;
+    if !horizontal_pitch_shape_counts_within_bounds(
+        nodes.len(),
+        baseline_routes.len(),
+        route_points,
+    ) {
+        return None;
+    }
+    let mut candidate_nodes = nodes.to_vec();
+    let mut candidate_routes = baseline_routes.to_vec();
+    let mut overrides = HorizontalCrossingOverrides::new();
+    for _ in 0..MAX_HORIZONTAL_PITCH_PASSES {
+        let (expanded_nodes, selected_bands, expanded_overrides) =
+            expanded_horizontal_crossing_band_nodes(
+                plan,
+                &candidate_nodes,
+                &candidate_routes,
+                options,
+                pitch,
+                &overrides,
+            )?;
+        let baseline_tracks = horizontal_crossing_band_tracks(
+            plan,
+            &candidate_nodes,
+            &candidate_routes,
+            options.edge_node_clearance,
+        )?
+        .1;
+        let baseline_close =
+            horizontal_crossing_close_pairs_in_bands(&baseline_tracks, &selected_bands, pitch)?;
+        if baseline_close == 0 {
+            return None;
+        }
+        let routed = route_planned_candidates_with_horizontal_overrides(
+            plan,
+            &expanded_nodes,
+            options,
+            false,
+            true,
+            true,
+            true,
+            true,
+            false,
+            Some(&expanded_overrides),
+        );
+        let mut candidates = Vec::new();
+        candidates.push((
+            routed
+                .primary_quality
+                .unwrap_or_else(|| route_quality_for_plan(plan, &routed.primary)),
+            routed.primary,
+        ));
+        candidates.extend(routed.repair);
+        candidates.extend(routed.alternatives);
+        let congestion = |routes: &[EdgeGeometry]| {
+            let segments = route_quality_profile_for_plan(plan, routes).1;
+            let horizontal = segments
+                .into_iter()
+                .filter(|segment| segment.horizontal)
+                .collect::<Vec<_>>();
+            parallel_congestion_profile_at(&horizontal, options.route_lane_gap)
+                .map_or(f64::INFINITY, |profile| profile.0)
+        };
+        let (quality, routes, remaining_close) = candidates
+            .into_iter()
+            .filter_map(|(quality, candidate)| {
+                if !horizontal_pitch_candidate_is_admissible(
+                    plan,
+                    nodes,
+                    baseline_routes,
+                    &expanded_nodes,
+                    &candidate,
+                    options,
+                ) {
+                    return None;
+                }
+                let tracks = horizontal_crossing_band_tracks(
+                    plan,
+                    &expanded_nodes,
+                    &candidate,
+                    options.edge_node_clearance,
+                )?
+                .1;
+                let remaining = horizontal_crossing_close_pairs(&tracks, pitch)?;
+                Some((quality, candidate, remaining))
+            })
+            .min_by(
+                |(left_quality, left, left_close), (right_quality, right, right_close)| {
+                    left_close
+                        .cmp(right_close)
+                        .then(congestion(left).total_cmp(&congestion(right)))
+                        .then(route_quality_cmp(*left_quality, *right_quality))
+                },
+            )?;
+        if remaining_close == 0 {
+            return Some((quality, expanded_nodes, routes));
+        }
+        candidate_nodes = expanded_nodes;
+        candidate_routes = routes;
+        overrides = expanded_overrides;
+    }
+    None
+}
+
 pub(crate) fn selected_layout_pitched_gap_candidate(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
@@ -5020,19 +5866,24 @@ pub(crate) fn selected_layout_pitched_gap_candidate(
     }
     let mut assignments =
         pitched_gap_track_assignments(&gap_lanes, &accesses, &layer_left, &layer_right, options)?;
-    let maximum_candidates = MAX_PITCHED_GAP_SUBSET_CANDIDATES
-        .min(MAX_PITCHED_GAP_SUBSET_ROUTE_POINT_VISITS.checked_div(route_points)?);
-    if maximum_candidates == 0 {
-        return None;
-    }
-    let ranked_gaps = retain_top_pitched_gap_candidates(
-        &mut assignments,
-        &close_gaps,
-        &layer_left,
-        &layer_right,
-        options,
-        maximum_candidates,
-    )?;
+    let full_family = crate::full_family_pitched_spacing_enabled(options);
+    let ranked_gaps = if full_family {
+        None
+    } else {
+        let maximum_candidates = MAX_PITCHED_GAP_SUBSET_CANDIDATES
+            .min(MAX_PITCHED_GAP_SUBSET_ROUTE_POINT_VISITS.checked_div(route_points)?);
+        if maximum_candidates == 0 {
+            return None;
+        }
+        Some(retain_top_pitched_gap_candidates(
+            &mut assignments,
+            &close_gaps,
+            &layer_left,
+            &layer_right,
+            options,
+            maximum_candidates,
+        )?)
+    };
     let (baseline_quality, baseline_segments) =
         route_quality_profile_for_plan(plan, baseline_routes);
     let baseline_maximum_knot =
@@ -5044,24 +5895,26 @@ pub(crate) fn selected_layout_pitched_gap_candidate(
         return None;
     }
     let baseline_close_congestion = parallel_congestion_ratio(&baseline_segments)?;
-    select_safe_pitched_gap_subset(
-        plan,
-        baseline_routes,
-        &mut assignments,
-        &ranked_gaps,
-        PitchedGapGeometry {
-            nodes,
-            layer_left: &layer_left,
-            layer_right: &layer_right,
-        },
-        options,
-        PitchedGapReadability {
-            quality: baseline_quality,
-            maximum_knot: baseline_maximum_knot,
-            congestion: baseline_congestion,
-            minimum_separation: baseline_minimum_separation,
-        },
-    )?;
+    if let Some(ranked_gaps) = ranked_gaps {
+        select_safe_pitched_gap_subset(
+            plan,
+            baseline_routes,
+            &mut assignments,
+            &ranked_gaps,
+            PitchedGapGeometry {
+                nodes,
+                layer_left: &layer_left,
+                layer_right: &layer_right,
+            },
+            options,
+            PitchedGapReadability {
+                quality: baseline_quality,
+                maximum_knot: baseline_maximum_knot,
+                congestion: baseline_congestion,
+                minimum_separation: baseline_minimum_separation,
+            },
+        )?;
+    }
     if pitched_gap_close_vertical_pairs(&assignments, &accesses, pitch)? != 0 {
         return None;
     }
@@ -5076,7 +5929,18 @@ pub(crate) fn selected_layout_pitched_gap_candidate(
         options,
     )?;
     let (candidate_quality, candidate_segments) = route_quality_profile_for_plan(plan, &candidate);
-    if !pitched_gap_route_quality_is_admissible(baseline_quality, candidate_quality) {
+    if !pitched_gap_route_quality_is_admissible(
+        baseline_quality,
+        candidate_quality,
+        options.max_quality_route_length_factor,
+    ) {
+        return None;
+    }
+    if pitched_geometry_area(&candidate_nodes, &candidate)?
+        > pitched_geometry_area(nodes, baseline_routes)? * options.max_quality_area_factor
+        || maximum_crossings_on_physical_segment(&plan.shared_endpoints, &candidate_segments)
+            > baseline_maximum_knot
+    {
         return None;
     }
     let (candidate_congestion, candidate_minimum_separation) =
@@ -5092,10 +5956,48 @@ pub(crate) fn selected_layout_pitched_gap_candidate(
             Some(baseline_minimum_separation),
             candidate_minimum_separation,
         )
+        || full_family
+            && !layout_vertical_gap_pitch_is_satisfied(plan, &candidate_nodes, &candidate, pitch)
     {
         return None;
     }
     Some((candidate_quality, candidate_nodes, candidate))
+}
+
+pub(crate) fn layout_vertical_gap_pitch_is_satisfied(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    pitch: f64,
+) -> bool {
+    layout_vertical_gap_close_pairs(plan, nodes, routes, pitch) == Some(0)
+}
+
+pub(crate) fn layout_vertical_gap_close_pairs(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    pitch: f64,
+) -> Option<usize> {
+    if !pitch.is_finite()
+        || pitch <= 0.0
+        || nodes.len() != plan.ranks.len()
+        || routes.len() != plan.edges.len()
+    {
+        return None;
+    }
+    let rank_count = plan.nodes_by_rank.len();
+    let mut layer_left = vec![f64::INFINITY; rank_count];
+    let mut layer_right = vec![f64::NEG_INFINITY; rank_count];
+    for (node, &rank) in nodes.iter().zip(&plan.ranks) {
+        layer_left[rank] = layer_left[rank].min(node.x);
+        layer_right[rank] = layer_right[rank].max(node.x + node.width);
+    }
+    selected_layout_gap_accesses(plan, routes, &layer_left, &layer_right)
+        .and_then(|(_, accesses, track_x)| {
+            pitched_gap_current_close_gaps(&track_x, &accesses, pitch)
+        })
+        .and_then(|close| close.into_iter().try_fold(0usize, usize::checked_add))
 }
 
 fn pitched_gap_current_close_gaps(
@@ -5171,13 +6073,17 @@ fn select_safe_pitched_gap_subset(
         let (candidate_quality, segments) = route_quality_profile_for_plan(plan, &candidate);
         let (candidate_congestion, candidate_minimum_separation) =
             parallel_congestion_profile_at(&segments, options.route_lane_gap)?;
-        if pitched_gap_route_quality_is_admissible(baseline.quality, candidate_quality)
-            && candidate_congestion <= retained_congestion
+        if pitched_gap_route_quality_is_admissible(
+            baseline.quality,
+            candidate_quality,
+            options.max_quality_route_length_factor,
+        ) && candidate_congestion <= retained_congestion
             && minimum_parallel_route_separation_does_not_regress(
                 Some(baseline.minimum_separation),
                 candidate_minimum_separation,
             )
-            && pitched_geometry_area(&candidate_nodes, &candidate)? <= baseline_area * 1.20
+            && pitched_geometry_area(&candidate_nodes, &candidate)?
+                <= baseline_area * options.max_quality_area_factor
             && maximum_crossings_on_physical_segment(&plan.shared_endpoints, &segments)
                 <= baseline.maximum_knot
         {
@@ -5611,7 +6517,7 @@ fn pitched_gap_quality_is_admissible(
     candidate: RouteQuality,
     candidate_congestion: f64,
 ) -> bool {
-    pitched_gap_route_quality_is_admissible(baseline, candidate)
+    pitched_gap_route_quality_is_admissible(baseline, candidate, 1.1)
         && candidate_congestion < baseline_congestion
         && candidate_congestion <= baseline_congestion * MAX_PITCHED_GAP_CONGESTION_FACTOR
 }
@@ -5619,6 +6525,7 @@ fn pitched_gap_quality_is_admissible(
 fn pitched_gap_route_quality_is_admissible(
     baseline: RouteQuality,
     candidate: RouteQuality,
+    maximum_length_factor: f64,
 ) -> bool {
     let crossing_allowance = baseline
         .crossings
@@ -5626,7 +6533,7 @@ fn pitched_gap_route_quality_is_admissible(
         .unwrap_or(usize::MAX);
     candidate.crossings <= baseline.crossings.saturating_add(crossing_allowance)
         && candidate.bends == baseline.bends
-        && candidate.route_length <= baseline.route_length * MAX_PITCHED_GAP_LENGTH_FACTOR
+        && candidate.route_length <= baseline.route_length * maximum_length_factor
 }
 
 fn route_quality_cmp(left: RouteQuality, right: RouteQuality) -> Ordering {
@@ -6957,6 +7864,7 @@ fn sparse_crossing_paths(
     free_by_rank: &[Vec<(f64, f64)>],
     endpoint_tracks: &EndpointTracks,
     port_stub: f64,
+    horizontal_overrides: Option<&HorizontalCrossingOverrides>,
 ) -> Vec<Option<Vec<f64>>> {
     // A single-driver net uses one obstacle-safe backbone; each sink route receives the prefix
     // that reaches its rank and branches only in the final gap.
@@ -7027,7 +7935,8 @@ fn sparse_crossing_paths(
         shared_paths.insert(net, (source_rank, path));
     }
 
-    plan.edges
+    let mut paths = plan
+        .edges
         .iter()
         .zip(sparse_spans)
         .map(|(resolved, span)| {
@@ -7057,7 +7966,22 @@ fn sparse_crossing_paths(
                 crossing_tie_lane_count,
             ))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(overrides) = horizontal_overrides {
+        for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(&mut paths) {
+            let (Some((source_rank, _)), Some(path)) = (span, path) else {
+                continue;
+            };
+            for (offset, y) in path.iter_mut().enumerate() {
+                if let Some(&override_y) =
+                    overrides.get(&(source_rank + offset + 1, resolved.edge.id))
+                {
+                    *y = override_y;
+                }
+            }
+        }
+    }
+    paths
 }
 
 #[derive(Clone, Default)]
@@ -8676,26 +9600,30 @@ mod tests {
         crossing_aware_gap_lane_indices, crossing_aware_gap_lane_indices_btree_reference,
         crossing_aware_outer_lane_indices, crossing_paths_have_unrelated_collinear_tracks,
         crossing_repair_within_budget, crossing_track_y, distance_transform,
-        expanded_gap_spacing_enabled, expanded_spacing_readability_is_better,
-        fanout_outer_channel_lane_indices, free_interval_containing, free_intervals_by_rank,
-        global_gap_candidate_work_within_budget, global_gap_lane_indices_with_rounds,
-        global_gap_order_seed, has_split_feedback_net, horizontal_crossing_counts_by_net,
-        lane_indices, large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
-        large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
-        large_gap_hot_nets, large_gap_hot_nets_with_limit, move_nets_to_outer_lanes,
-        negotiated_corridor_quality_is_better, outer_lane_assignments, outer_lane_channels_match,
-        outer_pair_crossings, physical_crossing_sweep, physical_crossing_sweep_lines,
-        physical_route_segments, physical_route_segments_btree_reference,
-        piecewise_constant_crossing_path, port_point, push_regional_ordinate,
-        raw_route_family_has_unexempt_collinear_overlap, raw_route_family_has_unrelated_contact,
-        raw_route_segments, raw_route_segments_have_unrelated_contact,
-        refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
-        regional_fanout_edges, regional_fanout_quality_is_better,
-        regional_safety_work_within_budget, regional_segment_intersects_node_interior,
-        regional_segments_have_unrelated_contact, repair_crossing_heavy_net,
-        repair_selection_adds_new_nets, route_edges, route_edges_with_lane_rounds,
-        route_edges_with_lane_rounds_and_global, route_family_has_unrelated_contact_bounded,
+        expanded_gap_spacing_enabled, expanded_horizontal_crossing_band_nodes,
+        expanded_spacing_readability_is_better, fanout_outer_channel_lane_indices,
+        free_interval_containing, free_intervals_by_rank, global_gap_candidate_work_within_budget,
+        global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
+        horizontal_crossing_band_tracks, horizontal_crossing_close_pairs,
+        horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
+        large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
+        large_gap_hot_insertion_order_with_rounds, large_gap_hot_nets,
+        large_gap_hot_nets_with_limit, layout_horizontal_crossing_pitch_is_satisfied,
+        move_nets_to_outer_lanes, negotiated_corridor_quality_is_better, outer_lane_assignments,
+        outer_lane_channels_match, outer_pair_crossings, physical_crossing_sweep,
+        physical_crossing_sweep_lines, physical_route_segments,
+        physical_route_segments_btree_reference, piecewise_constant_crossing_path, port_point,
+        push_regional_ordinate, raw_route_family_has_unexempt_collinear_overlap,
+        raw_route_family_has_unrelated_contact, raw_route_segments,
+        raw_route_segments_have_unrelated_contact, refined_large_gap_candidate_work_within_budget,
+        refined_large_gap_hot_insertion_orders, regional_fanout_edges,
+        regional_fanout_quality_is_better, regional_safety_work_within_budget,
+        regional_segment_intersects_node_interior, regional_segments_have_unrelated_contact,
+        repair_crossing_heavy_net, repair_selection_adds_new_nets, route_edges,
+        route_edges_with_lane_rounds, route_edges_with_lane_rounds_and_global,
+        route_family_has_unrelated_contact_bounded,
         route_family_satisfies_parallel_spacing_bounded, route_planned_candidates,
+        route_planned_candidates_with_horizontal_overrides,
         route_planned_candidates_with_quality_options, route_planned_candidates_with_sparse_global,
         route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
         route_supplemental_edges, select_crossing_repair_nets, select_gap_spacing_candidate,
@@ -8756,6 +9684,94 @@ mod tests {
             minimum_parallel_wire_spacing: 6.0,
             ..LayoutOptions::default()
         }));
+    }
+
+    #[test]
+    fn horizontal_pitch_work_and_retained_state_caps_are_exact_and_fail_closed() {
+        let mut visits = 0;
+        assert_eq!(
+            super::charge_horizontal_pitch_work(
+                &mut visits,
+                super::MAX_HORIZONTAL_PITCH_RANK_VISITS,
+            ),
+            Some(())
+        );
+        assert_eq!(visits, super::MAX_HORIZONTAL_PITCH_RANK_VISITS);
+        assert_eq!(super::charge_horizontal_pitch_work(&mut visits, 1), None);
+        assert_eq!(visits, super::MAX_HORIZONTAL_PITCH_RANK_VISITS + 1);
+
+        assert!(super::horizontal_pitch_shape_counts_within_bounds(
+            super::MAX_HORIZONTAL_PITCH_NODES,
+            super::MAX_HORIZONTAL_PITCH_EDGES,
+            super::MAX_HORIZONTAL_PITCH_PATH_POINTS,
+        ));
+        for counts in [
+            (
+                super::MAX_HORIZONTAL_PITCH_NODES + 1,
+                super::MAX_HORIZONTAL_PITCH_EDGES,
+                super::MAX_HORIZONTAL_PITCH_PATH_POINTS,
+            ),
+            (
+                super::MAX_HORIZONTAL_PITCH_NODES,
+                super::MAX_HORIZONTAL_PITCH_EDGES + 1,
+                super::MAX_HORIZONTAL_PITCH_PATH_POINTS,
+            ),
+            (
+                super::MAX_HORIZONTAL_PITCH_NODES,
+                super::MAX_HORIZONTAL_PITCH_EDGES,
+                super::MAX_HORIZONTAL_PITCH_PATH_POINTS + 1,
+            ),
+        ] {
+            assert!(!super::horizontal_pitch_shape_counts_within_bounds(
+                counts.0, counts.1, counts.2,
+            ));
+        }
+
+        assert!(super::horizontal_pitch_retained_counts_within_bounds(
+            super::MAX_HORIZONTAL_PITCH_TRACK_KEYS,
+            super::MAX_HORIZONTAL_PITCH_TRACK_MEMBERSHIPS,
+            super::MAX_HORIZONTAL_PITCH_OVERRIDES,
+        ));
+        for counts in [
+            (
+                super::MAX_HORIZONTAL_PITCH_TRACK_KEYS + 1,
+                super::MAX_HORIZONTAL_PITCH_TRACK_MEMBERSHIPS,
+                super::MAX_HORIZONTAL_PITCH_OVERRIDES,
+            ),
+            (
+                super::MAX_HORIZONTAL_PITCH_TRACK_KEYS,
+                super::MAX_HORIZONTAL_PITCH_TRACK_MEMBERSHIPS + 1,
+                super::MAX_HORIZONTAL_PITCH_OVERRIDES,
+            ),
+            (
+                super::MAX_HORIZONTAL_PITCH_TRACK_KEYS,
+                super::MAX_HORIZONTAL_PITCH_TRACK_MEMBERSHIPS,
+                super::MAX_HORIZONTAL_PITCH_OVERRIDES + 1,
+            ),
+        ] {
+            assert!(!super::horizontal_pitch_retained_counts_within_bounds(
+                counts.0, counts.1, counts.2,
+            ));
+        }
+    }
+
+    #[test]
+    fn horizontal_pitch_selector_falls_back_from_six_to_four_and_stops_at_success() {
+        let mut attempted = Vec::new();
+        let selected = super::select_horizontal_pitch_candidate(6.0, 4.0, |pitch| {
+            attempted.push(pitch);
+            (pitch == 4.0).then_some("fallback")
+        });
+        assert_eq!(selected, Some(("fallback", 4.0)));
+        assert_eq!(attempted, vec![6.0, 4.0]);
+
+        attempted.clear();
+        let selected = super::select_horizontal_pitch_candidate(6.0, 4.0, |pitch| {
+            attempted.push(pitch);
+            (pitch == 6.0).then_some("preferred")
+        });
+        assert_eq!(selected, Some(("preferred", 6.0)));
+        assert_eq!(attempted, vec![6.0]);
     }
 
     #[test]
@@ -9709,7 +10725,7 @@ mod tests {
         let boundary = RouteQuality {
             crossings: 101,
             bends: 100,
-            route_length: baseline.route_length * super::MAX_PITCHED_GAP_LENGTH_FACTOR,
+            route_length: baseline.route_length * 1.1,
         };
         assert!(super::pitched_gap_quality_is_admissible(
             baseline, 0.5, boundary, 0.475
@@ -10116,6 +11132,315 @@ mod tests {
         assert_eq!(
             free_interval_containing(&[(0.0, 1.0), (1.0, 2.0)], 1.0),
             Some((0.0, 1.0))
+        );
+    }
+
+    #[test]
+    fn expanded_horizontal_candidate_reroutes_the_real_family_at_exact_pitch() {
+        let endpoint = |id, side| Node {
+            id,
+            width: 20.0,
+            height: 100.0,
+            cycle_breaker: false,
+            ports: (0..4)
+                .map(|port| Port {
+                    id: port,
+                    side,
+                    offset: 25.0 + port as f64,
+                })
+                .collect(),
+        };
+        let blocker = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: Vec::new(),
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint(0, PortSide::East),
+                blocker(1),
+                blocker(2),
+                endpoint(3, PortSide::West),
+            ],
+            edges: (0..4)
+                .map(|edge| Edge {
+                    id: 100 + edge,
+                    source: Endpoint {
+                        node: 0,
+                        port: edge,
+                    },
+                    target: Endpoint {
+                        node: 3,
+                        port: edge,
+                    },
+                    net: [7, 7, 8, 9][edge as usize],
+                    participates_in_ranking: true,
+                })
+                .collect(),
+        };
+        let options = LayoutOptions {
+            edge_node_clearance: 20.0,
+            route_lane_gap: 6.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1, 1, 2]);
+        let nodes = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 100.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 66.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 200.0,
+                y: 0.0,
+                width: 20.0,
+                height: 100.0,
+            },
+        ];
+        let baseline = (0..4)
+            .map(|edge| {
+                let port_y = 25.0 + edge as f64;
+                let track_y = 41.0 + edge as f64;
+                EdgeGeometry {
+                    id: 100 + edge,
+                    points: vec![
+                        Point { x: 20.0, y: port_y },
+                        Point { x: 70.0, y: port_y },
+                        Point {
+                            x: 70.0,
+                            y: track_y,
+                        },
+                        Point {
+                            x: 150.0,
+                            y: track_y,
+                        },
+                        Point {
+                            x: 150.0,
+                            y: port_y,
+                        },
+                        Point {
+                            x: 200.0,
+                            y: port_y,
+                        },
+                    ],
+                }
+            })
+            .collect::<Vec<_>>();
+        let (expanded, _, overrides) = expanded_horizontal_crossing_band_nodes(
+            &plan,
+            &nodes,
+            &baseline,
+            options,
+            6.0,
+            &Default::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            overrides.keys().copied().collect::<Vec<_>>(),
+            vec![(1, 100), (1, 101), (1, 102), (1, 103)],
+            "same-net branches at distinct ordinates retain edge identity"
+        );
+        let routed = route_planned_candidates_with_horizontal_overrides(
+            &plan,
+            &expanded,
+            options,
+            false,
+            true,
+            true,
+            true,
+            true,
+            true,
+            Some(&overrides),
+        );
+        let (_, tracks) = horizontal_crossing_band_tracks(
+            &plan,
+            &expanded,
+            &routed.primary,
+            options.edge_node_clearance,
+        )
+        .unwrap();
+
+        assert_eq!(
+            horizontal_crossing_close_pairs(&tracks, options.route_lane_gap),
+            Some(0),
+            "{tracks:?}"
+        );
+        assert!(layout_horizontal_crossing_pitch_is_satisfied(
+            &plan,
+            &expanded,
+            &routed.primary,
+            options,
+            6.0,
+        ));
+        for routes in routed
+            .repair
+            .iter()
+            .chain(routed.alternatives.iter())
+            .map(|(_, routes)| routes)
+        {
+            assert!(
+                layout_horizontal_crossing_pitch_is_satisfied(
+                    &plan, &expanded, routes, options, 6.0,
+                ),
+                "downstream repair and alternative families must preserve horizontal overrides",
+            );
+        }
+
+        let mut regressed = routed.primary.clone();
+        let first_track = regressed[0]
+            .points
+            .windows(2)
+            .find(|pair| {
+                pair[0].y == pair[1].y
+                    && pair[0].x.min(pair[1].x) <= 100.0
+                    && pair[0].x.max(pair[1].x) >= 120.0
+            })
+            .unwrap()[0]
+            .y;
+        let second_track = regressed[2]
+            .points
+            .windows(2)
+            .position(|pair| {
+                pair[0].y == pair[1].y
+                    && pair[0].x.min(pair[1].x) <= 100.0
+                    && pair[0].x.max(pair[1].x) >= 120.0
+            })
+            .unwrap();
+        regressed[2].points[second_track].y = first_track.next_up();
+        regressed[2].points[second_track + 1].y = first_track.next_up();
+        assert!(
+            !layout_horizontal_crossing_pitch_is_satisfied(
+                &plan, &expanded, &regressed, options, 6.0,
+            ),
+            "a later route family that reintroduces a close pair must be rejected"
+        );
+    }
+
+    #[test]
+    fn cumulative_horizontal_overrides_remap_each_edge_rank_independently() {
+        let endpoint = |id, side| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side,
+                offset: 10.0,
+            }],
+        };
+        let blocker = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: Vec::new(),
+        };
+        let graph = Graph {
+            nodes: vec![
+                endpoint(0, PortSide::East),
+                blocker(1),
+                blocker(2),
+                blocker(3),
+                blocker(4),
+                endpoint(5, PortSide::West),
+            ],
+            edges: vec![Edge {
+                id: 100,
+                source: Endpoint { node: 0, port: 0 },
+                target: Endpoint { node: 5, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            }],
+        };
+        let options = LayoutOptions {
+            edge_node_clearance: 20.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1, 1, 2, 2, 3]);
+        let mut nodes = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 80.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 200.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 4,
+                x: 200.0,
+                y: 100.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 5,
+                x: 300.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        let baseline = nodes.clone();
+        nodes[2].y = 100.0;
+        nodes[4].y = 140.0;
+        let overrides =
+            super::HorizontalCrossingOverrides::from([((1, 100), 50.0), ((2, 100), 60.0)]);
+
+        assert_eq!(
+            super::remap_horizontal_crossing_overrides(
+                &plan,
+                &baseline,
+                &nodes,
+                options.edge_node_clearance,
+                &overrides,
+            ),
+            Some(super::HorizontalCrossingOverrides::from([
+                ((1, 100), 60.0),
+                ((2, 100), 80.0),
+            ])),
         );
     }
 
@@ -11688,6 +13013,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
             GapTrackSpacing::Compact,
             super::MAX_BATCHED_CROSSING_REPAIR_NETS,
             false,
@@ -11720,6 +13046,7 @@ mod tests {
             &BTreeMap::new(),
             &[],
             false,
+            None,
             Some((&empty_physical_segments, &empty_crossing_counts, baseline)),
             GapTrackSpacing::Compact,
             super::MAX_BATCHED_CROSSING_REPAIR_NETS,
