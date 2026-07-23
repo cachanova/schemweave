@@ -335,8 +335,9 @@ fn demand_aware_layer_gaps(
         .map(|gap| {
             active += difference[gap];
             let lane_count = usize::try_from(active).expect("net span count is nonnegative");
-            let demanded = options.port_stub * 2.0
-                + options.route_lane_gap * (lane_count.saturating_add(1) as f64);
+            let boundary = options.port_stub.max(options.edge_node_clearance) * 2.0;
+            let demanded =
+                boundary + options.route_lane_gap * (lane_count.saturating_add(1) as f64);
             options.layer_gap.max(demanded)
         })
         .collect()

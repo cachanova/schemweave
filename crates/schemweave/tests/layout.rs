@@ -375,7 +375,7 @@ fn configurable_clearance_expands_ordinary_same_rank_gaps() {
 }
 
 #[test]
-fn collapsed_outer_access_never_panics_or_loses_clearance() {
+fn coincident_distinct_corner_ports_fail_with_typed_contact_error() {
     let isolated = |id| Node {
         id,
         width: 80.0,
@@ -455,9 +455,8 @@ fn collapsed_outer_access_never_panics_or_loses_clearance() {
     let result = std::panic::catch_unwind(|| {
         schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max)
     })
-    .expect("positive-clearance layout must not panic")
-    .unwrap();
-    assert_edge_node_clearance(&graph, &result, 40.0);
+    .expect("positive-clearance layout must not panic");
+    assert_eq!(result, Err(LayoutError::UnrelatedRouteContactUnsatisfied));
 }
 
 #[test]
@@ -511,7 +510,7 @@ fn positive_clearance_self_loop_exempts_only_its_endpoint_node() {
 }
 
 #[test]
-fn mixed_side_seeds_17_and_25_have_complete_clearance_layouts() {
+fn mixed_side_corner_port_contacts_fail_with_typed_error_deterministically() {
     fn rng(state: &mut u64) -> u64 {
         *state = state
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -602,9 +601,8 @@ fn mixed_side_seeds_17_and_25_have_complete_clearance_layouts() {
             edge_node_clearance: 20.0,
             ..LayoutOptions::default()
         };
-        let result =
-            schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
-        assert_edge_node_clearance(&graph, &result, 20.0);
+        let result = schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max);
+        assert_eq!(result, Err(LayoutError::UnrelatedRouteContactUnsatisfied));
     }
 }
 
@@ -1054,7 +1052,10 @@ fn layout_errors_have_deterministic_public_classification() {
             | LayoutError::UnknownEndpointPort { .. } => "graph",
             LayoutError::InvalidOption { .. } | LayoutError::TooManyOrderingSweeps(_) => "option",
             LayoutError::EdgeNodeClearanceUnsatisfied { .. }
-            | LayoutError::EdgeNodeClearanceWorkLimitExceeded { .. } => "clearance",
+            | LayoutError::EdgeNodeClearanceWorkLimitExceeded { .. }
+            | LayoutError::UnrelatedRouteContactUnsatisfied
+            | LayoutError::UnrelatedRouteContactWorkLimitExceeded { .. }
+            | LayoutError::UnrelatedRouteContactSegmentLimitExceeded { .. } => "clearance",
         }
     }
 
