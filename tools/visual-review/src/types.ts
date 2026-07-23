@@ -27,6 +27,7 @@ export interface LayoutOptions {
   node_gap: number
   port_stub: number
   route_lane_gap: number
+  minimum_parallel_wire_spacing: number
   edge_node_clearance: number
   ordering_sweeps: number
   quality_effort: 'fast' | 'quality' | 'max'

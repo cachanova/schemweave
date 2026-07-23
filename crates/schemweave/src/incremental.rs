@@ -223,7 +223,9 @@ pub fn expand_group_in_place(
         &options.constraints,
     )
     .map_err(GroupExpansionError::InvalidExpandedGraph)?;
-    if options.layout.edge_node_clearance > 0.0 {
+    if options.layout.edge_node_clearance > 0.0
+        || options.layout.minimum_parallel_wire_spacing > 0.0
+    {
         return Err(GroupExpansionError::NeedsFullRelayout);
     }
     if expanded_graph.edges.len() > MAX_EXPANSION_EDGES {
@@ -2408,6 +2410,28 @@ mod tests {
                 &GroupExpansionOptions {
                     layout: LayoutOptions {
                         edge_node_clearance: 20.0,
+                        ..LayoutOptions::default()
+                    },
+                    ..GroupExpansionOptions::default()
+                },
+            ),
+            Err(GroupExpansionError::NeedsFullRelayout)
+        );
+    }
+
+    #[test]
+    fn positive_parallel_wire_spacing_requires_a_full_group_relayout() {
+        let (compact, expanded, expansion) = fixture();
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        assert_eq!(
+            expand_group_in_place(
+                &compact,
+                &compact_layout,
+                &expanded,
+                &expansion,
+                &GroupExpansionOptions {
+                    layout: LayoutOptions {
+                        minimum_parallel_wire_spacing: 6.0,
                         ..LayoutOptions::default()
                     },
                     ..GroupExpansionOptions::default()
