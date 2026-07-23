@@ -1,10 +1,9 @@
 #![forbid(unsafe_code)]
 
 use schemweave::{
-    Graph, GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConstraints,
-    LayoutOptions, QualityEffort,
+    Graph, GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConfig,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
 /// Lay out a graph through a compact JSON boundary suitable for Web Workers.
@@ -18,18 +17,13 @@ pub fn layout_serialized(graph_json: &str, options_json: &str) -> Result<String,
     let graph: Graph =
         serde_json::from_str(graph_json).map_err(|error| format!("invalid graph JSON: {error}"))?;
     let options = if options_json.trim().is_empty() {
-        SerializedLayoutOptions::default()
+        LayoutConfig::default()
     } else {
         serde_json::from_str(options_json)
             .map_err(|error| format!("invalid options JSON: {error}"))?
     };
-    let result = schemweave::layout_with_quality_effort_and_constraints(
-        &graph,
-        options.layout,
-        options.quality_effort,
-        &options.constraints,
-    )
-    .map_err(|error| error.to_string())?;
+    let result =
+        schemweave::layout_with_config(&graph, &options).map_err(|error| error.to_string())?;
     serde_json::to_string(&result).map_err(|error| format!("failed to encode layout: {error}"))
 }
 
@@ -69,7 +63,7 @@ pub fn expand_group_serialized(
     let expansion: GroupExpansion = serde_json::from_str(expansion_json)
         .map_err(|error| format!("invalid group expansion JSON: {error}"))?;
     let options = if options_json.trim().is_empty() {
-        SerializedLayoutOptions::default()
+        LayoutConfig::default()
     } else {
         serde_json::from_str(options_json)
             .map_err(|error| format!("invalid options JSON: {error}"))?
@@ -120,26 +114,6 @@ enum FullRelayoutReason {
     Geometry,
     WorkLimit,
     PreservedGeometryTooLarge,
-}
-
-#[derive(Deserialize)]
-#[serde(default)]
-struct SerializedLayoutOptions {
-    #[serde(flatten)]
-    layout: LayoutOptions,
-    quality_effort: QualityEffort,
-    #[serde(default)]
-    constraints: LayoutConstraints,
-}
-
-impl Default for SerializedLayoutOptions {
-    fn default() -> Self {
-        Self {
-            layout: LayoutOptions::default(),
-            quality_effort: QualityEffort::Quality,
-            constraints: LayoutConstraints::default(),
-        }
-    }
 }
 
 fn js_error(message: impl AsRef<str>) -> JsValue {
