@@ -6423,6 +6423,103 @@ struct EndpointAccess {
     high_x: f64,
 }
 
+// Absorb only floating-point noise around a nominal row; adjacent-row closure prevents a
+// conflict from falling through an arbitrary cluster boundary.
+const ENDPOINT_ROW_ULP_TOLERANCE: u64 = 4;
+
+fn ordered_finite_ulp_key(value: f64) -> Option<u64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let bits = if value == 0.0 { 0 } else { value.to_bits() };
+    Some(if bits >> 63 == 0 {
+        bits | (1_u64 << 63)
+    } else {
+        (!bits).wrapping_add(1)
+    })
+}
+
+fn endpoint_y_within_ulps(anchor: f64, candidate: f64, max_ulps: u64) -> bool {
+    if max_ulps == 0 {
+        return anchor.to_bits() == candidate.to_bits();
+    }
+    let (Some(anchor), Some(candidate)) = (
+        ordered_finite_ulp_key(anchor),
+        ordered_finite_ulp_key(candidate),
+    ) else {
+        return false;
+    };
+    anchor.abs_diff(candidate) <= max_ulps
+}
+
+fn endpoint_tracks_from_accesses(
+    mut accesses: Vec<EndpointAccess>,
+    max_ulps: u64,
+) -> BTreeMap<(u32, u32, u8), (usize, usize)> {
+    accesses.sort_by(|left, right| {
+        left.y
+            .total_cmp(&right.y)
+            .then(left.endpoint.node.cmp(&right.endpoint.node))
+            .then(left.endpoint.port.cmp(&right.endpoint.port))
+            .then(left.role.cmp(&right.role))
+    });
+
+    let mut tracks = BTreeMap::new();
+    let mut row_start = 0;
+    while row_start < accesses.len() {
+        let mut row_end = row_start + 1;
+        while row_end < accesses.len()
+            && endpoint_y_within_ulps(accesses[row_end - 1].y, accesses[row_end].y, max_ulps)
+        {
+            row_end += 1;
+        }
+
+        let mut row = accesses[row_start..row_end].to_vec();
+        row.sort_by(|left, right| {
+            left.low_x
+                .total_cmp(&right.low_x)
+                .then(left.high_x.total_cmp(&right.high_x))
+                .then(left.endpoint.node.cmp(&right.endpoint.node))
+                .then(left.endpoint.port.cmp(&right.endpoint.port))
+                .then(left.role.cmp(&right.role))
+        });
+        let mut conflicts = Vec::new();
+        let mut component_start = 0;
+        while component_start < row.len() {
+            let mut component_end = component_start + 1;
+            let mut high_x = row[component_start].high_x;
+            while component_end < row.len() && row[component_end].low_x <= high_x {
+                high_x = high_x.max(row[component_end].high_x);
+                component_end += 1;
+            }
+            let component = &row[component_start..component_end];
+            if component
+                .iter()
+                .any(|access| access.net != component[0].net)
+            {
+                conflicts.extend_from_slice(component);
+            }
+            component_start = component_end;
+        }
+        conflicts.sort_by(|left, right| {
+            left.y
+                .total_cmp(&right.y)
+                .then(left.endpoint.node.cmp(&right.endpoint.node))
+                .then(left.endpoint.port.cmp(&right.endpoint.port))
+                .then(left.role.cmp(&right.role))
+        });
+        let lane_count = conflicts.len();
+        for (lane, access) in conflicts.into_iter().enumerate() {
+            tracks.insert(
+                (access.endpoint.node, access.endpoint.port, access.role),
+                (lane, lane_count),
+            );
+        }
+        row_start = row_end;
+    }
+    tracks
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_endpoint_tracks(
     plan: &RoutingPlan<'_>,
@@ -6549,53 +6646,12 @@ fn build_endpoint_tracks(
         }
     }
 
-    let mut accesses_by_y = BTreeMap::<u64, Vec<EndpointAccess>>::new();
-    for access in accesses.into_values() {
-        accesses_by_y
-            .entry(access.y.to_bits())
-            .or_default()
-            .push(access);
-    }
-    let mut conflicts_by_y = BTreeMap::<u64, BTreeSet<(u32, u32, u8)>>::new();
-    for (y, mut accesses) in accesses_by_y {
-        accesses.sort_by(|left, right| {
-            left.low_x
-                .total_cmp(&right.low_x)
-                .then(left.high_x.total_cmp(&right.high_x))
-                .then(left.endpoint.node.cmp(&right.endpoint.node))
-                .then(left.endpoint.port.cmp(&right.endpoint.port))
-                .then(left.role.cmp(&right.role))
-        });
-        let mut component_start = 0;
-        while component_start < accesses.len() {
-            let mut component_end = component_start + 1;
-            let mut high_x = accesses[component_start].high_x;
-            while component_end < accesses.len() && accesses[component_end].low_x <= high_x {
-                high_x = high_x.max(accesses[component_end].high_x);
-                component_end += 1;
-            }
-            let component = &accesses[component_start..component_end];
-            if component
-                .iter()
-                .any(|access| access.net != component[0].net)
-            {
-                let conflicts = conflicts_by_y.entry(y).or_default();
-                for access in component {
-                    conflicts.insert((access.endpoint.node, access.endpoint.port, access.role));
-                }
-            }
-            component_start = component_end;
-        }
-    }
-
-    let mut tracks = BTreeMap::new();
-    for conflicts in conflicts_by_y.into_values() {
-        let lane_count = conflicts.len();
-        for (lane, endpoint) in conflicts.into_iter().enumerate() {
-            tracks.insert(endpoint, (lane, lane_count));
-        }
-    }
-    tracks
+    let max_ulps = if options.edge_node_clearance > 0.0 {
+        ENDPOINT_ROW_ULP_TOLERANCE
+    } else {
+        0
+    };
+    endpoint_tracks_from_accesses(accesses.into_values().collect(), max_ulps)
 }
 
 fn free_intervals(
@@ -8376,6 +8432,24 @@ mod tests {
         take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
     };
+
+    fn endpoint_access(
+        node: u32,
+        role: u8,
+        net: u32,
+        y: f64,
+        low_x: f64,
+        high_x: f64,
+    ) -> super::EndpointAccess {
+        super::EndpointAccess {
+            endpoint: Endpoint { node, port: 0 },
+            role,
+            net,
+            y,
+            low_x,
+            high_x,
+        }
+    }
 
     #[test]
     fn zero_length_vertical_access_has_no_crossings() {
@@ -13728,12 +13802,164 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_rows_cluster_overlapping_different_nets_within_four_ulps() {
+        let y = 840.0_f64;
+        let next_y = f64::from_bits(y.to_bits() + 1);
+        let accesses = vec![
+            endpoint_access(1, 0, 10, y, 20.0, 80.0),
+            endpoint_access(2, 0, 11, next_y, 40.0, 100.0),
+        ];
+        let tracks = super::endpoint_tracks_from_accesses(accesses.clone(), 4);
+
+        assert_eq!(
+            tracks,
+            BTreeMap::from([((1, 0, 0), (0, 2)), ((2, 0, 0), (1, 2))])
+        );
+        assert!(super::endpoint_tracks_from_accesses(accesses, 0).is_empty());
+    }
+
+    #[test]
+    fn endpoint_rows_close_adjacent_ulp_clusters_transitively() {
+        let y = 840.0_f64;
+        let at_four = f64::from_bits(y.to_bits() + 4);
+        let at_five = f64::from_bits(y.to_bits() + 5);
+        let tracks = super::endpoint_tracks_from_accesses(
+            vec![
+                endpoint_access(1, 0, 10, y, 20.0, 100.0),
+                endpoint_access(2, 0, 11, at_four, 20.0, 100.0),
+                endpoint_access(3, 0, 12, at_five, 20.0, 100.0),
+            ],
+            4,
+        );
+
+        assert_eq!(
+            tracks,
+            BTreeMap::from([
+                ((1, 0, 0), (0, 3)),
+                ((2, 0, 0), (1, 3)),
+                ((3, 0, 0), (2, 3)),
+            ])
+        );
+    }
+
+    #[test]
+    fn endpoint_row_ulp_distance_handles_negative_values_and_signed_zero() {
+        let negative = -840.0_f64;
+        let adjacent_negative = f64::from_bits(negative.to_bits() - 1);
+
+        assert!(super::endpoint_y_within_ulps(
+            negative,
+            adjacent_negative,
+            1
+        ));
+        assert!(super::endpoint_y_within_ulps(-0.0, 0.0, 4));
+        assert!(!super::endpoint_y_within_ulps(-0.0, 0.0, 0));
+        let four_min_positive = 4.0 * f64::MIN_POSITIVE;
+        let negative_distance = super::ordered_finite_ulp_key(-four_min_positive)
+            .unwrap()
+            .abs_diff(super::ordered_finite_ulp_key(-0.0).unwrap());
+        let positive_distance = super::ordered_finite_ulp_key(four_min_positive)
+            .unwrap()
+            .abs_diff(super::ordered_finite_ulp_key(0.0).unwrap());
+        assert_eq!(negative_distance, positive_distance);
+        assert_eq!(
+            super::ordered_finite_ulp_key(-four_min_positive)
+                .unwrap()
+                .abs_diff(super::ordered_finite_ulp_key(four_min_positive).unwrap()),
+            negative_distance * 2,
+        );
+        assert!(!super::endpoint_y_within_ulps(
+            840.0,
+            f64::from_bits(840.0_f64.to_bits() + 5),
+            4,
+        ));
+    }
+
+    #[test]
+    fn endpoint_row_closure_finds_overlap_after_a_disjoint_anchor() {
+        let y = 840.0_f64;
+        let at_four = f64::from_bits(y.to_bits() + 4);
+        let at_five = f64::from_bits(y.to_bits() + 5);
+        let tracks = super::endpoint_tracks_from_accesses(
+            vec![
+                endpoint_access(1, 0, 10, y, 0.0, 10.0),
+                endpoint_access(2, 0, 11, at_four, 20.0, 50.0),
+                endpoint_access(3, 0, 12, at_five, 30.0, 60.0),
+            ],
+            4,
+        );
+
+        assert_eq!(
+            tracks,
+            BTreeMap::from([((2, 0, 0), (0, 2)), ((3, 0, 0), (1, 2))])
+        );
+    }
+
+    #[test]
+    fn endpoint_rows_keep_disjoint_x_and_same_net_accesses_untracked() {
+        let y = 840.0_f64;
+        let next_y = f64::from_bits(y.to_bits() + 1);
+
+        assert!(
+            super::endpoint_tracks_from_accesses(
+                vec![
+                    endpoint_access(1, 0, 10, y, 0.0, 10.0),
+                    endpoint_access(2, 0, 11, next_y, 20.0, 30.0),
+                ],
+                4,
+            )
+            .is_empty()
+        );
+        assert!(
+            super::endpoint_tracks_from_accesses(
+                vec![
+                    endpoint_access(1, 0, 10, y, 0.0, 30.0),
+                    endpoint_access(2, 0, 10, next_y, 10.0, 40.0),
+                ],
+                4,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn endpoint_row_tracks_are_permutation_deterministic_and_preserve_vertical_order() {
+        let y = 840.0_f64;
+        let mut accesses = vec![
+            endpoint_access(3, 0, 12, f64::from_bits(y.to_bits() + 2), 0.0, 100.0),
+            endpoint_access(1, 0, 10, y, 0.0, 100.0),
+            endpoint_access(2, 0, 11, f64::from_bits(y.to_bits() + 1), 0.0, 100.0),
+        ];
+        let expected = super::endpoint_tracks_from_accesses(accesses.clone(), 4);
+        accesses.reverse();
+
+        assert_eq!(super::endpoint_tracks_from_accesses(accesses, 4), expected);
+        assert_eq!(
+            expected,
+            BTreeMap::from([
+                ((1, 0, 0), (0, 3)),
+                ((2, 0, 0), (1, 3)),
+                ((3, 0, 0), (2, 3)),
+            ])
+        );
+    }
+
+    #[test]
     fn near_equal_endpoint_tracks_use_an_orthogonal_detour() {
         let source = Point {
             x: 20.0,
             y: 840.000_000_000_000_1,
         };
         let target = Point { x: 100.0, y: 840.0 };
+        let tracks = super::endpoint_tracks_from_accesses(
+            vec![
+                endpoint_access(1, 0, 7, source.y, 20.0, 60.0),
+                endpoint_access(2, 1, 7, target.y, 60.0, 100.0),
+                endpoint_access(3, 0, 8, target.y, 20.0, 60.0),
+                endpoint_access(4, 1, 8, source.y, 60.0, 100.0),
+            ],
+            4,
+        );
         let points = sparse_channel_route(
             7,
             source,
@@ -13746,13 +13972,27 @@ mod tests {
             &[20.0, 120.0],
             &[BTreeMap::from([(7, 0)])],
             &[],
-            &BTreeMap::new(),
+            &tracks,
             LayoutOptions::default(),
             GapTrackSpacing::Compact,
         );
 
         assert_eq!(points.first(), Some(&source));
         assert_eq!(points.last(), Some(&target));
+        assert_eq!(
+            points.get(1),
+            Some(&Point {
+                x: source.x + LayoutOptions::default().port_stub,
+                y: source.y,
+            })
+        );
+        assert_eq!(
+            points.get(points.len() - 2),
+            Some(&Point {
+                x: target.x - LayoutOptions::default().port_stub,
+                y: target.y,
+            })
+        );
         assert!(points.windows(2).all(|pair| {
             (pair[0].x == pair[1].x || pair[0].y == pair[1].y)
                 && (pair[0].x != pair[1].x || pair[0].y != pair[1].y)
