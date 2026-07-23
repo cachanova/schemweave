@@ -91,6 +91,18 @@ pub enum QualityEffort {
     Max,
 }
 
+/// Optional semantic constraints for primary boundary nodes.
+///
+/// Constrained inputs occupy the leftmost rank. Constrained outputs occupy one
+/// shared rank to the right of every non-output node.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LayoutConstraints {
+    #[serde(default)]
+    pub inputs: Vec<NodeId>,
+    #[serde(default)]
+    pub outputs: Vec<NodeId>,
+}
+
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
@@ -171,9 +183,46 @@ pub enum LayoutError {
     TooManyOrderingSweeps(usize),
 }
 
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum LayoutConstraintError {
+    #[error("unknown constrained {boundary} node {node}")]
+    UnknownConstraintNode {
+        boundary: &'static str,
+        node: NodeId,
+    },
+    #[error("duplicate constrained {boundary} node {node}")]
+    DuplicateConstraintNode {
+        boundary: &'static str,
+        node: NodeId,
+    },
+    #[error("node {0} cannot be both a constrained input and output")]
+    OverlappingConstraintNode(NodeId),
+    #[error("constrained input node {0} has a participating incoming edge")]
+    ConstrainedInputHasIncomingEdge(NodeId),
+    #[error("constrained output node {0} has a participating outgoing edge")]
+    ConstrainedOutputHasOutgoingEdge(NodeId),
+}
+
+#[derive(Clone, Debug, Error, PartialEq)]
+pub enum ConstrainedLayoutError {
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
+    #[error(transparent)]
+    Constraint(#[from] LayoutConstraintError),
+}
+
 /// Lay out a graph. Output ordering depends only on stable identifiers, not input order.
 pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutError> {
     layout_with_quality_effort(graph, options, QualityEffort::Quality)
+}
+
+/// Lay out a graph with explicit primary boundary constraints.
+pub fn layout_with_constraints(
+    graph: &Graph,
+    options: LayoutOptions,
+    constraints: &LayoutConstraints,
+) -> Result<Layout, ConstrainedLayoutError> {
+    layout_with_quality_effort_and_constraints(graph, options, QualityEffort::Quality, constraints)
 }
 
 /// Lay out a graph with an explicit quality-versus-latency policy.
@@ -183,6 +232,26 @@ pub fn layout_with_quality_effort(
     quality_effort: QualityEffort,
 ) -> Result<Layout, LayoutError> {
     let indexed = validation::validate_and_index(graph, options)?;
+    Ok(layout_indexed(graph, options, quality_effort, indexed))
+}
+
+/// Lay out a graph with explicit boundary constraints and quality policy.
+pub fn layout_with_quality_effort_and_constraints(
+    graph: &Graph,
+    options: LayoutOptions,
+    quality_effort: QualityEffort,
+    constraints: &LayoutConstraints,
+) -> Result<Layout, ConstrainedLayoutError> {
+    let indexed = validation::validate_and_index_with_constraints(graph, options, constraints)?;
+    Ok(layout_indexed(graph, options, quality_effort, indexed))
+}
+
+fn layout_indexed(
+    graph: &Graph,
+    options: LayoutOptions,
+    quality_effort: QualityEffort,
+    indexed: validation::IndexedGraph<'_>,
+) -> Layout {
     let (ranks, latest_ranks) = topology::rank_candidates(&indexed);
     let (forward, reverse, net_representative, max_sifted) = if quality_effort == QualityEffort::Max
     {
@@ -377,7 +446,7 @@ pub fn layout_with_quality_effort(
             retain_better_candidate(&mut best, quality, layout);
         }
     }
-    Ok(best.expect("layout has deterministic candidates").1)
+    best.expect("layout has deterministic candidates").1
 }
 
 fn straight_chain_cost_is_bounded(

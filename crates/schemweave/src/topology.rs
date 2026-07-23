@@ -31,12 +31,17 @@ struct OrderingArc {
 
 pub(crate) fn assign_ranks(graph: &IndexedGraph<'_>) -> Vec<usize> {
     let (component, component_out, topological) = component_graph(graph);
-    earliest_ranks(&component, &component_out, &topological)
+    earliest_ranks(graph, &component, &component_out, &topological)
 }
 
 pub(crate) fn rank_candidates(graph: &IndexedGraph<'_>) -> (Vec<usize>, Option<Vec<usize>>) {
     let (component, component_out, topological) = component_graph(graph);
-    let earliest = earliest_ranks(&component, &component_out, &topological);
+    let earliest = earliest_ranks(graph, &component, &component_out, &topological);
+    if graph.boundary_inputs.iter().any(|&input| input)
+        || graph.boundary_outputs.iter().any(|&output| output)
+    {
+        return (earliest, None);
+    }
     let component_count = component_out.len();
     let mut distance_to_sink = vec![0usize; component_count];
     for &current in topological.iter().rev() {
@@ -117,17 +122,39 @@ pub(crate) fn rank_candidates(graph: &IndexedGraph<'_>) -> (Vec<usize>, Option<V
 }
 
 fn earliest_ranks(
+    graph: &IndexedGraph<'_>,
     component: &[usize],
     component_out: &[Vec<usize>],
     topological: &[usize],
 ) -> Vec<usize> {
     let mut component_rank = vec![0usize; component_out.len()];
+    if graph.boundary_inputs.iter().any(|&input| input) {
+        for (node, &component_id) in component.iter().enumerate() {
+            if !graph.boundary_inputs[node] {
+                component_rank[component_id] = 1;
+            }
+        }
+    }
     for &current in topological {
         for &next in &component_out[current] {
             component_rank[next] = component_rank[next].max(component_rank[current] + 1);
         }
     }
-    component.iter().map(|&id| component_rank[id]).collect()
+    let mut ranks: Vec<_> = component.iter().map(|&id| component_rank[id]).collect();
+    if graph.boundary_outputs.iter().any(|&output| output) {
+        let output_rank = ranks
+            .iter()
+            .enumerate()
+            .filter_map(|(node, &rank)| (!graph.boundary_outputs[node]).then_some(rank))
+            .max()
+            .map_or(0, |rank| rank.saturating_add(1));
+        for (node, rank) in ranks.iter_mut().enumerate() {
+            if graph.boundary_outputs[node] {
+                *rank = output_rank;
+            }
+        }
+    }
+    ranks
 }
 
 fn accept_latest_rank_candidate(
@@ -147,7 +174,8 @@ fn accept_latest_rank_candidate(
 }
 
 fn component_graph(graph: &IndexedGraph<'_>) -> (Vec<usize>, Vec<Vec<usize>>, Vec<usize>) {
-    let (component, component_count) = strongly_connected_components(graph);
+    let (component, component_count) =
+        strongly_connected_components(&graph.outgoing, &graph.incoming);
     let mut component_out = vec![Vec::new(); component_count];
     let mut indegree = vec![0usize; component_count];
     for (source, targets) in graph.outgoing.iter().enumerate() {
@@ -190,8 +218,12 @@ fn component_graph(graph: &IndexedGraph<'_>) -> (Vec<usize>, Vec<Vec<usize>>, Ve
     (component, component_out, topological)
 }
 
-fn strongly_connected_components(graph: &IndexedGraph<'_>) -> (Vec<usize>, usize) {
-    let count = graph.nodes.len();
+pub(crate) fn strongly_connected_components(
+    outgoing: &[Vec<usize>],
+    incoming: &[Vec<usize>],
+) -> (Vec<usize>, usize) {
+    debug_assert_eq!(outgoing.len(), incoming.len());
+    let count = outgoing.len();
     let mut seen = vec![false; count];
     let mut finish = Vec::with_capacity(count);
     for start in 0..count {
@@ -201,8 +233,8 @@ fn strongly_connected_components(graph: &IndexedGraph<'_>) -> (Vec<usize>, usize
         seen[start] = true;
         let mut stack = vec![(start, 0usize)];
         while let Some((node, cursor)) = stack.last_mut() {
-            if *cursor < graph.outgoing[*node].len() {
-                let next = graph.outgoing[*node][*cursor];
+            if *cursor < outgoing[*node].len() {
+                let next = outgoing[*node][*cursor];
                 *cursor += 1;
                 if !seen[next] {
                     seen[next] = true;
@@ -224,7 +256,7 @@ fn strongly_connected_components(graph: &IndexedGraph<'_>) -> (Vec<usize>, usize
         component[start] = component_count;
         let mut stack = vec![start];
         while let Some(node) = stack.pop() {
-            for &next in &graph.incoming[node] {
+            for &next in &incoming[node] {
                 if component[next] == usize::MAX {
                     component[next] = component_count;
                     stack.push(next);
@@ -1209,6 +1241,71 @@ mod tests {
         assert_eq!(ranks, vec![0, 1]);
         assert_eq!(ordering.outgoing[0], vec![1]);
         assert_eq!(ordering.incoming[1], vec![0]);
+    }
+
+    #[test]
+    fn acyclic_data_edge_into_cycle_breaker_remains_a_rank_constraint() {
+        let mut register = node(3);
+        register.cycle_breaker = true;
+        let graph = Graph {
+            nodes: vec![node(1), node(2), register],
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 1 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 2, port: 1 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+
+        assert_eq!(indexed.rank_edges, vec![true, true]);
+        assert_eq!(assign_ranks(&indexed), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn actual_feedback_edge_into_cycle_breaker_is_cut() {
+        let mut register = node(3);
+        register.cycle_breaker = true;
+        let graph = Graph {
+            nodes: vec![node(1), node(2), register],
+            edges: vec![
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 1 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 1,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 2, port: 1 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 2,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 3,
+                    source: Endpoint { node: 3, port: 1 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 3,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+
+        assert_eq!(indexed.rank_edges, vec![true, false, true]);
+        assert_eq!(assign_ranks(&indexed), vec![0, 1, 0]);
     }
 
     #[test]

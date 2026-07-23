@@ -1,5 +1,7 @@
 use schemweave::{
-    Edge, Endpoint, Graph, Layout, LayoutError, LayoutOptions, Node, Port, PortSide, layout,
+    ConstrainedLayoutError, Edge, Endpoint, Graph, Layout, LayoutConstraintError,
+    LayoutConstraints, LayoutError, LayoutOptions, Node, Port, PortSide, layout,
+    layout_with_constraints,
 };
 
 fn node(id: u32, cycle_breaker: bool) -> Node {
@@ -462,6 +464,313 @@ fn rejects_invalid_graphs_before_layout() {
             role: "target",
             node: 9
         })
+    );
+}
+
+#[test]
+fn unconstrained_layout_error_remains_exhaustively_source_compatible() {
+    fn classify(error: LayoutError) -> &'static str {
+        match error {
+            LayoutError::DuplicateNode(_)
+            | LayoutError::DuplicatePort { .. }
+            | LayoutError::DuplicateEdge(_)
+            | LayoutError::InvalidNodeDimension { .. }
+            | LayoutError::InvalidPortOffset { .. }
+            | LayoutError::UnknownEndpointNode { .. }
+            | LayoutError::UnknownEndpointPort { .. } => "graph",
+            LayoutError::InvalidOption { .. } | LayoutError::TooManyOrderingSweeps(_) => "option",
+        }
+    }
+
+    assert_eq!(classify(LayoutError::TooManyOrderingSweeps(17)), "option");
+}
+
+#[test]
+fn boundary_constraints_preserve_acyclic_register_dataflow() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(10, false),
+            node(20, true),
+            node(30, false),
+        ],
+        edges: vec![
+            edge(1, 1, 10),
+            edge(2, 10, 20),
+            edge(3, 2, 20),
+            edge(4, 3, 20),
+            edge(5, 20, 30),
+        ],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1, 2, 3],
+        outputs: vec![30],
+    };
+
+    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let geometry = |id| result.nodes.iter().find(|node| node.id == id).unwrap();
+    assert_eq!(geometry(1).x, geometry(2).x);
+    assert_eq!(geometry(2).x, geometry(3).x);
+    assert!(geometry(1).x < geometry(10).x);
+    assert!(geometry(10).x < geometry(20).x);
+    assert!(geometry(20).x < geometry(30).x);
+    assert!(
+        result
+            .nodes
+            .iter()
+            .filter(|node| node.id != 30)
+            .all(|node| node.x + node.width < geometry(30).x)
+    );
+    assert_routes_avoid_node_interiors(&result);
+}
+
+#[test]
+fn constrained_outputs_align_right_edges_across_widths_and_depths() {
+    let mut shallow_output = node(30, false);
+    shallow_output.width = 35.0;
+    let mut deep_output = node(40, false);
+    deep_output.width = 125.0;
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(10, false),
+            node(20, false),
+            shallow_output,
+            deep_output,
+        ],
+        edges: vec![
+            edge(1, 1, 30),
+            edge(2, 1, 10),
+            edge(3, 10, 20),
+            edge(4, 20, 40),
+        ],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![30, 40],
+    };
+
+    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let geometry = |id| result.nodes.iter().find(|node| node.id == id).unwrap();
+    assert_eq!(
+        geometry(30).x + geometry(30).width,
+        geometry(40).x + geometry(40).width
+    );
+    let output_left = geometry(30).x.min(geometry(40).x);
+    assert!(
+        [1, 10, 20]
+            .into_iter()
+            .all(|id| geometry(id).x + geometry(id).width < output_left)
+    );
+}
+
+#[test]
+fn constrained_layout_is_deterministic_across_node_port_edge_and_role_permutations() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(10, false),
+            node(20, false),
+            node(30, false),
+        ],
+        edges: vec![
+            edge(1, 1, 10),
+            edge(2, 2, 10),
+            edge(3, 10, 20),
+            edge(4, 10, 30),
+        ],
+    };
+    let mut permuted = graph.clone();
+    permuted.nodes.reverse();
+    for node in &mut permuted.nodes {
+        node.ports.reverse();
+    }
+    permuted.edges.reverse();
+    let constraints = LayoutConstraints {
+        inputs: vec![1, 2],
+        outputs: vec![20, 30],
+    };
+    let permuted_constraints = LayoutConstraints {
+        inputs: vec![2, 1],
+        outputs: vec![30, 20],
+    };
+
+    assert_eq!(
+        layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap(),
+        layout_with_constraints(&permuted, LayoutOptions::default(), &permuted_constraints)
+            .unwrap()
+    );
+}
+
+#[test]
+fn constrained_internal_sources_do_not_share_the_input_rank() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(4, false),
+        ],
+        edges: vec![edge(1, 1, 3), edge(2, 2, 4)],
+    };
+    let constraints = LayoutConstraints {
+        inputs: vec![1],
+        outputs: vec![3, 4],
+    };
+
+    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let geometry = |id| result.nodes.iter().find(|node| node.id == id).unwrap();
+    assert!(geometry(2).x > geometry(1).x);
+}
+
+#[test]
+fn boundary_constraints_handle_empty_and_one_sided_graphs() {
+    let empty = layout_with_constraints(
+        &Graph {
+            nodes: vec![],
+            edges: vec![],
+        },
+        LayoutOptions::default(),
+        &LayoutConstraints::default(),
+    )
+    .unwrap();
+    assert_eq!(empty.width, 0.0);
+    assert_eq!(empty.height, 0.0);
+
+    let inputs = layout_with_constraints(
+        &Graph {
+            nodes: vec![node(1, false), node(2, false)],
+            edges: vec![],
+        },
+        LayoutOptions::default(),
+        &LayoutConstraints {
+            inputs: vec![1, 2],
+            outputs: vec![],
+        },
+    )
+    .unwrap();
+    assert_eq!(inputs.nodes[0].x, inputs.nodes[1].x);
+
+    let mut narrow = node(1, false);
+    narrow.width = 35.0;
+    let mut wide = node(2, false);
+    wide.width = 125.0;
+    let outputs = layout_with_constraints(
+        &Graph {
+            nodes: vec![narrow, wide],
+            edges: vec![],
+        },
+        LayoutOptions::default(),
+        &LayoutConstraints {
+            inputs: vec![],
+            outputs: vec![1, 2],
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        outputs.nodes[0].x + outputs.nodes[0].width,
+        outputs.nodes[1].x + outputs.nodes[1].width
+    );
+}
+
+#[test]
+fn invalid_boundary_constraints_are_rejected_deterministically() {
+    let graph = Graph {
+        nodes: vec![node(1, false), node(2, false), node(3, false)],
+        edges: vec![edge(1, 1, 2), edge(2, 2, 3)],
+    };
+    let options = LayoutOptions::default();
+
+    assert_eq!(
+        layout_with_constraints(
+            &graph,
+            options,
+            &LayoutConstraints {
+                inputs: vec![99],
+                outputs: vec![],
+            }
+        ),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::UnknownConstraintNode {
+                boundary: "input",
+                node: 99,
+            }
+        ))
+    );
+    assert_eq!(
+        layout_with_constraints(
+            &graph,
+            options,
+            &LayoutConstraints {
+                inputs: vec![1, 1],
+                outputs: vec![],
+            }
+        ),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::DuplicateConstraintNode {
+                boundary: "input",
+                node: 1,
+            }
+        ))
+    );
+    assert_eq!(
+        layout_with_constraints(
+            &graph,
+            options,
+            &LayoutConstraints {
+                inputs: vec![1, 2],
+                outputs: vec![2],
+            }
+        ),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::OverlappingConstraintNode(2)
+        ))
+    );
+    assert_eq!(
+        layout_with_constraints(
+            &graph,
+            options,
+            &LayoutConstraints {
+                inputs: vec![2],
+                outputs: vec![],
+            }
+        ),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::ConstrainedInputHasIncomingEdge(2)
+        ))
+    );
+    assert_eq!(
+        layout_with_constraints(
+            &graph,
+            options,
+            &LayoutConstraints {
+                inputs: vec![],
+                outputs: vec![2],
+            }
+        ),
+        Err(ConstrainedLayoutError::Constraint(
+            LayoutConstraintError::ConstrainedOutputHasOutgoingEdge(2)
+        ))
+    );
+}
+
+#[test]
+fn empty_constraints_are_byte_identical_to_the_existing_api() {
+    let graph = Graph {
+        nodes: vec![node(1, false), node(2, false), node(3, false)],
+        edges: vec![edge(1, 1, 2), edge(2, 2, 3)],
+    };
+    assert_eq!(
+        layout(&graph, LayoutOptions::default()).unwrap(),
+        layout_with_constraints(
+            &graph,
+            LayoutOptions::default(),
+            &LayoutConstraints::default()
+        )
+        .unwrap()
     );
 }
 

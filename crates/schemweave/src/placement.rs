@@ -145,7 +145,12 @@ fn place_nodes_with_alignment(
             let node = graph.nodes[node_index];
             positioned[node_index] = Some(NodeGeometry {
                 id: node.id,
-                x: layer_x[rank],
+                x: layer_x[rank]
+                    + if graph.boundary_outputs[node_index] {
+                        widths[rank] - node.width
+                    } else {
+                        0.0
+                    },
                 y,
                 width: node.width,
                 height: node.height,

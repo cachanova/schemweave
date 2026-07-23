@@ -7754,6 +7754,58 @@ mod tests {
                 net: 30_008,
                 participates_in_ranking: true,
             },
+            Edge {
+                id: edge + 6,
+                source: Endpoint {
+                    node: first + 3,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: first + 1,
+                    port: 0,
+                },
+                net: 30_020,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 7,
+                source: Endpoint {
+                    node: first + 4,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: first + 1,
+                    port: 0,
+                },
+                net: 30_021,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 8,
+                source: Endpoint {
+                    node: first + 5,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: first + 2,
+                    port: 0,
+                },
+                net: 30_022,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: edge + 9,
+                source: Endpoint {
+                    node: first + 6,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: first + 2,
+                    port: 0,
+                },
+                net: 30_023,
+                participates_in_ranking: true,
+            },
         ]);
     }
 
@@ -8502,6 +8554,34 @@ mod tests {
                     net: 8,
                     participates_in_ranking: true,
                 },
+                Edge {
+                    id: 20,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 1, port: 0 },
+                    net: 20,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 21,
+                    source: Endpoint { node: 4, port: 0 },
+                    target: Endpoint { node: 1, port: 0 },
+                    net: 21,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 22,
+                    source: Endpoint { node: 5, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 22,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 23,
+                    source: Endpoint { node: 6, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 23,
+                    participates_in_ranking: true,
+                },
             ],
         };
         let mut geometry = vec![
@@ -8571,7 +8651,7 @@ mod tests {
         assert!(
             plan.edges
                 .iter()
-                .filter(|resolved| resolved.edge.id >= 10)
+                .filter(|resolved| (10..=13).contains(&resolved.edge.id))
                 .all(|resolved| !resolved.participates_in_ranking)
         );
 

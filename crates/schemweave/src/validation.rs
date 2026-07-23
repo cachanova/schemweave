@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    Edge, Endpoint, Graph, LayoutError, LayoutOptions, Node, NodeId, Port, PortId, PortSide,
+    ConstrainedLayoutError, Edge, Endpoint, Graph, LayoutConstraintError, LayoutConstraints,
+    LayoutError, LayoutOptions, Node, NodeId, Port, PortId, PortSide,
 };
 
 pub(crate) struct IndexedGraph<'a> {
@@ -12,12 +13,28 @@ pub(crate) struct IndexedGraph<'a> {
     pub(crate) ports: Vec<HashMap<PortId, &'a Port>>,
     pub(crate) outgoing: Vec<Vec<usize>>,
     pub(crate) incoming: Vec<Vec<usize>>,
+    pub(crate) boundary_inputs: Vec<bool>,
+    pub(crate) boundary_outputs: Vec<bool>,
 }
 
 pub(crate) fn validate_and_index(
     graph: &Graph,
     options: LayoutOptions,
 ) -> Result<IndexedGraph<'_>, LayoutError> {
+    match validate_and_index_with_constraints(graph, options, &LayoutConstraints::default()) {
+        Ok(indexed) => Ok(indexed),
+        Err(ConstrainedLayoutError::Layout(error)) => Err(error),
+        Err(ConstrainedLayoutError::Constraint(_)) => {
+            unreachable!("empty boundary constraints cannot fail validation")
+        }
+    }
+}
+
+pub(crate) fn validate_and_index_with_constraints<'a>(
+    graph: &'a Graph,
+    options: LayoutOptions,
+    constraints: &LayoutConstraints,
+) -> Result<IndexedGraph<'a>, ConstrainedLayoutError> {
     validate_options(options)?;
     let mut nodes: Vec<&Node> = graph.nodes.iter().collect();
     nodes.sort_unstable_by_key(|node| node.id);
@@ -25,7 +42,7 @@ pub(crate) fn validate_and_index(
     let mut ports = Vec::with_capacity(nodes.len());
     for (index, node) in nodes.iter().enumerate() {
         if node_index.insert(node.id, index).is_some() {
-            return Err(LayoutError::DuplicateNode(node.id));
+            return Err(LayoutError::DuplicateNode(node.id).into());
         }
         validate_dimension(node.id, "width", node.width)?;
         validate_dimension(node.id, "height", node.height)?;
@@ -35,7 +52,8 @@ pub(crate) fn validate_and_index(
                 return Err(LayoutError::DuplicatePort {
                     node: node.id,
                     port: port.id,
-                });
+                }
+                .into());
             }
             let limit = match port.side {
                 PortSide::East | PortSide::West => node.height,
@@ -46,7 +64,8 @@ pub(crate) fn validate_and_index(
                     node: node.id,
                     port: port.id,
                     offset: port.offset,
-                });
+                }
+                .into());
             }
         }
         ports.push(by_id);
@@ -57,18 +76,50 @@ pub(crate) fn validate_and_index(
     let mut edge_ids = HashSet::with_capacity(edges.len());
     for edge in &edges {
         if !edge_ids.insert(edge.id) {
-            return Err(LayoutError::DuplicateEdge(edge.id));
+            return Err(LayoutError::DuplicateEdge(edge.id).into());
         }
         validate_endpoint(edge.id, "source", edge.source, &node_index, &ports)?;
         validate_endpoint(edge.id, "target", edge.target, &node_index, &ports)?;
     }
 
-    let mut raw_incoming = vec![0usize; nodes.len()];
+    let (boundary_inputs, boundary_outputs) = validate_constraints(constraints, &node_index)?;
+    let mut raw_outgoing = vec![Vec::new(); nodes.len()];
+    let mut raw_incoming = vec![Vec::new(); nodes.len()];
     for edge in &edges {
-        if edge.participates_in_ranking {
-            raw_incoming[node_index[&edge.target.node]] += 1;
+        if !edge.participates_in_ranking {
+            continue;
         }
+        let source = node_index[&edge.source.node];
+        let target = node_index[&edge.target.node];
+        raw_outgoing[source].push(target);
+        raw_incoming[target].push(source);
     }
+    validate_constraint_structure(
+        &nodes,
+        &boundary_inputs,
+        &boundary_outputs,
+        &raw_outgoing,
+        &raw_incoming,
+    )?;
+    if !nodes.iter().any(|node| node.cycle_breaker) {
+        let rank_edges = edges
+            .iter()
+            .map(|edge| edge.participates_in_ranking)
+            .collect();
+        return Ok(IndexedGraph {
+            nodes,
+            edges,
+            rank_edges,
+            node_index,
+            ports,
+            outgoing: raw_outgoing,
+            incoming: raw_incoming,
+            boundary_inputs,
+            boundary_outputs,
+        });
+    }
+    let (raw_component, _) =
+        crate::topology::strongly_connected_components(&raw_outgoing, &raw_incoming);
     let mut outgoing = vec![Vec::new(); nodes.len()];
     let mut incoming = vec![Vec::new(); nodes.len()];
     let mut rank_edges = Vec::with_capacity(edges.len());
@@ -79,9 +130,8 @@ pub(crate) fn validate_and_index(
         }
         let source = node_index[&edge.source.node];
         let target = node_index[&edge.target.node];
-        // A root source cannot close a cycle, so its constraint can place a register after
-        // primary inputs. Other incoming register edges remain cut as feedback boundaries.
-        if nodes[target].cycle_breaker && raw_incoming[source] != 0 {
+        // Only an edge that participates in an actual cycle is a feedback boundary.
+        if nodes[target].cycle_breaker && raw_component[source] == raw_component[target] {
             rank_edges.push(false);
             continue;
         }
@@ -97,7 +147,80 @@ pub(crate) fn validate_and_index(
         ports,
         outgoing,
         incoming,
+        boundary_inputs,
+        boundary_outputs,
     })
+}
+
+fn validate_constraints(
+    constraints: &LayoutConstraints,
+    node_index: &HashMap<NodeId, usize>,
+) -> Result<(Vec<bool>, Vec<bool>), LayoutConstraintError> {
+    let mut inputs = constraints.inputs.clone();
+    let mut outputs = constraints.outputs.clone();
+    inputs.sort_unstable();
+    outputs.sort_unstable();
+    validate_constraint_ids("input", &inputs, node_index)?;
+    validate_constraint_ids("output", &outputs, node_index)?;
+    if let Some(node) = inputs
+        .iter()
+        .copied()
+        .find(|node| outputs.binary_search(node).is_ok())
+    {
+        return Err(LayoutConstraintError::OverlappingConstraintNode(node));
+    }
+    let mut boundary_inputs = vec![false; node_index.len()];
+    let mut boundary_outputs = vec![false; node_index.len()];
+    for node in inputs {
+        boundary_inputs[node_index[&node]] = true;
+    }
+    for node in outputs {
+        boundary_outputs[node_index[&node]] = true;
+    }
+    Ok((boundary_inputs, boundary_outputs))
+}
+
+fn validate_constraint_ids(
+    boundary: &'static str,
+    nodes: &[NodeId],
+    node_index: &HashMap<NodeId, usize>,
+) -> Result<(), LayoutConstraintError> {
+    if let Some(node) = nodes
+        .windows(2)
+        .find_map(|pair| (pair[0] == pair[1]).then_some(pair[0]))
+    {
+        return Err(LayoutConstraintError::DuplicateConstraintNode { boundary, node });
+    }
+    if let Some(node) = nodes
+        .iter()
+        .copied()
+        .find(|node| !node_index.contains_key(node))
+    {
+        return Err(LayoutConstraintError::UnknownConstraintNode { boundary, node });
+    }
+    Ok(())
+}
+
+fn validate_constraint_structure(
+    nodes: &[&Node],
+    boundary_inputs: &[bool],
+    boundary_outputs: &[bool],
+    raw_outgoing: &[Vec<usize>],
+    raw_incoming: &[Vec<usize>],
+) -> Result<(), LayoutConstraintError> {
+    for index in 0..nodes.len() {
+        if boundary_inputs[index] && !raw_incoming[index].is_empty() {
+            return Err(LayoutConstraintError::ConstrainedInputHasIncomingEdge(
+                nodes[index].id,
+            ));
+        }
+        if boundary_outputs[index] && !raw_outgoing[index].is_empty() {
+            return Err(LayoutConstraintError::ConstrainedOutputHasOutgoingEdge(
+                nodes[index].id,
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_dimension(node: NodeId, field: &'static str, value: f64) -> Result<(), LayoutError> {
