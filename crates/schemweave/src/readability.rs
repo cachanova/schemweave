@@ -416,40 +416,71 @@ pub(crate) fn measure_parallel_congestion_bounded(
     cutoff: f64,
     max_active_visits: usize,
 ) -> Option<ParallelCongestion> {
+    measure_parallel_congestion_profile_bounded(segments, cutoff, max_active_visits)
+        .map(|(congestion, _)| congestion)
+}
+
+pub(crate) fn measure_parallel_congestion_profile_bounded(
+    segments: &[ParallelSegment],
+    cutoff: f64,
+    max_active_visits: usize,
+) -> Option<(ParallelCongestion, Option<f64>)> {
+    let mut remaining_active_visits = max_active_visits;
+    measure_parallel_congestion_profile_with_budget(segments, cutoff, &mut remaining_active_visits)
+}
+
+pub(crate) fn measure_parallel_congestion_profile_with_budget(
+    segments: &[ParallelSegment],
+    cutoff: f64,
+    remaining_active_visits: &mut usize,
+) -> Option<(ParallelCongestion, Option<f64>)> {
     let total_length = segments
         .iter()
         .map(|segment| segment.end - segment.start)
         .sum::<f64>();
     if total_length <= 0.0 || cutoff <= 0.0 {
-        return Some(ParallelCongestion {
-            total_length,
-            congested_length: 0.0,
-        });
+        return Some((
+            ParallelCongestion {
+                total_length,
+                congested_length: 0.0,
+            },
+            None,
+        ));
     }
 
     let mut congested_length = 0.0;
-    let mut remaining_active_visits = max_active_visits;
+    let mut minimum_positive_separation = None::<f64>;
     for horizontal in [true, false] {
         let oriented = segments
             .iter()
             .filter(|segment| segment.horizontal == horizontal)
             .collect::<Vec<_>>();
         if oriented.len() >= 2 {
-            congested_length +=
-                congested_length_for_orientation(&oriented, cutoff, &mut remaining_active_visits)?;
+            let (oriented_length, oriented_minimum) =
+                congested_length_for_orientation(&oriented, cutoff, remaining_active_visits)?;
+            congested_length += oriented_length;
+            if let Some(oriented_minimum) = oriented_minimum {
+                minimum_positive_separation = Some(
+                    minimum_positive_separation
+                        .map_or(oriented_minimum, |current| current.min(oriented_minimum)),
+                );
+            }
         }
     }
-    Some(ParallelCongestion {
-        total_length,
-        congested_length,
-    })
+    Some((
+        ParallelCongestion {
+            total_length,
+            congested_length,
+        },
+        minimum_positive_separation,
+    ))
 }
 
 fn congested_length_for_orientation(
     segments: &[&ParallelSegment],
     cutoff: f64,
     remaining_active_visits: &mut usize,
-) -> Option<f64> {
+) -> Option<(f64, Option<f64>)> {
     let mut events = Vec::with_capacity(segments.len() * 2);
     for (index, segment) in segments.iter().enumerate() {
         // End events precede starts so longitudinal endpoint contact has zero
@@ -463,6 +494,7 @@ fn congested_length_for_orientation(
     let mut close_neighbor_counts = vec![0usize; segments.len()];
     let mut congested_active = 0usize;
     let mut congested_length = 0.0;
+    let mut minimum_positive_separation = None::<f64>;
     let mut neighbors = Vec::new();
     let mut previous = events
         .first()
@@ -482,6 +514,15 @@ fn congested_length_for_orientation(
             remaining_active_visits,
         ) {
             return None;
+        }
+        for &neighbor in &neighbors {
+            let separation = (segments[neighbor].fixed - segment.fixed).abs();
+            if separation > 0.0 {
+                minimum_positive_separation = Some(
+                    minimum_positive_separation
+                        .map_or(separation, |current| current.min(separation)),
+                );
+            }
         }
         if event_kind == 0 {
             if close_neighbor_counts[segment_index] != 0 {
@@ -526,7 +567,7 @@ fn congested_length_for_orientation(
     }
     debug_assert!(active.is_empty());
     debug_assert_eq!(congested_active, 0);
-    Some(congested_length)
+    Some((congested_length, minimum_positive_separation))
 }
 
 fn collect_close_active_other_nets(
@@ -580,7 +621,7 @@ mod tests {
     use super::{
         EdgeNodeClearanceError, EdgeNodeSegment, NetNodeRelation, ParallelSegment,
         measure_edge_node_clearance_bounded, measure_parallel_congestion,
-        measure_parallel_congestion_bounded,
+        measure_parallel_congestion_bounded, measure_parallel_congestion_profile_bounded,
     };
     use crate::NodeGeometry;
 
@@ -1090,6 +1131,43 @@ mod tests {
             measure_parallel_congestion_bounded(&segments, 4.0, 4),
             Some(measure_parallel_congestion(&segments, 4.0))
         );
+        assert_eq!(
+            measure_parallel_congestion_profile_bounded(&segments, 4.0, 4),
+            Some((measure_parallel_congestion(&segments, 4.0), Some(1.0)))
+        );
+    }
+
+    #[test]
+    fn congestion_profile_minimum_is_positive_strict_and_bounded() {
+        let segments = [
+            ParallelSegment {
+                net: 1,
+                horizontal: true,
+                fixed: 0.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            ParallelSegment {
+                net: 2,
+                horizontal: true,
+                fixed: 0.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            ParallelSegment {
+                net: 3,
+                horizontal: true,
+                fixed: 4.0,
+                start: 0.0,
+                end: 10.0,
+            },
+        ];
+
+        assert_eq!(
+            measure_parallel_congestion_profile_bounded(&segments, 4.0, 5),
+            Some((measure_parallel_congestion(&segments, 4.0), None))
+        );
+        assert!(measure_parallel_congestion_profile_bounded(&segments, 4.0, 4).is_none());
     }
 
     #[test]

@@ -6,11 +6,13 @@ use std::{
 #[cfg(test)]
 use std::cell::Cell;
 
+#[cfg(test)]
+use crate::readability::measure_parallel_congestion_profile_bounded;
 use crate::{
     Edge, EdgeGeometry, EdgeId, EdgeNodeClearance, EdgeNodeClearanceError, EdgeNodeSegment,
     Endpoint, LayoutOptions, NetId, NetNodeRelation, NodeGeometry, ParallelSegment, Point, Port,
     PortSide, measure_edge_node_clearance_bounded, measure_parallel_congestion_bounded,
-    validation::IndexedGraph,
+    measure_parallel_congestion_profile_with_budget, validation::IndexedGraph,
 };
 
 const MAX_SPARSE_NET_EDGES: usize = 300;
@@ -121,6 +123,24 @@ const MAX_EXPANDED_GAP_SPACING_NODES: usize = 400;
 const MAX_EXPANDED_GAP_SPACING_MAX_NODES: usize = 2_000;
 const MAX_EXPANDED_GAP_SPACING_EDGES: usize = 10_000;
 const MAX_PARALLEL_CONGESTION_ACTIVE_VISITS: usize = 100_000;
+const MIN_PITCHED_GAP_TRACK_PITCH: f64 = 4.0;
+const PREFERRED_PITCHED_GAP_TRACK_PITCH: f64 = 8.0;
+pub(crate) const MAX_PITCHED_GAP_WIDTH_FACTOR: f64 = 1.25;
+const MAX_PITCHED_GAP_NETS: usize = 1_024;
+const MAX_PITCHED_GAP_PAIRS: usize = 500_000;
+const MAX_PITCHED_GAP_INTERVAL_VISITS: usize = 2_000_000;
+const MAX_PITCHED_GAP_REFINEMENT_VISITS: usize = 1_000_000;
+const MAX_PITCHED_GAP_REFINEMENT_ROUNDS: usize = 8;
+const MAX_PITCHED_GAP_ROUTE_POINTS: usize = 100_000;
+const MAX_PITCHED_GAP_SUBSET_CANDIDATES: usize = 32;
+const MAX_PITCHED_GAP_GEOMETRY_VISITS: usize = 1_000_000;
+const MAX_PITCHED_GAP_PARALLEL_ACTIVE_VISITS: usize = 2_000_000;
+const MAX_PITCHED_GAP_SAFETY_VISITS: usize = 20_000_000;
+const MAX_PITCHED_GAP_CROSSING_FACTOR_DENOMINATOR: usize = 20;
+const MIN_PITCHED_GAP_CROSSING_ALLOWANCE: usize = 4;
+const MAX_PITCHED_GAP_LENGTH_FACTOR: f64 = 1.05;
+const MAX_PITCHED_GAP_CONGESTION_FACTOR: f64 = 0.60;
+const MAX_PITCHED_GAP_CLOSE_PROXY_ROUNDS: usize = 32;
 
 fn expanded_gap_spacing_enabled(
     adaptive_gap_spacing: bool,
@@ -191,6 +211,64 @@ struct RoutedLaneState {
     endpoint_tracks: BTreeMap<(u32, u32, u8), (usize, usize)>,
     crossing_paths_match_endpoint_tracks: bool,
     crossing_paths: Vec<Option<Vec<f64>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PitchedGapTracks {
+    slots: BTreeMap<NetId, usize>,
+    slot_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PitchedGapReadability {
+    congestion: f64,
+    minimum_separation: f64,
+}
+
+struct WidenedPitchedGapGeometry {
+    nodes: Vec<NodeGeometry>,
+    routes: Vec<EdgeGeometry>,
+    layer_left: Vec<f64>,
+    layer_right: Vec<f64>,
+    inserted_width: f64,
+}
+
+struct PitchedGapSubsetContext<'a, 'graph> {
+    plan: &'a RoutingPlan<'graph>,
+    baseline_routes: &'a [EdgeGeometry],
+    nodes: &'a [NodeGeometry],
+    layer_left: &'a [f64],
+    layer_right: &'a [f64],
+    port_stub: f64,
+    pitch: f64,
+    baseline: PitchedGapReadability,
+    work: &'a mut PitchedGapWorkBudget,
+    route_points: usize,
+}
+
+struct PitchedGapWorkBudget {
+    geometry_visits: usize,
+    parallel_active_visits: usize,
+    safety_visits: usize,
+    assignment: PitchedGapWork,
+}
+
+impl Default for PitchedGapWorkBudget {
+    fn default() -> Self {
+        Self {
+            geometry_visits: MAX_PITCHED_GAP_GEOMETRY_VISITS,
+            parallel_active_visits: MAX_PITCHED_GAP_PARALLEL_ACTIVE_VISITS,
+            safety_visits: MAX_PITCHED_GAP_SAFETY_VISITS,
+            assignment: PitchedGapWork::default(),
+        }
+    }
+}
+
+impl PitchedGapWorkBudget {
+    fn charge_geometry(&mut self, visits: usize) -> Option<()> {
+        self.geometry_visits = self.geometry_visits.checked_sub(visits)?;
+        Some(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4352,6 +4430,25 @@ fn selected_route_family_is_safe(
     selected_nets: &BTreeSet<NetId>,
     max_visits: usize,
 ) -> bool {
+    let mut remaining_visits = max_visits;
+    selected_route_family_is_safe_with_budget(
+        plan,
+        nodes,
+        routes,
+        segments,
+        selected_nets,
+        &mut remaining_visits,
+    )
+}
+
+fn selected_route_family_is_safe_with_budget(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    segments: &[PhysicalSegment],
+    selected_nets: &BTreeSet<NetId>,
+    remaining_visits: &mut usize,
+) -> bool {
     if routes.len() != plan.edges.len() {
         return false;
     }
@@ -4392,9 +4489,10 @@ fn selected_route_family_is_safe(
     let Some(node_visits) = selected_segments.len().checked_mul(nodes.len()) else {
         return false;
     };
-    let Some(mut remaining_visits) = max_visits.checked_sub(node_visits) else {
+    let Some(remaining) = remaining_visits.checked_sub(node_visits) else {
         return false;
     };
+    *remaining_visits = remaining;
     for segment in &selected_segments {
         if nodes
             .iter()
@@ -4403,7 +4501,7 @@ fn selected_route_family_is_safe(
             return false;
         }
     }
-    raw_route_family_has_unrelated_contact(&raw_segments, selected_nets, &mut remaining_visits)
+    raw_route_family_has_unrelated_contact(&raw_segments, selected_nets, remaining_visits)
         .is_some_and(|has_contact| !has_contact)
 }
 
@@ -4710,6 +4808,78 @@ fn parallel_congestion_ratio(segments: &[PhysicalSegment]) -> Option<f64> {
     .map(|congestion| congestion.ratio())
 }
 
+#[cfg(test)]
+fn parallel_congestion_ratio_at(segments: &[PhysicalSegment], cutoff: f64) -> Option<f64> {
+    parallel_congestion_profile_at(segments, cutoff).map(|(ratio, _)| ratio)
+}
+
+#[cfg(test)]
+fn parallel_congestion_profile_at(
+    segments: &[PhysicalSegment],
+    cutoff: f64,
+) -> Option<(f64, Option<f64>)> {
+    measure_parallel_congestion_profile_bounded(
+        &segments
+            .iter()
+            .map(|segment| ParallelSegment {
+                net: segment.net,
+                horizontal: segment.horizontal,
+                fixed: segment.fixed,
+                start: segment.start,
+                end: segment.end,
+            })
+            .collect::<Vec<_>>(),
+        cutoff,
+        MAX_PARALLEL_CONGESTION_ACTIVE_VISITS,
+    )
+    .map(|(congestion, minimum)| (congestion.ratio(), minimum))
+}
+
+fn parallel_congestion_ratio_with_budget(
+    segments: &[PhysicalSegment],
+    remaining_active_visits: &mut usize,
+) -> Option<f64> {
+    parallel_congestion_profile_at_with_budget(
+        segments,
+        PARALLEL_CONGESTION_CUTOFF,
+        remaining_active_visits,
+    )
+    .map(|(ratio, _)| ratio)
+}
+
+fn parallel_congestion_profile_at_with_budget(
+    segments: &[PhysicalSegment],
+    cutoff: f64,
+    remaining_active_visits: &mut usize,
+) -> Option<(f64, Option<f64>)> {
+    measure_parallel_congestion_profile_with_budget(
+        &segments
+            .iter()
+            .map(|segment| ParallelSegment {
+                net: segment.net,
+                horizontal: segment.horizontal,
+                fixed: segment.fixed,
+                start: segment.start,
+                end: segment.end,
+            })
+            .collect::<Vec<_>>(),
+        cutoff,
+        remaining_active_visits,
+    )
+    .map(|(congestion, minimum)| (congestion.ratio(), minimum))
+}
+
+fn minimum_parallel_route_separation_does_not_regress(
+    baseline: Option<f64>,
+    candidate: Option<f64>,
+) -> bool {
+    match (baseline, candidate) {
+        (None, None) | (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (Some(baseline), Some(candidate)) => candidate >= baseline,
+    }
+}
+
 pub(crate) fn route_parallel_congestion(
     plan: &RoutingPlan<'_>,
     routes: &[EdgeGeometry],
@@ -4717,6 +4887,884 @@ pub(crate) fn route_parallel_congestion(
     let segments =
         physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), routes).0;
     parallel_congestion_ratio(&segments)
+}
+
+pub(crate) fn selected_layout_pitched_gap_candidate(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline_routes: &[EdgeGeometry],
+    options: LayoutOptions,
+) -> Option<(RouteQuality, Vec<NodeGeometry>, Vec<EdgeGeometry>)> {
+    let preferred_pitch = options
+        .route_lane_gap
+        .max(PREFERRED_PITCHED_GAP_TRACK_PITCH);
+    let mut work = PitchedGapWorkBudget::default();
+    if let Some(candidate) = selected_layout_pitched_gap_candidate_at_pitch(
+        plan,
+        nodes,
+        baseline_routes,
+        options,
+        preferred_pitch,
+        &mut work,
+    ) {
+        return Some(candidate);
+    }
+    let fallback_pitch = options.route_lane_gap.max(MIN_PITCHED_GAP_TRACK_PITCH);
+    (fallback_pitch < preferred_pitch).then_some(())?;
+    selected_layout_pitched_gap_candidate_at_pitch(
+        plan,
+        nodes,
+        baseline_routes,
+        options,
+        fallback_pitch,
+        &mut work,
+    )
+}
+
+fn selected_layout_pitched_gap_candidate_at_pitch(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline_routes: &[EdgeGeometry],
+    options: LayoutOptions,
+    pitch: f64,
+    work: &mut PitchedGapWorkBudget,
+) -> Option<(RouteQuality, Vec<NodeGeometry>, Vec<EdgeGeometry>)> {
+    if !pitch.is_finite() || pitch < MIN_PITCHED_GAP_TRACK_PITCH {
+        return None;
+    }
+    if nodes.len() != plan.ranks.len() || baseline_routes.len() != plan.edges.len() {
+        return None;
+    }
+    let route_points = baseline_routes
+        .iter()
+        .try_fold(0usize, |total, route| total.checked_add(route.points.len()))?;
+    if route_points > MAX_PITCHED_GAP_ROUTE_POINTS {
+        return None;
+    }
+    let rank_count = plan.nodes_by_rank.len();
+    let mut layer_left = vec![f64::INFINITY; rank_count];
+    let mut layer_right = vec![f64::NEG_INFINITY; rank_count];
+    for (node, &rank) in nodes.iter().zip(&plan.ranks) {
+        layer_left[rank] = layer_left[rank].min(node.x);
+        layer_right[rank] = layer_right[rank].max(node.x + node.width);
+    }
+    let (gap_lanes, accesses, track_x) =
+        selected_layout_gap_accesses(plan, baseline_routes, &layer_left, &layer_right)?;
+    if !pitched_gap_has_current_close_vertical_pair(
+        &track_x,
+        &accesses,
+        pitch,
+        &mut work.assignment,
+    )? {
+        return None;
+    }
+    let mut assignments =
+        pitched_gap_track_assignments(&gap_lanes, &accesses, &mut work.assignment)?;
+    let candidate_count = assignments
+        .iter()
+        .filter(|assignment| assignment.is_some())
+        .count();
+    let initial_geometry_work =
+        pitched_gap_initial_geometry_work(candidate_count, nodes.len(), route_points)?;
+    if initial_geometry_work > work.geometry_visits {
+        return None;
+    }
+    work.charge_geometry(route_points.checked_mul(2)?)?;
+    let (baseline_quality, baseline_segments) =
+        route_quality_profile_for_plan(plan, baseline_routes);
+    let (baseline_congestion, baseline_minimum_separation) =
+        parallel_congestion_profile_at_with_budget(
+            &baseline_segments,
+            pitch,
+            &mut work.parallel_active_visits,
+        )?;
+    let baseline_minimum_separation = baseline_minimum_separation?;
+    if baseline_congestion == 0.0 {
+        return None;
+    }
+    let baseline_close_congestion = parallel_congestion_ratio_with_budget(
+        &baseline_segments,
+        &mut work.parallel_active_visits,
+    )?;
+    let mut expanded_gaps = vec![false; assignments.len()];
+    select_safe_pitched_gap_subset(
+        PitchedGapSubsetContext {
+            plan,
+            baseline_routes,
+            nodes,
+            layer_left: &layer_left,
+            layer_right: &layer_right,
+            port_stub: options.port_stub,
+            pitch,
+            baseline: PitchedGapReadability {
+                congestion: baseline_congestion,
+                minimum_separation: baseline_minimum_separation,
+            },
+            work,
+            route_points,
+        },
+        &mut assignments,
+        &mut expanded_gaps,
+        &gap_lanes,
+    )?;
+    if pitched_gap_close_vertical_pairs(&assignments, &accesses, pitch, &mut work.assignment)? != 0
+    {
+        return None;
+    }
+
+    charge_pitched_gap_widen(work, nodes.len(), route_points)?;
+    let widened = widen_pitched_gap_corridors(
+        plan,
+        nodes,
+        baseline_routes,
+        &assignments,
+        &expanded_gaps,
+        &layer_left,
+        &layer_right,
+        options.port_stub,
+        pitch,
+    )?;
+    refine_pitched_gap_close_proxy(
+        &mut assignments,
+        &expanded_gaps,
+        &accesses,
+        &mut work.parallel_active_visits,
+    )?;
+    charge_pitched_gap_apply(work, route_points)?;
+    let (candidate, mut selected_nets) = apply_pitched_gap_assignments(
+        plan,
+        &widened.routes,
+        &assignments,
+        &widened.layer_left,
+        &widened.layer_right,
+        options.port_stub,
+        pitch,
+    )?;
+    if widened.inserted_width > 0.0 {
+        selected_nets.extend(plan.edges.iter().map(|resolved| resolved.edge.net));
+    }
+    charge_pitched_gap_segments(work, route_points)?;
+    let (candidate_quality, candidate_segments) = route_quality_profile_for_plan(plan, &candidate);
+    let expanded_baseline_quality = route_quality_for_plan(plan, &widened.routes);
+    if !pitched_gap_route_quality_is_admissible(
+        baseline_quality,
+        expanded_baseline_quality.route_length,
+        candidate_quality,
+    ) {
+        return None;
+    }
+    let (candidate_congestion, candidate_minimum_separation) =
+        parallel_congestion_profile_at_with_budget(
+            &candidate_segments,
+            pitch,
+            &mut work.parallel_active_visits,
+        )?;
+    if candidate_congestion >= baseline_congestion
+        || candidate_congestion > baseline_congestion * MAX_PITCHED_GAP_CONGESTION_FACTOR
+    {
+        return None;
+    }
+    let candidate_close_congestion = parallel_congestion_ratio_with_budget(
+        &candidate_segments,
+        &mut work.parallel_active_visits,
+    )?;
+    if !vertical_track_pitch_is_at_least(
+        &candidate_segments,
+        pitch,
+        &mut work.parallel_active_visits,
+    )? {
+        return None;
+    }
+    let minimum_safe = minimum_parallel_route_separation_does_not_regress(
+        Some(baseline_minimum_separation),
+        candidate_minimum_separation,
+    );
+    let route_safe = selected_route_family_is_safe_with_budget(
+        plan,
+        &widened.nodes,
+        &candidate,
+        &candidate_segments,
+        &selected_nets,
+        &mut work.safety_visits,
+    );
+    if candidate_close_congestion > baseline_close_congestion || !minimum_safe || !route_safe {
+        return None;
+    }
+    Some((candidate_quality, widened.nodes, candidate))
+}
+
+fn pitched_gap_has_current_close_vertical_pair(
+    track_x: &[BTreeMap<NetId, f64>],
+    accesses: &[BTreeMap<NetId, GapNetAccess>],
+    pitch: f64,
+    work: &mut PitchedGapWork,
+) -> Option<bool> {
+    if track_x.len() != accesses.len() {
+        return None;
+    }
+    for (tracks, access) in track_x.iter().zip(accesses) {
+        let nets = tracks.keys().copied().collect::<Vec<_>>();
+        for (left_index, &left) in nets.iter().enumerate() {
+            for &right in &nets[left_index + 1..] {
+                let left_access = access.get(&left)?;
+                let right_access = access.get(&right)?;
+                charge_pitched_gap_interval_work(
+                    work,
+                    left_access
+                        .vertical
+                        .len()
+                        .checked_mul(right_access.vertical.len())?,
+                )?;
+                if (tracks[&left] - tracks[&right]).abs() < pitch
+                    && gap_vertical_accesses_conflict(left_access, right_access)
+                {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    Some(false)
+}
+
+fn vertical_track_pitch_is_at_least(
+    segments: &[PhysicalSegment],
+    pitch: f64,
+    remaining_visits: &mut usize,
+) -> Option<bool> {
+    use std::ops::Bound::Excluded;
+
+    if !pitch.is_finite() || pitch <= 0.0 {
+        return None;
+    }
+    let vertical = segments
+        .iter()
+        .filter(|segment| !segment.horizontal)
+        .collect::<Vec<_>>();
+    let mut events = Vec::with_capacity(vertical.len().checked_mul(2)?);
+    for (index, segment) in vertical.iter().enumerate() {
+        if !segment.fixed.is_finite()
+            || !segment.start.is_finite()
+            || !segment.end.is_finite()
+            || segment.start >= segment.end
+        {
+            return None;
+        }
+        events.push((FloatKey(segment.end), 0u8, index));
+        events.push((FloatKey(segment.start), 1u8, index));
+    }
+    events.sort_unstable();
+
+    // End-before-start events make endpoint-only contact non-overlapping. The active x-range then
+    // proves the selected pitch without comparing unrelated y-disjoint corridors.
+    let mut active = BTreeMap::<FloatKey, BTreeSet<usize>>::new();
+    for (_, event_kind, segment_index) in events {
+        let segment = vertical[segment_index];
+        if event_kind == 0 {
+            let coordinate = FloatKey(segment.fixed);
+            let remove_coordinate = {
+                let members = active.get_mut(&coordinate)?;
+                if !members.remove(&segment_index) {
+                    return None;
+                }
+                members.is_empty()
+            };
+            if remove_coordinate {
+                active.remove(&coordinate);
+            }
+            continue;
+        }
+        for other_index in active
+            .range((
+                Excluded(FloatKey(segment.fixed - pitch)),
+                Excluded(FloatKey(segment.fixed + pitch)),
+            ))
+            .flat_map(|(_, members)| members.iter().copied())
+        {
+            *remaining_visits = remaining_visits.checked_sub(1)?;
+            if vertical[other_index].fixed != segment.fixed {
+                return Some(false);
+            }
+        }
+        active
+            .entry(FloatKey(segment.fixed))
+            .or_default()
+            .insert(segment_index);
+    }
+    Some(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn widen_pitched_gap_corridors(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    routes: &[EdgeGeometry],
+    assignments: &[Option<PitchedGapTracks>],
+    expanded_gaps: &[bool],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    port_stub: f64,
+    pitch: f64,
+) -> Option<WidenedPitchedGapGeometry> {
+    if nodes.len() != plan.ranks.len()
+        || routes.len() != plan.edges.len()
+        || assignments.len() != expanded_gaps.len()
+        || layer_left.len() != layer_right.len()
+        || assignments.len().checked_add(1) != Some(layer_left.len())
+        || !port_stub.is_finite()
+        || port_stub < 0.0
+        || !pitch.is_finite()
+        || pitch < MIN_PITCHED_GAP_TRACK_PITCH
+    {
+        return None;
+    }
+    let mut deficits = vec![0.0; assignments.len()];
+    for (gap, assignment) in assignments.iter().enumerate() {
+        if assignment.is_none() || !expanded_gaps[gap] {
+            continue;
+        }
+        let current_gap = layer_left[gap + 1] - layer_right[gap];
+        let required_gap =
+            port_stub * 2.0 + pitch * assignment.as_ref()?.slot_count.checked_add(1)? as f64;
+        if !current_gap.is_finite() || current_gap <= 0.0 || !required_gap.is_finite() {
+            return None;
+        }
+        deficits[gap] = (required_gap - current_gap).max(0.0);
+    }
+    let inserted_width = deficits.iter().try_fold(0.0, |total, &deficit| {
+        let widened = total + deficit;
+        widened.is_finite().then_some(widened)
+    })?;
+    let baseline_span = layer_right.last()? - layer_left.first()?;
+    if !baseline_span.is_finite()
+        || baseline_span <= 0.0
+        || inserted_width > baseline_span * (MAX_PITCHED_GAP_WIDTH_FACTOR - 1.0)
+    {
+        return None;
+    }
+
+    let mut rank_shift = vec![0.0; layer_left.len()];
+    for gap in 0..deficits.len() {
+        rank_shift[gap + 1] = rank_shift[gap] + deficits[gap];
+    }
+    let mut widened_nodes = nodes.to_vec();
+    for (node, &rank) in widened_nodes.iter_mut().zip(&plan.ranks) {
+        node.x += rank_shift[rank];
+    }
+
+    let mut cuts = Vec::new();
+    let mut cumulative = 0.0;
+    for (gap, &deficit) in deficits.iter().enumerate() {
+        if deficit == 0.0 {
+            continue;
+        }
+        cumulative += deficit;
+        cuts.push((layer_left[gap + 1], cumulative));
+    }
+    let mut widened_routes = routes.to_vec();
+    for route in &mut widened_routes {
+        for point in &mut route.points {
+            let count = cuts.partition_point(|(cut, _)| *cut <= point.x);
+            if count != 0 {
+                point.x += cuts[count - 1].1;
+            }
+        }
+    }
+    let widened_layer_left = layer_left
+        .iter()
+        .zip(&rank_shift)
+        .map(|(&coordinate, &shift)| coordinate + shift)
+        .collect::<Vec<_>>();
+    let widened_layer_right = layer_right
+        .iter()
+        .zip(&rank_shift)
+        .map(|(&coordinate, &shift)| coordinate + shift)
+        .collect::<Vec<_>>();
+    if widened_nodes
+        .iter()
+        .any(|node| !node.x.is_finite() || !(node.x + node.width).is_finite())
+        || widened_routes.iter().any(|route| {
+            route
+                .points
+                .iter()
+                .any(|point| !point.x.is_finite() || !point.y.is_finite())
+        })
+    {
+        return None;
+    }
+    Some(WidenedPitchedGapGeometry {
+        nodes: widened_nodes,
+        routes: widened_routes,
+        layer_left: widened_layer_left,
+        layer_right: widened_layer_right,
+        inserted_width,
+    })
+}
+
+fn select_safe_pitched_gap_subset(
+    context: PitchedGapSubsetContext<'_, '_>,
+    assignments: &mut [Option<PitchedGapTracks>],
+    expanded_gaps: &mut [bool],
+    unique_lanes: &[BTreeMap<NetId, usize>],
+) -> Option<()> {
+    if assignments.len() != expanded_gaps.len() || assignments.len() != unique_lanes.len() {
+        return None;
+    }
+    let mut retained = vec![None; assignments.len()];
+    let mut retained_expansions = vec![false; assignments.len()];
+    let mut retained_any = false;
+    let mut retained_congestion = context.baseline.congestion;
+    for gap in 0..assignments.len() {
+        let Some(compact_assignment) = assignments[gap].clone() else {
+            continue;
+        };
+        let mut accepted = false;
+        for expand_gap in [false, true] {
+            retained[gap] = Some(if expand_gap {
+                PitchedGapTracks {
+                    slots: unique_lanes[gap].clone(),
+                    slot_count: unique_lanes[gap].len(),
+                }
+            } else {
+                compact_assignment.clone()
+            });
+            retained_expansions[gap] = expand_gap;
+            charge_pitched_gap_widen(context.work, context.nodes.len(), context.route_points)?;
+            let Some(widened) = widen_pitched_gap_corridors(
+                context.plan,
+                context.nodes,
+                context.baseline_routes,
+                &retained,
+                &retained_expansions,
+                context.layer_left,
+                context.layer_right,
+                context.port_stub,
+                context.pitch,
+            ) else {
+                continue;
+            };
+            charge_pitched_gap_apply(context.work, context.route_points)?;
+            let Some((candidate, _)) = apply_pitched_gap_assignments(
+                context.plan,
+                &widened.routes,
+                &retained,
+                &widened.layer_left,
+                &widened.layer_right,
+                context.port_stub,
+                context.pitch,
+            ) else {
+                continue;
+            };
+            charge_pitched_gap_segments(context.work, context.route_points)?;
+            let (segments, _, _) = physical_route_segments(
+                context.plan.edges.iter().map(|resolved| resolved.edge),
+                &candidate,
+            );
+            let (candidate_congestion, candidate_minimum_separation) =
+                parallel_congestion_profile_at_with_budget(
+                    &segments,
+                    context.pitch,
+                    &mut context.work.parallel_active_visits,
+                )?;
+            if candidate_congestion <= retained_congestion
+                && minimum_parallel_route_separation_does_not_regress(
+                    Some(context.baseline.minimum_separation),
+                    candidate_minimum_separation,
+                )
+            {
+                accepted = true;
+                retained_any = true;
+                retained_congestion = candidate_congestion;
+                break;
+            }
+        }
+        if !accepted {
+            retained[gap] = None;
+            retained_expansions[gap] = false;
+        }
+    }
+    if !retained_any {
+        return None;
+    }
+    assignments.clone_from_slice(&retained);
+    expanded_gaps.clone_from_slice(&retained_expansions);
+    Some(())
+}
+
+fn refine_pitched_gap_close_proxy(
+    assignments: &mut [Option<PitchedGapTracks>],
+    expanded_gaps: &[bool],
+    accesses: &[BTreeMap<NetId, GapNetAccess>],
+    remaining_visits: &mut usize,
+) -> Option<()> {
+    if assignments.len() != expanded_gaps.len() || assignments.len() != accesses.len() {
+        return None;
+    }
+    for (gap, expanded) in expanded_gaps.iter().copied().enumerate() {
+        if !expanded {
+            continue;
+        }
+        // Moving one track right lengthens its left arms and shortens its right arms. Rank each net
+        // by the difference between close left and right arms, then use bounded adjacent descent.
+        // Never take a proxy step that increases the established crossing-order objective.
+        let scores = accesses[gap]
+            .iter()
+            .map(|(&net, access)| {
+                let close_count =
+                    |ordinates: &[f64], left_side: bool, remaining_visits: &mut usize| {
+                        let mut count = 0i64;
+                        for &ordinate in ordinates {
+                            let mut close = false;
+                            for (&other_net, other) in &accesses[gap] {
+                                if other_net == net {
+                                    continue;
+                                }
+                                *remaining_visits = remaining_visits.checked_sub(1)?;
+                                let other_ordinates = if left_side {
+                                    &other.left_y
+                                } else {
+                                    &other.right_y
+                                };
+                                let start = other_ordinates.partition_point(|&other| {
+                                    other <= ordinate - PARALLEL_CONGESTION_CUTOFF
+                                });
+                                if other_ordinates.get(start).is_some_and(|&other| {
+                                    other < ordinate + PARALLEL_CONGESTION_CUTOFF
+                                }) {
+                                    close = true;
+                                    break;
+                                }
+                            }
+                            count += i64::from(close);
+                        }
+                        Some(count)
+                    };
+                let left = close_count(&access.left_y, true, remaining_visits)?;
+                let right = close_count(&access.right_y, false, remaining_visits)?;
+                Some((net, left - right))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?;
+        for _ in 0..MAX_PITCHED_GAP_CLOSE_PROXY_ROUNDS {
+            let tracks = assignments[gap].as_mut()?;
+            let mut by_slot = tracks
+                .slots
+                .iter()
+                .map(|(&net, &slot)| (slot, net))
+                .collect::<BTreeMap<_, _>>();
+            let mut changed = false;
+            for slot in 0..tracks.slot_count.saturating_sub(1) {
+                let left = by_slot[&slot];
+                let right = by_slot[&(slot + 1)];
+                let pair_visits = accesses[gap][&left]
+                    .vertical
+                    .len()
+                    .checked_add(accesses[gap][&right].vertical.len())?
+                    .checked_mul(2)?
+                    .checked_add(1)?;
+                *remaining_visits = remaining_visits.checked_sub(pair_visits)?;
+                if scores[&left] >= scores[&right]
+                    || gap_pair_crossings(&accesses[gap][&right], &accesses[gap][&left])
+                        > gap_pair_crossings(&accesses[gap][&left], &accesses[gap][&right])
+                {
+                    continue;
+                }
+                tracks.slots.insert(left, slot + 1);
+                tracks.slots.insert(right, slot);
+                by_slot.insert(slot, right);
+                by_slot.insert(slot + 1, left);
+                changed = true;
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+    Some(())
+}
+
+fn pitched_gap_initial_geometry_work(
+    candidate_count: usize,
+    nodes: usize,
+    route_points: usize,
+) -> Option<usize> {
+    if candidate_count > MAX_PITCHED_GAP_SUBSET_CANDIDATES {
+        return None;
+    }
+    // Widen clones and scans nodes/routes, apply clones and validates every route twice, and exact
+    // segment construction scans routes plus its emitted segments. Charge the conservative upper
+    // bound for both subset trials per gap, the final pass, and baseline segment construction.
+    let widen = nodes.checked_add(route_points)?.checked_mul(2)?;
+    let apply = route_points.checked_mul(4)?;
+    let segments = route_points.checked_mul(2)?;
+    let complete_pass = widen.checked_add(apply)?.checked_add(segments)?;
+    candidate_count
+        .checked_mul(2)?
+        .checked_add(1)?
+        .checked_mul(complete_pass)
+        .and_then(|visits| visits.checked_add(segments))
+}
+
+fn charge_pitched_gap_widen(
+    work: &mut PitchedGapWorkBudget,
+    nodes: usize,
+    route_points: usize,
+) -> Option<()> {
+    work.charge_geometry(nodes.checked_add(route_points)?.checked_mul(2)?)
+}
+
+fn charge_pitched_gap_apply(work: &mut PitchedGapWorkBudget, route_points: usize) -> Option<()> {
+    work.charge_geometry(route_points.checked_mul(4)?)
+}
+
+fn charge_pitched_gap_segments(work: &mut PitchedGapWorkBudget, route_points: usize) -> Option<()> {
+    work.charge_geometry(route_points.checked_mul(2)?)
+}
+
+fn apply_pitched_gap_assignments(
+    plan: &RoutingPlan<'_>,
+    baseline_routes: &[EdgeGeometry],
+    assignments: &[Option<PitchedGapTracks>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    port_stub: f64,
+    pitch: f64,
+) -> Option<(Vec<EdgeGeometry>, BTreeSet<NetId>)> {
+    let mut candidate = baseline_routes.to_vec();
+    let mut selected_nets = BTreeSet::new();
+    let mut changed = false;
+    for (resolved, route) in plan.edges.iter().zip(&mut candidate) {
+        let source_rank = plan.ranks[resolved.source_index];
+        let target_rank = plan.ranks[resolved.target_index];
+        if source_rank >= target_rank {
+            continue;
+        }
+        let original = route.points.clone();
+        for (point_index, pair) in original.windows(2).enumerate() {
+            if pair[0].x != pair[1].x || pair[0].y == pair[1].y {
+                continue;
+            }
+            let Some(gap) =
+                selected_route_gap(pair[0].x, source_rank, target_rank, layer_left, layer_right)
+            else {
+                continue;
+            };
+            let Some(tracks) = assignments[gap].as_ref() else {
+                continue;
+            };
+            let x = pitched_gap_track_x(
+                tracks,
+                resolved.edge.net,
+                gap,
+                layer_left,
+                layer_right,
+                port_stub,
+                pitch,
+            )?;
+            changed |= route.points[point_index].x != x;
+            route.points[point_index].x = x;
+            route.points[point_index + 1].x = x;
+            selected_nets.insert(resolved.edge.net);
+        }
+        if route.points.len() != original.len()
+            || route.points.first() != original.first()
+            || route.points.last() != original.last()
+            || route.points.windows(2).zip(original.windows(2)).any(
+                |(candidate_pair, original_pair)| {
+                    let candidate_horizontal = candidate_pair[0].y == candidate_pair[1].y;
+                    let original_horizontal = original_pair[0].y == original_pair[1].y;
+                    candidate_horizontal != original_horizontal
+                        || (candidate_pair[0].x == candidate_pair[1].x) == candidate_horizontal
+                        || (candidate_pair[1].x - candidate_pair[0].x).signum()
+                            != (original_pair[1].x - original_pair[0].x).signum()
+                        || (candidate_pair[1].y - candidate_pair[0].y).signum()
+                            != (original_pair[1].y - original_pair[0].y).signum()
+                },
+            )
+        {
+            return None;
+        }
+    }
+    if !changed || selected_nets.is_empty() {
+        return None;
+    }
+    Some((candidate, selected_nets))
+}
+
+fn selected_layout_gap_accesses(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+    layer_left: &[f64],
+    layer_right: &[f64],
+) -> Option<(GapLaneMaps, GapAccessMaps, GapTrackXMaps)> {
+    let gap_count = layer_left.len().saturating_sub(1);
+    let mut accesses = vec![BTreeMap::<NetId, GapNetAccess>::new(); gap_count];
+    let mut track_x = vec![BTreeMap::<NetId, f64>::new(); gap_count];
+    for (resolved, route) in plan.edges.iter().zip(routes) {
+        if route.id != resolved.edge.id || route.points.len() < 2 {
+            return None;
+        }
+        let source_rank = plan.ranks[resolved.source_index];
+        let target_rank = plan.ranks[resolved.target_index];
+        if source_rank >= target_rank {
+            continue;
+        }
+        for (point_index, pair) in route.points.windows(2).enumerate() {
+            let horizontal = pair[0].y == pair[1].y;
+            let vertical = pair[0].x == pair[1].x;
+            if horizontal == vertical {
+                return None;
+            }
+            if horizontal {
+                continue;
+            }
+            if point_index > 0 && route.points[point_index - 1].x == route.points[point_index].x
+                || point_index + 2 < route.points.len()
+                    && route.points[point_index + 1].x == route.points[point_index + 2].x
+            {
+                return None;
+            }
+            let Some(gap) =
+                selected_route_gap(pair[0].x, source_rank, target_rank, layer_left, layer_right)
+            else {
+                continue;
+            };
+            match track_x[gap].entry(resolved.edge.net) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(pair[0].x);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if *entry.get() != pair[0].x =>
+                {
+                    return None;
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+            let access = accesses[gap].entry(resolved.edge.net).or_default();
+            access
+                .vertical
+                .push((pair[0].y.min(pair[1].y), pair[0].y.max(pair[1].y)));
+            access.left_y.push(pair[0].y);
+            access.right_y.push(pair[1].y);
+        }
+    }
+    let lanes = track_x
+        .iter()
+        .map(|by_net| {
+            let mut ordered = by_net.iter().map(|(&net, &x)| (net, x)).collect::<Vec<_>>();
+            ordered.sort_by(|left, right| left.1.total_cmp(&right.1).then(left.0.cmp(&right.0)));
+            ordered
+                .into_iter()
+                .enumerate()
+                .map(|(lane, (net, _))| (net, lane))
+                .collect()
+        })
+        .collect();
+    for by_net in &mut accesses {
+        for access in by_net.values_mut() {
+            access.left_y.sort_by(f64::total_cmp);
+            access.right_y.sort_by(f64::total_cmp);
+        }
+    }
+    Some((lanes, accesses, track_x))
+}
+
+fn selected_route_gap(
+    x: f64,
+    source_rank: usize,
+    target_rank: usize,
+    layer_left: &[f64],
+    layer_right: &[f64],
+) -> Option<usize> {
+    let next_layers = layer_left.get(source_rank + 1..=target_rank)?;
+    let offset = next_layers.partition_point(|&left| left <= x);
+    let gap = source_rank.checked_add(offset)?;
+    (gap < target_rank && x > layer_right[gap] && x < layer_left[gap + 1]).then_some(gap)
+}
+
+fn pitched_gap_track_x(
+    tracks: &PitchedGapTracks,
+    net: NetId,
+    gap: usize,
+    layer_left: &[f64],
+    layer_right: &[f64],
+    port_stub: f64,
+    pitch: f64,
+) -> Option<f64> {
+    let available_left = layer_right[gap] + port_stub;
+    let available_right = layer_left[gap + 1] - port_stub;
+    let span = pitch * tracks.slot_count.saturating_sub(1) as f64;
+    if span > available_right - available_left {
+        return None;
+    }
+    let gap_width = layer_left[gap + 1] - layer_right[gap];
+    let preferred_left = layer_right[gap] + gap_width * 0.625 - span / 2.0;
+    let left = preferred_left.clamp(available_left, available_right - span);
+    Some(left + pitch * *tracks.slots.get(&net)? as f64)
+}
+
+fn pitched_gap_close_vertical_pairs(
+    assignments: &[Option<PitchedGapTracks>],
+    accesses: &[BTreeMap<NetId, GapNetAccess>],
+    pitch: f64,
+    work: &mut PitchedGapWork,
+) -> Option<usize> {
+    if assignments.len() != accesses.len() {
+        return None;
+    }
+    let mut close_pairs = 0usize;
+    for (assignment, access) in assignments.iter().zip(accesses) {
+        let Some(assignment) = assignment else {
+            continue;
+        };
+        let nets = assignment.slots.keys().copied().collect::<Vec<_>>();
+        for (left_index, &left) in nets.iter().enumerate() {
+            for &right in &nets[left_index + 1..] {
+                let left_access = access.get(&left)?;
+                let right_access = access.get(&right)?;
+                charge_pitched_gap_interval_work(
+                    work,
+                    left_access
+                        .vertical
+                        .len()
+                        .checked_mul(right_access.vertical.len())?,
+                )?;
+                let distance =
+                    assignment.slots[&left].abs_diff(assignment.slots[&right]) as f64 * pitch;
+                if distance < pitch && gap_vertical_accesses_conflict(left_access, right_access) {
+                    close_pairs = close_pairs.saturating_add(1);
+                }
+            }
+        }
+    }
+    Some(close_pairs)
+}
+
+#[cfg(test)]
+fn pitched_gap_quality_is_admissible(
+    baseline: RouteQuality,
+    baseline_congestion: f64,
+    candidate: RouteQuality,
+    candidate_congestion: f64,
+) -> bool {
+    pitched_gap_route_quality_is_admissible(baseline, baseline.route_length, candidate)
+        && candidate_congestion < baseline_congestion
+        && candidate_congestion <= baseline_congestion * MAX_PITCHED_GAP_CONGESTION_FACTOR
+}
+
+fn pitched_gap_route_quality_is_admissible(
+    baseline: RouteQuality,
+    expanded_baseline_length: f64,
+    candidate: RouteQuality,
+) -> bool {
+    let crossing_allowance = MIN_PITCHED_GAP_CROSSING_ALLOWANCE.max(
+        baseline
+            .crossings
+            .checked_div(MAX_PITCHED_GAP_CROSSING_FACTOR_DENOMINATOR)
+            .unwrap_or(usize::MAX),
+    );
+    let discretionary_length = baseline.route_length * (MAX_PITCHED_GAP_LENGTH_FACTOR - 1.0);
+    candidate.crossings <= baseline.crossings.saturating_add(crossing_allowance)
+        && candidate.bends == baseline.bends
+        && candidate.route_length <= expanded_baseline_length + discretionary_length
 }
 
 fn route_quality_cmp(left: RouteQuality, right: RouteQuality) -> Ordering {
@@ -5997,6 +7045,10 @@ struct GapNetAccess {
     right_y: Vec<f64>,
 }
 
+type GapLaneMaps = Vec<BTreeMap<NetId, usize>>;
+type GapAccessMaps = Vec<BTreeMap<NetId, GapNetAccess>>;
+type GapTrackXMaps = Vec<BTreeMap<NetId, f64>>;
+
 struct GapLaneCandidates {
     baseline: Vec<BTreeMap<u32, usize>>,
     global: Option<Vec<BTreeMap<u32, usize>>>,
@@ -6057,41 +7109,15 @@ fn crossing_aware_gap_lanes(
     large_global_candidates: bool,
     refined_large_global_candidates: bool,
 ) -> GapLaneCandidates {
-    let mut accesses = (0..current_lanes.len())
-        .map(|_| BTreeMap::<u32, GapNetAccess>::new())
-        .collect::<Vec<_>>();
-    for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(crossing_paths) {
-        let edge = resolved.edge;
-        let (Some(&(source_rank, target_rank)), Some(path)) = (span.as_ref(), path) else {
-            continue;
-        };
-        let source = port_point(&nodes[resolved.source_index], resolved.source_port);
-        let target = port_point(&nodes[resolved.target_index], resolved.target_port);
-        let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
-        let target_y = endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub);
-        for gap in source_rank..target_rank {
-            let before = if gap == source_rank {
-                source_y
-            } else {
-                path[gap - source_rank - 1]
-            };
-            let after = if gap + 1 == target_rank {
-                target_y
-            } else {
-                path[gap - source_rank]
-            };
-            let access = accesses[gap].entry(edge.net).or_default();
-            access.vertical.push((before.min(after), before.max(after)));
-            access.left_y.push(before);
-            access.right_y.push(after);
-        }
-    }
-    for by_net in &mut accesses {
-        for access in by_net.values_mut() {
-            access.left_y.sort_by(f64::total_cmp);
-            access.right_y.sort_by(f64::total_cmp);
-        }
-    }
+    let accesses = gap_net_accesses(
+        plan,
+        nodes,
+        sparse_spans,
+        crossing_paths,
+        current_lanes.len(),
+        endpoint_tracks,
+        port_stub,
+    );
     let global_candidates = global_candidates
         && global_gap_candidate_work_within_budget(
             current_lanes,
@@ -6192,6 +7218,251 @@ fn crossing_aware_gap_lanes(
         preserved_refined,
         refined,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gap_net_accesses(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    sparse_spans: &[Option<(usize, usize)>],
+    crossing_paths: &[Option<Vec<f64>>],
+    gap_count: usize,
+    endpoint_tracks: &BTreeMap<(u32, u32, u8), (usize, usize)>,
+    port_stub: f64,
+) -> Vec<BTreeMap<NetId, GapNetAccess>> {
+    let mut accesses = (0..gap_count)
+        .map(|_| BTreeMap::<u32, GapNetAccess>::new())
+        .collect::<Vec<_>>();
+    for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(crossing_paths) {
+        let edge = resolved.edge;
+        let (Some(&(source_rank, target_rank)), Some(path)) = (span.as_ref(), path) else {
+            continue;
+        };
+        let source = port_point(&nodes[resolved.source_index], resolved.source_port);
+        let target = port_point(&nodes[resolved.target_index], resolved.target_port);
+        let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
+        let target_y = endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub);
+        for gap in source_rank..target_rank {
+            let before = if gap == source_rank {
+                source_y
+            } else {
+                path[gap - source_rank - 1]
+            };
+            let after = if gap + 1 == target_rank {
+                target_y
+            } else {
+                path[gap - source_rank]
+            };
+            let access = accesses[gap].entry(edge.net).or_default();
+            access.vertical.push((before.min(after), before.max(after)));
+            access.left_y.push(before);
+            access.right_y.push(after);
+        }
+    }
+    for by_net in &mut accesses {
+        for access in by_net.values_mut() {
+            access.left_y.sort_by(f64::total_cmp);
+            access.right_y.sort_by(f64::total_cmp);
+        }
+    }
+    accesses
+}
+
+#[derive(Default)]
+struct PitchedGapWork {
+    pairs: usize,
+    interval_visits: usize,
+    refinement_visits: usize,
+}
+
+fn charge_pitched_gap_interval_work(work: &mut PitchedGapWork, visits: usize) -> Option<()> {
+    work.interval_visits = work.interval_visits.checked_add(visits)?;
+    (work.interval_visits <= MAX_PITCHED_GAP_INTERVAL_VISITS).then_some(())
+}
+
+fn pitched_gap_track_assignments(
+    current_lanes: &[BTreeMap<NetId, usize>],
+    accesses: &[BTreeMap<NetId, GapNetAccess>],
+    work: &mut PitchedGapWork,
+) -> Option<Vec<Option<PitchedGapTracks>>> {
+    if current_lanes.len() != accesses.len() {
+        return None;
+    }
+    let mut changed = false;
+    let assignments = current_lanes
+        .iter()
+        .zip(accesses)
+        .map(|(lanes, access)| {
+            let assignment = pitched_gap_track_assignment(lanes, access, work)?;
+            changed |= assignment.is_some();
+            Some(assignment)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    changed.then_some(assignments)
+}
+
+fn pitched_gap_track_assignment(
+    lanes: &BTreeMap<NetId, usize>,
+    accesses: &BTreeMap<NetId, GapNetAccess>,
+    work: &mut PitchedGapWork,
+) -> Option<Option<PitchedGapTracks>> {
+    if lanes.len() < 2 {
+        return Some(None);
+    }
+    if lanes.len() > MAX_PITCHED_GAP_NETS || lanes.keys().any(|net| !accesses.contains_key(net)) {
+        return None;
+    }
+    let pair_count = lanes.len().checked_mul(lanes.len().saturating_sub(1))? / 2;
+    work.pairs = work.pairs.checked_add(pair_count)?;
+    if work.pairs > MAX_PITCHED_GAP_PAIRS {
+        return None;
+    }
+
+    let nets = lanes.keys().copied().collect::<Vec<_>>();
+    let mut conflicts = vec![false; nets.len().checked_mul(nets.len())?];
+    for left in 0..nets.len() {
+        for right in left + 1..nets.len() {
+            let left_access = &accesses[&nets[left]];
+            let right_access = &accesses[&nets[right]];
+            let visits = left_access
+                .vertical
+                .len()
+                .checked_mul(right_access.vertical.len())?;
+            charge_pitched_gap_interval_work(work, visits)?;
+            let conflict = gap_vertical_accesses_conflict(left_access, right_access);
+            conflicts[left * nets.len() + right] = conflict;
+            conflicts[right * nets.len() + left] = conflict;
+        }
+    }
+
+    // Color in the existing unique-lane permutation, using stable net ID as the deterministic tie.
+    // Physical color ordering is refined separately, so endpoint tracks and all existing
+    // lane-order semantics remain a unique permutation.
+    let mut colors = Vec::<Vec<usize>>::new();
+    let mut net_colors = vec![0usize; nets.len()];
+    let mut coloring_order = (0..nets.len()).collect::<Vec<_>>();
+    coloring_order.sort_by_key(|&index| (lanes[&nets[index]], nets[index]));
+    let mut assigned = Vec::with_capacity(nets.len());
+    for net_index in coloring_order {
+        let compatible = colors
+            .iter()
+            .enumerate()
+            .filter(|(_, members)| {
+                members
+                    .iter()
+                    .all(|&member| !conflicts[net_index * nets.len() + member])
+            })
+            .map(|(color, _)| {
+                let mut delta = 0i128;
+                for &prior in &assigned {
+                    let prior_color = net_colors[prior];
+                    let prior_before =
+                        gap_pair_crossings(&accesses[&nets[prior]], &accesses[&nets[net_index]]);
+                    let candidate_cost = if prior_color == color {
+                        0
+                    } else if prior_color > color {
+                        gap_pair_crossings(&accesses[&nets[net_index]], &accesses[&nets[prior]])
+                    } else {
+                        prior_before
+                    };
+                    let visits = accesses[&nets[prior]]
+                        .vertical
+                        .len()
+                        .checked_add(accesses[&nets[net_index]].vertical.len())
+                        .and_then(|visits| visits.checked_mul(2))?;
+                    work.refinement_visits = work.refinement_visits.checked_add(visits)?;
+                    if work.refinement_visits > MAX_PITCHED_GAP_REFINEMENT_VISITS {
+                        return None;
+                    }
+                    delta += candidate_cost as i128 - prior_before as i128;
+                }
+                Some((delta, color))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let color = compatible
+            .into_iter()
+            .min()
+            .filter(|(delta, _)| *delta <= 0)
+            .map_or(colors.len(), |(_, color)| color);
+        if color == colors.len() {
+            colors.push(Vec::new());
+        }
+        colors[color].push(net_index);
+        net_colors[net_index] = color;
+        assigned.push(net_index);
+    }
+    let mut ordered_colors = (0..colors.len()).collect::<Vec<_>>();
+    ordered_colors.sort_by_key(|&color| {
+        colors[color]
+            .iter()
+            .map(|&net| (lanes[&nets[net]], nets[net]))
+            .min()
+            .expect("color contains a net")
+    });
+    let mut pair_costs = vec![0usize; colors.len().checked_mul(colors.len())?];
+    for &left_color in &ordered_colors {
+        for &right_color in &ordered_colors {
+            if left_color == right_color {
+                continue;
+            }
+            let mut cost = 0usize;
+            for &left in &colors[left_color] {
+                for &right in &colors[right_color] {
+                    let visits = accesses[&nets[left]]
+                        .vertical
+                        .len()
+                        .checked_add(accesses[&nets[right]].vertical.len())?;
+                    work.refinement_visits = work.refinement_visits.checked_add(visits)?;
+                    if work.refinement_visits > MAX_PITCHED_GAP_REFINEMENT_VISITS {
+                        return None;
+                    }
+                    cost = cost.saturating_add(gap_pair_crossings(
+                        &accesses[&nets[left]],
+                        &accesses[&nets[right]],
+                    ));
+                }
+            }
+            pair_costs[left_color * colors.len() + right_color] = cost;
+        }
+    }
+    for _ in 0..MAX_PITCHED_GAP_REFINEMENT_ROUNDS {
+        let mut refined = false;
+        for index in 0..ordered_colors.len().saturating_sub(1) {
+            let left = ordered_colors[index];
+            let right = ordered_colors[index + 1];
+            if pair_costs[right * colors.len() + left] < pair_costs[left * colors.len() + right] {
+                ordered_colors.swap(index, index + 1);
+                refined = true;
+            }
+        }
+        if !refined {
+            break;
+        }
+    }
+
+    let color_slots = ordered_colors
+        .into_iter()
+        .enumerate()
+        .map(|(slot, color)| (color, slot))
+        .collect::<BTreeMap<_, _>>();
+    let slots = nets
+        .iter()
+        .enumerate()
+        .map(|(index, &net)| (net, color_slots[&net_colors[index]]))
+        .collect();
+    Some(Some(PitchedGapTracks {
+        slots,
+        slot_count: colors.len(),
+    }))
+}
+
+fn gap_vertical_accesses_conflict(left: &GapNetAccess, right: &GapNetAccess) -> bool {
+    left.vertical.iter().any(|&(left_low, left_high)| {
+        right
+            .vertical
+            .iter()
+            .any(|&(right_low, right_high)| left_low <= right_high && right_low <= left_high)
+    })
 }
 
 fn global_gap_candidate_work_within_budget(
@@ -7093,10 +8364,10 @@ fn sparse_gap_x(
     gap_spacing: GapTrackSpacing,
 ) -> f64 {
     let lanes = &gap_lanes[gap];
-    let lane_fraction = (lanes[&net] + 1) as f64 / (lanes.len() + 1) as f64;
     let gap_left = layer_right[gap];
     let gap_right = layer_left[gap + 1];
     let gap_width = gap_right - gap_left;
+    let lane_fraction = (lanes[&net] + 1) as f64 / (lanes.len() + 1) as f64;
     let demand_aware = gap_width > options.layer_gap + f64::EPSILON;
     let compact_x = if demand_aware {
         let available_left = gap_left + options.port_stub;
@@ -7461,6 +8732,712 @@ mod tests {
             vertical_horizontal_crossings(&[(20.0, 20.0)], &[10.0, 20.0, 30.0]),
             0
         );
+    }
+
+    #[test]
+    fn pitched_gap_tracks_reuse_only_closed_disjoint_vertical_accesses() {
+        let lanes = BTreeMap::from([(10, 0), (11, 1), (12, 2)]);
+        let accesses = BTreeMap::from([
+            (
+                10,
+                GapNetAccess {
+                    vertical: vec![(0.0, 10.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+            (
+                11,
+                GapNetAccess {
+                    vertical: vec![(10.0, 20.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+            (
+                12,
+                GapNetAccess {
+                    vertical: vec![(30.0, 40.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+        ]);
+        let assignment = super::pitched_gap_track_assignment(
+            &lanes,
+            &accesses,
+            &mut super::PitchedGapWork::default(),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(assignment.slot_count, 2);
+        assert_ne!(assignment.slots[&10], assignment.slots[&11]);
+        assert_eq!(assignment.slots[&10], assignment.slots[&12]);
+        assert_eq!(
+            assignment,
+            super::pitched_gap_track_assignment(
+                &BTreeMap::from([(12, 2), (11, 1), (10, 0)]),
+                &BTreeMap::from_iter(accesses.into_iter().rev()),
+                &mut super::PitchedGapWork::default(),
+            )
+            .unwrap()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn pitched_gap_track_assignment_fails_closed_at_exact_work_caps() {
+        let lanes = BTreeMap::from([(10, 0), (11, 1)]);
+        let accesses = BTreeMap::from([
+            (
+                10,
+                GapNetAccess {
+                    vertical: vec![(0.0, 1.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+            (
+                11,
+                GapNetAccess {
+                    vertical: vec![(2.0, 3.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+        ]);
+        let mut exact = super::PitchedGapWork {
+            pairs: super::MAX_PITCHED_GAP_PAIRS - 1,
+            interval_visits: super::MAX_PITCHED_GAP_INTERVAL_VISITS - 1,
+            refinement_visits: 0,
+        };
+        assert!(
+            super::pitched_gap_track_assignment(&lanes, &accesses, &mut exact)
+                .unwrap()
+                .is_some()
+        );
+        let mut over_pairs = super::PitchedGapWork {
+            pairs: super::MAX_PITCHED_GAP_PAIRS,
+            ..super::PitchedGapWork::default()
+        };
+        assert!(super::pitched_gap_track_assignment(&lanes, &accesses, &mut over_pairs).is_none());
+        let mut over_intervals = super::PitchedGapWork {
+            interval_visits: super::MAX_PITCHED_GAP_INTERVAL_VISITS,
+            ..super::PitchedGapWork::default()
+        };
+        assert!(
+            super::pitched_gap_track_assignment(&lanes, &accesses, &mut over_intervals).is_none()
+        );
+        let mut exact_refinement = super::PitchedGapWork {
+            refinement_visits: super::MAX_PITCHED_GAP_REFINEMENT_VISITS - 4,
+            ..super::PitchedGapWork::default()
+        };
+        assert!(
+            super::pitched_gap_track_assignment(&lanes, &accesses, &mut exact_refinement)
+                .unwrap()
+                .is_some()
+        );
+        let mut over_refinement = super::PitchedGapWork {
+            refinement_visits: super::MAX_PITCHED_GAP_REFINEMENT_VISITS - 3,
+            ..super::PitchedGapWork::default()
+        };
+        assert!(
+            super::pitched_gap_track_assignment(&lanes, &accesses, &mut over_refinement).is_none()
+        );
+
+        let mut shared = super::PitchedGapWork {
+            pairs: super::MAX_PITCHED_GAP_PAIRS - 2,
+            ..super::PitchedGapWork::default()
+        };
+        for _ in 0..2 {
+            assert!(
+                super::pitched_gap_track_assignment(&lanes, &accesses, &mut shared)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(super::pitched_gap_track_assignment(&lanes, &accesses, &mut shared).is_none());
+
+        let mut shared_intervals = super::PitchedGapWork {
+            interval_visits: super::MAX_PITCHED_GAP_INTERVAL_VISITS - 1,
+            ..super::PitchedGapWork::default()
+        };
+        assert!(super::charge_pitched_gap_interval_work(&mut shared_intervals, 1).is_some());
+        assert!(super::charge_pitched_gap_interval_work(&mut shared_intervals, 1).is_none());
+    }
+
+    #[test]
+    fn pitched_gap_geometry_work_gate_and_shared_ledger_have_exact_boundaries() {
+        let exact_route_points = super::MAX_PITCHED_GAP_GEOMETRY_VISITS / 10;
+        assert_eq!(
+            super::pitched_gap_initial_geometry_work(0, 0, exact_route_points),
+            Some(super::MAX_PITCHED_GAP_GEOMETRY_VISITS)
+        );
+        assert!(
+            super::pitched_gap_initial_geometry_work(0, 0, exact_route_points + 1)
+                .is_some_and(|visits| visits > super::MAX_PITCHED_GAP_GEOMETRY_VISITS)
+        );
+        assert!(
+            super::pitched_gap_initial_geometry_work(
+                super::MAX_PITCHED_GAP_SUBSET_CANDIDATES + 1,
+                0,
+                0,
+            )
+            .is_none()
+        );
+        assert!(super::pitched_gap_initial_geometry_work(2, usize::MAX, usize::MAX).is_none());
+
+        let mut work = super::PitchedGapWorkBudget::default();
+        assert!(
+            work.charge_geometry(super::MAX_PITCHED_GAP_GEOMETRY_VISITS)
+                .is_some()
+        );
+        assert!(work.charge_geometry(1).is_none());
+    }
+
+    #[test]
+    fn pitched_gap_corridor_widening_shifts_ranks_routes_and_aligned_boundaries_monotonically() {
+        let graph = Graph {
+            nodes: (1..=4)
+                .map(|id| Node {
+                    id,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![
+                        Port {
+                            id: 0,
+                            side: PortSide::East,
+                            offset: 10.0,
+                        },
+                        Port {
+                            id: 1,
+                            side: PortSide::West,
+                            offset: 10.0,
+                        },
+                        Port {
+                            id: 2,
+                            side: PortSide::North,
+                            offset: 15.0,
+                        },
+                    ],
+                })
+                .collect(),
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 1 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 2, port: 0 },
+                    target: Endpoint { node: 3, port: 1 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 2,
+                    source: Endpoint { node: 1, port: 2 },
+                    target: Endpoint { node: 4, port: 2 },
+                    net: 12,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1, 2, 2]);
+        let nodes = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 100.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 200.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 4,
+                x: 190.0,
+                y: 40.0,
+                width: 30.0,
+                height: 20.0,
+            },
+        ];
+        let routes = vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![
+                    Point { x: 20.0, y: 10.0 },
+                    Point { x: 50.0, y: 10.0 },
+                    Point { x: 50.0, y: 30.0 },
+                    Point { x: 90.0, y: 30.0 },
+                    Point { x: 90.0, y: 10.0 },
+                    Point { x: 100.0, y: 10.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![
+                    Point { x: 120.0, y: 10.0 },
+                    Point { x: 150.0, y: 10.0 },
+                    Point { x: 150.0, y: 30.0 },
+                    Point { x: 190.0, y: 30.0 },
+                    Point { x: 190.0, y: 10.0 },
+                    Point { x: 200.0, y: 10.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 2,
+                points: vec![
+                    Point { x: 15.0, y: 0.0 },
+                    Point { x: 15.0, y: -10.0 },
+                    Point { x: 205.0, y: -10.0 },
+                    Point { x: 205.0, y: 40.0 },
+                ],
+            },
+        ];
+        let assignments = vec![
+            Some(super::PitchedGapTracks {
+                slots: BTreeMap::new(),
+                slot_count: 8,
+            }),
+            Some(super::PitchedGapTracks {
+                slots: BTreeMap::new(),
+                slot_count: 8,
+            }),
+        ];
+        let widened = super::widen_pitched_gap_corridors(
+            &plan,
+            &nodes,
+            &routes,
+            &assignments,
+            &[true, true],
+            &[0.0, 100.0, 200.0],
+            &[20.0, 120.0, 220.0],
+            10.0,
+            super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+        )
+        .unwrap();
+
+        assert_eq!(widened.inserted_width, 24.0);
+        assert_eq!(
+            widened.nodes.iter().map(|node| node.x).collect::<Vec<_>>(),
+            vec![0.0, 112.0, 224.0, 214.0]
+        );
+        assert_eq!(
+            widened.routes[0].points,
+            vec![
+                Point { x: 20.0, y: 10.0 },
+                Point { x: 50.0, y: 10.0 },
+                Point { x: 50.0, y: 30.0 },
+                Point { x: 90.0, y: 30.0 },
+                Point { x: 90.0, y: 10.0 },
+                Point { x: 112.0, y: 10.0 },
+            ]
+        );
+        assert_eq!(
+            widened.routes[1].points,
+            vec![
+                Point { x: 132.0, y: 10.0 },
+                Point { x: 162.0, y: 10.0 },
+                Point { x: 162.0, y: 30.0 },
+                Point { x: 202.0, y: 30.0 },
+                Point { x: 202.0, y: 10.0 },
+                Point { x: 224.0, y: 10.0 },
+            ]
+        );
+        assert_eq!(
+            widened.routes[2].points,
+            vec![
+                Point { x: 15.0, y: 0.0 },
+                Point { x: 15.0, y: -10.0 },
+                Point { x: 229.0, y: -10.0 },
+                Point { x: 229.0, y: 40.0 },
+            ]
+        );
+        assert_eq!(
+            widened.nodes[2].x + widened.nodes[2].width,
+            widened.nodes[3].x + widened.nodes[3].width
+        );
+        for (before, after) in routes.iter().zip(&widened.routes) {
+            assert_eq!(before.points.len(), after.points.len());
+            assert!(after.points.windows(2).all(|pair| {
+                (pair[0].x == pair[1].x) != (pair[0].y == pair[1].y) && pair[1].x >= pair[0].x
+            }));
+        }
+        for (resolved, route) in plan.edges.iter().zip(&routes) {
+            assert_eq!(
+                route.points.first(),
+                Some(&super::port_point(
+                    &nodes[resolved.source_index],
+                    resolved.source_port,
+                ))
+            );
+            assert_eq!(
+                route.points.last(),
+                Some(&super::port_point(
+                    &nodes[resolved.target_index],
+                    resolved.target_port,
+                ))
+            );
+        }
+        for (resolved, route) in plan.edges.iter().zip(&widened.routes) {
+            assert_eq!(
+                route.points.first(),
+                Some(&super::port_point(
+                    &widened.nodes[resolved.source_index],
+                    resolved.source_port,
+                ))
+            );
+            assert_eq!(
+                route.points.last(),
+                Some(&super::port_point(
+                    &widened.nodes[resolved.target_index],
+                    resolved.target_port,
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn pitched_gap_corridor_widening_accepts_the_exact_width_cap_and_rejects_above_it() {
+        let graph = Graph {
+            nodes: (1..=2)
+                .map(|id| Node {
+                    id,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: Vec::new(),
+                })
+                .collect(),
+            edges: Vec::new(),
+        };
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1]);
+        let nodes = vec![
+            NodeGeometry {
+                id: 1,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 98.0,
+                y: 0.0,
+                width: 22.0,
+                height: 20.0,
+            },
+        ];
+        let assignments = [Some(super::PitchedGapTracks {
+            slots: BTreeMap::new(),
+            slot_count: 10,
+        })];
+        let exact = super::widen_pitched_gap_corridors(
+            &plan,
+            &nodes,
+            &[],
+            &assignments,
+            &[true],
+            &[0.0, 98.0],
+            &[20.0, 120.0],
+            10.0,
+            super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+        )
+        .unwrap();
+        assert_eq!(exact.inserted_width, 30.0);
+        assert!(
+            super::widen_pitched_gap_corridors(
+                &plan,
+                &nodes,
+                &[],
+                &assignments,
+                &[true],
+                &[0.0, 98.0],
+                &[20.0, 120.0],
+                10.0,
+                super::PREFERRED_PITCHED_GAP_TRACK_PITCH + 1e-9,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pitched_gap_tracks_spread_conflicting_unique_slots_to_eight_units() {
+        let lanes = [BTreeMap::from([(10, 0), (11, 1)])];
+        let accesses = [BTreeMap::from([
+            (
+                10,
+                GapNetAccess {
+                    vertical: vec![(0.0, 10.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+            (
+                11,
+                GapNetAccess {
+                    vertical: vec![(5.0, 15.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+        ])];
+        let layer_left = [0.0, 100.0];
+        let layer_right = [20.0, 120.0];
+        let assignments = super::pitched_gap_track_assignments(
+            &lanes,
+            &accesses,
+            &mut super::PitchedGapWork::default(),
+        )
+        .unwrap();
+        let tracks = assignments[0].as_ref().unwrap();
+        let left = super::pitched_gap_track_x(
+            tracks,
+            10,
+            0,
+            &layer_left,
+            &layer_right,
+            LayoutOptions::default().port_stub,
+            super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+        )
+        .unwrap();
+        let right = super::pitched_gap_track_x(
+            tracks,
+            11,
+            0,
+            &layer_left,
+            &layer_right,
+            LayoutOptions::default().port_stub,
+            super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+        )
+        .unwrap();
+
+        assert_eq!(tracks.slot_count, 2);
+        assert_eq!(
+            (right - left).abs(),
+            super::PREFERRED_PITCHED_GAP_TRACK_PITCH
+        );
+    }
+
+    #[test]
+    fn pitched_gap_close_pair_gate_checks_conflicts_below_eight() {
+        let accesses = [BTreeMap::from([
+            (
+                10,
+                GapNetAccess {
+                    vertical: vec![(0.0, 10.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+            (
+                11,
+                GapNetAccess {
+                    vertical: vec![(5.0, 15.0)],
+                    ..GapNetAccess::default()
+                },
+            ),
+        ])];
+        let overlapping = [Some(super::PitchedGapTracks {
+            slots: BTreeMap::from([(10, 0), (11, 0)]),
+            slot_count: 1,
+        })];
+        let separated = [Some(super::PitchedGapTracks {
+            slots: BTreeMap::from([(10, 0), (11, 1)]),
+            slot_count: 2,
+        })];
+        let mut work = super::PitchedGapWork::default();
+
+        assert_eq!(
+            super::pitched_gap_close_vertical_pairs(
+                &overlapping,
+                &accesses,
+                super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+                &mut work,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            super::pitched_gap_close_vertical_pairs(
+                &separated,
+                &accesses,
+                super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+                &mut work,
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pitched_gap_congestion_uses_a_strict_eight_unit_cutoff() {
+        let segments = |fixed| {
+            vec![
+                PhysicalSegment {
+                    net: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    horizontal: true,
+                    fixed: 0.0,
+                    start: 0.0,
+                    end: 10.0,
+                },
+                PhysicalSegment {
+                    net: 11,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 4, port: 0 },
+                    horizontal: true,
+                    fixed,
+                    start: 0.0,
+                    end: 10.0,
+                },
+            ]
+        };
+
+        assert!(
+            super::parallel_congestion_ratio_at(
+                &segments(super::PREFERRED_PITCHED_GAP_TRACK_PITCH - 1e-9),
+                super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+            )
+            .unwrap()
+                > 0.0
+        );
+        assert_eq!(
+            super::parallel_congestion_ratio_at(
+                &segments(super::PREFERRED_PITCHED_GAP_TRACK_PITCH),
+                super::PREFERRED_PITCHED_GAP_TRACK_PITCH,
+            ),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn pitched_gap_candidate_wide_pitch_gate_rejects_a_close_track_in_an_unselected_gap() {
+        let vertical = |fixed, start, end| PhysicalSegment {
+            net: fixed as u32,
+            source: Endpoint { node: 1, port: 0 },
+            target: Endpoint { node: 2, port: 0 },
+            horizontal: false,
+            fixed,
+            start,
+            end,
+        };
+        let segments = vec![
+            // The selected gap is safely pitched.
+            vertical(0.0, 0.0, 10.0),
+            vertical(8.0, 0.0, 10.0),
+            // A different, unselected gap still contains a sub-floor pair.
+            vertical(100.0, 20.0, 30.0),
+            vertical(103.0, 20.0, 30.0),
+        ];
+        let mut visits = 16;
+        assert_eq!(
+            super::vertical_track_pitch_is_at_least(
+                &segments,
+                super::MIN_PITCHED_GAP_TRACK_PITCH,
+                &mut visits,
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn pitched_gap_candidate_wide_pitch_gate_has_strict_overlap_and_work_boundaries() {
+        let segment = |fixed, start, end| PhysicalSegment {
+            net: fixed as u32,
+            source: Endpoint { node: 1, port: 0 },
+            target: Endpoint { node: 2, port: 0 },
+            horizontal: false,
+            fixed,
+            start,
+            end,
+        };
+        let exact_pitch = [segment(0.0, 0.0, 10.0), segment(4.0, 0.0, 10.0)];
+        assert_eq!(
+            super::vertical_track_pitch_is_at_least(&exact_pitch, 4.0, &mut 0),
+            Some(true)
+        );
+        let endpoint_only = [segment(0.0, 0.0, 10.0), segment(1.0, 10.0, 20.0)];
+        assert_eq!(
+            super::vertical_track_pitch_is_at_least(&endpoint_only, 4.0, &mut 0),
+            Some(true)
+        );
+        let same_track = [segment(0.0, 0.0, 10.0), segment(0.0, 5.0, 15.0)];
+        assert_eq!(
+            super::vertical_track_pitch_is_at_least(&same_track, 4.0, &mut 1),
+            Some(true)
+        );
+        assert_eq!(
+            super::vertical_track_pitch_is_at_least(&same_track, 4.0, &mut 0),
+            None
+        );
+    }
+
+    #[test]
+    fn pitched_gap_admission_enforces_every_quality_boundary() {
+        let baseline = RouteQuality {
+            crossings: 100,
+            bends: 100,
+            route_length: 100.0,
+        };
+        let boundary = RouteQuality {
+            crossings: 105,
+            bends: 100,
+            route_length: 105.0,
+        };
+        assert!(super::pitched_gap_quality_is_admissible(
+            baseline, 0.5, boundary, 0.3
+        ));
+        for candidate in [
+            RouteQuality {
+                crossings: 106,
+                ..boundary
+            },
+            RouteQuality {
+                bends: 101,
+                ..boundary
+            },
+            RouteQuality {
+                route_length: 105.000_001,
+                ..boundary
+            },
+        ] {
+            assert!(!super::pitched_gap_quality_is_admissible(
+                baseline, 0.5, candidate, 0.3
+            ));
+        }
+        assert!(!super::pitched_gap_quality_is_admissible(
+            baseline, 0.5, boundary, 0.300_001
+        ));
+
+        let expanded_boundary = RouteQuality {
+            route_length: 135.0,
+            ..boundary
+        };
+        assert!(super::pitched_gap_route_quality_is_admissible(
+            baseline,
+            130.0,
+            expanded_boundary,
+        ));
+        assert!(!super::pitched_gap_route_quality_is_admissible(
+            baseline,
+            130.0,
+            RouteQuality {
+                route_length: 135.000_001,
+                ..expanded_boundary
+            },
+        ));
     }
 
     #[test]

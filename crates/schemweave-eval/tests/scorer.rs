@@ -137,6 +137,31 @@ fn constructed_routes(routes: &[(u32, Vec<Point>)]) -> (Graph, Layout) {
     )
 }
 
+fn minimum_overlapping_vertical_track_separation(layout: &Layout) -> Option<f64> {
+    let tracks = layout
+        .edges
+        .iter()
+        .flat_map(|edge| edge.points.windows(2))
+        .filter_map(|pair| {
+            (pair[0].x == pair[1].x && pair[0].y != pair[1].y).then_some((
+                pair[0].x,
+                pair[0].y.min(pair[1].y),
+                pair[0].y.max(pair[1].y),
+            ))
+        })
+        .collect::<Vec<_>>();
+    tracks
+        .iter()
+        .enumerate()
+        .flat_map(|(left_index, left)| {
+            tracks[left_index + 1..].iter().filter_map(move |right| {
+                (left.0 != right.0 && left.1 < right.2 && right.1 < left.2)
+                    .then_some((left.0 - right.0).abs())
+            })
+        })
+        .reduce(f64::min)
+}
+
 #[test]
 fn new_quality_fields_preserve_default_json_compatibility() {
     let options: ScoreOptions = serde_json::from_str("{}").unwrap();
@@ -1186,7 +1211,7 @@ fn positive_clearance_covers_regional_fanout_and_boundary_constraints() {
 }
 
 #[test]
-fn demand_aware_max_candidate_is_selected_safely_and_deterministically() {
+fn demand_aware_and_pitched_max_candidates_are_selected_safely_and_deterministically() {
     let (graph, constraints): (Graph, LayoutConstraints) =
         serde_json::from_str(include_str!("fixtures/demand_aware_priority.json")).unwrap();
     let options = LayoutOptions::default();
@@ -1206,14 +1231,53 @@ fn demand_aware_max_candidate_is_selected_safely_and_deterministically() {
     .unwrap();
     let quality_report = score(&graph, &quality, ScoreOptions::default());
     let selected_report = score(&graph, &selected, ScoreOptions::default());
-
+    let fast = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Fast,
+        &constraints,
+    )
+    .unwrap();
+    let fast_report = score(&graph, &fast, ScoreOptions::default());
     assert!(selected_report.passes_hard_gates(), "{selected_report:#?}");
-    assert_eq!(selected_report.crossings, 823);
+    assert_eq!(fast_report.crossings, 870);
+    assert_eq!(fast_report.bends, 1_368);
+    assert_eq!(fast_report.area, 5_581_099.951_159_525);
+    assert_eq!(quality_report.crossings, 870);
+    assert_eq!(quality_report.bends, 1_368);
+    assert_eq!(quality_report.area, 5_581_099.951_159_525);
+    assert_eq!(selected_report.crossings, 784);
     assert_eq!(selected_report.bends, 1_226);
+    assert_eq!(selected_report.route_length, 234_500.701_028_490_18);
+    assert_eq!(selected_report.area, 10_450_714.288_783_494);
+    assert_eq!(
+        selected_report.minimum_parallel_route_separation,
+        Some(0.329_454_178_100_149_9)
+    );
+    assert_eq!(
+        selected_report.parallel_congestion_ratio,
+        0.105_189_450_998_712_09
+    );
+    assert!(
+        minimum_overlapping_vertical_track_separation(&selected).is_some_and(|pitch| pitch >= 8.0)
+    );
     assert!(selected_report.area > quality_report.area * 1.75);
     assert!(
         selected_report.parallel_congestion_ratio < quality_report.parallel_congestion_ratio * 0.20
     );
+    let node = |id| selected.nodes.iter().find(|node| node.id == id).unwrap();
+    let input_x = constraints
+        .inputs
+        .iter()
+        .map(|&id| node(id).x)
+        .collect::<Vec<_>>();
+    let output_right = constraints
+        .outputs
+        .iter()
+        .map(|&id| node(id).x + node(id).width)
+        .collect::<Vec<_>>();
+    assert!(input_x.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(output_right.windows(2).all(|pair| pair[0] == pair[1]));
 
     let mut permuted = graph.clone();
     permuted.nodes.reverse();
