@@ -1210,8 +1210,6 @@ fn hard_geometry_failure(
         LayoutError::BoundaryBundleGeometryWorkLimitExceeded {
             maximum: boundary_bundles::MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
         }
-    } else if admission_state.boundary_bundle_rejected {
-        LayoutError::BoundaryBundleGeometryUnsatisfied
     } else if admission_state.contact_segment_exhausted {
         LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
             maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
@@ -1220,6 +1218,8 @@ fn hard_geometry_failure(
         LayoutError::UnrelatedRouteContactWorkLimitExceeded {
             maximum: MAX_LAYOUT_ROUTE_CONTACT_VISITS,
         }
+    } else if admission_state.boundary_bundle_rejected {
+        LayoutError::BoundaryBundleGeometryUnsatisfied
     } else if admission_state.clearance_work_exhausted {
         LayoutError::EdgeNodeClearanceWorkLimitExceeded {
             maximum: MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
@@ -2758,7 +2758,10 @@ mod tests {
     #[test]
     fn boundary_bundle_contact_limits_preserve_public_failure_classification() {
         let options = LayoutOptions::default();
-        let mut segment_state = CandidateAdmissionState::default();
+        let mut segment_state = CandidateAdmissionState {
+            boundary_bundle_rejected: true,
+            ..CandidateAdmissionState::default()
+        };
         record_boundary_bundle_application_error(
             &LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
                 maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
@@ -2772,7 +2775,10 @@ mod tests {
             },
         );
 
-        let mut work_state = CandidateAdmissionState::default();
+        let mut work_state = CandidateAdmissionState {
+            boundary_bundle_rejected: true,
+            ..CandidateAdmissionState::default()
+        };
         record_boundary_bundle_application_error(
             &LayoutError::UnrelatedRouteContactWorkLimitExceeded {
                 maximum: MAX_LAYOUT_ROUTE_CONTACT_VISITS,
