@@ -874,6 +874,31 @@ fn layout_indexed(
             layout = demand_candidate.layout;
         }
     }
+    if quality_effort != QualityEffort::Fast
+        && best_uses_primary_ranks
+        && let Some((candidate_quality, edges)) = routing::ordinary_fanout_candidate(
+            &routing_plan,
+            &raw_layout.nodes,
+            &raw_layout.edges,
+            routing::route_quality(&indexed, &raw_layout.edges),
+            options,
+        )
+        && let Some(candidate) = prepare_owned_candidate(
+            &indexed,
+            candidate_quality,
+            raw_layout.nodes.clone(),
+            edges,
+            options,
+            &mut admission_state,
+        )
+        && candidate.layout.width * candidate.layout.height <= layout.width * layout.height * 1.05
+        && route_quality_cmp(candidate.selection_quality, selection_quality).is_lt()
+    {
+        selection_quality = candidate.selection_quality;
+        quality = candidate.quality;
+        raw_layout = candidate.raw_layout;
+        layout = candidate.layout;
+    }
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && let Some((candidate_quality, edges)) = routing::regional_fanout_candidate(
@@ -1594,10 +1619,49 @@ fn candidate_quality_cmp(
     right: routing::RouteQuality,
     right_layout: &Layout,
 ) -> std::cmp::Ordering {
-    route_quality_cmp(left, right).then(
-        (left_layout.width * left_layout.height)
-            .total_cmp(&(right_layout.width * right_layout.height)),
-    )
+    route_quality_cmp(left, right)
+        .then_with(|| {
+            candidate_bend_concentration(left_layout)
+                .cmp(&candidate_bend_concentration(right_layout))
+        })
+        .then_with(|| {
+            (left_layout.width * left_layout.height)
+                .total_cmp(&(right_layout.width * right_layout.height))
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BendConcentration {
+    maximum_per_route: usize,
+    squared_per_route: usize,
+}
+
+fn candidate_bend_concentration(layout: &Layout) -> BendConcentration {
+    let mut maximum_per_route = 0usize;
+    let mut squared_per_route = 0usize;
+    for route in &layout.edges {
+        let mut previous_direction = None;
+        let mut bends = 0usize;
+        for segment in route.points.windows(2) {
+            let direction = if segment[0].x == segment[1].x {
+                0
+            } else if segment[0].y == segment[1].y {
+                1
+            } else {
+                continue;
+            };
+            if previous_direction.is_some_and(|previous| previous != direction) {
+                bends += 1;
+            }
+            previous_direction = Some(direction);
+        }
+        maximum_per_route = maximum_per_route.max(bends);
+        squared_per_route = squared_per_route.saturating_add(bends.saturating_mul(bends));
+    }
+    BendConcentration {
+        maximum_per_route,
+        squared_per_route,
+    }
 }
 
 #[cfg(test)]
@@ -1646,6 +1710,57 @@ mod tests {
                 height: 1.0,
             },
         )
+    }
+
+    #[test]
+    fn candidate_ties_prefer_bends_distributed_across_routes() {
+        let quality = RouteQuality {
+            crossings: 0,
+            bends: 2,
+            route_length: 50.0,
+        };
+        let layout = |edges| Layout {
+            nodes: Vec::new(),
+            edges,
+            boundary_bundles: Vec::new(),
+            width: 100.0,
+            height: 100.0,
+        };
+        let concentrated = layout(vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: 10.0, y: 0.0 },
+                    Point { x: 10.0, y: 10.0 },
+                    Point { x: 20.0, y: 10.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 0.0, y: 20.0 }, Point { x: 20.0, y: 20.0 }],
+            },
+        ]);
+        let distributed = layout(vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![
+                    Point { x: 0.0, y: 0.0 },
+                    Point { x: 10.0, y: 0.0 },
+                    Point { x: 10.0, y: 10.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![
+                    Point { x: 0.0, y: 20.0 },
+                    Point { x: 10.0, y: 20.0 },
+                    Point { x: 10.0, y: 30.0 },
+                ],
+            },
+        ]);
+
+        assert!(candidate_quality_cmp(quality, &distributed, quality, &concentrated).is_lt());
     }
 
     #[test]
