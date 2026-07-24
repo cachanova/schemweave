@@ -6766,9 +6766,12 @@ fn spacing_score_reuse_is_eligible(
     base: &SpacingRouteCandidate<'_>,
     sibling: &SpacingRouteCandidate<'_>,
 ) -> bool {
-    // Spacing names are deliberately absent: only an identical lane/path plan and unchanged
-    // per-edge physical segment topology make crossings and bends invariant.
-    same_plan_component(base.plan.gap_lanes, sibling.plan.gap_lanes)
+    // Current emission sites copy one SpacingRoutePlan into both candidates, so these component
+    // identity checks are guards for future call sites. The substantive proof today is the
+    // pure-sparse outer-lane exclusion plus unchanged per-edge physical segment topology.
+    base.plan.outer_lanes.is_empty()
+        && sibling.plan.outer_lanes.is_empty()
+        && same_plan_component(base.plan.gap_lanes, sibling.plan.gap_lanes)
         && same_plan_component(base.plan.endpoint_tracks, sibling.plan.endpoint_tracks)
         && same_plan_component(base.plan.crossing_paths, sibling.plan.crossing_paths)
         && same_plan_component(base.plan.outer_lanes, sibling.plan.outer_lanes)
