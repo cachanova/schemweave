@@ -12,7 +12,6 @@ pub(crate) const MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS: usize = 20_000_000;
 pub(crate) const MAX_INTERIOR_COLLECTOR_BUNDLES: usize = 32;
 pub(crate) const MAX_INTERIOR_HORIZONTAL_TAP_VISITS: usize = 2_000_000;
 pub(crate) const MAX_SHARED_ROUTE_ADMISSION_VISITS: usize = 250_000;
-pub(crate) const MAX_SHARED_ROUTE_MEMBERS: usize = 1_024;
 const BUNDLE_CLEARANCE_NET_BASE: u32 = 0x8000_0000;
 const PRESERVED_GEOMETRY_EPSILON: f64 = 1e-7;
 
@@ -370,10 +369,33 @@ fn same_endpoint_shared_route_candidate(
     admission_remaining: &mut usize,
 ) -> Option<SameEndpointSharedRouteCandidate> {
     if bundle.width <= 1
-        || bundle.members.len() > MAX_SHARED_ROUTE_MEMBERS
         || context.graph.boundary_bundles.len() > MAX_INTERIOR_COLLECTOR_BUNDLES
         || geometry.members.len() != bundle.members.len()
-        || !bundle_members_share_opposite_endpoint_bounded(context, bundle, admission_remaining)
+    {
+        return None;
+    }
+    let first_route = bundle
+        .members
+        .first()
+        .and_then(|member| context.route_index.get(&member.edge))
+        .and_then(|index| routes.get(*index))?;
+    let first_tap = geometry.members.first()?.tap;
+    let mut unchanged = true;
+    for (member, member_geometry) in bundle.members.iter().zip(&geometry.members) {
+        if !consume_shared_route_admission(admission_remaining, 2) {
+            return None;
+        }
+        unchanged &= context
+            .route_index
+            .get(&member.edge)
+            .and_then(|index| routes.get(*index))
+            .is_some_and(|route| route.points == first_route.points)
+            && preserved_point_matches(member_geometry.tap, first_tap);
+    }
+    if unchanged {
+        return None;
+    }
+    if !bundle_members_share_opposite_endpoint_bounded(context, bundle, admission_remaining)
         || !consume_shared_route_admission(admission_remaining, bundle.members.len())
     {
         return None;
@@ -409,28 +431,6 @@ fn same_endpoint_shared_route_candidate(
     if representative.len() < 2 {
         return None;
     }
-    let mut unchanged = true;
-    for member in &bundle.members {
-        if !consume_shared_route_admission(admission_remaining, 1) {
-            return None;
-        }
-        unchanged &= context
-            .route_index
-            .get(&member.edge)
-            .and_then(|index| routes.get(*index))
-            .is_some_and(|route| route.points == *representative);
-    }
-    if unchanged {
-        for member in &geometry.members {
-            if !consume_shared_route_admission(admission_remaining, 1) {
-                return None;
-            }
-            unchanged &= preserved_point_matches(member.tap, representative_tap);
-        }
-    }
-    if unchanged {
-        return None;
-    }
     if shared_route_contacts_external_geometry(
         context,
         representative,
@@ -457,17 +457,27 @@ fn same_endpoint_shared_route_candidate(
         .len()
         .saturating_sub(1)
         .saturating_mul(bundle.members.len());
-    if existing_segments
-        .saturating_sub(replaced_segments)
-        .saturating_add(candidate_segments)
-        > crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS
+    // Incremental planning precharges verification from the rewritten family size. Keep this
+    // optional aliasing pass non-growing so it cannot invalidate that upper bound.
+    if candidate_segments > replaced_segments
+        || existing_segments
+            .saturating_sub(replaced_segments)
+            .saturating_add(candidate_segments)
+            > crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS
     {
         return None;
     }
 
+    let geometry_copy_work = geometry
+        .members
+        .iter()
+        .try_fold(geometry.members.len().saturating_mul(2), |work, member| {
+            work.checked_add(member.slots.len())
+        })?;
+    let route_copy_work = candidate_segments.checked_add(bundle.members.len())?;
     if !consume_shared_route_admission(
         admission_remaining,
-        geometry.members.len().saturating_mul(2),
+        geometry_copy_work.checked_add(route_copy_work)?,
     ) {
         return None;
     }
@@ -3401,7 +3411,21 @@ mod tests {
         );
 
         routes.pop();
-        admission_remaining = MAX_SHARED_ROUTE_ADMISSION_VISITS;
+        admission_remaining = 25;
+        assert!(
+            same_endpoint_shared_route_candidate(
+                &context,
+                &indexed.boundary_bundles[0],
+                &geometry,
+                &[],
+                &routes,
+                segments,
+                &mut admission_remaining,
+            )
+            .is_none(),
+            "admission must charge every route point, member, and nested slot copied"
+        );
+        admission_remaining = 26;
         assert!(
             same_endpoint_shared_route_candidate(
                 &context,
@@ -3413,7 +3437,43 @@ mod tests {
                 &mut admission_remaining,
             )
             .is_some(),
-            "the same compact cohort remains eligible after external contact is removed"
+            "the exact fully charged copy-work boundary remains inclusive"
+        );
+        assert_eq!(admission_remaining, 0);
+
+        let mut growth_geometry = geometry.clone();
+        growth_geometry.members[0].tap = Point { x: 94.0, y: 23.0 };
+        growth_geometry.members[1].tap = Point { x: 94.0, y: 25.0 };
+        let growth_routes = vec![
+            EdgeGeometry {
+                id: 10,
+                points: vec![Point { x: 94.0, y: 23.0 }, Point { x: 300.0, y: 23.0 }],
+            },
+            EdgeGeometry {
+                id: 11,
+                points: vec![
+                    Point { x: 94.0, y: 25.0 },
+                    Point { x: 100.0, y: 25.0 },
+                    Point { x: 100.0, y: 150.0 },
+                    Point { x: 280.0, y: 150.0 },
+                    Point { x: 280.0, y: 25.0 },
+                    Point { x: 300.0, y: 25.0 },
+                ],
+            },
+        ];
+        admission_remaining = MAX_SHARED_ROUTE_ADMISSION_VISITS;
+        assert!(
+            same_endpoint_shared_route_candidate(
+                &context,
+                &indexed.boundary_bundles[0],
+                &growth_geometry,
+                &[],
+                &growth_routes,
+                6,
+                &mut admission_remaining,
+            )
+            .is_none(),
+            "aliasing must not grow the route family beyond the incremental work estimate"
         );
     }
 
