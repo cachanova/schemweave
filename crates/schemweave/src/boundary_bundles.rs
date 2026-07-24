@@ -35,9 +35,9 @@ struct InteriorCollectorRange {
 }
 
 struct SameEndpointSharedRouteCandidate {
+    candidate_route_segments: usize,
     geometry: BoundaryBundleGeometry,
-    original_routes: Vec<(usize, Vec<Point>)>,
-    representative: Vec<Point>,
+    representative_edge: u32,
 }
 
 pub(crate) fn preserved_point_matches(left: Point, right: Point) -> bool {
@@ -157,6 +157,11 @@ fn apply_bundle_geometry(
         .enumerate()
         .map(|(index, route)| (route.id, index))
         .collect::<HashMap<_, _>>();
+    let mut route_segments = layout
+        .edges
+        .iter()
+        .map(|route| route.points.len().saturating_sub(1))
+        .sum::<usize>();
     let pitch = options
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
@@ -221,6 +226,16 @@ fn apply_bundle_geometry(
         }
         let corridor_offset = corridor_offsets[bundle_index];
         let planned_collector = interior_collectors[bundle_index];
+        let previous_member_segments = bundle
+            .members
+            .iter()
+            .map(|member| {
+                layout.edges[route_index[&member.edge]]
+                    .points
+                    .len()
+                    .saturating_sub(1)
+            })
+            .sum::<usize>();
         let preserved = planned_collector.map(|_| {
             bundle
                 .members
@@ -275,47 +290,66 @@ fn apply_bundle_geometry(
                 Err(error) => return Err(error),
             }
         }
-        let current_geometry = layout
-            .boundary_bundles
-            .last()
-            .cloned()
-            .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
-        if options.minimum_parallel_wire_spacing == 0.0
-            && let Some(shared) = same_endpoint_shared_route_candidate(
+        let current_member_segments = bundle
+            .members
+            .iter()
+            .map(|member| {
+                layout.edges[route_index[&member.edge]]
+                    .points
+                    .len()
+                    .saturating_sub(1)
+            })
+            .sum::<usize>();
+        route_segments = route_segments
+            .saturating_sub(previous_member_segments)
+            .saturating_add(current_member_segments);
+        let shared = if options.minimum_parallel_wire_spacing == 0.0 {
+            same_endpoint_shared_route_candidate(
                 &geometry_context,
                 bundle,
-                &current_geometry,
+                layout
+                    .boundary_bundles
+                    .last()
+                    .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?,
                 &layout.edges,
+                route_segments,
             )
-        {
+        } else {
+            None
+        };
+        if let Some(shared) = shared {
+            // Admission proves that every replacement reuses an existing member
+            // route between identical endpoints, leaves the spine unchanged,
+            // and only shortens the collector. The final complete verifier
+            // remains the fail-closed gate, so another per-bundle scan would
+            // repeat work without admitting any new geometry.
+            let representative = layout.edges[route_index[&shared.representative_edge]]
+                .points
+                .clone();
             *layout
                 .boundary_bundles
                 .last_mut()
                 .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)? = shared.geometry;
-            for member in &bundle.members {
-                layout.edges[route_index[&member.edge]].points = shared.representative.clone();
+            for member in bundle
+                .members
+                .iter()
+                .filter(|member| member.edge != shared.representative_edge)
+            {
+                layout.edges[route_index[&member.edge]].points = representative.clone();
             }
-            match partial_geometry_is_clean(
-                graph,
-                &layout,
-                options,
-                bundle_index,
-                &mut partial_remaining,
-            ) {
-                Ok(()) => {}
-                Err(LayoutError::BoundaryBundleGeometryUnsatisfied) => {
-                    *layout
-                        .boundary_bundles
-                        .last_mut()
-                        .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)? = current_geometry;
-                    for (index, points) in shared.original_routes {
-                        layout.edges[index].points = points;
-                    }
-                }
-                Err(error) => return Err(error),
-            }
+            route_segments = route_segments
+                .saturating_sub(current_member_segments)
+                .saturating_add(shared.candidate_route_segments);
         }
     }
+    debug_assert_eq!(
+        route_segments,
+        layout
+            .edges
+            .iter()
+            .map(|route| route.points.len().saturating_sub(1))
+            .sum::<usize>()
+    );
     layout
         .boundary_bundles
         .sort_unstable_by_key(|bundle| bundle.id);
@@ -329,6 +363,7 @@ fn same_endpoint_shared_route_candidate(
     bundle: &IndexedBoundaryBundle,
     geometry: &BoundaryBundleGeometry,
     routes: &[EdgeGeometry],
+    existing_segments: usize,
 ) -> Option<SameEndpointSharedRouteCandidate> {
     if bundle.width <= 1
         || context.graph.boundary_bundles.len() > MAX_INTERIOR_COLLECTOR_BUNDLES
@@ -361,43 +396,31 @@ fn same_endpoint_shared_route_candidate(
     ) {
         return None;
     }
-    let representative = routes
-        .get(
-            *context
-                .route_index
-                .get(&bundle.members[representative_index].edge)?,
-        )?
-        .points
-        .clone();
+    let representative_edge = bundle.members[representative_index].edge;
+    let representative = &routes
+        .get(*context.route_index.get(&representative_edge)?)?
+        .points;
     if representative.len() < 2 {
         return None;
     }
-    let original_routes = bundle
+    if bundle.members.iter().all(|member| {
+        context
+            .route_index
+            .get(&member.edge)
+            .and_then(|index| routes.get(*index))
+            .is_some_and(|route| route.points == *representative)
+    }) && geometry
         .members
         .iter()
-        .map(|member| {
-            let index = *context.route_index.get(&member.edge)?;
-            Some((index, routes.get(index)?.points.clone()))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    if original_routes
-        .iter()
-        .all(|(_, points)| points == &representative)
-        && geometry
-            .members
-            .iter()
-            .all(|member| preserved_point_matches(member.tap, representative_tap))
+        .all(|member| preserved_point_matches(member.tap, representative_tap))
     {
         return None;
     }
-    let existing_segments = routes
-        .iter()
-        .map(|route| route.points.len().saturating_sub(1))
-        .sum::<usize>();
-    let replaced_segments = original_routes
-        .iter()
-        .map(|(_, points)| points.len().saturating_sub(1))
-        .sum::<usize>();
+    let replaced_segments = bundle.members.iter().try_fold(0usize, |segments, member| {
+        let index = *context.route_index.get(&member.edge)?;
+        let route = routes.get(index)?;
+        Some(segments.saturating_add(route.points.len().saturating_sub(1)))
+    })?;
     let candidate_segments = representative
         .len()
         .saturating_sub(1)
@@ -424,11 +447,39 @@ fn same_endpoint_shared_route_candidate(
             y: geometry.spine.end.y.max(representative_tap.y),
         },
     };
+    if !vertical_segment_contains(geometry.collector, candidate.collector) {
+        return None;
+    }
     Some(SameEndpointSharedRouteCandidate {
+        candidate_route_segments: candidate_segments,
         geometry: candidate,
-        original_routes,
-        representative,
+        representative_edge,
     })
+}
+
+fn vertical_segment_contains(outer: BoundaryBundleSegment, inner: BoundaryBundleSegment) -> bool {
+    preserved_point_matches(
+        Point {
+            x: outer.start.x,
+            y: inner.start.y,
+        },
+        Point {
+            x: inner.start.x,
+            y: inner.start.y,
+        },
+    ) && preserved_point_matches(
+        Point {
+            x: outer.end.x,
+            y: inner.end.y,
+        },
+        Point {
+            x: inner.end.x,
+            y: inner.end.y,
+        },
+    ) && outer.start.y.min(outer.end.y) - PRESERVED_GEOMETRY_EPSILON
+        <= inner.start.y.min(inner.end.y)
+        && outer.start.y.max(outer.end.y) + PRESERVED_GEOMETRY_EPSILON
+            >= inner.start.y.max(inner.end.y)
 }
 
 fn bundle_members_share_opposite_endpoint(
@@ -1431,15 +1482,16 @@ pub(crate) fn verify_preserved_geometry_structure(
             x: endpoint.x + direction * rail_depth,
             y: endpoint.y,
         };
-        let interior_collector = preserved_point_matches(geometry.spine.start, endpoint)
+        let interior_collector = options.minimum_parallel_wire_spacing == 0.0
+            && graph.boundary_bundles.len() <= MAX_INTERIOR_COLLECTOR_BUNDLES
+            && preserved_point_matches(geometry.spine.start, endpoint)
             && (geometry.spine.end.y - endpoint.y).abs() <= PRESERVED_GEOMETRY_EPSILON
             && direction * (geometry.spine.end.x - endpoint.x) >= rail_depth + pitch
             && (geometry.collector.start.x - geometry.spine.end.x).abs()
                 <= PRESERVED_GEOMETRY_EPSILON
             && (geometry.collector.end.x - geometry.spine.end.x).abs()
                 <= PRESERVED_GEOMETRY_EPSILON;
-        let shared_local_collector = !interior_collector
-            && bundle_members_share_opposite_endpoint(graph, bundle)
+        let coincident_taps = geometry.members.len() > 1
             && geometry.members.first().is_some_and(|first| {
                 first.tap.x.is_finite()
                     && first.tap.y.is_finite()
@@ -1447,8 +1499,30 @@ pub(crate) fn verify_preserved_geometry_structure(
                         .members
                         .iter()
                         .all(|member| preserved_point_matches(member.tap, first.tap))
-                    && (first.tap.x - fallback_collector_center.x).abs()
-                        <= PRESERVED_GEOMETRY_EPSILON
+            });
+        let members_share_opposite_endpoint = bundle_members_share_opposite_endpoint(graph, bundle);
+        let shared_route_contract = coincident_taps
+            && options.minimum_parallel_wire_spacing == 0.0
+            && bundle.width > 1
+            && graph.boundary_bundles.len() <= MAX_INTERIOR_COLLECTOR_BUNDLES
+            && members_share_opposite_endpoint
+            && geometry.members.first().is_some_and(|first| {
+                routes.get(&first.edge).is_some_and(|representative| {
+                    representative.points.len() >= 2
+                        && geometry.members.iter().all(|member| {
+                            routes
+                                .get(&member.edge)
+                                .is_some_and(|route| route.points == representative.points)
+                        })
+                })
+            });
+        if coincident_taps && members_share_opposite_endpoint && !shared_route_contract {
+            return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+        }
+        let shared_local_collector = !interior_collector
+            && shared_route_contract
+            && geometry.members.first().is_some_and(|first| {
+                (first.tap.x - fallback_collector_center.x).abs() <= PRESERVED_GEOMETRY_EPSILON
             });
         let collector_center = if interior_collector {
             geometry.spine.end
@@ -2757,6 +2831,78 @@ mod tests {
         assert_eq!(
             verify_preserved_geometry_structure(&indexed, &permuted, options),
             Err(LayoutError::BoundaryBundleGeometryUnsatisfied)
+        );
+    }
+
+    #[test]
+    fn preserved_shared_routes_require_the_exact_emission_contract() {
+        let graph = Graph {
+            nodes: vec![node(1, PortSide::East), node(2, PortSide::West)],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1],
+            outputs: vec![2],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 1, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            }],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let layout = crate::layout_with_constraints(&graph, options, &constraints).unwrap();
+        assert_eq!(layout.edges[0].points, layout.edges[1].points);
+        assert_eq!(
+            verify_preserved_geometry_structure(&indexed, &layout, options),
+            Ok(())
+        );
+
+        assert_eq!(
+            verify_preserved_geometry_structure(
+                &indexed,
+                &layout,
+                LayoutOptions {
+                    minimum_parallel_wire_spacing: 1.0,
+                    ..options
+                },
+            ),
+            Err(LayoutError::BoundaryBundleGeometryUnsatisfied),
+            "positive-spacing layouts must not preserve a shared route the planner cannot emit"
+        );
+
+        let mut mismatched_route = layout;
+        let repeated_start = mismatched_route.edges[1].points[0];
+        mismatched_route.edges[1].points.insert(1, repeated_start);
+        assert_eq!(
+            verify_preserved_geometry_structure(&indexed, &mismatched_route, options),
+            Err(LayoutError::BoundaryBundleGeometryUnsatisfied),
+            "coincident taps alone must not admit non-identical member routes"
         );
     }
 
