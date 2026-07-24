@@ -15,6 +15,8 @@ use crate::{
 };
 
 const MAX_SPARSE_NET_EDGES: usize = 300;
+const MIN_ORDINARY_FANOUT_EDGES: usize = 3;
+const MAX_ORDINARY_FANOUT_EDGES: usize = 20;
 const MIN_REGIONAL_FANOUT_EDGES: usize = MAX_SPARSE_NET_EDGES + 1;
 const MAX_REGIONAL_FANOUT_EDGES: usize = 512;
 const MAX_REGIONAL_FANOUT_NODES: usize = 1_000;
@@ -32,6 +34,7 @@ const MAX_COMPLETE_ROUTE_SEGMENTS: usize = 100_000;
 const REGIONAL_FANOUT_EDGES_PER_TRUNK: usize = 128;
 const MAX_REGIONAL_FANOUT_TRUNKS: usize = 4;
 const MIN_REGIONAL_FANOUT_CROSSING_GAIN: usize = 32;
+const MIN_ORDINARY_FANOUT_CROSSING_GAIN: usize = 1;
 const MIN_REGIONAL_FANOUT_CROSSING_GAIN_DENOMINATOR: usize = 10;
 const MAX_REGIONAL_FANOUT_BEND_FACTOR: f64 = 1.10;
 const MAX_REGIONAL_FANOUT_LENGTH_FACTOR: f64 = 1.05;
@@ -4127,6 +4130,48 @@ pub(crate) fn regional_fanout_candidate(
     baseline_quality: RouteQuality,
     options: LayoutOptions,
 ) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
+    fanout_trunk_candidate(
+        plan,
+        nodes,
+        baseline,
+        baseline_quality,
+        options,
+        MIN_REGIONAL_FANOUT_EDGES,
+        MAX_REGIONAL_FANOUT_EDGES,
+        MIN_REGIONAL_FANOUT_CROSSING_GAIN,
+    )
+}
+
+pub(crate) fn ordinary_fanout_candidate(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline: &[EdgeGeometry],
+    baseline_quality: RouteQuality,
+    options: LayoutOptions,
+) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
+    fanout_trunk_candidate(
+        plan,
+        nodes,
+        baseline,
+        baseline_quality,
+        options,
+        MIN_ORDINARY_FANOUT_EDGES,
+        MAX_ORDINARY_FANOUT_EDGES,
+        MIN_ORDINARY_FANOUT_CROSSING_GAIN,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fanout_trunk_candidate(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    baseline: &[EdgeGeometry],
+    baseline_quality: RouteQuality,
+    options: LayoutOptions,
+    minimum_edges: usize,
+    maximum_edges: usize,
+    minimum_crossing_gain_floor: usize,
+) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
     let options = crate::effective_layout_options(options);
     if nodes.len() > MAX_REGIONAL_FANOUT_NODES
         || plan.edges.len() > MAX_REGIONAL_FANOUT_GRAPH_EDGES
@@ -4138,7 +4183,7 @@ pub(crate) fn regional_fanout_candidate(
     {
         return None;
     }
-    let eligible = regional_fanout_edges(plan, nodes);
+    let eligible = fanout_edges_in_range(plan, nodes, minimum_edges, maximum_edges);
     if eligible.is_empty() {
         return None;
     }
@@ -4146,7 +4191,7 @@ pub(crate) fn regional_fanout_candidate(
         physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), baseline).0;
     let baseline_congestion = parallel_congestion_ratio(&baseline_segments)?;
     let free_by_rank = free_intervals_by_rank(plan, nodes, options.edge_node_clearance);
-    let minimum_crossing_gain = MIN_REGIONAL_FANOUT_CROSSING_GAIN.max(
+    let minimum_crossing_gain = minimum_crossing_gain_floor.max(
         baseline_quality
             .crossings
             .div_ceil(MIN_REGIONAL_FANOUT_CROSSING_GAIN_DENOMINATOR),
@@ -4191,9 +4236,24 @@ fn regional_fanout_quality_is_better(
         && candidate_congestion <= baseline_congestion + f64::EPSILON
 }
 
+#[cfg(test)]
 fn regional_fanout_edges(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
+) -> Vec<(NetId, Vec<usize>)> {
+    fanout_edges_in_range(
+        plan,
+        nodes,
+        MIN_REGIONAL_FANOUT_EDGES,
+        MAX_REGIONAL_FANOUT_EDGES,
+    )
+}
+
+fn fanout_edges_in_range(
+    plan: &RoutingPlan<'_>,
+    nodes: &[NodeGeometry],
+    minimum_edges: usize,
+    maximum_edges: usize,
 ) -> Vec<(NetId, Vec<usize>)> {
     let mut layer_left = vec![f64::INFINITY; plan.nodes_by_rank.len()];
     let mut layer_right = vec![f64::NEG_INFINITY; plan.nodes_by_rank.len()];
@@ -4208,7 +4268,7 @@ fn regional_fanout_edges(
     by_net
         .into_iter()
         .filter_map(|(net, indices)| {
-            if !(MIN_REGIONAL_FANOUT_EDGES..=MAX_REGIONAL_FANOUT_EDGES).contains(&indices.len()) {
+            if !(minimum_edges..=maximum_edges).contains(&indices.len()) {
                 return None;
             }
             let first = plan.edges[*indices.first()?];
@@ -4609,8 +4669,11 @@ fn regional_trunk_score(
     for ((arm, crossing_ys), parallel) in arms.iter().zip(arm_crossings).zip(arm_parallel) {
         let low = y.min(arm.y);
         let high = y.max(arm.y);
-        crossings += crossing_ys.partition_point(|&fixed| fixed < high)
-            - crossing_ys.partition_point(|&fixed| fixed <= low);
+        if low < high {
+            crossings += crossing_ys
+                .partition_point(|&fixed| fixed < high)
+                .saturating_sub(crossing_ys.partition_point(|&fixed| fixed <= low));
+        }
         for &(start, end) in parallel {
             congestion += (end.min(high) - start.max(low)).max(0.0);
         }
@@ -7933,75 +7996,6 @@ fn sparse_crossing_paths(
     port_stub: f64,
     horizontal_overrides: Option<&HorizontalCrossingOverrides>,
 ) -> Vec<Option<Vec<f64>>> {
-    // A single-driver net uses one obstacle-safe backbone; each sink route receives the prefix
-    // that reaches its rank and branches only in the final gap.
-    let mut edges_by_net = HashMap::<u32, Vec<usize>>::new();
-    for (edge_index, resolved) in plan.edges.iter().enumerate() {
-        if plan.net_edge_counts[&resolved.edge.net] > 1 {
-            let edge = resolved.edge;
-            edges_by_net.entry(edge.net).or_default().push(edge_index);
-        }
-    }
-    let mut shared_paths = HashMap::<u32, (usize, Vec<f64>)>::new();
-    for (net, edge_indices) in edges_by_net {
-        if edge_indices.len() < 2
-            || edge_indices
-                .iter()
-                .any(|&edge_index| sparse_spans[edge_index].is_none())
-        {
-            continue;
-        }
-        let first = plan.edges[edge_indices[0]];
-        let first_edge = first.edge;
-        if edge_indices
-            .iter()
-            .any(|&edge_index| plan.edges[edge_index].edge.source != first_edge.source)
-        {
-            continue;
-        }
-        let (source_rank, max_target_rank) = edge_indices
-            .iter()
-            .map(|&edge_index| sparse_spans[edge_index].expect("all spans are sparse"))
-            .fold(
-                (usize::MAX, 0),
-                |(min_source, max_target), (source, target)| {
-                    (min_source.min(source), max_target.max(target))
-                },
-            );
-        if max_target_rank <= source_rank + 1 {
-            continue;
-        }
-        let source = port_point(&nodes[first.source_index], first.source_port);
-        let source_y = endpoint_escape_y(source, first_edge.source, 0, endpoint_tracks, port_stub);
-        let mut target_ys = edge_indices
-            .iter()
-            .map(|&edge_index| {
-                let resolved = plan.edges[edge_index];
-                let edge = resolved.edge;
-                let target = port_point(&nodes[resolved.target_index], resolved.target_port);
-                endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub)
-            })
-            .collect::<Vec<_>>();
-        target_ys.sort_by(f64::total_cmp);
-        let target_y = target_ys[target_ys.len() / 2];
-        let path = shortest_crossing_path(
-            &free_by_rank[source_rank + 1..max_target_rank],
-            source_y,
-            target_y,
-            &(source_rank + 1..max_target_rank)
-                .map(|rank| crossing_lanes[rank][&net])
-                .collect::<Vec<_>>(),
-            &(source_rank + 1..max_target_rank)
-                .map(|rank| crossing_lanes[rank].len())
-                .collect::<Vec<_>>(),
-            &(source_rank + 1..max_target_rank)
-                .map(|rank| crossing_tie_lanes[&(rank, net)])
-                .collect::<Vec<_>>(),
-            crossing_tie_lane_count,
-        );
-        shared_paths.insert(net, (source_rank, path));
-    }
-
     let mut paths = plan
         .edges
         .iter()
@@ -8009,10 +8003,6 @@ fn sparse_crossing_paths(
         .map(|(resolved, span)| {
             let edge = resolved.edge;
             let &(source_rank, target_rank) = span.as_ref()?;
-            if let Some(&(shared_source_rank, ref shared_path)) = shared_paths.get(&edge.net) {
-                debug_assert_eq!(shared_source_rank, source_rank);
-                return Some(shared_path[..target_rank - source_rank - 1].to_vec());
-            }
             let source = port_point(&nodes[resolved.source_index], resolved.source_port);
             let target = port_point(&nodes[resolved.target_index], resolved.target_port);
             let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
@@ -8034,6 +8024,155 @@ fn sparse_crossing_paths(
             ))
         })
         .collect::<Vec<_>>();
+
+    // Share obstacle-safe sparse backbones among the eligible subset of each
+    // net. An outer-routed sibling must not disqualify otherwise compatible
+    // branches. Single-source groups reuse a prefix and diverge near their
+    // sinks; unassigned single-target groups reuse a suffix and converge near
+    // their target.
+    let mut sparse_edges_by_net = BTreeMap::<NetId, Vec<usize>>::new();
+    for (edge_index, (resolved, span)) in plan.edges.iter().zip(sparse_spans).enumerate() {
+        if span.is_some() && plan.net_edge_counts[&resolved.edge.net] > 1 {
+            sparse_edges_by_net
+                .entry(resolved.edge.net)
+                .or_default()
+                .push(edge_index);
+        }
+    }
+    let mut assigned = vec![false; plan.edges.len()];
+    for (net, edge_indices) in sparse_edges_by_net {
+        let mut fanout_groups = BTreeMap::<(u32, u32), Vec<usize>>::new();
+        for &edge_index in &edge_indices {
+            let endpoint = plan.edges[edge_index].edge.source;
+            fanout_groups
+                .entry((endpoint.node, endpoint.port))
+                .or_default()
+                .push(edge_index);
+        }
+        for group in fanout_groups.values() {
+            if group.len() < 2 {
+                continue;
+            }
+            let first = plan.edges[group[0]];
+            let source_rank = sparse_spans[group[0]]
+                .expect("shared fanout edge is sparse")
+                .0;
+            let max_target_rank = group
+                .iter()
+                .map(|&edge_index| {
+                    sparse_spans[edge_index]
+                        .expect("shared fanout edge is sparse")
+                        .1
+                })
+                .max()
+                .expect("shared fanout group is nonempty");
+            if max_target_rank <= source_rank + 1 {
+                continue;
+            }
+            let source = port_point(&nodes[first.source_index], first.source_port);
+            let source_y =
+                endpoint_escape_y(source, first.edge.source, 0, endpoint_tracks, port_stub);
+            let mut target_ys = group
+                .iter()
+                .map(|&edge_index| {
+                    let resolved = plan.edges[edge_index];
+                    let target = port_point(&nodes[resolved.target_index], resolved.target_port);
+                    endpoint_escape_y(target, resolved.edge.target, 1, endpoint_tracks, port_stub)
+                })
+                .collect::<Vec<_>>();
+            target_ys.sort_by(f64::total_cmp);
+            let target_y = target_ys[target_ys.len() / 2];
+            let shared = shortest_crossing_path(
+                &free_by_rank[source_rank + 1..max_target_rank],
+                source_y,
+                target_y,
+                &(source_rank + 1..max_target_rank)
+                    .map(|rank| crossing_lanes[rank][&net])
+                    .collect::<Vec<_>>(),
+                &(source_rank + 1..max_target_rank)
+                    .map(|rank| crossing_lanes[rank].len())
+                    .collect::<Vec<_>>(),
+                &(source_rank + 1..max_target_rank)
+                    .map(|rank| crossing_tie_lanes[&(rank, net)])
+                    .collect::<Vec<_>>(),
+                crossing_tie_lane_count,
+            );
+            for &edge_index in group {
+                let target_rank = sparse_spans[edge_index]
+                    .expect("shared fanout edge is sparse")
+                    .1;
+                paths[edge_index] = Some(shared[..target_rank - source_rank - 1].to_vec());
+                assigned[edge_index] = true;
+            }
+        }
+
+        let mut fanin_groups = BTreeMap::<(u32, u32), Vec<usize>>::new();
+        for &edge_index in &edge_indices {
+            if !assigned[edge_index] {
+                let endpoint = plan.edges[edge_index].edge.target;
+                fanin_groups
+                    .entry((endpoint.node, endpoint.port))
+                    .or_default()
+                    .push(edge_index);
+            }
+        }
+        for group in fanin_groups.values() {
+            if group.len() < 2 {
+                continue;
+            }
+            let first = plan.edges[group[0]];
+            let target_rank = sparse_spans[group[0]]
+                .expect("shared fanin edge is sparse")
+                .1;
+            let min_source_rank = group
+                .iter()
+                .map(|&edge_index| {
+                    sparse_spans[edge_index]
+                        .expect("shared fanin edge is sparse")
+                        .0
+                })
+                .min()
+                .expect("shared fanin group is nonempty");
+            if target_rank <= min_source_rank + 1 {
+                continue;
+            }
+            let mut source_ys = group
+                .iter()
+                .map(|&edge_index| {
+                    let resolved = plan.edges[edge_index];
+                    let source = port_point(&nodes[resolved.source_index], resolved.source_port);
+                    endpoint_escape_y(source, resolved.edge.source, 0, endpoint_tracks, port_stub)
+                })
+                .collect::<Vec<_>>();
+            source_ys.sort_by(f64::total_cmp);
+            let source_y = source_ys[source_ys.len() / 2];
+            let target = port_point(&nodes[first.target_index], first.target_port);
+            let target_y =
+                endpoint_escape_y(target, first.edge.target, 1, endpoint_tracks, port_stub);
+            let shared = shortest_crossing_path(
+                &free_by_rank[min_source_rank + 1..target_rank],
+                source_y,
+                target_y,
+                &(min_source_rank + 1..target_rank)
+                    .map(|rank| crossing_lanes[rank][&net])
+                    .collect::<Vec<_>>(),
+                &(min_source_rank + 1..target_rank)
+                    .map(|rank| crossing_lanes[rank].len())
+                    .collect::<Vec<_>>(),
+                &(min_source_rank + 1..target_rank)
+                    .map(|rank| crossing_tie_lanes[&(rank, net)])
+                    .collect::<Vec<_>>(),
+                crossing_tie_lane_count,
+            );
+            for &edge_index in group {
+                let source_rank = sparse_spans[edge_index]
+                    .expect("shared fanin edge is sparse")
+                    .0;
+                paths[edge_index] = Some(shared[source_rank - min_source_rank..].to_vec());
+            }
+        }
+    }
+
     if let Some(overrides) = horizontal_overrides {
         for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(&mut paths) {
             let (Some((source_rank, _)), Some(path)) = (span, path) else {
@@ -9695,7 +9834,7 @@ mod tests {
         route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
         route_supplemental_edges, select_crossing_repair_nets, select_gap_spacing_candidate,
         select_outer_side_repairs, selected_route_family_is_safe, shortest_crossing_path,
-        sparse_channel_route, sparse_gap_x, sum_within_limit,
+        sparse_channel_route, sparse_crossing_paths, sparse_gap_x, sum_within_limit,
         take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
     };
@@ -9728,6 +9867,192 @@ mod tests {
             lane_count,
             approximate_offset,
         }
+    }
+
+    fn shared_sparse_paths(
+        graph: &Graph,
+        nodes: &[NodeGeometry],
+        ranks: &[usize],
+        sparse_spans: &[Option<(usize, usize)>],
+    ) -> Vec<Option<Vec<f64>>> {
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index(graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, ranks);
+        let rank_count = ranks.iter().copied().max().unwrap_or(0) + 1;
+        let crossing_lanes = (0..rank_count)
+            .map(|_| BTreeMap::from([(7, 0)]))
+            .collect::<Vec<_>>();
+        let crossing_tie_lanes = (0..rank_count)
+            .map(|rank| ((rank, 7), 0))
+            .collect::<BTreeMap<_, _>>();
+        let free_by_rank = vec![vec![(-100.0, 200.0)]; rank_count];
+
+        sparse_crossing_paths(
+            &plan,
+            nodes,
+            sparse_spans,
+            &crossing_lanes,
+            &crossing_tie_lanes,
+            1,
+            &free_by_rank,
+            &BTreeMap::new(),
+            options.port_stub,
+            None,
+        )
+    }
+
+    #[test]
+    fn sparse_fanout_shares_the_eligible_prefix_despite_an_outer_sibling() {
+        let source = Node {
+            id: 0,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: PortSide::East,
+                offset: 10.0,
+            }],
+        };
+        let sink = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: PortSide::West,
+                offset: 10.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![source, sink(1), sink(2), sink(3)],
+            edges: (0..3)
+                .map(|id| Edge {
+                    id,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint {
+                        node: id + 1,
+                        port: 0,
+                    },
+                    net: 7,
+                    participates_in_ranking: true,
+                })
+                .collect(),
+        };
+        let nodes = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 40.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 200.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 300.0,
+                y: 80.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 3,
+                x: 200.0,
+                y: 40.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        let paths = shared_sparse_paths(
+            &graph,
+            &nodes,
+            &[0, 2, 3, 2],
+            &[Some((0, 2)), Some((0, 3)), None],
+        );
+
+        assert_eq!(paths[0], paths[1].as_ref().map(|path| path[..1].to_vec()));
+        assert!(paths[2].is_none());
+    }
+
+    #[test]
+    fn sparse_fanin_shares_the_final_suffix() {
+        let source = |id| Node {
+            id,
+            width: 20.0,
+            height: 20.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: PortSide::East,
+                offset: 10.0,
+            }],
+        };
+        let graph = Graph {
+            nodes: vec![
+                source(0),
+                source(1),
+                Node {
+                    id: 2,
+                    width: 20.0,
+                    height: 20.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 10.0,
+                    }],
+                },
+            ],
+            edges: vec![
+                Edge {
+                    id: 0,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 1,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 7,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let nodes = vec![
+            NodeGeometry {
+                id: 0,
+                x: 0.0,
+                y: 0.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 1,
+                x: 100.0,
+                y: 80.0,
+                width: 20.0,
+                height: 20.0,
+            },
+            NodeGeometry {
+                id: 2,
+                x: 300.0,
+                y: 40.0,
+                width: 20.0,
+                height: 20.0,
+            },
+        ];
+        let paths = shared_sparse_paths(&graph, &nodes, &[0, 1, 3], &[Some((0, 3)), Some((1, 3))]);
+
+        assert_eq!(paths[0].as_ref().map(|path| path[1..].to_vec()), paths[1],);
     }
 
     #[test]
@@ -13480,6 +13805,26 @@ mod tests {
             regional_fanout_edges(&plan, &geometry).is_empty(),
             "the source feeder must start beyond every node in its rank",
         );
+    }
+
+    #[test]
+    fn ordinary_fanout_eligibility_has_exact_branch_boundaries() {
+        for (branches, expected) in [(2, false), (3, true), (20, true), (21, false)] {
+            let (graph, geometry, ranks) = fanout_candidate_fixture(branches, 0);
+            let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            assert_eq!(
+                !super::fanout_edges_in_range(
+                    &plan,
+                    &geometry,
+                    super::MIN_ORDINARY_FANOUT_EDGES,
+                    super::MAX_ORDINARY_FANOUT_EDGES,
+                )
+                .is_empty(),
+                expected,
+                "unexpected ordinary eligibility at {branches} branches",
+            );
+        }
     }
 
     #[test]

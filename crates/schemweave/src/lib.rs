@@ -874,6 +874,31 @@ fn layout_indexed(
             layout = demand_candidate.layout;
         }
     }
+    if quality_effort != QualityEffort::Fast
+        && best_uses_primary_ranks
+        && let Some((candidate_quality, edges)) = routing::ordinary_fanout_candidate(
+            &routing_plan,
+            &raw_layout.nodes,
+            &raw_layout.edges,
+            routing::route_quality(&indexed, &raw_layout.edges),
+            options,
+        )
+        && let Some(candidate) = prepare_owned_candidate(
+            &indexed,
+            candidate_quality,
+            raw_layout.nodes.clone(),
+            edges,
+            options,
+            &mut admission_state,
+        )
+        && candidate.layout.width * candidate.layout.height <= layout.width * layout.height * 1.05
+        && route_quality_cmp(candidate.selection_quality, selection_quality).is_lt()
+    {
+        selection_quality = candidate.selection_quality;
+        quality = candidate.quality;
+        raw_layout = candidate.raw_layout;
+        layout = candidate.layout;
+    }
     if quality_effort == QualityEffort::Max
         && best_uses_primary_ranks
         && let Some((candidate_quality, edges)) = routing::regional_fanout_candidate(
