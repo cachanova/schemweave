@@ -454,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_returns_a_stable_full_relayout_status() {
+    fn wider_expansion_returns_a_layout_and_contract_errors_remain_stable() {
         let compact = Graph {
             nodes: vec![node(1), node(10), node(4)],
             edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
@@ -494,13 +494,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            response,
-            serde_json::json!({
-                "status":"needs_full_relayout",
-                "reason":"geometry"
-            })
-        );
+        assert_eq!(response["status"], "layout");
+        let layout: Layout = serde_json::from_value(response["layout"].clone()).unwrap();
+        let first_member = layout.nodes.iter().find(|node| node.id == 2).unwrap();
+        let second_member = layout.nodes.iter().find(|node| node.id == 3).unwrap();
+        let output = layout.nodes.iter().find(|node| node.id == 4).unwrap();
+        assert!(first_member.x < second_member.x);
+        assert!(second_member.x < output.x);
 
         let mut invalid = expansion;
         invalid.boundary_trunks.clear();
