@@ -7338,6 +7338,343 @@ fn route_length_from_physical_segments(segments: &[PhysicalSegment]) -> f64 {
         .sum()
 }
 
+#[allow(dead_code)]
+mod lane_pair_contribution {
+    use super::{
+        BTreeMap, BTreeSet, Endpoint, HashSet, NetId, PhysicalSegment, UnmergedPhysicalSegment,
+        merge_sorted_physical_route_segments,
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) struct CanonicalLaneTrack {
+        pub(super) net: NetId,
+        pub(super) lane: usize,
+        pub(super) fixed: f64,
+    }
+
+    /// One canonical physical contact. Vertical contacts use both coordinates as an open
+    /// interval; horizontal contacts use `ordinate_or_low` as their ordinate and repeat it in
+    /// `high`. Source and target deliberately remain the first sorted survivor from canonical
+    /// same-net merging.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub(super) struct CanonicalLaneContact {
+        pub(super) ordinate_or_low: f64,
+        pub(super) high: f64,
+        pub(super) source: Endpoint,
+        pub(super) target: Endpoint,
+        pub(super) shared_source: Option<usize>,
+        pub(super) shared_target: Option<usize>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) struct CanonicalLaneNetAccess {
+        pub(super) net: NetId,
+        pub(super) track: f64,
+        pub(super) vertical: Vec<CanonicalLaneContact>,
+        pub(super) left: Vec<CanonicalLaneContact>,
+        pub(super) right: Vec<CanonicalLaneContact>,
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) struct CanonicalLaneGapAccess {
+        /// Dense ordinals are ordered by `(baseline_lane, NetId)`.
+        pub(super) nets: Vec<CanonicalLaneNetAccess>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct OrderedLanePairContribution {
+        /// Contacts between the second net's verticals and the first net's right arms.
+        pub(super) horizontal_first: usize,
+        /// Contacts between the first net's verticals and the second net's left arms.
+        pub(super) horizontal_second: usize,
+    }
+
+    impl OrderedLanePairContribution {
+        pub(super) fn checked_total(self) -> Option<usize> {
+            self.horizontal_first.checked_add(self.horizontal_second)
+        }
+    }
+
+    pub(super) struct DenseOrderedLanePairContributions {
+        pub(super) nets: Vec<NetId>,
+        width: usize,
+        values: Vec<Option<OrderedLanePairContribution>>,
+    }
+
+    impl DenseOrderedLanePairContributions {
+        pub(super) fn get(
+            &self,
+            first: usize,
+            second: usize,
+        ) -> Option<OrderedLanePairContribution> {
+            if first >= self.width || second >= self.width {
+                return None;
+            }
+            let index = first.checked_mul(self.width)?.checked_add(second)?;
+            self.values.get(index).copied().flatten()
+        }
+    }
+
+    fn shared_endpoint_ordinals(
+        shared_endpoints: &HashSet<Endpoint>,
+    ) -> BTreeMap<(u32, u32), usize> {
+        let mut ordered = BTreeSet::new();
+        for endpoint in shared_endpoints {
+            ordered.insert((endpoint.node, endpoint.port));
+        }
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, endpoint)| (endpoint, ordinal))
+            .collect()
+    }
+
+    fn canonical_contact(
+        segment: &PhysicalSegment,
+        shared_ordinals: &BTreeMap<(u32, u32), usize>,
+    ) -> CanonicalLaneContact {
+        let ordinate_or_low = if segment.horizontal {
+            segment.fixed
+        } else {
+            segment.start
+        };
+        let high = if segment.horizontal {
+            segment.fixed
+        } else {
+            segment.end
+        };
+        CanonicalLaneContact {
+            ordinate_or_low,
+            high,
+            source: segment.source,
+            target: segment.target,
+            shared_source: shared_ordinals
+                .get(&(segment.source.node, segment.source.port))
+                .copied(),
+            shared_target: shared_ordinals
+                .get(&(segment.target.node, segment.target.port))
+                .copied(),
+        }
+    }
+
+    /// Canonicalize once from the same sorted raw segment stream consumed by
+    /// `physical_route_segments`, then tag each surviving segment as a vertical interval, a left
+    /// arm, a right arm, or both arms for every declared gap track.
+    pub(super) fn canonical_lane_gap_accesses_from_sorted_segments(
+        sorted_segments: Vec<UnmergedPhysicalSegment>,
+        gap_tracks: &[Vec<CanonicalLaneTrack>],
+        shared_endpoints: &HashSet<Endpoint>,
+    ) -> Option<(Vec<PhysicalSegment>, Vec<CanonicalLaneGapAccess>)> {
+        let segments = merge_sorted_physical_route_segments(sorted_segments);
+        if segments.iter().any(|segment| {
+            !segment.fixed.is_finite()
+                || !segment.start.is_finite()
+                || !segment.end.is_finite()
+                || segment.start >= segment.end
+        }) {
+            return None;
+        }
+        let shared_ordinals = shared_endpoint_ordinals(shared_endpoints);
+        let mut gaps = Vec::new();
+        gaps.try_reserve_exact(gap_tracks.len()).ok()?;
+        for tracks in gap_tracks {
+            let mut ordered = tracks.clone();
+            ordered
+                .sort_by(|left, right| left.lane.cmp(&right.lane).then(left.net.cmp(&right.net)));
+            let distinct_nets = ordered
+                .iter()
+                .map(|track| track.net)
+                .collect::<BTreeSet<_>>();
+            if ordered
+                .iter()
+                .enumerate()
+                .any(|(ordinal, track)| track.lane != ordinal || !track.fixed.is_finite())
+                || distinct_nets.len() != ordered.len()
+                || ordered
+                    .windows(2)
+                    .any(|pair| pair[0].fixed >= pair[1].fixed)
+            {
+                return None;
+            }
+
+            let mut nets = Vec::new();
+            nets.try_reserve_exact(ordered.len()).ok()?;
+            for track in ordered {
+                let mut vertical = Vec::new();
+                let mut left = Vec::new();
+                let mut right = Vec::new();
+                for segment in segments.iter().filter(|segment| segment.net == track.net) {
+                    if !segment.horizontal {
+                        if segment.fixed == track.fixed {
+                            vertical.push(canonical_contact(segment, &shared_ordinals));
+                        }
+                        continue;
+                    }
+                    if segment.start < track.fixed && track.fixed <= segment.end {
+                        left.push(canonical_contact(segment, &shared_ordinals));
+                    }
+                    if segment.start <= track.fixed && track.fixed < segment.end {
+                        right.push(canonical_contact(segment, &shared_ordinals));
+                    }
+                }
+                nets.push(CanonicalLaneNetAccess {
+                    net: track.net,
+                    track: track.fixed,
+                    vertical,
+                    left,
+                    right,
+                });
+            }
+            gaps.push(CanonicalLaneGapAccess { nets });
+        }
+        Some((segments, gaps))
+    }
+
+    fn shares_retained_shared_endpoint(
+        vertical: &CanonicalLaneContact,
+        horizontal: &CanonicalLaneContact,
+    ) -> bool {
+        [vertical.shared_source, vertical.shared_target]
+            .into_iter()
+            .flatten()
+            .any(|vertical_endpoint| {
+                horizontal.shared_source == Some(vertical_endpoint)
+                    || horizontal.shared_target == Some(vertical_endpoint)
+            })
+    }
+
+    fn exact_vertical_horizontal_contribution(
+        vertical: &[CanonicalLaneContact],
+        horizontal: &[CanonicalLaneContact],
+    ) -> Option<usize> {
+        let mut total = 0usize;
+        for interval in vertical {
+            if interval.ordinate_or_low >= interval.high {
+                continue;
+            }
+            let start = horizontal
+                .partition_point(|contact| contact.ordinate_or_low <= interval.ordinate_or_low);
+            let end = horizontal.partition_point(|contact| contact.ordinate_or_low < interval.high);
+            let candidate_count = end.checked_sub(start)?;
+            let excluded = horizontal[start..end]
+                .iter()
+                .filter(|contact| shares_retained_shared_endpoint(interval, contact))
+                .count();
+            let included = candidate_count.checked_sub(excluded)?;
+            total = total.checked_add(included)?;
+        }
+        Some(total)
+    }
+
+    /// Exact contribution for the ordered relation `first before second`.
+    pub(super) fn exact_ordered_lane_pair_contribution(
+        first: &CanonicalLaneNetAccess,
+        second: &CanonicalLaneNetAccess,
+    ) -> Option<OrderedLanePairContribution> {
+        if first.net == second.net {
+            return Some(OrderedLanePairContribution::default());
+        }
+        Some(OrderedLanePairContribution {
+            horizontal_first: exact_vertical_horizontal_contribution(
+                &second.vertical,
+                &first.right,
+            )?,
+            horizontal_second: exact_vertical_horizontal_contribution(
+                &first.vertical,
+                &second.left,
+            )?,
+        })
+    }
+
+    pub(super) fn dense_ordered_lane_pair_contributions(
+        gap: &CanonicalLaneGapAccess,
+    ) -> Option<DenseOrderedLanePairContributions> {
+        let width = gap.nets.len();
+        let value_count = width.checked_mul(width)?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(value_count).ok()?;
+        values.resize(value_count, None);
+        for (first, first_access) in gap.nets.iter().enumerate() {
+            for (second, second_access) in gap.nets.iter().enumerate() {
+                if first == second {
+                    continue;
+                }
+                let index = first.checked_mul(width)?.checked_add(second)?;
+                values[index] = Some(exact_ordered_lane_pair_contribution(
+                    first_access,
+                    second_access,
+                )?);
+            }
+        }
+        let mut nets = Vec::new();
+        nets.try_reserve_exact(width).ok()?;
+        nets.extend(gap.nets.iter().map(|access| access.net));
+        Some(DenseOrderedLanePairContributions {
+            nets,
+            width,
+            values,
+        })
+    }
+
+    #[cfg(test)]
+    fn exhaustive_vertical_horizontal_contribution(
+        vertical: &[CanonicalLaneContact],
+        horizontal: &[CanonicalLaneContact],
+    ) -> Option<usize> {
+        let mut total = 0usize;
+        for interval in vertical {
+            for contact in horizontal {
+                if interval.ordinate_or_low < contact.ordinate_or_low
+                    && contact.ordinate_or_low < interval.high
+                    && !shares_retained_shared_endpoint(interval, contact)
+                {
+                    total = total.checked_add(1)?;
+                }
+            }
+        }
+        Some(total)
+    }
+
+    #[cfg(test)]
+    fn exhaustive_ordered_lane_pair_contribution(
+        first: &CanonicalLaneNetAccess,
+        second: &CanonicalLaneNetAccess,
+    ) -> Option<OrderedLanePairContribution> {
+        if first.net == second.net {
+            return Some(OrderedLanePairContribution::default());
+        }
+        Some(OrderedLanePairContribution {
+            horizontal_first: exhaustive_vertical_horizontal_contribution(
+                &second.vertical,
+                &first.right,
+            )?,
+            horizontal_second: exhaustive_vertical_horizontal_contribution(
+                &first.vertical,
+                &second.left,
+            )?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn exhaustive_ordered_lane_pair_contributions(
+        gap: &CanonicalLaneGapAccess,
+    ) -> Option<BTreeMap<(NetId, NetId), OrderedLanePairContribution>> {
+        let mut contributions = BTreeMap::new();
+        for (first_ordinal, first) in gap.nets.iter().enumerate() {
+            for (second_ordinal, second) in gap.nets.iter().enumerate() {
+                if first_ordinal == second_ordinal {
+                    continue;
+                }
+                contributions.insert(
+                    (first.net, second.net),
+                    exhaustive_ordered_lane_pair_contribution(first, second)?,
+                );
+            }
+        }
+        Some(contributions)
+    }
+}
+
 #[cfg(test)]
 fn physical_route_segments_btree_reference<'a>(
     edges: impl Iterator<Item = &'a Edge>,
@@ -10314,30 +10651,38 @@ mod tests {
         free_interval_containing, free_intervals_by_rank, global_gap_candidate_work_within_budget,
         global_gap_lane_indices_with_rounds, global_gap_order_seed, has_split_feedback_net,
         horizontal_crossing_band_tracks, horizontal_crossing_close_pairs,
-        horizontal_crossing_counts_by_net, lane_indices, large_gap_hot_access_work,
-        large_gap_hot_access_work_from_counts, large_gap_hot_insertion_order_btree_reference,
-        large_gap_hot_insertion_order_with_rounds, large_gap_hot_nets,
-        large_gap_hot_nets_with_limit, layout_horizontal_crossing_pitch_is_satisfied,
-        move_nets_to_outer_lanes, negotiated_corridor_quality_is_better, outer_lane_assignments,
-        outer_lane_channels_match, outer_pair_crossings, physical_crossing_sweep,
-        physical_crossing_sweep_lines, physical_route_segments,
-        physical_route_segments_btree_reference, piecewise_constant_crossing_path, port_point,
-        push_regional_ordinate, raw_route_family_has_unexempt_collinear_overlap,
-        raw_route_family_has_unrelated_contact, raw_route_segments,
-        raw_route_segments_have_unrelated_contact, refined_large_gap_candidate_work_within_budget,
-        refined_large_gap_hot_insertion_orders, regional_fanout_edges,
-        regional_fanout_quality_is_better, regional_safety_work_within_budget,
-        regional_segment_intersects_node_interior, regional_segments_have_unrelated_contact,
-        repair_crossing_heavy_net, repair_selection_adds_new_nets, route_edges,
-        route_edges_with_lane_rounds, route_edges_with_lane_rounds_and_global,
-        route_family_has_unrelated_contact_bounded,
+        horizontal_crossing_counts_by_net, lane_indices,
+        lane_pair_contribution::{
+            CanonicalLaneContact, CanonicalLaneGapAccess, CanonicalLaneNetAccess,
+            CanonicalLaneTrack, OrderedLanePairContribution,
+            canonical_lane_gap_accesses_from_sorted_segments,
+            dense_ordered_lane_pair_contributions, exact_ordered_lane_pair_contribution,
+            exhaustive_ordered_lane_pair_contributions,
+        },
+        large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
+        large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
+        large_gap_hot_nets, large_gap_hot_nets_with_limit,
+        layout_horizontal_crossing_pitch_is_satisfied, move_nets_to_outer_lanes,
+        negotiated_corridor_quality_is_better, outer_lane_assignments, outer_lane_channels_match,
+        outer_pair_crossings, physical_crossing_sweep, physical_crossing_sweep_lines,
+        physical_route_segments, physical_route_segments_btree_reference,
+        piecewise_constant_crossing_path, port_point, push_regional_ordinate,
+        raw_route_family_has_unexempt_collinear_overlap, raw_route_family_has_unrelated_contact,
+        raw_route_segments, raw_route_segments_have_unrelated_contact,
+        refined_large_gap_candidate_work_within_budget, refined_large_gap_hot_insertion_orders,
+        regional_fanout_edges, regional_fanout_quality_is_better,
+        regional_safety_work_within_budget, regional_segment_intersects_node_interior,
+        regional_segments_have_unrelated_contact, repair_crossing_heavy_net,
+        repair_selection_adds_new_nets, route_edges, route_edges_with_lane_rounds,
+        route_edges_with_lane_rounds_and_global, route_family_has_unrelated_contact_bounded,
         route_family_satisfies_parallel_spacing_bounded, route_planned_candidates,
         route_planned_candidates_with_horizontal_overrides,
         route_planned_candidates_with_quality_options, route_planned_candidates_with_sparse_global,
         route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
         route_supplemental_edges, select_crossing_repair_nets, select_gap_spacing_candidate,
-        select_outer_side_repairs, selected_route_family_is_safe, shortest_crossing_path,
-        sparse_channel_route, sparse_crossing_paths, sparse_gap_x, sum_within_limit,
+        select_outer_side_repairs, selected_route_family_is_safe, shared_endpoints,
+        shortest_crossing_path, sorted_unmerged_physical_route_segments, sparse_channel_route,
+        sparse_crossing_paths, sparse_gap_x, sum_within_limit,
         take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
     };
@@ -18041,6 +18386,506 @@ mod tests {
             }
         }
         assert_eq!(actual_profiles, expected_profiles);
+    }
+
+    fn canonical_lane_contact(
+        low_or_ordinate: f64,
+        high: f64,
+        source: u32,
+        target: u32,
+        shared_source: Option<usize>,
+        shared_target: Option<usize>,
+    ) -> CanonicalLaneContact {
+        CanonicalLaneContact {
+            ordinate_or_low: low_or_ordinate,
+            high,
+            source: Endpoint {
+                node: source,
+                port: 0,
+            },
+            target: Endpoint {
+                node: target,
+                port: 0,
+            },
+            shared_source,
+            shared_target,
+        }
+    }
+
+    fn canonical_lane_access(
+        net: u32,
+        track: f64,
+        vertical: Vec<CanonicalLaneContact>,
+        left: Vec<CanonicalLaneContact>,
+        right: Vec<CanonicalLaneContact>,
+    ) -> CanonicalLaneNetAccess {
+        CanonicalLaneNetAccess {
+            net,
+            track,
+            vertical,
+            left,
+            right,
+        }
+    }
+
+    #[test]
+    fn exact_lane_pair_uses_strict_vertical_start_and_end_contacts() {
+        let first = canonical_lane_access(
+            1,
+            2.0,
+            vec![canonical_lane_contact(0.0, 10.0, 1, 2, None, None)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let second = canonical_lane_access(
+            2,
+            8.0,
+            Vec::new(),
+            vec![
+                canonical_lane_contact(0.0, 0.0, 3, 4, None, None),
+                canonical_lane_contact(5.0, 5.0, 5, 6, None, None),
+                canonical_lane_contact(10.0, 10.0, 7, 8, None, None),
+            ],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            exact_ordered_lane_pair_contribution(&first, &second),
+            Some(OrderedLanePairContribution {
+                horizontal_first: 0,
+                horizontal_second: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_lane_state_merges_touching_and_overlapping_same_net_segments() {
+        let edges = [
+            Edge {
+                id: 9,
+                source: Endpoint { node: 90, port: 0 },
+                target: Endpoint { node: 91, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 3,
+                source: Endpoint { node: 30, port: 0 },
+                target: Endpoint { node: 31, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+            Edge {
+                id: 1,
+                source: Endpoint { node: 10, port: 0 },
+                target: Endpoint { node: 11, port: 0 },
+                net: 7,
+                participates_in_ranking: true,
+            },
+        ];
+        let routes = [
+            EdgeGeometry {
+                id: 9,
+                points: vec![Point { x: 5.0, y: 0.0 }, Point { x: 5.0, y: 5.0 }],
+            },
+            EdgeGeometry {
+                id: 3,
+                points: vec![Point { x: 5.0, y: 5.0 }, Point { x: 5.0, y: 10.0 }],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 5.0, y: 8.0 }, Point { x: 5.0, y: 12.0 }],
+            },
+        ];
+        let sorted = sorted_unmerged_physical_route_segments(edges.iter(), &routes, None);
+        let tracks = vec![vec![CanonicalLaneTrack {
+            net: 7,
+            lane: 0,
+            fixed: 5.0,
+        }]];
+        let later_merged_endpoint = Endpoint { node: 30, port: 0 };
+        let (segments, gaps) = canonical_lane_gap_accesses_from_sorted_segments(
+            sorted,
+            &tracks,
+            &HashSet::from([later_merged_endpoint]),
+        )
+        .expect("valid canonical lane state");
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].source, Endpoint { node: 90, port: 0 });
+        assert_eq!(segments[0].target, Endpoint { node: 91, port: 0 });
+        assert_eq!(segments[0].start, 0.0);
+        assert_eq!(segments[0].end, 12.0);
+        assert_eq!(gaps[0].nets[0].vertical.len(), 1);
+        assert_eq!(gaps[0].nets[0].vertical[0].source, segments[0].source);
+        assert_eq!(gaps[0].nets[0].vertical[0].target, segments[0].target);
+        assert_eq!(gaps[0].nets[0].vertical[0].ordinate_or_low, 0.0);
+        assert_eq!(gaps[0].nets[0].vertical[0].high, 12.0);
+        assert_eq!(gaps[0].nets[0].vertical[0].shared_source, None);
+        assert_eq!(gaps[0].nets[0].vertical[0].shared_target, None);
+    }
+
+    #[test]
+    fn exact_lane_pair_excludes_perpendicular_contacts_within_one_net() {
+        let first = canonical_lane_access(
+            4,
+            2.0,
+            vec![canonical_lane_contact(0.0, 10.0, 1, 2, None, None)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let second = canonical_lane_access(
+            4,
+            8.0,
+            Vec::new(),
+            vec![canonical_lane_contact(5.0, 5.0, 3, 4, None, None)],
+            Vec::new(),
+        );
+
+        assert_eq!(
+            exact_ordered_lane_pair_contribution(&first, &second),
+            Some(OrderedLanePairContribution::default())
+        );
+    }
+
+    #[test]
+    fn exact_lane_pair_excludes_shared_endpoint_on_either_or_both_survivor_ends() {
+        let vertical_source = canonical_lane_access(
+            1,
+            2.0,
+            vec![canonical_lane_contact(0.0, 10.0, 10, 11, Some(0), None)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let horizontal_target = canonical_lane_access(
+            2,
+            8.0,
+            Vec::new(),
+            vec![canonical_lane_contact(5.0, 5.0, 20, 10, None, Some(0))],
+            Vec::new(),
+        );
+        assert_eq!(
+            exact_ordered_lane_pair_contribution(&vertical_source, &horizontal_target),
+            Some(OrderedLanePairContribution::default())
+        );
+
+        let vertical_target = canonical_lane_access(
+            1,
+            2.0,
+            vec![canonical_lane_contact(0.0, 10.0, 11, 12, None, Some(1))],
+            Vec::new(),
+            Vec::new(),
+        );
+        let horizontal_source = canonical_lane_access(
+            2,
+            8.0,
+            Vec::new(),
+            vec![canonical_lane_contact(5.0, 5.0, 12, 20, Some(1), None)],
+            Vec::new(),
+        );
+        assert_eq!(
+            exact_ordered_lane_pair_contribution(&vertical_target, &horizontal_source),
+            Some(OrderedLanePairContribution::default())
+        );
+
+        let vertical_both = canonical_lane_access(
+            1,
+            2.0,
+            vec![canonical_lane_contact(0.0, 10.0, 10, 12, Some(0), Some(1))],
+            Vec::new(),
+            Vec::new(),
+        );
+        let horizontal_both = canonical_lane_access(
+            2,
+            8.0,
+            Vec::new(),
+            vec![canonical_lane_contact(5.0, 5.0, 12, 10, Some(1), Some(0))],
+            Vec::new(),
+        );
+        assert_eq!(
+            exact_ordered_lane_pair_contribution(&vertical_both, &horizontal_both),
+            Some(OrderedLanePairContribution::default())
+        );
+    }
+
+    #[test]
+    fn exact_lane_pair_components_follow_horizontal_transpose_attribution() {
+        let endpoint = |node| Endpoint { node, port: 0 };
+        let first = canonical_lane_access(
+            1,
+            2.0,
+            vec![canonical_lane_contact(0.0, 10.0, 1, 2, None, None)],
+            Vec::new(),
+            vec![canonical_lane_contact(5.0, 5.0, 3, 4, None, None)],
+        );
+        let second = canonical_lane_access(
+            2,
+            8.0,
+            vec![canonical_lane_contact(0.0, 10.0, 5, 6, None, None)],
+            vec![
+                canonical_lane_contact(3.0, 3.0, 7, 8, None, None),
+                canonical_lane_contact(7.0, 7.0, 9, 10, None, None),
+            ],
+            Vec::new(),
+        );
+        let contribution =
+            exact_ordered_lane_pair_contribution(&first, &second).expect("small exact count");
+        assert_eq!(
+            contribution,
+            OrderedLanePairContribution {
+                horizontal_first: 1,
+                horizontal_second: 2,
+            }
+        );
+        assert_eq!(contribution.checked_total(), Some(3));
+
+        let segments = vec![
+            PhysicalSegment {
+                net: 1,
+                source: endpoint(1),
+                target: endpoint(2),
+                horizontal: false,
+                fixed: 2.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            PhysicalSegment {
+                net: 1,
+                source: endpoint(3),
+                target: endpoint(4),
+                horizontal: true,
+                fixed: 5.0,
+                start: 2.0,
+                end: 10.0,
+            },
+            PhysicalSegment {
+                net: 2,
+                source: endpoint(5),
+                target: endpoint(6),
+                horizontal: false,
+                fixed: 8.0,
+                start: 0.0,
+                end: 10.0,
+            },
+            PhysicalSegment {
+                net: 2,
+                source: endpoint(7),
+                target: endpoint(8),
+                horizontal: true,
+                fixed: 3.0,
+                start: 0.0,
+                end: 8.0,
+            },
+            PhysicalSegment {
+                net: 2,
+                source: endpoint(9),
+                target: endpoint(10),
+                horizontal: true,
+                fixed: 7.0,
+                start: 0.0,
+                end: 8.0,
+            },
+        ];
+        let mut horizontal_counts = BTreeMap::new();
+        let total = physical_crossing_sweep(
+            &HashSet::new(),
+            &segments,
+            true,
+            Some(&mut horizontal_counts),
+        );
+        assert_eq!(total, 3);
+        assert_eq!(horizontal_counts, BTreeMap::from([(1, 1), (2, 2)]));
+    }
+
+    fn generated_canonical_lane_corpus(
+        state: &mut u64,
+    ) -> (Vec<Edge>, Vec<EdgeGeometry>, Vec<Vec<CanonicalLaneTrack>>) {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        let lane_count = 2 + (next(state) % 6) as usize;
+        let mut edges = Vec::new();
+        let mut routes = Vec::new();
+        let mut tracks = Vec::new();
+        let mut edge_id = 0u32;
+        for lane in 0..lane_count {
+            let net = 1_000 - lane as u32 * 17;
+            let fixed = 10.0 + lane as f64 * 10.0;
+            tracks.push(CanonicalLaneTrack { net, lane, fixed });
+            let branch_count = 1 + (next(state) % 3) as usize;
+            for branch in 0..branch_count {
+                let source = Endpoint {
+                    node: 500 + (lane % 2) as u32,
+                    port: 0,
+                };
+                let target = Endpoint {
+                    node: 10_000 + edge_id,
+                    port: 0,
+                };
+                let left_y = (next(state) % 13) as f64;
+                let right_y = (next(state) % 13) as f64;
+                edges.push(Edge {
+                    id: edge_id,
+                    source,
+                    target,
+                    net,
+                    participates_in_ranking: true,
+                });
+                routes.push(EdgeGeometry {
+                    id: edge_id,
+                    points: vec![
+                        Point { x: 0.0, y: left_y },
+                        Point {
+                            x: fixed,
+                            y: left_y,
+                        },
+                        Point {
+                            x: fixed,
+                            y: right_y,
+                        },
+                        Point {
+                            x: 100.0,
+                            y: right_y,
+                        },
+                    ],
+                });
+                edge_id += 1;
+                if branch == 0 && lane % 3 == 0 {
+                    let overlap_target = Endpoint {
+                        node: 20_000 + edge_id,
+                        port: 0,
+                    };
+                    edges.push(Edge {
+                        id: edge_id,
+                        source,
+                        target: overlap_target,
+                        net,
+                        participates_in_ranking: true,
+                    });
+                    routes.push(EdgeGeometry {
+                        id: edge_id,
+                        points: vec![
+                            Point { x: 0.0, y: left_y },
+                            Point {
+                                x: fixed,
+                                y: left_y,
+                            },
+                            Point {
+                                x: fixed,
+                                y: right_y + 1.0,
+                            },
+                            Point {
+                                x: 100.0,
+                                y: right_y + 1.0,
+                            },
+                        ],
+                    });
+                    edge_id += 1;
+                }
+            }
+        }
+        if next(state) & 1 != 0 {
+            tracks.reverse();
+        }
+        (edges, routes, vec![tracks])
+    }
+
+    fn canonical_lane_state_for_generated_corpus(
+        state: &mut u64,
+    ) -> (
+        Vec<PhysicalSegment>,
+        Vec<CanonicalLaneGapAccess>,
+        HashSet<Endpoint>,
+    ) {
+        let (edges, routes, tracks) = generated_canonical_lane_corpus(state);
+        let shared = shared_endpoints(edges.iter());
+        let sorted = sorted_unmerged_physical_route_segments(edges.iter(), &routes, None);
+        let (segments, gaps) =
+            canonical_lane_gap_accesses_from_sorted_segments(sorted, &tracks, &shared)
+                .expect("generated track state is valid");
+        (segments, gaps, shared)
+    }
+
+    #[test]
+    fn canonical_lane_dense_pairs_match_seeded_exhaustive_btree_reference() {
+        let mut state = 0x5eed_f00d_dead_beefu64;
+        for _ in 0..128 {
+            let (_, gaps, _) = canonical_lane_state_for_generated_corpus(&mut state);
+            let gap = &gaps[0];
+            let dense =
+                dense_ordered_lane_pair_contributions(gap).expect("generated counts fit usize");
+            let reference = exhaustive_ordered_lane_pair_contributions(gap)
+                .expect("generated reference counts fit usize");
+            assert_eq!(
+                dense.nets,
+                gap.nets.iter().map(|access| access.net).collect::<Vec<_>>()
+            );
+            assert_eq!(reference.len(), gap.nets.len() * (gap.nets.len() - 1));
+            for (first, first_access) in gap.nets.iter().enumerate() {
+                for (second, second_access) in gap.nets.iter().enumerate() {
+                    if first == second {
+                        assert_eq!(dense.get(first, second), None);
+                    } else {
+                        assert_eq!(
+                            dense.get(first, second),
+                            reference
+                                .get(&(first_access.net, second_access.net))
+                                .copied(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_lane_pair_totals_and_components_match_generated_physical_sweeps() {
+        let mut state = 0xc0ff_ee12_3456_789au64;
+        for _ in 0..128 {
+            let (segments, gaps, shared) = canonical_lane_state_for_generated_corpus(&mut state);
+            let gap = &gaps[0];
+            let dense =
+                dense_ordered_lane_pair_contributions(gap).expect("generated counts fit usize");
+            let mut expected_total = 0usize;
+            let mut expected_horizontal = BTreeMap::<u32, usize>::new();
+            for first in 0..gap.nets.len() {
+                for second in first + 1..gap.nets.len() {
+                    let contribution = dense
+                        .get(first, second)
+                        .expect("ordered distinct pair is populated");
+                    expected_total = expected_total
+                        .checked_add(contribution.checked_total().expect("pair total fits"))
+                        .expect("corpus total fits");
+                    if contribution.horizontal_first != 0 {
+                        let count = expected_horizontal.entry(gap.nets[first].net).or_default();
+                        *count = count
+                            .checked_add(contribution.horizontal_first)
+                            .expect("horizontal component fits");
+                    }
+                    if contribution.horizontal_second != 0 {
+                        let count = expected_horizontal.entry(gap.nets[second].net).or_default();
+                        *count = count
+                            .checked_add(contribution.horizontal_second)
+                            .expect("horizontal component fits");
+                    }
+                }
+            }
+
+            assert_eq!(
+                physical_crossing_sweep(&shared, &segments, false, None),
+                expected_total
+            );
+            let mut actual_horizontal = BTreeMap::new();
+            assert_eq!(
+                physical_crossing_sweep(&shared, &segments, true, Some(&mut actual_horizontal),),
+                expected_total
+            );
+            assert_eq!(actual_horizontal, expected_horizontal);
+        }
     }
 
     #[test]
