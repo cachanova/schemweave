@@ -5095,6 +5095,21 @@ pub(crate) fn route_family_has_unrelated_contact_bounded(
     max_segments: usize,
     max_visits: usize,
 ) -> Result<bool, RouteContactError> {
+    let mut remaining_visits = max_visits;
+    route_family_has_unrelated_contact_with_budget(
+        graph,
+        routes,
+        max_segments,
+        &mut remaining_visits,
+    )
+}
+
+pub(crate) fn route_family_has_unrelated_contact_with_budget(
+    graph: &IndexedGraph<'_>,
+    routes: &[EdgeGeometry],
+    max_segments: usize,
+    remaining_visits: &mut usize,
+) -> Result<bool, RouteContactError> {
     let segments =
         raw_route_segments_bounded(graph.edges.iter().copied(), routes, max_segments, 0.0)?;
     let selected_nets = graph
@@ -5102,8 +5117,7 @@ pub(crate) fn route_family_has_unrelated_contact_bounded(
         .iter()
         .map(|edge| edge.net)
         .collect::<BTreeSet<_>>();
-    let mut remaining_visits = max_visits;
-    raw_route_family_has_unrelated_contact(&segments, &selected_nets, &mut remaining_visits)
+    raw_route_family_has_unrelated_contact(&segments, &selected_nets, remaining_visits)
         .ok_or(RouteContactError::WorkLimitExceeded)
 }
 
@@ -5355,115 +5369,144 @@ fn raw_route_family_has_unexempt_collinear_overlap(
     Some(false)
 }
 
+fn raw_route_family_has_unrelated_collinear_contact(
+    segments: &[RawRouteSegment],
+    selected_nets: &BTreeSet<NetId>,
+    remaining_visits: &mut usize,
+) -> Option<bool> {
+    let mut groups = BTreeMap::<(bool, u64), Vec<usize>>::new();
+    for (index, segment) in segments.iter().enumerate() {
+        groups
+            .entry((segment.horizontal, indexed_float_key(segment.fixed)))
+            .or_default()
+            .push(index);
+    }
+    for indices in groups.values() {
+        if indices.len() < 2 {
+            continue;
+        }
+        let mut events = Vec::with_capacity(indices.len() * 2);
+        for &index in indices {
+            let canonical = |value| FloatKey(if value == 0.0 { 0.0 } else { value });
+            // Starts precede ends so endpoint-only contact remains a candidate.
+            events.push((canonical(segments[index].start), 0u8, index));
+            events.push((canonical(segments[index].end), 1u8, index));
+        }
+        events.sort_unstable();
+        let mut active = BTreeSet::<usize>::new();
+        let mut selected_active = BTreeSet::<usize>::new();
+        for (_, event_kind, index) in events {
+            let segment = &segments[index];
+            let selected = selected_nets.contains(&segment.net);
+            if event_kind == 1 {
+                assert!(active.remove(&index));
+                if selected {
+                    assert!(selected_active.remove(&index));
+                }
+                continue;
+            }
+            let candidates = if selected { &active } else { &selected_active };
+            charge_negotiated_work(remaining_visits, candidates.len())?;
+            if candidates
+                .iter()
+                .any(|&other| raw_route_segments_have_unrelated_contact(segment, &segments[other]))
+            {
+                return Some(true);
+            }
+            active.insert(index);
+            if selected {
+                selected_active.insert(index);
+            }
+        }
+        debug_assert!(active.is_empty());
+        debug_assert!(selected_active.is_empty());
+    }
+    Some(false)
+}
+
+fn raw_route_family_has_unrelated_perpendicular_contact(
+    segments: &[RawRouteSegment],
+    selected_nets: &BTreeSet<NetId>,
+    remaining_visits: &mut usize,
+) -> Option<bool> {
+    let mut intervals = BTreeMap::<(bool, u64), Vec<usize>>::new();
+    let mut queries = BTreeMap::<(bool, u64), Vec<(FloatKey, usize)>>::new();
+    for (index, segment) in segments.iter().enumerate() {
+        intervals
+            .entry((segment.horizontal, indexed_float_key(segment.fixed)))
+            .or_default()
+            .push(index);
+        for endpoint in [segment.start, segment.end] {
+            queries
+                .entry((!segment.horizontal, indexed_float_key(endpoint)))
+                .or_default()
+                .push((FloatKey(segment.fixed), index));
+        }
+    }
+    for (key, group_queries) in queries {
+        let Some(group_intervals) = intervals.get(&key) else {
+            continue;
+        };
+        let mut events = Vec::with_capacity(group_intervals.len() * 2 + group_queries.len());
+        for &index in group_intervals {
+            let canonical = |value| FloatKey(if value == 0.0 { 0.0 } else { value });
+            events.push((canonical(segments[index].start), 0u8, index));
+            events.push((canonical(segments[index].end), 2u8, index));
+        }
+        for (point, index) in group_queries {
+            events.push((
+                FloatKey(if point.0 == 0.0 { 0.0 } else { point.0 }),
+                1u8,
+                index,
+            ));
+        }
+        events.sort_unstable();
+        let mut active = BTreeSet::<usize>::new();
+        let mut selected_active = BTreeSet::<usize>::new();
+        for (_, event_kind, index) in events {
+            let segment = &segments[index];
+            let selected = selected_nets.contains(&segment.net);
+            match event_kind {
+                0 => {
+                    active.insert(index);
+                    if selected {
+                        selected_active.insert(index);
+                    }
+                }
+                1 => {
+                    let candidates = if selected { &active } else { &selected_active };
+                    charge_negotiated_work(remaining_visits, candidates.len())?;
+                    if candidates.iter().any(|&other| {
+                        raw_route_segments_have_unrelated_contact(segment, &segments[other])
+                    }) {
+                        return Some(true);
+                    }
+                }
+                2 => {
+                    assert!(active.remove(&index));
+                    if selected {
+                        assert!(selected_active.remove(&index));
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        debug_assert!(active.is_empty());
+        debug_assert!(selected_active.is_empty());
+    }
+    Some(false)
+}
+
 fn raw_route_family_has_unrelated_contact(
     segments: &[RawRouteSegment],
     selected_nets: &BTreeSet<NetId>,
     remaining_visits: &mut usize,
 ) -> Option<bool> {
-    let mut horizontal = Vec::new();
-    let mut vertical = Vec::new();
-    let mut selected_horizontal = Vec::new();
-    let mut selected_vertical = Vec::new();
-    for segment in segments {
-        let all = if segment.horizontal {
-            &mut horizontal
-        } else {
-            &mut vertical
-        };
-        all.push((indexed_float_key(segment.fixed), segment));
-        if selected_nets.contains(&segment.net) {
-            let selected = if segment.horizontal {
-                &mut selected_horizontal
-            } else {
-                &mut selected_vertical
-            };
-            selected.push((indexed_float_key(segment.fixed), segment));
-        }
-    }
-    for index in [
-        &mut horizontal,
-        &mut vertical,
-        &mut selected_horizontal,
-        &mut selected_vertical,
-    ] {
-        index.sort_unstable_by_key(|(key, _)| *key);
-    }
-
-    for segment in segments
-        .iter()
-        .filter(|segment| selected_nets.contains(&segment.net))
+    if raw_route_family_has_unrelated_collinear_contact(segments, selected_nets, remaining_visits)?
     {
-        let collinear = if segment.horizontal {
-            indexed_raw_segments(&horizontal, indexed_float_key(segment.fixed))
-        } else {
-            indexed_raw_segments(&vertical, indexed_float_key(segment.fixed))
-        };
-        if !collinear.is_empty() {
-            charge_negotiated_work(remaining_visits, collinear.len())?;
-            if collinear
-                .iter()
-                .any(|(_, other)| raw_route_segments_have_unrelated_contact(segment, other))
-            {
-                return Some(true);
-            }
-        }
-        let perpendicular = if segment.horizontal {
-            &vertical
-        } else {
-            &horizontal
-        };
-        for endpoint in [segment.start, segment.end] {
-            let candidates = indexed_raw_segments(perpendicular, indexed_float_key(endpoint));
-            if !candidates.is_empty() {
-                charge_negotiated_work(remaining_visits, candidates.len())?;
-                if candidates
-                    .iter()
-                    .any(|(_, other)| raw_route_segments_have_unrelated_contact(segment, other))
-                {
-                    return Some(true);
-                }
-            }
-        }
+        return Some(true);
     }
-
-    if segments
-        .iter()
-        .all(|segment| selected_nets.contains(&segment.net))
-    {
-        return Some(false);
-    }
-
-    // A moved segment can contain an endpoint owned by an unchanged segment. Query the reverse
-    // direction as well; testing only selected endpoints would miss that T-contact.
-    for segment in segments {
-        let perpendicular = if segment.horizontal {
-            &selected_vertical
-        } else {
-            &selected_horizontal
-        };
-        for endpoint in [segment.start, segment.end] {
-            let candidates = indexed_raw_segments(perpendicular, indexed_float_key(endpoint));
-            if !candidates.is_empty() {
-                charge_negotiated_work(remaining_visits, candidates.len())?;
-                if candidates
-                    .iter()
-                    .any(|(_, other)| raw_route_segments_have_unrelated_contact(segment, other))
-                {
-                    return Some(true);
-                }
-            }
-        }
-    }
-    Some(false)
-}
-
-fn indexed_raw_segments<'a>(
-    index: &'a [(u64, &'a RawRouteSegment)],
-    key: u64,
-) -> &'a [(u64, &'a RawRouteSegment)] {
-    let start = index.partition_point(|(candidate, _)| *candidate < key);
-    let end = start + index[start..].partition_point(|(candidate, _)| *candidate == key);
-    &index[start..end]
+    raw_route_family_has_unrelated_perpendicular_contact(segments, selected_nets, remaining_visits)
 }
 
 fn indexed_float_key(value: f64) -> u64 {
@@ -11062,7 +11105,7 @@ mod tests {
                     id: 2,
                     source: Endpoint { node: 3, port: 0 },
                     target: Endpoint { node: 4, port: 0 },
-                    net: 2,
+                    net: 1,
                     participates_in_ranking: true,
                 },
             ],
@@ -11074,7 +11117,7 @@ mod tests {
             },
             EdgeGeometry {
                 id: 2,
-                points: vec![Point { x: 10.0, y: 105.0 }, Point { x: 100.0, y: 105.0 }],
+                points: vec![Point { x: 10.0, y: 5.0 }, Point { x: 100.0, y: 5.0 }],
             },
         ];
         let options = LayoutOptions {
@@ -11084,11 +11127,11 @@ mod tests {
         let indexed = validate_and_index(&graph, options).unwrap();
 
         assert_eq!(
-            route_family_has_unrelated_contact_bounded(&indexed, &routes, 2, 2),
+            route_family_has_unrelated_contact_bounded(&indexed, &routes, 2, 1),
             Ok(false),
         );
         assert_eq!(
-            route_family_has_unrelated_contact_bounded(&indexed, &routes, 2, 1),
+            route_family_has_unrelated_contact_bounded(&indexed, &routes, 2, 0),
             Err(RouteContactError::WorkLimitExceeded),
         );
         assert_eq!(
@@ -11102,7 +11145,7 @@ mod tests {
         };
         let permuted = validate_and_index(&permuted, options).unwrap();
         assert_eq!(
-            route_family_has_unrelated_contact_bounded(&permuted, &routes, 2, 2),
+            route_family_has_unrelated_contact_bounded(&permuted, &routes, 2, 1),
             Ok(false),
         );
     }
@@ -14974,6 +15017,133 @@ mod tests {
                 Some(true),
             );
         }
+    }
+
+    #[test]
+    fn unrelated_contact_sweep_matches_pairwise_oracle_and_permutations() {
+        let endpoint = |node| Endpoint { node, port: 0 };
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut next = |upper: u32| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 32) as u32) % upper
+        };
+
+        for case in 0..64u32 {
+            let segments = (0..40u32)
+                .map(|edge| {
+                    let start = f64::from(next(17)) - 8.0;
+                    super::RawRouteSegment {
+                        edge,
+                        net: next(6),
+                        source: endpoint(next(12)),
+                        target: endpoint(next(12)),
+                        horizontal: next(2) == 0,
+                        fixed: f64::from(next(17)) - 8.0,
+                        start,
+                        end: start + f64::from(next(6) + 1),
+                        source_escape: None,
+                        target_escape: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut selected_nets = (0..6)
+                .filter(|net| (case + net) % 3 != 0)
+                .collect::<BTreeSet<_>>();
+            if selected_nets.is_empty() {
+                selected_nets.insert(0);
+            }
+            let expected = segments.iter().enumerate().any(|(left_index, left)| {
+                segments[left_index + 1..].iter().any(|right| {
+                    (selected_nets.contains(&left.net) || selected_nets.contains(&right.net))
+                        && raw_route_segments_have_unrelated_contact(left, right)
+                })
+            });
+
+            for ordered in [segments.clone(), segments.iter().cloned().rev().collect()] {
+                let mut visits = usize::MAX;
+                assert_eq!(
+                    raw_route_family_has_unrelated_contact(&ordered, &selected_nets, &mut visits,),
+                    Some(expected),
+                    "case {case}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_contact_sweep_does_not_charge_disjoint_collinear_segments() {
+        let endpoint = |node| Endpoint { node, port: 0 };
+        let segments = (0..5_000)
+            .map(|edge| {
+                let start = f64::from(edge) * 2.0;
+                super::RawRouteSegment {
+                    edge,
+                    net: edge,
+                    source: endpoint(edge * 2),
+                    target: endpoint(edge * 2 + 1),
+                    horizontal: true,
+                    fixed: 10.0,
+                    start,
+                    end: start + 1.0,
+                    source_escape: None,
+                    target_escape: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected_nets = segments.iter().map(|segment| segment.net).collect();
+        let mut visits = 1_000;
+
+        assert_eq!(
+            raw_route_family_has_unrelated_contact(&segments, &selected_nets, &mut visits,),
+            Some(false),
+        );
+        assert_eq!(visits, 1_000);
+    }
+
+    #[test]
+    fn unrelated_contact_sweep_does_not_charge_disjoint_perpendicular_segments() {
+        let endpoint = |node| Endpoint { node, port: 0 };
+        let vertical = (0..2_000).map(|edge| {
+            let start = f64::from(edge) * 2.0;
+            super::RawRouteSegment {
+                edge,
+                net: edge,
+                source: endpoint(edge * 2),
+                target: endpoint(edge * 2 + 1),
+                horizontal: false,
+                fixed: 10.0,
+                start,
+                end: start + 1.0,
+                source_escape: None,
+                target_escape: None,
+            }
+        });
+        let horizontal = (0..2_000).map(|offset| {
+            let edge = 2_000 + offset;
+            super::RawRouteSegment {
+                edge,
+                net: edge,
+                source: endpoint(edge * 2),
+                target: endpoint(edge * 2 + 1),
+                horizontal: true,
+                fixed: f64::from(offset) * 2.0 + 1.5,
+                start: 10.0,
+                end: 11.0,
+                source_escape: None,
+                target_escape: None,
+            }
+        });
+        let segments = vertical.chain(horizontal).collect::<Vec<_>>();
+        let selected_nets = (2_000..4_000).collect();
+        let mut visits = 1_000;
+
+        assert_eq!(
+            raw_route_family_has_unrelated_contact(&segments, &selected_nets, &mut visits,),
+            Some(false),
+        );
+        assert_eq!(visits, 1_000);
     }
 
     #[test]

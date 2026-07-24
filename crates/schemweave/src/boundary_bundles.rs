@@ -2072,34 +2072,20 @@ fn verify_rewritten_route_contacts(
     if options.edge_node_clearance <= 0.0 {
         return Ok(());
     }
-    let segments = layout
-        .edges
-        .iter()
-        .map(|route| route.points.len().saturating_sub(1))
-        .sum::<usize>();
-    if segments > crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS {
-        return Err(LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
-            maximum: crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
-        });
-    }
-    let maximum = segments.saturating_mul(segments).max(1);
-    *remaining = remaining.checked_sub(maximum).ok_or(
-        LayoutError::UnrelatedRouteContactWorkLimitExceeded {
-            maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
-        },
-    )?;
-    match crate::routing::route_family_has_unrelated_contact_bounded(
+    match crate::routing::route_family_has_unrelated_contact_with_budget(
         graph,
         &layout.edges,
         crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
-        maximum,
+        remaining,
     ) {
         Ok(false) => Ok(()),
         Ok(true) | Err(crate::routing::RouteContactError::InvalidInput) => {
             Err(LayoutError::BoundaryBundleGeometryUnsatisfied)
         }
         Err(crate::routing::RouteContactError::WorkLimitExceeded) => {
-            Err(LayoutError::UnrelatedRouteContactWorkLimitExceeded { maximum })
+            Err(LayoutError::UnrelatedRouteContactWorkLimitExceeded {
+                maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
+            })
         }
         Err(crate::routing::RouteContactError::SegmentLimitExceeded) => {
             Err(LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
@@ -2472,6 +2458,71 @@ mod tests {
             None
         );
         assert_eq!(exhausted_budget, 0);
+    }
+
+    #[test]
+    fn rewritten_contact_verification_charges_only_indexed_candidates() {
+        let edge_count = 600u32;
+        let graph = Graph {
+            nodes: (0..edge_count)
+                .flat_map(|edge| {
+                    [
+                        node(edge * 2 + 1, PortSide::East),
+                        node(edge * 2 + 2, PortSide::West),
+                    ]
+                })
+                .collect(),
+            edges: (0..edge_count)
+                .map(|edge| Edge {
+                    id: edge,
+                    source: Endpoint {
+                        node: edge * 2 + 1,
+                        port: 0,
+                    },
+                    target: Endpoint {
+                        node: edge * 2 + 2,
+                        port: 0,
+                    },
+                    net: edge,
+                    participates_in_ranking: true,
+                })
+                .collect(),
+        };
+        let options = LayoutOptions {
+            edge_node_clearance: 1.0,
+            ..LayoutOptions::default()
+        };
+        let indexed =
+            validate_and_index_with_constraints(&graph, options, &LayoutConstraints::default())
+                .unwrap();
+        let layout = Layout {
+            nodes: Vec::new(),
+            edges: (0..edge_count)
+                .map(|edge| EdgeGeometry {
+                    id: edge,
+                    points: vec![
+                        Point {
+                            x: 0.0,
+                            y: f64::from(edge) * 2.0,
+                        },
+                        Point {
+                            x: 100.0,
+                            y: f64::from(edge) * 2.0,
+                        },
+                    ],
+                })
+                .collect(),
+            boundary_bundles: Vec::new(),
+            width: 100.0,
+            height: f64::from(edge_count) * 2.0,
+        };
+        let mut remaining = 1_000;
+
+        assert_eq!(
+            verify_rewritten_route_contacts(&indexed, &layout, options, &mut remaining),
+            Ok(()),
+        );
+        assert_eq!(remaining, 1_000);
     }
 
     #[test]
