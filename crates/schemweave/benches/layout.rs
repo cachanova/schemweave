@@ -1,7 +1,10 @@
 mod support;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use schemweave::{Graph, LayoutConfig, QualityEffort, layout_with_config};
+use schemweave::{
+    BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Endpoint, Graph, LayoutConfig,
+    QualityEffort, layout_with_config,
+};
 use support::generators;
 
 #[allow(clippy::field_reassign_with_default)]
@@ -16,6 +19,69 @@ const EFFORTS: [(&str, QualityEffort); 3] = [
     ("quality", QualityEffort::Quality),
     ("max", QualityEffort::Max),
 ];
+
+fn boundary_config(
+    graph: &Graph,
+    effort: QualityEffort,
+    input: bool,
+    boundary_nodes: &[u32],
+    width: u32,
+) -> LayoutConfig {
+    let mut config = config(effort);
+    if input {
+        config.constraints.inputs = boundary_nodes.to_vec();
+    } else {
+        config.constraints.outputs = boundary_nodes.to_vec();
+    }
+    config.constraints.boundary_bundles = boundary_nodes
+        .iter()
+        .enumerate()
+        .map(|(bundle, &node)| {
+            let mut edges = graph
+                .edges
+                .iter()
+                .filter(|edge| {
+                    if input {
+                        edge.source.node == node
+                    } else {
+                        edge.target.node == node
+                    }
+                })
+                .collect::<Vec<_>>();
+            edges.sort_unstable_by_key(|edge| edge.id);
+            let endpoint = if input {
+                edges[0].source
+            } else {
+                edges[0].target
+            };
+            let members = if edges.len() == 1 {
+                vec![BoundaryBundleMemberConstraint {
+                    edge: edges[0].id,
+                    slots: (0..width).collect(),
+                }]
+            } else {
+                edges
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, edge)| BoundaryBundleMemberConstraint {
+                        edge: edge.id,
+                        slots: vec![slot as u32],
+                    })
+                    .collect()
+            };
+            BoundaryBundleConstraint {
+                id: bundle as u32 + 1,
+                endpoint: Endpoint {
+                    node: endpoint.node,
+                    port: endpoint.port,
+                },
+                width,
+                members,
+            }
+        })
+        .collect();
+    config
+}
 
 fn assert_reproducible(graph: &Graph, config: &LayoutConfig) {
     let first = layout_with_config(graph, config).expect("fixture must lay out");
@@ -187,6 +253,61 @@ fn expand_benches(c: &mut Criterion) {
                     },
                 );
             }
+        }
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("expand/affected-boundary");
+    for (role, fixture) in [
+        (
+            "fanout",
+            generators::boundary_fanout_expansion_pair
+                as fn(u32) -> (Graph, Graph, schemweave::GroupExpansion),
+        ),
+        ("fanin", generators::boundary_fanin_expansion_pair),
+    ] {
+        let members = 16;
+        let (compact, expanded, expansion) = fixture(members);
+        for (effort_label, effort) in EFFORTS {
+            let input = role == "fanout";
+            let boundary_nodes = if input { vec![0] } else { vec![2] };
+            let compact_config = boundary_config(&compact, effort, input, &boundary_nodes, members);
+            let config = boundary_config(&expanded, effort, input, &boundary_nodes, members);
+            let compact_layout = layout_with_config(&compact, &compact_config)
+                .expect("compact fixture must lay out");
+            let options = GroupExpansionOptions {
+                layout: config.layout,
+                quality_effort: config.quality_effort,
+                constraints: config.constraints.clone(),
+                protected_groups: Vec::new(),
+            };
+            let first =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("affected-boundary expansion");
+            let second =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("affected-boundary expansion");
+            assert_eq!(
+                first, second,
+                "affected-boundary expansion must be deterministic before measuring"
+            );
+            group.throughput(Throughput::Elements(expanded.edges.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new(role, effort_label),
+                &(&compact, &compact_layout, &expanded, &expansion),
+                |b, (compact, compact_layout, expanded, expansion)| {
+                    b.iter(|| {
+                        expand_group_in_place(
+                            compact,
+                            compact_layout,
+                            expanded,
+                            expansion,
+                            &options,
+                        )
+                        .expect("affected-boundary expansion")
+                    })
+                },
+            );
         }
     }
     group.finish();

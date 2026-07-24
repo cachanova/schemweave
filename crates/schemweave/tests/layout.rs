@@ -1635,6 +1635,161 @@ fn highest_quality_routes_captured_reg_mux_boundary_bundles_with_positive_cleara
 }
 
 #[test]
+fn captured_reg_mux_vectors_share_one_route_to_the_same_compact_endpoint() {
+    let ports = |entries: &[(u32, PortSide, f64)]| {
+        entries
+            .iter()
+            .map(|&(id, side, offset)| Port { id, side, offset })
+            .collect()
+    };
+    let nodes = vec![
+        Node {
+            id: 26,
+            width: 74.0,
+            height: 34.0,
+            cycle_breaker: false,
+            ports: ports(&[(0, PortSide::East, 17.0)]),
+        },
+        Node {
+            id: 43,
+            width: 92.0,
+            height: 84.0,
+            cycle_breaker: true,
+            ports: ports(&[(0, PortSide::West, 18.56), (1, PortSide::East, 29.0)]),
+        },
+        Node {
+            id: 44,
+            width: 70.0,
+            height: 72.0,
+            cycle_breaker: false,
+            ports: ports(&[
+                (0, PortSide::West, 18.0),
+                (1, PortSide::West, 36.0),
+                (2, PortSide::West, 54.0),
+                (3, PortSide::East, 36.0),
+            ]),
+        },
+        Node {
+            id: 45,
+            width: 74.0,
+            height: 34.0,
+            cycle_breaker: false,
+            ports: ports(&[(0, PortSide::East, 17.0)]),
+        },
+        Node {
+            id: 46,
+            width: 74.0,
+            height: 34.0,
+            cycle_breaker: false,
+            ports: ports(&[(0, PortSide::East, 17.0)]),
+        },
+        Node {
+            id: 47,
+            width: 74.0,
+            height: 34.0,
+            cycle_breaker: false,
+            ports: ports(&[(0, PortSide::West, 17.0)]),
+        },
+    ];
+    let edge = |id, source_node, source_port, target_node, target_port, net| Edge {
+        id,
+        source: Endpoint {
+            node: source_node,
+            port: source_port,
+        },
+        target: Endpoint {
+            node: target_node,
+            port: target_port,
+        },
+        net,
+        participates_in_ranking: true,
+    };
+    let mut edges = vec![edge(0, 26, 0, 44, 2, 25), edge(9, 44, 3, 43, 0, 24)];
+    edges.extend((1..=8).map(|id| edge(id, 43, 1, 47, 0, id + 10)));
+    edges.extend((10..=17).map(|id| edge(id, 45, 0, 44, 0, id - 10)));
+    edges.extend((18..=25).map(|id| edge(id, 46, 0, 44, 1, id - 15)));
+    let graph = Graph { nodes, edges };
+    let members = |first: u32| {
+        (0..8)
+            .map(|slot| BoundaryBundleMemberConstraint {
+                edge: first + slot,
+                slots: vec![slot],
+            })
+            .collect()
+    };
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints = LayoutConstraints {
+        inputs: vec![26, 45, 46],
+        outputs: vec![47],
+        boundary_bundles: vec![
+            BoundaryBundleConstraint {
+                id: 0,
+                endpoint: Endpoint { node: 45, port: 0 },
+                width: 8,
+                members: members(10),
+            },
+            BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 46, port: 0 },
+                width: 8,
+                members: members(18),
+            },
+            BoundaryBundleConstraint {
+                id: 2,
+                endpoint: Endpoint { node: 47, port: 0 },
+                width: 8,
+                members: members(1),
+            },
+        ],
+    };
+
+    let result = layout_with_config(&graph, &config).unwrap();
+    for bundle in &result.boundary_bundles {
+        let routes = bundle
+            .members
+            .iter()
+            .map(|member| {
+                result
+                    .edges
+                    .iter()
+                    .find(|route| route.id == member.edge)
+                    .unwrap()
+                    .points
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            routes.windows(2).all(|pair| pair[0] == pair[1]),
+            "the members of boundary bundle {} should reuse one route",
+            bundle.id
+        );
+        assert!(
+            bundle
+                .members
+                .iter()
+                .all(|member| member.tap == bundle.members[0].tap),
+            "the members of boundary bundle {} should leave through one shared tap",
+            bundle.id
+        );
+    }
+
+    let mut permuted_graph = graph.clone();
+    permuted_graph.nodes.reverse();
+    permuted_graph.edges.reverse();
+    let mut permuted_config = config.clone();
+    permuted_config.constraints.inputs.reverse();
+    permuted_config.constraints.outputs.reverse();
+    permuted_config.constraints.boundary_bundles.reverse();
+    for bundle in &mut permuted_config.constraints.boundary_bundles {
+        bundle.members.reverse();
+    }
+    assert_eq!(
+        result,
+        layout_with_config(&permuted_graph, &permuted_config).unwrap()
+    );
+}
+
+#[test]
 fn input_boundary_bundle_advances_one_collector_to_the_first_interior_divergence() {
     let graph = Graph {
         nodes: vec![
