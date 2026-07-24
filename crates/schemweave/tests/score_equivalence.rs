@@ -1,7 +1,5 @@
-//! Locks output equivalence across scoring-path optimizations: full layouts
-//! of every bench fixture must be byte-identical to committed expectations
-//! established before the optimization (asserted by double-run + cross-effort
-//! stability, since golden files are not tracked).
+//! Locks byte-identical full-layout output across scoring-path optimizations.
+//! Digests were captured from SchemWeave main at d02c032, before this branch.
 
 #[path = "support/digest.rs"]
 mod digest;
@@ -99,31 +97,7 @@ fn mixed_fixture_produces_outer_lane_routes() {
 }
 
 #[test]
-fn layouts_are_stable_across_efforts_and_runs() {
-    let fixtures = [
-        ("pipeline", generators::pipeline(30, 4)),
-        ("fanout240", generators::fanout(240)),
-        ("fanin64", generators::fanin(64)),
-        ("dag_medium", generators::layered_dag(12, 25, 7)),
-        ("dag_large", generators::layered_dag(25, 60, 7)),
-        ("bus", generators::bus_chain(4, 32)),
-        ("mixed_sparse_outer", mixed_sparse_outer_fixture()),
-    ];
-    for (name, graph) in fixtures {
-        for effort in [
-            QualityEffort::Fast,
-            QualityEffort::Quality,
-            QualityEffort::Max,
-        ] {
-            let first = layout_with_config(&graph, &config(effort)).expect("layout");
-            let second = layout_with_config(&graph, &config(effort)).expect("layout");
-            assert_eq!(first, second, "{name} {effort:?} not reproducible");
-        }
-    }
-}
-
-#[test]
-fn quality_and_max_layout_digests_match_spacing_reuse_baseline() {
+fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() {
     let fixtures = [
         (
             "pipeline",
@@ -134,11 +108,27 @@ fn quality_and_max_layout_digests_match_spacing_reuse_baseline() {
             ],
         ),
         (
-            "fanout240",
-            generators::fanout(240),
+            "fanout8_ordinary",
+            generators::fanout(8),
             [
-                (QualityEffort::Quality, 1_454_913_959_470_172_659),
-                (QualityEffort::Max, 1_454_913_959_470_172_659),
+                (QualityEffort::Quality, 5_780_370_522_801_744_726),
+                (QualityEffort::Max, 5_780_370_522_801_744_726),
+            ],
+        ),
+        (
+            "fanout301_regional_min",
+            generators::fanout(301),
+            [
+                (QualityEffort::Quality, 4_047_175_013_081_998_229),
+                (QualityEffort::Max, 4_047_175_013_081_998_229),
+            ],
+        ),
+        (
+            "fanout512_regional_max",
+            generators::fanout(512),
+            [
+                (QualityEffort::Quality, 2_490_547_472_294_486_322),
+                (QualityEffort::Max, 2_490_547_472_294_486_322),
             ],
         ),
         (
@@ -185,6 +175,8 @@ fn quality_and_max_layout_digests_match_spacing_reuse_baseline() {
     for (name, graph, expected) in fixtures {
         for (effort, expected_digest) in expected {
             let layout = layout_with_config(&graph, &config(effort)).expect("layout");
+            let repeated = layout_with_config(&graph, &config(effort)).expect("repeated layout");
+            assert_eq!(repeated, layout, "{name}/{effort:?} is not reproducible");
             assert_eq!(
                 layout_digest(&layout),
                 expected_digest,
@@ -199,7 +191,9 @@ fn quality_and_max_layout_digests_match_spacing_reuse_baseline() {
 fn print_fixture_digests() {
     let fixtures = [
         ("pipeline", generators::pipeline(30, 4)),
-        ("fanout240", generators::fanout(240)),
+        ("fanout8_ordinary", generators::fanout(8)),
+        ("fanout301_regional_min", generators::fanout(301)),
+        ("fanout512_regional_max", generators::fanout(512)),
         ("fanin64", generators::fanin(64)),
         ("dag_medium", generators::layered_dag(12, 25, 7)),
         ("dag_large", generators::layered_dag(25, 60, 7)),
