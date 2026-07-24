@@ -2,7 +2,7 @@ use schemweave::{
     BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Graph, GroupCollapseOptions,
     GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConfig,
     LayoutConstraints, collapse_group_in_place, expand_group_in_place,
-    expand_group_in_place_with_reference_height,
+    expand_group_in_place_with_reference_height, layout_with_config,
 };
 use serde::Deserialize;
 
@@ -181,6 +181,44 @@ fn captured_register_vector_expands_without_a_full_relayout() {
             .iter()
             .any(|point| point.y > frame_top && point.y < frame_bottom),
         "the shared fanout trunk should enter through the expanded frame, not detour around it"
+    );
+}
+
+#[test]
+fn current_register_vector_layout_expands_without_a_full_relayout() {
+    let mut captured = captured_register_vector_expansion();
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints = captured.constraints.clone();
+    captured.compact_layout =
+        layout_with_config(&captured.compact_graph, &config).expect("compact layout succeeds");
+
+    let expanded = expand_without_a_full_relayout(&captured);
+    assert_eq!(
+        &expanded.boundary_bundles[..2],
+        &captured.compact_layout.boundary_bundles[..2],
+        "unaffected input bundles remain byte-identical",
+    );
+    let output = expanded
+        .boundary_bundles
+        .iter()
+        .find(|bundle| bundle.id == 2)
+        .expect("expanded output bundle exists");
+    let member_right = expanded
+        .nodes
+        .iter()
+        .filter(|node| captured.expansion.members.contains(&node.id))
+        .map(|node| node.x + node.width)
+        .max_by(f64::total_cmp)
+        .expect("expanded group contains members");
+    let output_left = expanded
+        .nodes
+        .iter()
+        .find(|node| node.id == output.endpoint.node)
+        .expect("output endpoint exists")
+        .x;
+    assert!(
+        output.collector.start.x > member_right && output.collector.start.x < output_left,
+        "affected output bundle should be replanned between the expanded group and output",
     );
 }
 
