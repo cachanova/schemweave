@@ -252,3 +252,83 @@ pub fn expansion_pair(members: u32, bystanders: u32) -> (Graph, Graph, GroupExpa
     };
     (compact, expanded, expansion)
 }
+
+/// A wider expansion followed by one retained peer chain. The peer lies
+/// entirely to the right of the compact anchor, so opening the horizontal
+/// corridor must translate every peer node and internal route rigidly.
+///
+/// Node ids: 0 = driver, 1 = anchor, 200.. = expanded members,
+/// 400.. = retained peer members.
+pub fn protected_horizontal_expansion_pair(
+    members: u32,
+    peer_members: u32,
+) -> (Graph, Graph, GroupExpansion, Vec<u32>) {
+    assert!(members >= 2);
+    assert!(peer_members >= 1);
+    let driver = block(0, 0, 1);
+    let anchor = block(1, 1, 1);
+    let member_ids = (0..members).map(|index| 200 + index).collect::<Vec<_>>();
+    let peer_ids = (0..peer_members)
+        .map(|index| 400 + index)
+        .collect::<Vec<_>>();
+    let peer_nodes = peer_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| block(id, 1, u32::from(index + 1 < peer_ids.len())))
+        .collect::<Vec<_>>();
+    let peer_edges = peer_ids
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| {
+            let id = 500 + index as u32;
+            edge(id, (pair[0], 1), (pair[1], 0), id)
+        })
+        .collect::<Vec<_>>();
+
+    let mut compact_nodes = vec![driver.clone(), anchor];
+    compact_nodes.extend(peer_nodes.iter().cloned());
+    let mut compact_edges = vec![
+        edge(1, (0, 0), (1, 0), 1),
+        edge(2, (1, 1), (peer_ids[0], 0), 2),
+    ];
+    compact_edges.extend(peer_edges.iter().cloned());
+    let compact = Graph {
+        nodes: compact_nodes,
+        edges: compact_edges,
+    };
+
+    let mut expanded_nodes = vec![driver];
+    expanded_nodes.extend(member_ids.iter().map(|&id| block(id, 1, 1)));
+    expanded_nodes.extend(peer_nodes);
+    let mut expanded_edges = vec![edge(10, (0, 0), (member_ids[0], 0), 1)];
+    for pair in member_ids.windows(2) {
+        let id = 300 + expanded_edges.len() as u32;
+        expanded_edges.push(edge(id, (pair[0], 1), (pair[1], 0), id));
+    }
+    expanded_edges.push(edge(
+        11,
+        (*member_ids.last().expect("members >= 2"), 1),
+        (peer_ids[0], 0),
+        2,
+    ));
+    expanded_edges.extend(peer_edges);
+    let expanded = Graph {
+        nodes: expanded_nodes,
+        edges: expanded_edges,
+    };
+    let expansion = GroupExpansion {
+        anchor: 1,
+        members: member_ids,
+        boundary_trunks: vec![
+            BoundaryTrunk {
+                expanded_edge: 10,
+                compact_edge: 1,
+            },
+            BoundaryTrunk {
+                expanded_edge: 11,
+                compact_edge: 2,
+            },
+        ],
+    };
+    (compact, expanded, expansion, peer_ids)
+}

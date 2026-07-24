@@ -79,7 +79,8 @@ fn layout_benches(c: &mut Criterion) {
 }
 
 use schemweave::{
-    GroupCollapseOptions, GroupExpansionOptions, collapse_group_in_place, expand_group_in_place,
+    GroupCollapseOptions, GroupExpansionOptions, ProtectedGroup, collapse_group_in_place,
+    expand_group_in_place,
 };
 
 fn expand_benches(c: &mut Criterion) {
@@ -95,6 +96,7 @@ fn expand_benches(c: &mut Criterion) {
                 layout: config.layout,
                 quality_effort: config.quality_effort,
                 constraints: config.constraints.clone(),
+                protected_groups: Vec::new(),
             };
             let first =
                 expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
@@ -125,6 +127,78 @@ fn expand_benches(c: &mut Criterion) {
         }
     }
     group.finish();
+
+    let mut group = c.benchmark_group("expand/protected-peers");
+    for (label, peer_count, peer_members) in [("1x8", 1, 8), ("8x1", 8, 1)] {
+        let (compact, expanded, expansion, peer_ids) =
+            generators::protected_horizontal_expansion_pair(8, peer_count * peer_members);
+        for (effort_label, effort) in EFFORTS {
+            let config = config(effort);
+            let compact_layout =
+                layout_with_config(&compact, &config).expect("compact fixture must lay out");
+            let protected_groups = (0..peer_count)
+                .map(|group| ProtectedGroup {
+                    id: 1_000 + group,
+                    members: peer_ids
+                        [(group * peer_members) as usize..((group + 1) * peer_members) as usize]
+                        .to_vec(),
+                    frame_padding: 16.0,
+                })
+                .collect();
+            let options = GroupExpansionOptions {
+                layout: config.layout,
+                quality_effort: config.quality_effort,
+                constraints: config.constraints.clone(),
+                protected_groups,
+            };
+            let first =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("protected expansion");
+            let second =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("protected expansion");
+            assert_eq!(
+                first, second,
+                "protected expansion must be deterministic before measuring"
+            );
+            let compact_peer_left = compact_layout
+                .nodes
+                .iter()
+                .filter(|node| peer_ids.contains(&node.id))
+                .map(|node| node.x)
+                .min_by(f64::total_cmp)
+                .expect("compact peer frame");
+            let expanded_peer_left = first
+                .nodes
+                .iter()
+                .filter(|node| peer_ids.contains(&node.id))
+                .map(|node| node.x)
+                .min_by(f64::total_cmp)
+                .expect("expanded peer frame");
+            assert!(
+                expanded_peer_left > compact_peer_left,
+                "protected benchmark must exercise horizontal corridor movement"
+            );
+            group.throughput(Throughput::Elements(expanded.edges.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new(label, effort_label),
+                &(&compact, &compact_layout, &expanded, &expansion),
+                |b, (compact, compact_layout, expanded, expansion)| {
+                    b.iter(|| {
+                        expand_group_in_place(
+                            compact,
+                            compact_layout,
+                            expanded,
+                            expansion,
+                            &options,
+                        )
+                        .expect("protected expansion")
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
 }
 
 fn collapse_benches(c: &mut Criterion) {
@@ -139,6 +213,7 @@ fn collapse_benches(c: &mut Criterion) {
                 layout: config.layout,
                 quality_effort: config.quality_effort,
                 constraints: config.constraints.clone(),
+                protected_groups: Vec::new(),
             };
             let expanded_layout = expand_group_in_place(
                 &compact,

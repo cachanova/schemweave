@@ -58,10 +58,13 @@ geometry, opens a horizontal corridor for additional width, and can move the
 connected local vertical slab obstructing a taller expansion. Routes crossing
 that slab receive deterministic orthogonal jogs; the non-reflow retained
 candidate remains available when local reflow is unsafe or over budget. The
-engine lays out members canonically and accepts either composition only when
-all hard geometry and left-to-right invariants hold. Native callers receive
-`GroupExpansionError`; the WASM boundary converts selected safe fallbacks into
-a tagged full-relayout response.
+caller can identify already-expanded peers as protected groups. Their frames
+participate atomically in slab closure, their members and internal routes move
+rigidly, and new member frames cannot enter their declared keep-out padding.
+The engine lays out members canonically and accepts either composition only
+when all hard geometry and left-to-right invariants hold. Native callers
+receive `GroupExpansionError`; the WASM boundary converts selected safe
+fallbacks into a tagged full-relayout response.
 
 ## Invariants
 

@@ -27,7 +27,7 @@ use thiserror::Error;
 
 pub use incremental::{
     BoundaryTrunk, GroupCollapseOptions, GroupExpansion, GroupExpansionError,
-    GroupExpansionOptions, collapse_group_in_place, expand_group_in_place,
+    GroupExpansionOptions, ProtectedGroup, collapse_group_in_place, expand_group_in_place,
     expand_group_in_place_with_reference_height,
 };
 pub use placement::place;

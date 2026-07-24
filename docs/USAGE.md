@@ -97,10 +97,13 @@ reference. Call it from a reusable Web Worker. The consumer owns cancellation,
 caching, request supersession, and rendering.
 
 `expand_group_json` accepts compact graph/layout JSON, expanded graph JSON, and
-expansion metadata. A successful call returns either `status: "layout"` or
-`status: "needs_full_relayout"` with `geometry`, `work_limit`, or
-`preserved_geometry_too_large` as its reason; request a normal layout for the
-latter. Malformed input and other contract failures reject with an error.
+expansion metadata. Expansion options may include `protected_groups`, each with
+a stable `id`, retained `members`, and nonnegative `frame_padding`; later local
+reflow treats those active peer groups as atomic keep-out regions. A successful
+call returns either `status: "layout"` or `status: "needs_full_relayout"` with
+`geometry`, `work_limit`, or `preserved_geometry_too_large` as its reason;
+request a normal layout for the latter. Malformed input and other contract
+failures reject with an error.
 
 The model is optimized for directed, port-based data-flow. See
 [Architecture](ARCHITECTURE.md) and [Evaluation](EVALUATION.md).
