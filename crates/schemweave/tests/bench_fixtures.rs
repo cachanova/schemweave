@@ -21,6 +21,47 @@ fn generators_are_deterministic() {
         generators::layered_dag(6, 8, 7)
     );
     assert_eq!(generators::bus_chain(3, 8), generators::bus_chain(3, 8));
+    assert_eq!(
+        generators::protected_horizontal_expansion_pair(8, 8),
+        generators::protected_horizontal_expansion_pair(8, 8)
+    );
+}
+
+#[test]
+fn protected_expansion_fixture_moves_the_peer_corridor() {
+    use schemweave::{GroupExpansionOptions, ProtectedGroup, expand_group_in_place};
+
+    let (compact, expanded, expansion, peer_ids) =
+        generators::protected_horizontal_expansion_pair(8, 8);
+    let config = fast();
+    let compact_layout = layout_with_config(&compact, &config).expect("compact protected fixture");
+    let layout = expand_group_in_place(
+        &compact,
+        &compact_layout,
+        &expanded,
+        &expansion,
+        &GroupExpansionOptions {
+            layout: config.layout,
+            quality_effort: config.quality_effort,
+            constraints: config.constraints,
+            protected_groups: vec![ProtectedGroup {
+                id: 1_000,
+                members: peer_ids.clone(),
+                frame_padding: 16.0,
+            }],
+        },
+    )
+    .expect("protected horizontal expansion");
+    let peer_left = |layout: &schemweave::Layout| {
+        layout
+            .nodes
+            .iter()
+            .filter(|node| peer_ids.contains(&node.id))
+            .map(|node| node.x)
+            .min_by(f64::total_cmp)
+            .expect("peer frame")
+    };
+    assert!(peer_left(&layout) > peer_left(&compact_layout));
 }
 
 #[test]

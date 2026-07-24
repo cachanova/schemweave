@@ -130,14 +130,8 @@ fn expand_benches(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("expand/protected-peers");
     for (label, peer_count, peer_members) in [("1x8", 1, 8), ("8x1", 8, 1)] {
-        let bystanders = peer_count * peer_members;
-        let (mut compact, expanded, expansion) = generators::expansion_pair(8, bystanders);
-        compact
-            .nodes
-            .iter_mut()
-            .find(|node| node.id == expansion.anchor)
-            .expect("compact anchor")
-            .width = 2_400.0;
+        let (compact, expanded, expansion, peer_ids) =
+            generators::protected_horizontal_expansion_pair(8, peer_count * peer_members);
         for (effort_label, effort) in EFFORTS {
             let config = config(effort);
             let compact_layout =
@@ -145,9 +139,9 @@ fn expand_benches(c: &mut Criterion) {
             let protected_groups = (0..peer_count)
                 .map(|group| ProtectedGroup {
                     id: 1_000 + group,
-                    members: (0..peer_members)
-                        .map(|member| 3 + group * peer_members + member)
-                        .collect(),
+                    members: peer_ids
+                        [(group * peer_members) as usize..((group + 1) * peer_members) as usize]
+                        .to_vec(),
                     frame_padding: 16.0,
                 })
                 .collect();
@@ -166,6 +160,24 @@ fn expand_benches(c: &mut Criterion) {
             assert_eq!(
                 first, second,
                 "protected expansion must be deterministic before measuring"
+            );
+            let compact_peer_left = compact_layout
+                .nodes
+                .iter()
+                .filter(|node| peer_ids.contains(&node.id))
+                .map(|node| node.x)
+                .min_by(f64::total_cmp)
+                .expect("compact peer frame");
+            let expanded_peer_left = first
+                .nodes
+                .iter()
+                .filter(|node| peer_ids.contains(&node.id))
+                .map(|node| node.x)
+                .min_by(f64::total_cmp)
+                .expect("expanded peer frame");
+            assert!(
+                expanded_peer_left > compact_peer_left,
+                "protected benchmark must exercise horizontal corridor movement"
             );
             group.throughput(Throughput::Elements(expanded.edges.len() as u64));
             group.bench_with_input(

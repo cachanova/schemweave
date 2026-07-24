@@ -2292,16 +2292,27 @@ fn insert_local_vertical_expansion_corridor(
                 && frame.bottom + HARD_GATE_EPSILON >= cut
         })
         .collect::<Vec<_>>();
-    if compact_layout.nodes.iter().any(|node| {
-        node.id != anchor
-            && !owner_by_member
-                .get(&node.id)
-                .is_some_and(|&group| moved_groups[group])
-            && node.x < slab.right - HARD_GATE_EPSILON
-            && node.x + node.width > slab.left + HARD_GATE_EPSILON
-            && node.y < cut - HARD_GATE_EPSILON
-            && node.y + node.height > cut + HARD_GATE_EPSILON
-    }) {
+    let cut_crosses_unmoved_node = if protected_frames.is_empty() {
+        compact_layout.nodes.iter().any(|node| {
+            node.id != anchor
+                && node.x < slab.right - HARD_GATE_EPSILON
+                && node.x + node.width > slab.left + HARD_GATE_EPSILON
+                && node.y < cut - HARD_GATE_EPSILON
+                && node.y + node.height > cut + HARD_GATE_EPSILON
+        })
+    } else {
+        compact_layout.nodes.iter().any(|node| {
+            node.id != anchor
+                && !owner_by_member
+                    .get(&node.id)
+                    .is_some_and(|&group| moved_groups[group])
+                && node.x < slab.right - HARD_GATE_EPSILON
+                && node.x + node.width > slab.left + HARD_GATE_EPSILON
+                && node.y < cut - HARD_GATE_EPSILON
+                && node.y + node.height > cut + HARD_GATE_EPSILON
+        })
+    };
+    if cut_crosses_unmoved_node {
         return None;
     }
 
@@ -2396,17 +2407,8 @@ fn insert_local_vertical_expansion_corridor(
     if route_segment_count(&expanded) > MAX_LAYOUT_SEGMENTS {
         return None;
     }
-    for bundle in &mut expanded.boundary_bundles {
-        let endpoint_group = owner_by_member.get(&bundle.endpoint.node).copied();
-        if endpoint_group.is_some_and(|group| moved_groups[group]) {
-            bundle.collector.start.y += delta;
-            bundle.collector.end.y += delta;
-            bundle.spine.start.y += delta;
-            bundle.spine.end.y += delta;
-            for member in &mut bundle.members {
-                member.tap.y += delta;
-            }
-        } else {
+    if protected_frames.is_empty() {
+        for bundle in &mut expanded.boundary_bundles {
             bundle.collector =
                 warp_vertical_slab_segment(bundle.collector, slab.left, slab.right, cut, delta)?;
             bundle.spine =
@@ -2414,6 +2416,33 @@ fn insert_local_vertical_expansion_corridor(
             for member in &mut bundle.members {
                 member.tap =
                     warp_vertical_slab_point(member.tap, slab.left, slab.right, cut, delta);
+            }
+        }
+    } else {
+        for bundle in &mut expanded.boundary_bundles {
+            let endpoint_group = owner_by_member.get(&bundle.endpoint.node).copied();
+            if endpoint_group.is_some_and(|group| moved_groups[group]) {
+                bundle.collector.start.y += delta;
+                bundle.collector.end.y += delta;
+                bundle.spine.start.y += delta;
+                bundle.spine.end.y += delta;
+                for member in &mut bundle.members {
+                    member.tap.y += delta;
+                }
+            } else {
+                bundle.collector = warp_vertical_slab_segment(
+                    bundle.collector,
+                    slab.left,
+                    slab.right,
+                    cut,
+                    delta,
+                )?;
+                bundle.spine =
+                    warp_vertical_slab_segment(bundle.spine, slab.left, slab.right, cut, delta)?;
+                for member in &mut bundle.members {
+                    member.tap =
+                        warp_vertical_slab_point(member.tap, slab.left, slab.right, cut, delta);
+                }
             }
         }
     }
