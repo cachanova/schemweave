@@ -482,8 +482,17 @@ pub(crate) fn verify_preserved_geometry_structure(
             .last()
             .map_or(0, |member| member.tap_lane + 1);
         let center = lane_count.saturating_sub(1) as f64 / 2.0;
+        let mut declared_members = HashMap::with_capacity(geometry.members.len());
+        for declared in &geometry.members {
+            if declared_members.insert(declared.edge, declared).is_some() {
+                return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+            }
+        }
         let mut expected_taps = Vec::with_capacity(bundle.members.len());
-        for (member, declared) in bundle.members.iter().zip(&geometry.members) {
+        for member in &bundle.members {
+            let Some(declared) = declared_members.get(&member.edge).copied() else {
+                return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+            };
             let expected_tap = Point {
                 x: collector_center.x,
                 y: collector_center.y + (member.tap_lane as f64 - center) * pitch,
@@ -1076,6 +1085,68 @@ mod tests {
         let once = apply_and_normalize(&indexed, layout, options).unwrap();
         let twice = apply_and_normalize(&indexed, once.clone(), options).unwrap();
         assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn preserved_bundle_geometry_is_member_order_invariant_but_rejects_duplicates() {
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1],
+            outputs: vec![2, 3],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 1, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            }],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let layout = crate::layout_with_constraints(&graph, options, &constraints).unwrap();
+
+        let mut permuted = layout.clone();
+        permuted.boundary_bundles[0].members.reverse();
+        assert_eq!(
+            verify_preserved_geometry_structure(&indexed, &permuted, options),
+            Ok(())
+        );
+
+        permuted.boundary_bundles[0].members[1].edge = permuted.boundary_bundles[0].members[0].edge;
+        assert_eq!(
+            verify_preserved_geometry_structure(&indexed, &permuted, options),
+            Err(LayoutError::BoundaryBundleGeometryUnsatisfied)
+        );
     }
 
     fn node(id: u32, side: PortSide) -> Node {

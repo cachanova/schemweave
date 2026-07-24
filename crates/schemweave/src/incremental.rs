@@ -341,9 +341,27 @@ pub fn collapse_group_in_place(
         &expanded_edge_geometry,
         options.layout,
     )?;
-    let candidate =
+    let mut candidate =
         boundary_bundles::apply_and_normalize(&compact_indexed, candidate, options.layout)
             .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
+    // Bundle normalization may recompute an equivalent tap coordinate with a
+    // few ULPs of floating-point drift. Restore unrelated routes from the
+    // validated expanded layout before admission so collapse keeps its exact
+    // retained-geometry contract rather than falling back on numeric noise.
+    if candidate.edges.len() != compact_indexed.edges.len() {
+        return Err(GroupExpansionError::NeedsFullRelayout);
+    }
+    for (candidate_edge, edge) in candidate.edges.iter_mut().zip(&compact_indexed.edges) {
+        if candidate_edge.id != edge.id {
+            return Err(GroupExpansionError::NeedsFullRelayout);
+        }
+        if edge.source.node != expansion.anchor && edge.target.node != expansion.anchor {
+            let Some(expanded_edge) = expanded_edge_geometry.get(&edge.id) else {
+                return Err(GroupExpansionError::NeedsFullRelayout);
+            };
+            *candidate_edge = (*expanded_edge).clone();
+        }
+    }
     if route_segment_count(&candidate) > MAX_LAYOUT_SEGMENTS {
         return Err(GroupExpansionError::PreservedGeometryTooLarge {
             actual: route_segment_count(&candidate),
@@ -5354,6 +5372,29 @@ mod tests {
                 .unwrap()
                 .points[0],
             compact_bundle.members[0].tap
+        );
+
+        let collapsed = collapse_group_in_place(
+            &expanded,
+            &result,
+            &compact,
+            &expansion,
+            &GroupCollapseOptions {
+                layout: options,
+                constraints: compact_constraints,
+            },
+        )
+        .unwrap();
+        assert!(
+            crate::routing::route_family_satisfies_parallel_spacing_bounded(
+                &crate::validation::validate_and_index(&compact, options).unwrap(),
+                &collapsed.edges,
+                options.minimum_parallel_wire_spacing,
+                crate::outward_obstacle_clearance_stub(options),
+                crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
+                crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
+            )
+            .unwrap()
         );
     }
 

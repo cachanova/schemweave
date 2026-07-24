@@ -15,6 +15,15 @@ struct CapturedExpansion {
     constraints: LayoutConstraints,
 }
 
+#[derive(Clone, Deserialize)]
+struct CapturedCollapse {
+    expanded_graph: Graph,
+    expanded_layout: Layout,
+    compact_graph: Graph,
+    expansion: GroupExpansion,
+    constraints: LayoutConstraints,
+}
+
 fn captured_register_vector_expansion() -> CapturedExpansion {
     serde_json::from_str(include_str!(
         "fixtures/consumer_reg_mux_register_expansion.json"
@@ -32,6 +41,28 @@ fn captured_focused_register_vector_expansion() -> CapturedExpansion {
         "fixtures/consumer_reg_mux_focused_register_expansion.json"
     ))
     .expect("captured focused consumer expansion request is valid")
+}
+
+fn captured_pipe_middle_group_collapse() -> CapturedCollapse {
+    serde_json::from_str(include_str!(
+        "fixtures/consumer_pipe_middle_group_collapse.json"
+    ))
+    .expect("captured middle-group collapse request is valid")
+}
+
+fn collapse_captured_group(captured: &CapturedCollapse) -> Result<Layout, GroupExpansionError> {
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints = captured.constraints.clone();
+    collapse_group_in_place(
+        &captured.expanded_graph,
+        &captured.expanded_layout,
+        &captured.compact_graph,
+        &captured.expansion,
+        &GroupCollapseOptions {
+            layout: config.layout,
+            constraints: config.constraints,
+        },
+    )
 }
 
 fn expand_without_a_full_relayout(captured: &CapturedExpansion) -> Layout {
@@ -207,6 +238,127 @@ fn captured_mux_vector_collapses_without_moving_unrelated_nodes() {
             collapsed.nodes.iter().find(|node| node.id == retained.id),
             expanded.nodes.iter().find(|node| node.id == retained.id),
         );
+    }
+}
+
+#[test]
+fn captured_middle_group_collapses_without_moving_expanded_peers() {
+    let captured = captured_pipe_middle_group_collapse();
+    let collapsed = collapse_captured_group(&captured)
+        .expect("a middle group should collapse without rebuilding its expanded peers");
+
+    for retained in captured
+        .compact_graph
+        .nodes
+        .iter()
+        .filter(|node| node.id != captured.expansion.anchor)
+    {
+        assert_eq!(
+            collapsed.nodes.iter().find(|node| node.id == retained.id),
+            captured
+                .expanded_layout
+                .nodes
+                .iter()
+                .find(|node| node.id == retained.id),
+        );
+    }
+    for retained in captured.compact_graph.edges.iter().filter(|edge| {
+        edge.source.node != captured.expansion.anchor
+            && edge.target.node != captured.expansion.anchor
+    }) {
+        assert_eq!(
+            collapsed.edges.iter().find(|edge| edge.id == retained.id),
+            captured
+                .expanded_layout
+                .edges
+                .iter()
+                .find(|edge| edge.id == retained.id),
+        );
+    }
+    assert!(
+        captured
+            .expansion
+            .members
+            .iter()
+            .all(|member| collapsed.nodes.iter().all(|node| node.id != *member))
+    );
+    assert!(
+        collapsed
+            .nodes
+            .iter()
+            .any(|node| node.id == captured.expansion.anchor)
+    );
+}
+
+#[test]
+fn captured_middle_group_collapse_is_permutation_deterministic() {
+    let captured = captured_pipe_middle_group_collapse();
+    let expected = collapse_captured_group(&captured).expect("canonical collapse");
+    let mut permutations = Vec::<(&str, CapturedCollapse)>::new();
+    macro_rules! reversed {
+        ($label:literal, $mutation:expr) => {{
+            let mut permuted = captured.clone();
+            $mutation(&mut permuted);
+            permutations.push(($label, permuted));
+        }};
+    }
+    reversed!("expanded graph nodes", |value: &mut CapturedCollapse| {
+        value.expanded_graph.nodes.reverse()
+    });
+    reversed!("expanded graph edges", |value: &mut CapturedCollapse| {
+        value.expanded_graph.edges.reverse()
+    });
+    reversed!("expanded layout nodes", |value: &mut CapturedCollapse| {
+        value.expanded_layout.nodes.reverse()
+    });
+    reversed!("expanded layout edges", |value: &mut CapturedCollapse| {
+        value.expanded_layout.edges.reverse()
+    });
+    reversed!("expanded layout bundles", |value: &mut CapturedCollapse| {
+        value.expanded_layout.boundary_bundles.reverse()
+    });
+    reversed!(
+        "expanded layout bundle members",
+        |value: &mut CapturedCollapse| {
+            for bundle in &mut value.expanded_layout.boundary_bundles {
+                bundle.members.reverse();
+            }
+        }
+    );
+    reversed!("compact graph nodes", |value: &mut CapturedCollapse| {
+        value.compact_graph.nodes.reverse()
+    });
+    reversed!("compact graph edges", |value: &mut CapturedCollapse| {
+        value.compact_graph.edges.reverse()
+    });
+    reversed!("expansion members", |value: &mut CapturedCollapse| {
+        value.expansion.members.reverse()
+    });
+    reversed!("boundary trunks", |value: &mut CapturedCollapse| {
+        value.expansion.boundary_trunks.reverse()
+    });
+    reversed!("constraint inputs", |value: &mut CapturedCollapse| {
+        value.constraints.inputs.reverse()
+    });
+    reversed!("constraint outputs", |value: &mut CapturedCollapse| {
+        value.constraints.outputs.reverse()
+    });
+    reversed!("constraint bundles", |value: &mut CapturedCollapse| {
+        value.constraints.boundary_bundles.reverse()
+    });
+    reversed!(
+        "constraint bundle members",
+        |value: &mut CapturedCollapse| {
+            for bundle in &mut value.constraints.boundary_bundles {
+                bundle.members.reverse();
+            }
+        }
+    );
+
+    for (label, permuted) in permutations {
+        let actual =
+            collapse_captured_group(&permuted).unwrap_or_else(|error| panic!("{label}: {error:?}"));
+        assert_eq!(actual, expected, "{label}");
     }
 }
 
