@@ -273,6 +273,20 @@ enum GapTrackSpacing {
     Expanded,
 }
 
+#[derive(Clone, Copy)]
+struct SpacingRoutePlan<'a> {
+    gap_lanes: &'a [BTreeMap<NetId, usize>],
+    endpoint_tracks: &'a EndpointTracks,
+    crossing_paths: &'a [Option<Vec<f64>>],
+    outer_lanes: &'a BTreeMap<EdgeId, OuterLane>,
+}
+
+struct SpacingRouteCandidate<'a> {
+    routes: Vec<EdgeGeometry>,
+    spacing: GapTrackSpacing,
+    plan: SpacingRoutePlan<'a>,
+}
+
 struct GapSpacingSelection {
     routes: Vec<EdgeGeometry>,
     quality: Option<RouteQuality>,
@@ -333,6 +347,18 @@ struct PhysicalSegment {
     fixed: f64,
     start: f64,
     end: f64,
+}
+
+#[derive(Clone, Copy)]
+struct UnmergedPhysicalSegment {
+    net: u32,
+    source: Endpoint,
+    target: Endpoint,
+    horizontal: bool,
+    fixed: f64,
+    start: f64,
+    end: f64,
+    edge: EdgeId,
 }
 
 #[derive(Clone, Copy)]
@@ -887,6 +913,12 @@ fn route_edges_with_lane_rounds_and_refined_global(
         );
         let candidate_crossing_paths_match_endpoint_tracks =
             crossing_paths_match_endpoint_tracks && candidate_endpoint_tracks == endpoint_tracks;
+        let candidate_spacing_plan = SpacingRoutePlan {
+            gap_lanes: &candidate_lanes,
+            endpoint_tracks: &candidate_endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &baseline_outer_lanes,
+        };
         let compact_candidate_routes = emit_routes(
             plan,
             nodes,
@@ -904,30 +936,32 @@ fn route_edges_with_lane_rounds_and_refined_global(
         );
         let adaptive_candidate_routes = (adaptive_gap_spacing
             && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| {
-            (
-                emit_routes(
-                    plan,
-                    nodes,
-                    &sparse_spans,
-                    &crossing_paths,
-                    &layer_left,
-                    &layer_right,
-                    &candidate_lanes,
-                    &candidate_endpoint_tracks,
-                    &baseline_outer_lanes,
-                    top,
-                    bottom,
-                    options,
-                    GapTrackSpacing::Adaptive,
-                ),
+        .then(|| SpacingRouteCandidate {
+            routes: emit_routes(
+                plan,
+                nodes,
+                &sparse_spans,
+                &crossing_paths,
+                &layer_left,
+                &layer_right,
+                &candidate_lanes,
+                &candidate_endpoint_tracks,
+                &baseline_outer_lanes,
+                top,
+                bottom,
+                options,
                 GapTrackSpacing::Adaptive,
-            )
+            ),
+            spacing: GapTrackSpacing::Adaptive,
+            plan: candidate_spacing_plan,
         });
         let mut selected = select_gap_spacing_candidate(
             plan,
-            compact_candidate_routes,
-            GapTrackSpacing::Compact,
+            SpacingRouteCandidate {
+                routes: compact_candidate_routes,
+                spacing: GapTrackSpacing::Compact,
+                plan: candidate_spacing_plan,
+            },
             None,
             adaptive_candidate_routes,
             requires_exact_candidate_admission(options),
@@ -940,31 +974,33 @@ fn route_edges_with_lane_rounds_and_refined_global(
             plan.edges.len(),
             baseline_outer_lanes.is_empty(),
         ) && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| {
-            (
-                emit_routes(
-                    plan,
-                    nodes,
-                    &sparse_spans,
-                    &crossing_paths,
-                    &layer_left,
-                    &layer_right,
-                    &candidate_lanes,
-                    &candidate_endpoint_tracks,
-                    &baseline_outer_lanes,
-                    top,
-                    bottom,
-                    options,
-                    GapTrackSpacing::Expanded,
-                ),
+        .then(|| SpacingRouteCandidate {
+            routes: emit_routes(
+                plan,
+                nodes,
+                &sparse_spans,
+                &crossing_paths,
+                &layer_left,
+                &layer_right,
+                &candidate_lanes,
+                &candidate_endpoint_tracks,
+                &baseline_outer_lanes,
+                top,
+                bottom,
+                options,
                 GapTrackSpacing::Expanded,
-            )
+            ),
+            spacing: GapTrackSpacing::Expanded,
+            plan: candidate_spacing_plan,
         });
         let selected = if let Some(expanded_candidate_routes) = expanded_candidate_routes {
             let mut selected = select_gap_spacing_candidate(
                 plan,
-                selected.routes,
-                selected.spacing,
+                SpacingRouteCandidate {
+                    routes: selected.routes,
+                    spacing: selected.spacing,
+                    plan: candidate_spacing_plan,
+                },
                 selected.quality,
                 Some(expanded_candidate_routes),
                 requires_exact_candidate_admission(options),
@@ -2581,6 +2617,12 @@ fn emit_routes_with_outer_lanes(
         let matches = endpoint_tracks == initial_endpoint_tracks;
         (endpoint_tracks, matches)
     };
+    let spacing_plan = SpacingRoutePlan {
+        gap_lanes: &gap_lanes,
+        endpoint_tracks: &endpoint_tracks,
+        crossing_paths: &crossing_paths,
+        outer_lanes,
+    };
     let compact_routes = emit_routes(
         plan,
         nodes,
@@ -2602,45 +2644,8 @@ fn emit_routes_with_outer_lanes(
     // require its exact congestion gain to pay for any added length.
     let node_count = plan.nodes_by_rank.iter().map(Vec::len).sum::<usize>();
     let adaptive_routes = (adaptive_gap_spacing && gap_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| {
-            (
-                emit_routes(
-                    plan,
-                    nodes,
-                    sparse_spans,
-                    &crossing_paths,
-                    layer_left,
-                    layer_right,
-                    &gap_lanes,
-                    &endpoint_tracks,
-                    outer_lanes,
-                    top,
-                    bottom,
-                    options,
-                    GapTrackSpacing::Adaptive,
-                ),
-                GapTrackSpacing::Adaptive,
-            )
-        });
-    let mut selected = select_gap_spacing_candidate(
-        plan,
-        compact_routes,
-        GapTrackSpacing::Compact,
-        None,
-        adaptive_routes,
-        requires_exact_candidate_admission(options),
-    );
-    let mut spacing_alternatives = selected.rejected.take().into_iter().collect::<Vec<_>>();
-    let expanded_routes = (expanded_gap_spacing_enabled(
-        adaptive_gap_spacing,
-        max_quality_effort,
-        node_count,
-        plan.edges.len(),
-        outer_lanes.is_empty(),
-    ) && gap_lanes.iter().any(|lanes| lanes.len() > 1))
-    .then(|| {
-        (
-            emit_routes(
+        .then(|| SpacingRouteCandidate {
+            routes: emit_routes(
                 plan,
                 nodes,
                 sparse_spans,
@@ -2653,16 +2658,57 @@ fn emit_routes_with_outer_lanes(
                 top,
                 bottom,
                 options,
-                GapTrackSpacing::Expanded,
+                GapTrackSpacing::Adaptive,
             ),
+            spacing: GapTrackSpacing::Adaptive,
+            plan: spacing_plan,
+        });
+    let mut selected = select_gap_spacing_candidate(
+        plan,
+        SpacingRouteCandidate {
+            routes: compact_routes,
+            spacing: GapTrackSpacing::Compact,
+            plan: spacing_plan,
+        },
+        None,
+        adaptive_routes,
+        requires_exact_candidate_admission(options),
+    );
+    let mut spacing_alternatives = selected.rejected.take().into_iter().collect::<Vec<_>>();
+    let expanded_routes = (expanded_gap_spacing_enabled(
+        adaptive_gap_spacing,
+        max_quality_effort,
+        node_count,
+        plan.edges.len(),
+        outer_lanes.is_empty(),
+    ) && gap_lanes.iter().any(|lanes| lanes.len() > 1))
+    .then(|| SpacingRouteCandidate {
+        routes: emit_routes(
+            plan,
+            nodes,
+            sparse_spans,
+            &crossing_paths,
+            layer_left,
+            layer_right,
+            &gap_lanes,
+            &endpoint_tracks,
+            outer_lanes,
+            top,
+            bottom,
+            options,
             GapTrackSpacing::Expanded,
-        )
+        ),
+        spacing: GapTrackSpacing::Expanded,
+        plan: spacing_plan,
     });
     let selected = if let Some(expanded_routes) = expanded_routes {
         let mut selected = select_gap_spacing_candidate(
             plan,
-            selected.routes,
-            selected.spacing,
+            SpacingRouteCandidate {
+                routes: selected.routes,
+                spacing: selected.spacing,
+                plan: spacing_plan,
+            },
             selected.quality,
             Some(expanded_routes),
             requires_exact_candidate_admission(options),
@@ -6687,27 +6733,112 @@ fn expanded_spacing_readability_is_better(
         && expanded_congestion <= compact_congestion * MAX_ADAPTIVE_SPACING_CONGESTION_FACTOR
 }
 
+fn same_plan_component<T>(left: &T, right: &T) -> bool
+where
+    T: ?Sized + PartialEq,
+{
+    std::ptr::eq(left, right) || left == right
+}
+
+fn per_edge_bend_structure_matches(left: &[EdgeGeometry], right: &[EdgeGeometry]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id
+                && left
+                    .points
+                    .windows(2)
+                    .map(|points| {
+                        (
+                            points[0].y == points[1].y,
+                            points[0].x == points[1].x && points[0].y == points[1].y,
+                        )
+                    })
+                    .eq(right.points.windows(2).map(|points| {
+                        (
+                            points[0].y == points[1].y,
+                            points[0].x == points[1].x && points[0].y == points[1].y,
+                        )
+                    }))
+        })
+}
+
+fn spacing_score_reuse_is_eligible(
+    base: &SpacingRouteCandidate<'_>,
+    sibling: &SpacingRouteCandidate<'_>,
+) -> bool {
+    // Spacing names are deliberately absent: only an identical lane/path plan and unchanged
+    // per-edge physical segment topology make crossings and bends invariant.
+    same_plan_component(base.plan.gap_lanes, sibling.plan.gap_lanes)
+        && same_plan_component(base.plan.endpoint_tracks, sibling.plan.endpoint_tracks)
+        && same_plan_component(base.plan.crossing_paths, sibling.plan.crossing_paths)
+        && same_plan_component(base.plan.outer_lanes, sibling.plan.outer_lanes)
+        && per_edge_bend_structure_matches(&base.routes, &sibling.routes)
+}
+
+fn reused_spacing_route_quality(
+    plan: &RoutingPlan<'_>,
+    base: RouteQuality,
+    sibling: &[EdgeGeometry],
+) -> RouteQuality {
+    let reused = RouteQuality {
+        crossings: base.crossings,
+        bends: base.bends,
+        route_length: canonical_route_length_for_plan(plan, sibling),
+    };
+    debug_assert_eq!(reused, route_quality_for_plan(plan, sibling));
+    reused
+}
+
+fn reused_spacing_route_quality_profile(
+    plan: &RoutingPlan<'_>,
+    base: RouteQuality,
+    sibling: &[EdgeGeometry],
+) -> (RouteQuality, Vec<PhysicalSegment>) {
+    let (segments, route_length) = canonical_route_segments_and_length_for_plan(plan, sibling);
+    let reused = RouteQuality {
+        crossings: base.crossings,
+        bends: base.bends,
+        route_length,
+    };
+    debug_assert_eq!(reused, route_quality_for_plan(plan, sibling));
+    (reused, segments)
+}
+
 fn select_gap_spacing_candidate(
     plan: &RoutingPlan<'_>,
-    compact: Vec<EdgeGeometry>,
-    compact_spacing: GapTrackSpacing,
+    compact: SpacingRouteCandidate<'_>,
     compact_quality: Option<RouteQuality>,
-    adaptive: Option<(Vec<EdgeGeometry>, GapTrackSpacing)>,
+    adaptive: Option<SpacingRouteCandidate<'_>>,
     retain_rejected: bool,
 ) -> GapSpacingSelection {
-    let Some((adaptive, adaptive_spacing)) = adaptive else {
+    let Some(adaptive) = adaptive else {
         return GapSpacingSelection {
-            routes: compact,
+            routes: compact.routes,
             quality: compact_quality,
-            spacing: compact_spacing,
+            spacing: compact.spacing,
             rejected: None,
         };
     };
+    let reuse_is_eligible = spacing_score_reuse_is_eligible(&compact, &adaptive);
+    let SpacingRouteCandidate {
+        routes: compact,
+        spacing: compact_spacing,
+        ..
+    } = compact;
+    let SpacingRouteCandidate {
+        routes: adaptive,
+        spacing: adaptive_spacing,
+        ..
+    } = adaptive;
     let distinct = compact != adaptive;
     if adaptive_spacing != GapTrackSpacing::Expanded {
         let compact_quality =
             compact_quality.unwrap_or_else(|| route_quality_for_plan(plan, &compact));
-        let adaptive_quality = route_quality_for_plan(plan, &adaptive);
+        let adaptive_quality = if reuse_is_eligible {
+            reused_spacing_route_quality(plan, compact_quality, &adaptive)
+        } else {
+            route_quality_for_plan(plan, &adaptive)
+        };
         return if route_quality_cmp(adaptive_quality, compact_quality).is_lt() {
             GapSpacingSelection {
                 routes: adaptive,
@@ -6729,11 +6860,15 @@ fn select_gap_spacing_candidate(
         |quality| {
             (
                 quality,
-                physical_route_segments(plan.edges.iter().map(|edge| edge.edge), &compact).0,
+                canonical_route_segments_and_length_for_plan(plan, &compact).0,
             )
         },
     );
-    let (adaptive_quality, adaptive_segments) = route_quality_profile_for_plan(plan, &adaptive);
+    let (adaptive_quality, adaptive_segments) = if reuse_is_eligible {
+        reused_spacing_route_quality_profile(plan, compact_quality, &adaptive)
+    } else {
+        route_quality_profile_for_plan(plan, &adaptive)
+    };
     let ordinary_quality_is_better = route_quality_cmp(adaptive_quality, compact_quality).is_lt();
     let readability_is_better = if ordinary_quality_is_better {
         false
@@ -6770,25 +6905,48 @@ fn physical_route_segments<'a>(
     edges: impl Iterator<Item = &'a Edge>,
     routes: &[EdgeGeometry],
 ) -> (Vec<PhysicalSegment>, usize, f64) {
-    struct RawSegment {
-        net: u32,
-        source: Endpoint,
-        target: Endpoint,
-        horizontal: bool,
-        fixed: f64,
-        start: f64,
-        end: f64,
-        edge: EdgeId,
-    }
-
-    let mut segments = Vec::<RawSegment>::new();
     let mut bends = Vec::new();
+    let segments = sorted_unmerged_physical_route_segments(edges, routes, Some(&mut bends));
+    bends.sort_unstable();
+    bends.dedup();
+    let merged = merge_sorted_physical_route_segments(segments);
+    let route_length = route_length_from_physical_segments(&merged);
+    (merged, bends.len(), route_length)
+}
+
+fn canonical_route_length_for_plan(plan: &RoutingPlan<'_>, routes: &[EdgeGeometry]) -> f64 {
+    canonical_route_segments_and_length_for_plan(plan, routes).1
+}
+
+fn canonical_route_segments_and_length_for_plan(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+) -> (Vec<PhysicalSegment>, f64) {
+    // Share the exact raw-segment sort, merge, and length fold used by physical_route_segments.
+    let segments = sorted_unmerged_physical_route_segments(
+        plan.edges.iter().map(|edge| edge.edge),
+        routes,
+        None,
+    );
+    let merged = merge_sorted_physical_route_segments(segments);
+    let route_length = route_length_from_physical_segments(&merged);
+    (merged, route_length)
+}
+
+fn sorted_unmerged_physical_route_segments<'a>(
+    edges: impl Iterator<Item = &'a Edge>,
+    routes: &[EdgeGeometry],
+    mut bends: Option<&mut Vec<(u32, FloatKey, FloatKey)>>,
+) -> Vec<UnmergedPhysicalSegment> {
+    let mut segments = Vec::new();
     for (edge, route) in edges.zip(routes) {
-        for points in route.points.windows(3) {
-            let first_horizontal = points[0].y == points[1].y;
-            let second_horizontal = points[1].y == points[2].y;
-            if first_horizontal != second_horizontal {
-                bends.push((edge.net, FloatKey(points[1].x), FloatKey(points[1].y)));
+        if let Some(bends) = &mut bends {
+            for points in route.points.windows(3) {
+                let first_horizontal = points[0].y == points[1].y;
+                let second_horizontal = points[1].y == points[2].y;
+                if first_horizontal != second_horizontal {
+                    bends.push((edge.net, FloatKey(points[1].x), FloatKey(points[1].y)));
+                }
             }
         }
         for points in route.points.windows(2) {
@@ -6804,7 +6962,7 @@ fn physical_route_segments<'a>(
             if start == end {
                 continue;
             }
-            segments.push(RawSegment {
+            segments.push(UnmergedPhysicalSegment {
                 net: edge.net,
                 source: edge.source,
                 target: edge.target,
@@ -6817,8 +6975,6 @@ fn physical_route_segments<'a>(
         }
     }
 
-    bends.sort_unstable();
-    bends.dedup();
     segments.sort_unstable_by(|left, right| {
         left.net
             .cmp(&right.net)
@@ -6828,6 +6984,12 @@ fn physical_route_segments<'a>(
             .then(left.end.total_cmp(&right.end))
             .then(left.edge.cmp(&right.edge))
     });
+    segments
+}
+
+fn merge_sorted_physical_route_segments(
+    segments: Vec<UnmergedPhysicalSegment>,
+) -> Vec<PhysicalSegment> {
     let mut merged = Vec::<PhysicalSegment>::new();
     for segment in segments {
         if let Some(prior) = merged.last_mut()
@@ -6849,11 +7011,14 @@ fn physical_route_segments<'a>(
             });
         }
     }
-    let route_length = merged
+    merged
+}
+
+fn route_length_from_physical_segments(segments: &[PhysicalSegment]) -> f64 {
+    segments
         .iter()
         .map(|segment| segment.end - segment.start)
-        .sum();
-    (merged, bends.len(), route_length)
+        .sum()
 }
 
 #[cfg(test)]
@@ -9800,8 +9965,8 @@ mod tests {
         MAX_REGIONAL_FANOUT_ROUTE_POINTS, MAX_REGIONAL_FANOUT_SAFETY_VISITS,
         MAX_REGIONAL_FANOUT_SCORE_VISITS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
         OuterLane, OuterNetAccess, OuterSide, ParallelWireSpacingError, PhysicalSegment,
-        RouteContactError, RouteQuality, RoutingPlan, align_crossing_path_staircases,
-        build_endpoint_tracks, build_regional_fanout_candidate,
+        RouteContactError, RouteQuality, RoutingPlan, SpacingRouteCandidate, SpacingRoutePlan,
+        align_crossing_path_staircases, build_endpoint_tracks, build_regional_fanout_candidate,
         candidate_route_points_within_budget, charge_negotiated_relations, charge_negotiated_work,
         charge_regional_relation, charge_regional_work, common_free_intervals,
         crossing_aware_gap_lane_indices, crossing_aware_gap_lane_indices_btree_reference,
@@ -16110,13 +16275,30 @@ mod tests {
             points: vec![Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 0.0 }],
         }];
         let retained_quality = route_quality_for_plan(&plan, &retained);
+        let gap_lanes = Vec::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let spacing_plan = SpacingRoutePlan {
+            gap_lanes: &gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
 
         let selected = select_gap_spacing_candidate(
             &plan,
-            retained.clone(),
-            GapTrackSpacing::Adaptive,
+            SpacingRouteCandidate {
+                routes: retained.clone(),
+                spacing: GapTrackSpacing::Adaptive,
+                plan: spacing_plan,
+            },
             Some(retained_quality),
-            Some((retained.clone(), GapTrackSpacing::Expanded)),
+            Some(SpacingRouteCandidate {
+                routes: retained.clone(),
+                spacing: GapTrackSpacing::Expanded,
+                plan: spacing_plan,
+            }),
             false,
         );
 
@@ -16179,13 +16361,30 @@ mod tests {
         let compact_quality = route_quality_for_plan(&plan, &compact);
         let adaptive_quality = route_quality_for_plan(&plan, &adaptive);
         assert!(route_quality_cmp(compact_quality, adaptive_quality).is_lt());
+        let gap_lanes = Vec::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let spacing_plan = SpacingRoutePlan {
+            gap_lanes: &gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
 
         let selected = select_gap_spacing_candidate(
             &plan,
-            compact.clone(),
-            GapTrackSpacing::Compact,
+            SpacingRouteCandidate {
+                routes: compact.clone(),
+                spacing: GapTrackSpacing::Compact,
+                plan: spacing_plan,
+            },
             Some(compact_quality),
-            Some((adaptive.clone(), GapTrackSpacing::Adaptive)),
+            Some(SpacingRouteCandidate {
+                routes: adaptive.clone(),
+                spacing: GapTrackSpacing::Adaptive,
+                plan: spacing_plan,
+            }),
             true,
         );
 
