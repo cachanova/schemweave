@@ -11,6 +11,7 @@ use crate::{
 pub(crate) const MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS: usize = 20_000_000;
 pub(crate) const MAX_INTERIOR_COLLECTOR_BUNDLES: usize = 32;
 pub(crate) const MAX_INTERIOR_HORIZONTAL_TAP_VISITS: usize = 2_000_000;
+pub(crate) const MAX_SHARED_ROUTE_OVERLAP_VISITS: usize = 250_000;
 const BUNDLE_CLEARANCE_NET_BASE: u32 = 0x8000_0000;
 const PRESERVED_GEOMETRY_EPSILON: f64 = 1e-7;
 
@@ -205,6 +206,7 @@ fn apply_bundle_geometry(
         )
     });
     let mut partial_remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
+    let mut shared_route_overlap_remaining = MAX_SHARED_ROUTE_OVERLAP_VISITS;
     let mut preserved_geometry = layout
         .boundary_bundles
         .iter()
@@ -313,16 +315,12 @@ fn apply_bundle_geometry(
                     .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?,
                 &layout.edges,
                 route_segments,
+                &mut shared_route_overlap_remaining,
             )
         } else {
             None
         };
         if let Some(shared) = shared {
-            // Admission proves that every replacement reuses an existing member
-            // route between identical endpoints, leaves the spine unchanged,
-            // and only shortens the collector. The final complete verifier
-            // remains the fail-closed gate, so another per-bundle scan would
-            // repeat work without admitting any new geometry.
             let representative = layout.edges[route_index[&shared.representative_edge]]
                 .points
                 .clone();
@@ -364,6 +362,7 @@ fn same_endpoint_shared_route_candidate(
     geometry: &BoundaryBundleGeometry,
     routes: &[EdgeGeometry],
     existing_segments: usize,
+    overlap_remaining: &mut usize,
 ) -> Option<SameEndpointSharedRouteCandidate> {
     if bundle.width <= 1
         || context.graph.boundary_bundles.len() > MAX_INTERIOR_COLLECTOR_BUNDLES
@@ -401,6 +400,15 @@ fn same_endpoint_shared_route_candidate(
         .get(*context.route_index.get(&representative_edge)?)?
         .points;
     if representative.len() < 2 {
+        return None;
+    }
+    if route_overlaps_external_geometry(
+        representative,
+        representative_edge,
+        bundle,
+        routes,
+        overlap_remaining,
+    ) {
         return None;
     }
     if bundle.members.iter().all(|member| {
@@ -455,6 +463,55 @@ fn same_endpoint_shared_route_candidate(
         geometry: candidate,
         representative_edge,
     })
+}
+
+fn route_overlaps_external_geometry(
+    representative: &[Point],
+    representative_edge: u32,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    remaining: &mut usize,
+) -> bool {
+    for route in routes.iter().filter(|route| {
+        route.id != representative_edge
+            && !bundle.members.iter().any(|member| member.edge == route.id)
+    }) {
+        for pair in representative.windows(2) {
+            for external in route.points.windows(2) {
+                let Some(next) = remaining.checked_sub(1) else {
+                    return true;
+                };
+                *remaining = next;
+                if segments_have_collinear_positive_overlap(
+                    pair[0],
+                    pair[1],
+                    external[0],
+                    external[1],
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn segments_have_collinear_positive_overlap(
+    left_start: Point,
+    left_end: Point,
+    right_start: Point,
+    right_end: Point,
+) -> bool {
+    if left_start.y == left_end.y && right_start.y == right_end.y && left_start.y == right_start.y {
+        intervals_overlap_positive(left_start.x, left_end.x, right_start.x, right_end.x)
+    } else if left_start.x == left_end.x
+        && right_start.x == right_end.x
+        && left_start.x == right_start.x
+    {
+        intervals_overlap_positive(left_start.y, left_end.y, right_start.y, right_end.y)
+    } else {
+        false
+    }
 }
 
 fn vertical_segment_contains(outer: BoundaryBundleSegment, inner: BoundaryBundleSegment) -> bool {
@@ -1501,6 +1558,13 @@ pub(crate) fn verify_preserved_geometry_structure(
                         .all(|member| preserved_point_matches(member.tap, first.tap))
             });
         let members_share_opposite_endpoint = bundle_members_share_opposite_endpoint(graph, bundle);
+        let ordinary_coincident_cohort = coincident_taps
+            && bundle.members.first().is_some_and(|first| {
+                bundle
+                    .members
+                    .iter()
+                    .all(|member| member.tap_lane == first.tap_lane && member.net == first.net)
+            });
         let shared_route_contract = coincident_taps
             && options.minimum_parallel_wire_spacing == 0.0
             && bundle.width > 1
@@ -1516,7 +1580,11 @@ pub(crate) fn verify_preserved_geometry_structure(
                         })
                 })
             });
-        if coincident_taps && members_share_opposite_endpoint && !shared_route_contract {
+        if coincident_taps
+            && members_share_opposite_endpoint
+            && !ordinary_coincident_cohort
+            && !shared_route_contract
+        {
             return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
         }
         let shared_local_collector = !interior_collector
@@ -2903,6 +2971,195 @@ mod tests {
             verify_preserved_geometry_structure(&indexed, &mismatched_route, options),
             Err(LayoutError::BoundaryBundleGeometryUnsatisfied),
             "coincident taps alone must not admit non-identical member routes"
+        );
+
+        let mut cohort_graph = graph.clone();
+        cohort_graph.edges[1].net = cohort_graph.edges[0].net;
+        let mut cohort_constraints = constraints.clone();
+        cohort_constraints.boundary_bundles[0].members[1].slots = vec![0];
+        let cohort_options = LayoutOptions {
+            minimum_parallel_wire_spacing: 1.0,
+            ..options
+        };
+        let cohort_indexed =
+            validate_and_index_with_constraints(&cohort_graph, cohort_options, &cohort_constraints)
+                .unwrap();
+        let cohort_layout =
+            crate::layout_with_constraints(&cohort_graph, cohort_options, &cohort_constraints)
+                .unwrap();
+        assert_eq!(
+            verify_preserved_geometry_structure(&cohort_indexed, &cohort_layout, cohort_options,),
+            Ok(()),
+            "same-net members in one validated tap-lane cohort may share a positive-spacing tap"
+        );
+    }
+
+    #[test]
+    fn unsafe_cross_net_shared_route_candidate_is_not_emitted() {
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::East),
+                node(4, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 12,
+                    source: Endpoint { node: 3, port: 0 },
+                    target: Endpoint { node: 4, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1, 3],
+            outputs: vec![2, 4],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 1, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            }],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let geometry = BoundaryBundleGeometry {
+            id: 1,
+            endpoint: Endpoint { node: 1, port: 0 },
+            role: BoundaryBundleRole::Input,
+            width: 2,
+            collector: BoundaryBundleSegment {
+                start: Point { x: 94.0, y: 23.0 },
+                end: Point { x: 94.0, y: 25.0 },
+            },
+            spine: BoundaryBundleSegment {
+                start: Point { x: 80.0, y: 25.0 },
+                end: Point { x: 94.0, y: 25.0 },
+            },
+            members: vec![
+                BoundaryBundleMemberGeometry {
+                    edge: 10,
+                    slots: vec![0],
+                    tap: Point { x: 94.0, y: 25.0 },
+                },
+                BoundaryBundleMemberGeometry {
+                    edge: 11,
+                    slots: vec![1],
+                    tap: Point { x: 94.0, y: 23.0 },
+                },
+            ],
+        };
+        let mut routes = vec![
+            EdgeGeometry {
+                id: 10,
+                points: vec![Point { x: 94.0, y: 25.0 }, Point { x: 300.0, y: 25.0 }],
+            },
+            EdgeGeometry {
+                id: 11,
+                points: vec![
+                    Point { x: 94.0, y: 23.0 },
+                    Point { x: 100.0, y: 23.0 },
+                    Point { x: 100.0, y: 150.0 },
+                    Point { x: 280.0, y: 150.0 },
+                    Point { x: 280.0, y: 25.0 },
+                    Point { x: 300.0, y: 25.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 12,
+                points: vec![
+                    Point { x: 200.0, y: -30.0 },
+                    Point { x: 200.0, y: 25.0 },
+                    Point { x: 260.0, y: 25.0 },
+                    Point { x: 260.0, y: 80.0 },
+                ],
+            },
+        ];
+        let node_geometry = HashMap::new();
+        let route_index = HashMap::from([(10, 0), (11, 1), (12, 2)]);
+        let fallback_corridors = HashMap::new();
+        let context = BundleGeometryContext {
+            graph: &indexed,
+            nodes: &[],
+            node_geometry: &node_geometry,
+            route_index: &route_index,
+            input_fallback_corridors: &fallback_corridors,
+            output_fallback_corridors: &fallback_corridors,
+            pitch: options.route_lane_gap,
+            rail_depth: crate::boundary_bundle_rail_depth(options),
+            member_endpoint_reserve: 0.0,
+        };
+        let segments = routes
+            .iter()
+            .map(|route| route.points.len().saturating_sub(1))
+            .sum();
+        let mut overlap_remaining = MAX_SHARED_ROUTE_OVERLAP_VISITS;
+        assert!(
+            same_endpoint_shared_route_candidate(
+                &context,
+                &indexed.boundary_bundles[0],
+                &geometry,
+                &routes,
+                segments,
+                &mut overlap_remaining,
+            )
+            .is_none(),
+            "a representative route that contacts external geometry must not be cloned"
+        );
+
+        routes[2].points = vec![Point { x: 200.0, y: 300.0 }, Point { x: 260.0, y: 300.0 }];
+        overlap_remaining = 0;
+        assert!(
+            same_endpoint_shared_route_candidate(
+                &context,
+                &indexed.boundary_bundles[0],
+                &geometry,
+                &routes,
+                segments,
+                &mut overlap_remaining,
+            )
+            .is_none(),
+            "external-overlap admission must fail closed at the exact visit boundary"
+        );
+
+        routes.pop();
+        overlap_remaining = MAX_SHARED_ROUTE_OVERLAP_VISITS;
+        assert!(
+            same_endpoint_shared_route_candidate(
+                &context,
+                &indexed.boundary_bundles[0],
+                &geometry,
+                &routes,
+                segments,
+                &mut overlap_remaining,
+            )
+            .is_some(),
+            "the same compact cohort remains eligible after external contact is removed"
         );
     }
 

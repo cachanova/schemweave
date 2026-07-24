@@ -1287,6 +1287,14 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     } else {
         0
     };
+    let shared_route_overlap_planning = if replanned_bundles > 0
+        && options.minimum_parallel_wire_spacing == 0.0
+        && bundles <= boundary_bundles::MAX_INTERIOR_COLLECTOR_BUNDLES
+    {
+        boundary_bundles::MAX_SHARED_ROUTE_OVERLAP_VISITS
+    } else {
+        0
+    };
     let partial_per_bundle = nodes
         .saturating_mul(2)
         .saturating_add(rewritten_segments.saturating_mul(nodes))
@@ -1309,6 +1317,7 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     initial_verification
         .saturating_add(final_verification)
         .saturating_add(interior_planning)
+        .saturating_add(shared_route_overlap_planning)
         .saturating_add(partial_verification)
         .saturating_add(structure)
         .saturating_add(rewritten_segments)
@@ -8197,7 +8206,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(bounded_bundle_candidates.len(), 21);
+        assert_eq!(bounded_bundle_candidates.len(), 20);
         let bundle_replan_over_budget = ExpansionWork {
             nodes: 1_000,
             edges: 2_000,
@@ -8222,7 +8231,7 @@ mod tests {
                 0,
             ),
             Err(GroupExpansionError::ExpansionWorkLimitExceeded {
-                required: 115_174_440,
+                required: 115_924_440,
                 maximum: super::QUALITY_CANDIDATE_WORK,
             })
         );
@@ -8382,8 +8391,8 @@ mod tests {
                 ..LayoutOptions::default()
             },
         );
-        assert_eq!(without_fallback_growth, 2_002_247);
-        assert_eq!(with_fallback_growth, 2_003_007);
+        assert_eq!(without_fallback_growth, 2_252_247);
+        assert_eq!(with_fallback_growth, 2_253_007);
     }
 
     #[test]
