@@ -101,6 +101,8 @@ pub enum GroupExpansionError {
     InvalidEdgeGeometry(EdgeId),
     #[error("compact layout has invalid bounds")]
     InvalidLayoutBounds,
+    #[error("group expansion reference height must be finite and positive, got {0}")]
+    InvalidReferenceHeight(f64),
     #[error("compact layout has {actual} route segments, maximum is {maximum}")]
     TooManyCompactRouteSegments { actual: usize, maximum: usize },
     #[error("compact layout violates a hard geometry invariant")]
@@ -242,8 +244,38 @@ pub fn expand_group_in_place(
     expansion: &GroupExpansion,
     options: &GroupExpansionOptions,
 ) -> Result<Layout, GroupExpansionError> {
+    expand_group_in_place_with_reference_height(
+        compact_graph,
+        compact_layout,
+        expanded_graph,
+        expansion,
+        compact_layout.height,
+        options,
+    )
+}
+
+/// Expand one quotient node using a stable schematic height to choose the
+/// expanded member arrangement.
+///
+/// This variant preserves the vertical-stack versus grid decision when the
+/// compact layout is a focused projection of a larger schematic. The reference
+/// height should be the height of the layout in which the group was originally
+/// expanded.
+pub fn expand_group_in_place_with_reference_height(
+    compact_graph: &Graph,
+    compact_layout: &Layout,
+    expanded_graph: &Graph,
+    expansion: &GroupExpansion,
+    reference_height: f64,
+    options: &GroupExpansionOptions,
+) -> Result<Layout, GroupExpansionError> {
     validation::validate_and_index(compact_graph, options.layout)
         .map_err(GroupExpansionError::InvalidCompactGraph)?;
+    if !reference_height.is_finite() || reference_height <= 0.0 {
+        return Err(GroupExpansionError::InvalidReferenceHeight(
+            reference_height,
+        ));
+    }
     let expanded_indexed = validation::validate_and_index_with_constraints(
         expanded_graph,
         options.layout,
@@ -310,7 +342,7 @@ pub fn expand_group_in_place(
             &member_layout,
             component_gap,
             horizontal_gap,
-            compact_layout.height,
+            reference_height,
             None,
         );
         // Changing the gap can change the aspect-ratio-derived column
@@ -329,7 +361,7 @@ pub fn expand_group_in_place(
                 &member_layout,
                 component_gap,
                 horizontal_gap,
-                compact_layout.height,
+                reference_height,
                 None,
             );
         }
