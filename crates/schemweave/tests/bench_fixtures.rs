@@ -42,7 +42,9 @@ fn every_fixture_lays_out_and_layout_is_reproducible() {
 
 #[test]
 fn expansion_fixture_expands_without_full_relayout() {
-    use schemweave::{GroupExpansionOptions, expand_group_in_place};
+    use schemweave::{
+        GroupCollapseOptions, GroupExpansionOptions, collapse_group_in_place, expand_group_in_place,
+    };
 
     for (members, bystanders) in [(4, 6), (8, 40)] {
         let (compact, expanded, expansion) = generators::expansion_pair(members, bystanders);
@@ -57,7 +59,7 @@ fn expansion_fixture_expands_without_full_relayout() {
             &GroupExpansionOptions {
                 layout: config.layout,
                 quality_effort: config.quality_effort,
-                constraints: config.constraints,
+                constraints: config.constraints.clone(),
             },
         );
         let layout = result.unwrap_or_else(|error| {
@@ -72,6 +74,29 @@ fn expansion_fixture_expands_without_full_relayout() {
             layout.edges.len(),
             expanded.edges.len(),
             "({members}, {bystanders}) edge count"
+        );
+        let collapsed = collapse_group_in_place(
+            &expanded,
+            &layout,
+            &compact,
+            &expansion,
+            &GroupCollapseOptions {
+                layout: config.layout,
+                constraints: config.constraints,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("({members}, {bystanders}) synthetic collapse must succeed in place: {error:?}")
+        });
+        assert_eq!(
+            collapsed.nodes.len(),
+            compact.nodes.len(),
+            "({members}, {bystanders}) collapsed node count"
+        );
+        assert_eq!(
+            collapsed.edges.len(),
+            compact.edges.len(),
+            "({members}, {bystanders}) collapsed edge count"
         );
     }
 }
