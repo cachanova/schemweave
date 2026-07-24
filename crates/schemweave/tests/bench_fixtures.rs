@@ -25,6 +25,22 @@ fn generators_are_deterministic() {
         generators::protected_horizontal_expansion_pair(8, 8),
         generators::protected_horizontal_expansion_pair(8, 8)
     );
+    assert_eq!(
+        generators::boundary_fanout_expansion_pair(64),
+        generators::boundary_fanout_expansion_pair(64)
+    );
+    assert_eq!(
+        generators::boundary_fanin_expansion_pair(64),
+        generators::boundary_fanin_expansion_pair(64)
+    );
+    assert_eq!(
+        generators::grouped_boundary_fanout_expansion_pair(8, 64),
+        generators::grouped_boundary_fanout_expansion_pair(8, 64)
+    );
+    assert_eq!(
+        generators::grouped_boundary_fanin_expansion_pair(8, 64),
+        generators::grouped_boundary_fanin_expansion_pair(8, 64)
+    );
 }
 
 #[test]
@@ -140,5 +156,121 @@ fn expansion_fixture_expands_without_full_relayout() {
             compact.edges.len(),
             "({members}, {bystanders}) collapsed edge count"
         );
+    }
+}
+
+#[test]
+fn shared_boundary_expansion_fixtures_are_reproducible() {
+    use schemweave::{GroupExpansionOptions, expand_group_in_place};
+
+    fn assert_fixture(
+        name: &str,
+        compact: schemweave::Graph,
+        expanded: schemweave::Graph,
+        expansion: schemweave::GroupExpansion,
+    ) {
+        let config = fast();
+        let compact_layout =
+            layout_with_config(&compact, &config).expect("compact boundary fixture");
+        let options = GroupExpansionOptions {
+            layout: config.layout,
+            quality_effort: config.quality_effort,
+            constraints: config.constraints,
+            protected_groups: Vec::new(),
+        };
+        let expected =
+            expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                .unwrap_or_else(|error| {
+                    panic!("{name} shared-boundary expansion failed: {error:?}")
+                });
+        let repeated =
+            expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                .expect("second shared-boundary expansion");
+        assert_eq!(expected, repeated, "{name} expansion is not reproducible");
+
+        let mut permutations = Vec::new();
+        macro_rules! reversed {
+            ($label:literal, $mutation:expr) => {{
+                let mut compact = compact.clone();
+                let mut expanded = expanded.clone();
+                let mut expansion = expansion.clone();
+                $mutation(&mut compact, &mut expanded, &mut expansion);
+                permutations.push(($label, compact, expanded, expansion));
+            }};
+        }
+        reversed!("compact nodes", |compact: &mut schemweave::Graph, _, _| {
+            compact.nodes.reverse()
+        });
+        reversed!("compact edges", |compact: &mut schemweave::Graph, _, _| {
+            compact.edges.reverse()
+        });
+        reversed!("expanded nodes", |_,
+                                     expanded: &mut schemweave::Graph,
+                                     _| {
+            expanded.nodes.reverse()
+        });
+        reversed!("expanded edges", |_,
+                                     expanded: &mut schemweave::Graph,
+                                     _| {
+            expanded.edges.reverse()
+        });
+        reversed!(
+            "expansion members",
+            |_, _, expansion: &mut schemweave::GroupExpansion| expansion.members.reverse()
+        );
+        reversed!(
+            "boundary trunks",
+            |_, _, expansion: &mut schemweave::GroupExpansion| expansion.boundary_trunks.reverse()
+        );
+        for (permutation, compact, expanded, expansion) in permutations {
+            let actual =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .unwrap_or_else(|error| {
+                        panic!("{name} {permutation} permutation failed: {error:?}")
+                    });
+            assert_eq!(actual, expected, "{name} {permutation}");
+        }
+    }
+
+    for (name, fixture) in [
+        (
+            "fanout",
+            generators::boundary_fanout_expansion_pair
+                as fn(
+                    u32,
+                ) -> (
+                    schemweave::Graph,
+                    schemweave::Graph,
+                    schemweave::GroupExpansion,
+                ),
+        ),
+        ("fanin", generators::boundary_fanin_expansion_pair),
+    ] {
+        for members in [64, 256] {
+            let (compact, expanded, expansion) = fixture(members);
+            assert_fixture(&format!("{name}-{members}"), compact, expanded, expansion);
+        }
+    }
+
+    for (name, fixture) in [
+        (
+            "grouped-fanout",
+            generators::grouped_boundary_fanout_expansion_pair
+                as fn(
+                    u32,
+                    u32,
+                ) -> (
+                    schemweave::Graph,
+                    schemweave::Graph,
+                    schemweave::GroupExpansion,
+                ),
+        ),
+        (
+            "grouped-fanin",
+            generators::grouped_boundary_fanin_expansion_pair,
+        ),
+    ] {
+        let (compact, expanded, expansion) = fixture(8, 64);
+        assert_fixture(name, compact, expanded, expansion);
     }
 }
