@@ -97,12 +97,13 @@ fn mixed_fixture_produces_outer_lane_routes() {
 }
 
 #[test]
-fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() {
+fn all_effort_layouts_are_reproducible_and_match_preoptimization_digests() {
     let fixtures = [
         (
             "pipeline",
             generators::pipeline(30, 4),
             [
+                (QualityEffort::Fast, 446_743_631_513_152_497),
                 (QualityEffort::Quality, 15_100_337_167_565_156_021),
                 (QualityEffort::Max, 15_100_337_167_565_156_021),
             ],
@@ -111,6 +112,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "fanout8_ordinary",
             generators::fanout(8),
             [
+                (QualityEffort::Fast, 5_780_370_522_801_744_726),
                 (QualityEffort::Quality, 5_780_370_522_801_744_726),
                 (QualityEffort::Max, 5_780_370_522_801_744_726),
             ],
@@ -119,6 +121,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "fanout301_regional_min",
             generators::fanout(301),
             [
+                (QualityEffort::Fast, 4_047_175_013_081_998_229),
                 (QualityEffort::Quality, 4_047_175_013_081_998_229),
                 (QualityEffort::Max, 4_047_175_013_081_998_229),
             ],
@@ -127,6 +130,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "fanout512_regional_max",
             generators::fanout(512),
             [
+                (QualityEffort::Fast, 2_490_547_472_294_486_322),
                 (QualityEffort::Quality, 2_490_547_472_294_486_322),
                 (QualityEffort::Max, 2_490_547_472_294_486_322),
             ],
@@ -135,6 +139,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "fanin64",
             generators::fanin(64),
             [
+                (QualityEffort::Fast, 18_167_339_820_869_073_029),
                 (QualityEffort::Quality, 18_167_339_820_869_073_029),
                 (QualityEffort::Max, 18_167_339_820_869_073_029),
             ],
@@ -143,6 +148,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "dag_medium",
             generators::layered_dag(12, 25, 7),
             [
+                (QualityEffort::Fast, 1_622_400_051_917_171_911),
                 (QualityEffort::Quality, 10_140_361_843_858_544_721),
                 (QualityEffort::Max, 3_609_306_717_082_297_601),
             ],
@@ -151,6 +157,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "dag_large",
             generators::layered_dag(25, 60, 7),
             [
+                (QualityEffort::Fast, 6_934_771_201_752_993_155),
                 (QualityEffort::Quality, 6_961_204_979_231_150_895),
                 (QualityEffort::Max, 6_961_204_979_231_150_895),
             ],
@@ -159,6 +166,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "bus",
             generators::bus_chain(4, 32),
             [
+                (QualityEffort::Fast, 3_874_013_447_867_824_340),
                 (QualityEffort::Quality, 3_874_013_447_867_824_340),
                 (QualityEffort::Max, 3_874_013_447_867_824_340),
             ],
@@ -167,6 +175,7 @@ fn quality_and_max_layouts_are_reproducible_and_match_preoptimization_digests() 
             "mixed_sparse_outer",
             mixed_sparse_outer_fixture(),
             [
+                (QualityEffort::Fast, 1_792_070_392_815_886_279),
                 (QualityEffort::Quality, 11_407_819_457_709_047_713),
                 (QualityEffort::Max, 13_280_536_908_894_956_178),
             ],
