@@ -1,0 +1,2363 @@
+{
+  "compact_graph": {
+    "nodes": [
+      {
+        "id": 26,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "east",
+            "offset": 17
+          }
+        ]
+      },
+      {
+        "id": 43,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 44,
+        "width": 70,
+        "height": 72,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18
+          },
+          {
+            "id": 1,
+            "side": "west",
+            "offset": 36
+          },
+          {
+            "id": 2,
+            "side": "west",
+            "offset": 54
+          },
+          {
+            "id": 3,
+            "side": "east",
+            "offset": 36
+          }
+        ]
+      },
+      {
+        "id": 45,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "east",
+            "offset": 17
+          }
+        ]
+      },
+      {
+        "id": 46,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "east",
+            "offset": 17
+          }
+        ]
+      },
+      {
+        "id": 47,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 17
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "id": 0,
+        "source": {
+          "node": 26,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 2
+        },
+        "net": 25,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 1,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 11,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 2,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 12,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 3,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 13,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 4,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 14,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 5,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 15,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 6,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 16,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 7,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 17,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 8,
+        "source": {
+          "node": 43,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 18,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 9,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 43,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 10,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 0,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 11,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 1,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 12,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 2,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 13,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 19,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 14,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 20,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 15,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 21,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 16,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 22,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 17,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 23,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 18,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 3,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 19,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 4,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 20,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 5,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 21,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 6,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 22,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 7,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 23,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 8,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 24,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 9,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 25,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 10,
+        "participates_in_ranking": true
+      }
+    ]
+  },
+  "compact_layout": {
+    "nodes": [
+      {
+        "id": 26,
+        "x": 0,
+        "y": 0,
+        "width": 74,
+        "height": 34
+      },
+      {
+        "id": 43,
+        "x": 346,
+        "y": 92.96559935657528,
+        "width": 92,
+        "height": 84
+      },
+      {
+        "id": 44,
+        "x": 210,
+        "y": 78.7566641919812,
+        "width": 70,
+        "height": 72
+      },
+      {
+        "id": 45,
+        "x": 0,
+        "y": 64,
+        "width": 74,
+        "height": 34
+      },
+      {
+        "id": 46,
+        "x": 0,
+        "y": 128,
+        "width": 74,
+        "height": 34
+      },
+      {
+        "id": 47,
+        "x": 526,
+        "y": 104.57566419749608,
+        "width": 74,
+        "height": 34
+      }
+    ],
+    "edges": [
+      {
+        "id": 0,
+        "points": [
+          {
+            "x": 74,
+            "y": 17
+          },
+          {
+            "x": 96.93333333333334,
+            "y": 17
+          },
+          {
+            "x": 96.93333333333334,
+            "y": 132.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 132.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 1,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 460.93333333333334,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 460.93333333333334,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 500,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 500,
+            "y": 100.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 100.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 463.8666666666667,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 463.8666666666667,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 494,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 494,
+            "y": 106.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 106.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 466.8,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 466.8,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 488,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 488,
+            "y": 112.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 112.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 469.73333333333335,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 469.73333333333335,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 482,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 482,
+            "y": 118.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 118.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 5,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 472.6666666666667,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 472.6666666666667,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 476,
+            "y": 121.57566419749608
+          },
+          {
+            "x": 476,
+            "y": 124.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 124.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 6,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 470,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 470,
+            "y": 130.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 130.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 7,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 464,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 464,
+            "y": 136.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 136.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 8,
+        "points": [
+          {
+            "x": 438,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 458,
+            "y": 121.96559935657528
+          },
+          {
+            "x": 458,
+            "y": 142.57566419749608
+          },
+          {
+            "x": 506,
+            "y": 142.57566419749608
+          }
+        ]
+      },
+      {
+        "id": 9,
+        "points": [
+          {
+            "x": 280,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 307.15,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 307.15,
+            "y": 111.52559935657528
+          },
+          {
+            "x": 346,
+            "y": 111.52559935657528
+          }
+        ]
+      },
+      {
+        "id": 10,
+        "points": [
+          {
+            "x": 94,
+            "y": 90
+          },
+          {
+            "x": 130,
+            "y": 90
+          },
+          {
+            "x": 130,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 11,
+        "points": [
+          {
+            "x": 94,
+            "y": 96
+          },
+          {
+            "x": 136,
+            "y": 96
+          },
+          {
+            "x": 136,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 12,
+        "points": [
+          {
+            "x": 94,
+            "y": 102
+          },
+          {
+            "x": 142,
+            "y": 102
+          },
+          {
+            "x": 142,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 13,
+        "points": [
+          {
+            "x": 94,
+            "y": 60
+          },
+          {
+            "x": 100,
+            "y": 60
+          },
+          {
+            "x": 100,
+            "y": 81
+          },
+          {
+            "x": 108.66666666666667,
+            "y": 81
+          },
+          {
+            "x": 108.66666666666667,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 14,
+        "points": [
+          {
+            "x": 94,
+            "y": 66
+          },
+          {
+            "x": 106,
+            "y": 66
+          },
+          {
+            "x": 106,
+            "y": 81
+          },
+          {
+            "x": 111.6,
+            "y": 81
+          },
+          {
+            "x": 111.6,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 15,
+        "points": [
+          {
+            "x": 94,
+            "y": 72
+          },
+          {
+            "x": 112,
+            "y": 72
+          },
+          {
+            "x": 112,
+            "y": 81
+          },
+          {
+            "x": 114.53333333333333,
+            "y": 81
+          },
+          {
+            "x": 114.53333333333333,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 16,
+        "points": [
+          {
+            "x": 94,
+            "y": 78
+          },
+          {
+            "x": 118,
+            "y": 78
+          },
+          {
+            "x": 118,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 17,
+        "points": [
+          {
+            "x": 94,
+            "y": 84
+          },
+          {
+            "x": 124,
+            "y": 84
+          },
+          {
+            "x": 124,
+            "y": 96.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 96.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 18,
+        "points": [
+          {
+            "x": 94,
+            "y": 124
+          },
+          {
+            "x": 148,
+            "y": 124
+          },
+          {
+            "x": 148,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 19,
+        "points": [
+          {
+            "x": 94,
+            "y": 130
+          },
+          {
+            "x": 154,
+            "y": 130
+          },
+          {
+            "x": 154,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 20,
+        "points": [
+          {
+            "x": 94,
+            "y": 136
+          },
+          {
+            "x": 160,
+            "y": 136
+          },
+          {
+            "x": 160,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 21,
+        "points": [
+          {
+            "x": 94,
+            "y": 142
+          },
+          {
+            "x": 166,
+            "y": 142
+          },
+          {
+            "x": 166,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 22,
+        "points": [
+          {
+            "x": 94,
+            "y": 148
+          },
+          {
+            "x": 172,
+            "y": 148
+          },
+          {
+            "x": 172,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 23,
+        "points": [
+          {
+            "x": 94,
+            "y": 154
+          },
+          {
+            "x": 178,
+            "y": 154
+          },
+          {
+            "x": 178,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 24,
+        "points": [
+          {
+            "x": 94,
+            "y": 160
+          },
+          {
+            "x": 184,
+            "y": 160
+          },
+          {
+            "x": 184,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      },
+      {
+        "id": 25,
+        "points": [
+          {
+            "x": 94,
+            "y": 166
+          },
+          {
+            "x": 190,
+            "y": 166
+          },
+          {
+            "x": 190,
+            "y": 114.7566641919812
+          },
+          {
+            "x": 210,
+            "y": 114.7566641919812
+          }
+        ]
+      }
+    ],
+    "boundary_bundles": [
+      {
+        "id": 0,
+        "endpoint": {
+          "node": 45,
+          "port": 0
+        },
+        "role": "input",
+        "width": 8,
+        "collector": {
+          "start": {
+            "x": 94,
+            "y": 60
+          },
+          "end": {
+            "x": 94,
+            "y": 102
+          }
+        },
+        "spine": {
+          "start": {
+            "x": 74,
+            "y": 81
+          },
+          "end": {
+            "x": 94,
+            "y": 81
+          }
+        },
+        "members": [
+          {
+            "edge": 13,
+            "slots": [
+              0
+            ],
+            "tap": {
+              "x": 94,
+              "y": 60
+            }
+          },
+          {
+            "edge": 14,
+            "slots": [
+              1
+            ],
+            "tap": {
+              "x": 94,
+              "y": 66
+            }
+          },
+          {
+            "edge": 15,
+            "slots": [
+              2
+            ],
+            "tap": {
+              "x": 94,
+              "y": 72
+            }
+          },
+          {
+            "edge": 16,
+            "slots": [
+              3
+            ],
+            "tap": {
+              "x": 94,
+              "y": 78
+            }
+          },
+          {
+            "edge": 17,
+            "slots": [
+              4
+            ],
+            "tap": {
+              "x": 94,
+              "y": 84
+            }
+          },
+          {
+            "edge": 10,
+            "slots": [
+              5
+            ],
+            "tap": {
+              "x": 94,
+              "y": 90
+            }
+          },
+          {
+            "edge": 11,
+            "slots": [
+              6
+            ],
+            "tap": {
+              "x": 94,
+              "y": 96
+            }
+          },
+          {
+            "edge": 12,
+            "slots": [
+              7
+            ],
+            "tap": {
+              "x": 94,
+              "y": 102
+            }
+          }
+        ]
+      },
+      {
+        "id": 1,
+        "endpoint": {
+          "node": 46,
+          "port": 0
+        },
+        "role": "input",
+        "width": 8,
+        "collector": {
+          "start": {
+            "x": 94,
+            "y": 124
+          },
+          "end": {
+            "x": 94,
+            "y": 166
+          }
+        },
+        "spine": {
+          "start": {
+            "x": 74,
+            "y": 145
+          },
+          "end": {
+            "x": 94,
+            "y": 145
+          }
+        },
+        "members": [
+          {
+            "edge": 18,
+            "slots": [
+              0
+            ],
+            "tap": {
+              "x": 94,
+              "y": 124
+            }
+          },
+          {
+            "edge": 19,
+            "slots": [
+              1
+            ],
+            "tap": {
+              "x": 94,
+              "y": 130
+            }
+          },
+          {
+            "edge": 20,
+            "slots": [
+              2
+            ],
+            "tap": {
+              "x": 94,
+              "y": 136
+            }
+          },
+          {
+            "edge": 21,
+            "slots": [
+              3
+            ],
+            "tap": {
+              "x": 94,
+              "y": 142
+            }
+          },
+          {
+            "edge": 22,
+            "slots": [
+              4
+            ],
+            "tap": {
+              "x": 94,
+              "y": 148
+            }
+          },
+          {
+            "edge": 23,
+            "slots": [
+              5
+            ],
+            "tap": {
+              "x": 94,
+              "y": 154
+            }
+          },
+          {
+            "edge": 24,
+            "slots": [
+              6
+            ],
+            "tap": {
+              "x": 94,
+              "y": 160
+            }
+          },
+          {
+            "edge": 25,
+            "slots": [
+              7
+            ],
+            "tap": {
+              "x": 94,
+              "y": 166
+            }
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "endpoint": {
+          "node": 47,
+          "port": 0
+        },
+        "role": "output",
+        "width": 8,
+        "collector": {
+          "start": {
+            "x": 506,
+            "y": 100.57566419749608
+          },
+          "end": {
+            "x": 506,
+            "y": 142.57566419749608
+          }
+        },
+        "spine": {
+          "start": {
+            "x": 526,
+            "y": 121.57566419749608
+          },
+          "end": {
+            "x": 506,
+            "y": 121.57566419749608
+          }
+        },
+        "members": [
+          {
+            "edge": 1,
+            "slots": [
+              0
+            ],
+            "tap": {
+              "x": 506,
+              "y": 100.57566419749608
+            }
+          },
+          {
+            "edge": 2,
+            "slots": [
+              1
+            ],
+            "tap": {
+              "x": 506,
+              "y": 106.57566419749608
+            }
+          },
+          {
+            "edge": 3,
+            "slots": [
+              2
+            ],
+            "tap": {
+              "x": 506,
+              "y": 112.57566419749608
+            }
+          },
+          {
+            "edge": 4,
+            "slots": [
+              3
+            ],
+            "tap": {
+              "x": 506,
+              "y": 118.57566419749608
+            }
+          },
+          {
+            "edge": 5,
+            "slots": [
+              4
+            ],
+            "tap": {
+              "x": 506,
+              "y": 124.57566419749608
+            }
+          },
+          {
+            "edge": 6,
+            "slots": [
+              5
+            ],
+            "tap": {
+              "x": 506,
+              "y": 130.57566419749608
+            }
+          },
+          {
+            "edge": 7,
+            "slots": [
+              6
+            ],
+            "tap": {
+              "x": 506,
+              "y": 136.57566419749608
+            }
+          },
+          {
+            "edge": 8,
+            "slots": [
+              7
+            ],
+            "tap": {
+              "x": 506,
+              "y": 142.57566419749608
+            }
+          }
+        ]
+      }
+    ],
+    "width": 600,
+    "height": 176.9655993565753
+  },
+  "expanded_graph": {
+    "nodes": [
+      {
+        "id": 26,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "east",
+            "offset": 17
+          }
+        ]
+      },
+      {
+        "id": 35,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 36,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 37,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 38,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 39,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 40,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 41,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 42,
+        "width": 92,
+        "height": 84,
+        "cycle_breaker": true,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18.56
+          },
+          {
+            "id": 1,
+            "side": "east",
+            "offset": 29
+          }
+        ]
+      },
+      {
+        "id": 44,
+        "width": 70,
+        "height": 72,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 18
+          },
+          {
+            "id": 1,
+            "side": "west",
+            "offset": 36
+          },
+          {
+            "id": 2,
+            "side": "west",
+            "offset": 54
+          },
+          {
+            "id": 3,
+            "side": "east",
+            "offset": 36
+          }
+        ]
+      },
+      {
+        "id": 45,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "east",
+            "offset": 17
+          }
+        ]
+      },
+      {
+        "id": 46,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "east",
+            "offset": 17
+          }
+        ]
+      },
+      {
+        "id": 47,
+        "width": 74,
+        "height": 34,
+        "cycle_breaker": false,
+        "ports": [
+          {
+            "id": 0,
+            "side": "west",
+            "offset": 17
+          }
+        ]
+      }
+    ],
+    "edges": [
+      {
+        "id": 0,
+        "source": {
+          "node": 26,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 2
+        },
+        "net": 25,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 1,
+        "source": {
+          "node": 35,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 11,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 2,
+        "source": {
+          "node": 36,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 12,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 3,
+        "source": {
+          "node": 37,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 13,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 4,
+        "source": {
+          "node": 38,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 14,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 5,
+        "source": {
+          "node": 39,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 15,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 6,
+        "source": {
+          "node": 40,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 16,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 7,
+        "source": {
+          "node": 41,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 17,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 8,
+        "source": {
+          "node": 42,
+          "port": 1
+        },
+        "target": {
+          "node": 47,
+          "port": 0
+        },
+        "net": 18,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 9,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 35,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 10,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 0,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 11,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 1,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 12,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 2,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 13,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 19,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 14,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 20,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 15,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 21,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 16,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 22,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 17,
+        "source": {
+          "node": 45,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 0
+        },
+        "net": 23,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 18,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 3,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 19,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 4,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 20,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 5,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 21,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 6,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 22,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 7,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 23,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 8,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 24,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 9,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 25,
+        "source": {
+          "node": 46,
+          "port": 0
+        },
+        "target": {
+          "node": 44,
+          "port": 1
+        },
+        "net": 10,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 26,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 36,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 27,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 37,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 28,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 38,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 29,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 39,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 30,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 40,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 31,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 41,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      },
+      {
+        "id": 32,
+        "source": {
+          "node": 44,
+          "port": 3
+        },
+        "target": {
+          "node": 42,
+          "port": 0
+        },
+        "net": 24,
+        "participates_in_ranking": true
+      }
+    ]
+  },
+  "expansion": {
+    "anchor": 43,
+    "members": [
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42
+    ],
+    "boundary_trunks": [
+      {
+        "expanded_edge": 1,
+        "compact_edge": 1
+      },
+      {
+        "expanded_edge": 2,
+        "compact_edge": 2
+      },
+      {
+        "expanded_edge": 3,
+        "compact_edge": 3
+      },
+      {
+        "expanded_edge": 4,
+        "compact_edge": 4
+      },
+      {
+        "expanded_edge": 5,
+        "compact_edge": 5
+      },
+      {
+        "expanded_edge": 6,
+        "compact_edge": 6
+      },
+      {
+        "expanded_edge": 7,
+        "compact_edge": 7
+      },
+      {
+        "expanded_edge": 8,
+        "compact_edge": 8
+      },
+      {
+        "expanded_edge": 9,
+        "compact_edge": 9
+      },
+      {
+        "expanded_edge": 26,
+        "compact_edge": 9
+      },
+      {
+        "expanded_edge": 27,
+        "compact_edge": 9
+      },
+      {
+        "expanded_edge": 28,
+        "compact_edge": 9
+      },
+      {
+        "expanded_edge": 29,
+        "compact_edge": 9
+      },
+      {
+        "expanded_edge": 30,
+        "compact_edge": 9
+      },
+      {
+        "expanded_edge": 31,
+        "compact_edge": 9
+      },
+      {
+        "expanded_edge": 32,
+        "compact_edge": 9
+      }
+    ]
+  },
+  "constraints": {
+    "inputs": [
+      26,
+      45,
+      46
+    ],
+    "outputs": [
+      47
+    ],
+    "boundary_bundles": [
+      {
+        "id": 0,
+        "endpoint": {
+          "node": 45,
+          "port": 0
+        },
+        "width": 8,
+        "members": [
+          {
+            "edge": 10,
+            "slots": [
+              5
+            ]
+          },
+          {
+            "edge": 11,
+            "slots": [
+              6
+            ]
+          },
+          {
+            "edge": 12,
+            "slots": [
+              7
+            ]
+          },
+          {
+            "edge": 13,
+            "slots": [
+              0
+            ]
+          },
+          {
+            "edge": 14,
+            "slots": [
+              1
+            ]
+          },
+          {
+            "edge": 15,
+            "slots": [
+              2
+            ]
+          },
+          {
+            "edge": 16,
+            "slots": [
+              3
+            ]
+          },
+          {
+            "edge": 17,
+            "slots": [
+              4
+            ]
+          }
+        ]
+      },
+      {
+        "id": 1,
+        "endpoint": {
+          "node": 46,
+          "port": 0
+        },
+        "width": 8,
+        "members": [
+          {
+            "edge": 18,
+            "slots": [
+              0
+            ]
+          },
+          {
+            "edge": 19,
+            "slots": [
+              1
+            ]
+          },
+          {
+            "edge": 20,
+            "slots": [
+              2
+            ]
+          },
+          {
+            "edge": 21,
+            "slots": [
+              3
+            ]
+          },
+          {
+            "edge": 22,
+            "slots": [
+              4
+            ]
+          },
+          {
+            "edge": 23,
+            "slots": [
+              5
+            ]
+          },
+          {
+            "edge": 24,
+            "slots": [
+              6
+            ]
+          },
+          {
+            "edge": 25,
+            "slots": [
+              7
+            ]
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "endpoint": {
+          "node": 47,
+          "port": 0
+        },
+        "width": 8,
+        "members": [
+          {
+            "edge": 1,
+            "slots": [
+              0
+            ]
+          },
+          {
+            "edge": 2,
+            "slots": [
+              1
+            ]
+          },
+          {
+            "edge": 3,
+            "slots": [
+              2
+            ]
+          },
+          {
+            "edge": 4,
+            "slots": [
+              3
+            ]
+          },
+          {
+            "edge": 5,
+            "slots": [
+              4
+            ]
+          },
+          {
+            "edge": 6,
+            "slots": [
+              5
+            ]
+          },
+          {
+            "edge": 7,
+            "slots": [
+              6
+            ]
+          },
+          {
+            "edge": 8,
+            "slots": [
+              7
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
