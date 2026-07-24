@@ -161,3 +161,94 @@ pub fn bus_chain(stages: u32, width: u32) -> Graph {
     }
     Graph { nodes, edges }
 }
+
+use schemweave::{BoundaryTrunk, GroupExpansion};
+
+/// A compact graph whose anchor node hides a `members`-long chain, plus
+/// `bystanders` retained chain nodes that must stay byte-identical after
+/// expansion. Node ids: 0 = driver, 1 = anchor, 2 = consumer,
+/// 3..3 + bystanders = retained chain, 200.. = members (expanded only).
+/// Edge ids: 1/2 compact boundary trunks, 10/11 expanded boundary edges,
+/// 100.. bystander edges, 300.. internal member edges.
+pub fn expansion_pair(members: u32, bystanders: u32) -> (Graph, Graph, GroupExpansion) {
+    assert!(members >= 1);
+    let driver = block(0, 0, 1);
+    let anchor = block(1, 1, 1);
+    let consumer = block(2, 1, 0);
+
+    // Retained bystander chain, identical in both graphs.
+    let bystander_nodes: Vec<Node> = (0..bystanders)
+        .map(|index| {
+            let (inputs, outputs) = if index == 0 {
+                (0, 1)
+            } else if index + 1 == bystanders {
+                (1, 0)
+            } else {
+                (1, 1)
+            };
+            block(3 + index, inputs, outputs)
+        })
+        .collect();
+    let bystander_edges: Vec<Edge> = (0..bystanders.saturating_sub(1))
+        .map(|index| {
+            let source_out = if index == 0 { 0 } else { 1 };
+            edge(
+                100 + index,
+                (3 + index, source_out),
+                (3 + index + 1, 0),
+                100 + index,
+            )
+        })
+        .collect();
+
+    // Compact: driver -> anchor (edge 1, net 1), anchor -> consumer (edge 2, net 2).
+    let mut compact_nodes = vec![driver.clone(), anchor, consumer.clone()];
+    compact_nodes.extend(bystander_nodes.iter().cloned());
+    let mut compact_edges = vec![edge(1, (0, 0), (1, 0), 1), edge(2, (1, 1), (2, 0), 2)];
+    compact_edges.extend(bystander_edges.iter().cloned());
+    let compact = Graph {
+        nodes: compact_nodes,
+        edges: compact_edges,
+    };
+
+    // Expanded: anchor replaced by member chain 100..100 + members.
+    let member_ids: Vec<u32> = (0..members).map(|index| 200 + index).collect();
+    let member_nodes: Vec<Node> = member_ids.iter().map(|&id| block(id, 1, 1)).collect();
+    let mut expanded_nodes = vec![driver, consumer];
+    expanded_nodes.extend(bystander_nodes);
+    expanded_nodes.extend(member_nodes);
+    // Boundary edges keep the compact nets; internal member edges get fresh
+    // ids/nets from 300.
+    let mut expanded_edges = vec![edge(10, (0, 0), (member_ids[0], 0), 1)];
+    for window in member_ids.windows(2) {
+        let id = 300 + expanded_edges.len() as u32;
+        expanded_edges.push(edge(id, (window[0], 1), (window[1], 0), id));
+    }
+    expanded_edges.push(edge(
+        11,
+        (*member_ids.last().expect("members >= 1"), 1),
+        (2, 0),
+        2,
+    ));
+    expanded_edges.extend(bystander_edges);
+    let expanded = Graph {
+        nodes: expanded_nodes,
+        edges: expanded_edges,
+    };
+
+    let expansion = GroupExpansion {
+        anchor: 1,
+        members: member_ids,
+        boundary_trunks: vec![
+            BoundaryTrunk {
+                expanded_edge: 10,
+                compact_edge: 1,
+            },
+            BoundaryTrunk {
+                expanded_edge: 11,
+                compact_edge: 2,
+            },
+        ],
+    };
+    (compact, expanded, expansion)
+}

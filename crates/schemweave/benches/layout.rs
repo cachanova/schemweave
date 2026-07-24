@@ -78,6 +78,42 @@ fn layout_benches(c: &mut Criterion) {
     );
 }
 
+use schemweave::{GroupExpansionOptions, expand_group_in_place};
+
+fn expand_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("expand/chain");
+    for (label, members, bystanders) in [("4m-6b", 4, 6), ("8m-40b", 8, 40)] {
+        let (compact, expanded, expansion) = generators::expansion_pair(members, bystanders);
+        for (effort_label, effort) in EFFORTS {
+            let config = config(effort);
+            let compact_layout =
+                layout_with_config(&compact, &config).expect("compact fixture must lay out");
+            let options = GroupExpansionOptions {
+                layout: config.layout,
+                quality_effort: config.quality_effort,
+                constraints: config.constraints.clone(),
+            };
+            group.bench_with_input(
+                BenchmarkId::new(label, effort_label),
+                &(&compact, &compact_layout, &expanded, &expansion),
+                |b, (compact, compact_layout, expanded, expansion)| {
+                    b.iter(|| {
+                        expand_group_in_place(
+                            compact,
+                            compact_layout,
+                            expanded,
+                            expansion,
+                            &options,
+                        )
+                        .expect("expansion")
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 fn tuned() -> Criterion {
     Criterion::default().sample_size(20)
 }
@@ -85,6 +121,6 @@ fn tuned() -> Criterion {
 criterion_group! {
     name = benches;
     config = tuned();
-    targets = layout_benches
+    targets = layout_benches, expand_benches
 }
 criterion_main!(benches);
