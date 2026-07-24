@@ -1,0 +1,114 @@
+{
+  "compact_graph": {
+    "nodes": [
+      {"id":43,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":47,"width":74,"height":34,"cycle_breaker":false,"ports":[{"id":0,"side":"west","offset":17}]}
+    ],
+    "edges": [
+      {"id":0,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":0,"participates_in_ranking":true},
+      {"id":1,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":1,"participates_in_ranking":true},
+      {"id":2,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":2,"participates_in_ranking":true},
+      {"id":3,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":3,"participates_in_ranking":true},
+      {"id":4,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":4,"participates_in_ranking":true},
+      {"id":5,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":5,"participates_in_ranking":true},
+      {"id":6,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":6,"participates_in_ranking":true},
+      {"id":7,"source":{"node":43,"port":1},"target":{"node":47,"port":0},"net":7,"participates_in_ranking":true}
+    ]
+  },
+  "compact_layout": {
+    "nodes": [
+      {"id":43,"x":0,"y":0.3823529411764781,"width":92,"height":84},
+      {"id":47,"x":180,"y":12.382352941176478,"width":74,"height":34}
+    ],
+    "edges": [
+      {"id":0,"points":[{"x":92,"y":29.382352941176478},{"x":154,"y":29.382352941176478},{"x":154,"y":8.382352941176478},{"x":160,"y":8.382352941176478}]},
+      {"id":1,"points":[{"x":92,"y":29.382352941176478},{"x":148,"y":29.382352941176478},{"x":148,"y":14.382352941176478},{"x":160,"y":14.382352941176478}]},
+      {"id":2,"points":[{"x":92,"y":29.382352941176478},{"x":142,"y":29.382352941176478},{"x":142,"y":20.382352941176478},{"x":160,"y":20.382352941176478}]},
+      {"id":3,"points":[{"x":92,"y":29.382352941176478},{"x":136,"y":29.382352941176478},{"x":136,"y":26.382352941176478},{"x":160,"y":26.382352941176478}]},
+      {"id":4,"points":[{"x":92,"y":29.382352941176478},{"x":130,"y":29.382352941176478},{"x":130,"y":32.38235294117648},{"x":160,"y":32.38235294117648}]},
+      {"id":5,"points":[{"x":92,"y":29.382352941176478},{"x":124,"y":29.382352941176478},{"x":124,"y":38.38235294117648},{"x":160,"y":38.38235294117648}]},
+      {"id":6,"points":[{"x":92,"y":29.382352941176478},{"x":118,"y":29.382352941176478},{"x":118,"y":44.38235294117648},{"x":160,"y":44.38235294117648}]},
+      {"id":7,"points":[{"x":92,"y":29.382352941176478},{"x":112,"y":29.382352941176478},{"x":112,"y":50.38235294117648},{"x":160,"y":50.38235294117648}]}
+    ],
+    "boundary_bundles": [
+      {
+        "id":0,
+        "endpoint":{"node":47,"port":0},
+        "role":"output",
+        "width":8,
+        "collector":{"start":{"x":160,"y":8.382352941176478},"end":{"x":160,"y":50.38235294117648}},
+        "spine":{"start":{"x":180,"y":29.382352941176478},"end":{"x":160,"y":29.382352941176478}},
+        "members":[
+          {"edge":0,"slots":[0],"tap":{"x":160,"y":8.382352941176478}},
+          {"edge":1,"slots":[1],"tap":{"x":160,"y":14.382352941176478}},
+          {"edge":2,"slots":[2],"tap":{"x":160,"y":20.382352941176478}},
+          {"edge":3,"slots":[3],"tap":{"x":160,"y":26.382352941176478}},
+          {"edge":4,"slots":[4],"tap":{"x":160,"y":32.38235294117648}},
+          {"edge":5,"slots":[5],"tap":{"x":160,"y":38.38235294117648}},
+          {"edge":6,"slots":[6],"tap":{"x":160,"y":44.38235294117648}},
+          {"edge":7,"slots":[7],"tap":{"x":160,"y":50.38235294117648}}
+        ]
+      }
+    ],
+    "width":254,
+    "height":84.38235294117648
+  },
+  "expanded_graph": {
+    "nodes": [
+      {"id":35,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":36,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":37,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":38,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":39,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":40,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":41,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":42,"width":92,"height":84,"cycle_breaker":true,"ports":[{"id":0,"side":"west","offset":18.56},{"id":1,"side":"east","offset":29}]},
+      {"id":47,"width":74,"height":34,"cycle_breaker":false,"ports":[{"id":0,"side":"west","offset":17}]}
+    ],
+    "edges": [
+      {"id":0,"source":{"node":35,"port":1},"target":{"node":47,"port":0},"net":0,"participates_in_ranking":true},
+      {"id":1,"source":{"node":36,"port":1},"target":{"node":47,"port":0},"net":1,"participates_in_ranking":true},
+      {"id":2,"source":{"node":37,"port":1},"target":{"node":47,"port":0},"net":2,"participates_in_ranking":true},
+      {"id":3,"source":{"node":38,"port":1},"target":{"node":47,"port":0},"net":3,"participates_in_ranking":true},
+      {"id":4,"source":{"node":39,"port":1},"target":{"node":47,"port":0},"net":4,"participates_in_ranking":true},
+      {"id":5,"source":{"node":40,"port":1},"target":{"node":47,"port":0},"net":5,"participates_in_ranking":true},
+      {"id":6,"source":{"node":41,"port":1},"target":{"node":47,"port":0},"net":6,"participates_in_ranking":true},
+      {"id":7,"source":{"node":42,"port":1},"target":{"node":47,"port":0},"net":7,"participates_in_ranking":true}
+    ]
+  },
+  "expansion": {
+    "anchor":43,
+    "members":[35,36,37,38,39,40,41,42],
+    "boundary_trunks":[
+      {"expanded_edge":0,"compact_edge":0},
+      {"expanded_edge":1,"compact_edge":1},
+      {"expanded_edge":2,"compact_edge":2},
+      {"expanded_edge":3,"compact_edge":3},
+      {"expanded_edge":4,"compact_edge":4},
+      {"expanded_edge":5,"compact_edge":5},
+      {"expanded_edge":6,"compact_edge":6},
+      {"expanded_edge":7,"compact_edge":7}
+    ]
+  },
+  "constraints": {
+    "inputs":[],
+    "outputs":[47],
+    "boundary_bundles":[
+      {
+        "id":0,
+        "endpoint":{"node":47,"port":0},
+        "width":8,
+        "members":[
+          {"edge":0,"slots":[0]},
+          {"edge":1,"slots":[1]},
+          {"edge":2,"slots":[2]},
+          {"edge":3,"slots":[3]},
+          {"edge":4,"slots":[4]},
+          {"edge":5,"slots":[5]},
+          {"edge":6,"slots":[6]},
+          {"edge":7,"slots":[7]}
+        ]
+      }
+    ]
+  }
+}

@@ -25,6 +25,13 @@ fn captured_mux_vector_expansion() -> CapturedExpansion {
         .expect("captured consumer expansion request is valid")
 }
 
+fn captured_focused_register_vector_expansion() -> CapturedExpansion {
+    serde_json::from_str(include_str!(
+        "fixtures/consumer_reg_mux_focused_register_expansion.json"
+    ))
+    .expect("captured focused consumer expansion request is valid")
+}
+
 fn expand_without_a_full_relayout(captured: &CapturedExpansion) -> Layout {
     let mut config = LayoutConfig::highest_quality();
     config.constraints = captured.constraints.clone();
@@ -103,4 +110,48 @@ fn captured_register_vector_expands_without_a_full_relayout() {
 #[test]
 fn captured_mux_vector_expands_without_a_full_relayout() {
     expand_without_a_full_relayout(&captured_mux_vector_expansion());
+}
+
+#[test]
+fn captured_focused_register_vector_expands_without_a_full_relayout() {
+    let captured = captured_focused_register_vector_expansion();
+    let expanded = expand_without_a_full_relayout(&captured);
+    let members = expanded
+        .nodes
+        .iter()
+        .filter(|node| captured.expansion.members.contains(&node.id))
+        .collect::<Vec<_>>();
+    let columns = members
+        .iter()
+        .map(|node| node.x.to_bits())
+        .collect::<std::collections::BTreeSet<_>>();
+    let rows = members
+        .iter()
+        .map(|node| node.y.to_bits())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(columns.len() > 1 && rows.len() > 1);
+
+    let left = members
+        .iter()
+        .map(|node| node.x)
+        .fold(f64::INFINITY, f64::min);
+    let top = members
+        .iter()
+        .map(|node| node.y)
+        .fold(f64::INFINITY, f64::min);
+    let right = members
+        .iter()
+        .map(|node| node.x + node.width)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let bottom = members
+        .iter()
+        .map(|node| node.y + node.height)
+        .fold(f64::NEG_INFINITY, f64::max);
+    assert!(expanded.nodes.iter().all(|node| {
+        captured.expansion.members.contains(&node.id)
+            || node.x >= right
+            || node.x + node.width <= left
+            || node.y >= bottom
+            || node.y + node.height <= top
+    }));
 }
