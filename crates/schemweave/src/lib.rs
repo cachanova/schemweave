@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod boundary_bundles;
+mod groups;
 mod incremental;
 mod placement;
 mod readability;
@@ -25,6 +26,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use groups::{ExpandedGroupConstraint, ExpandedGroupLayoutError};
 pub use incremental::{
     BoundaryTrunk, GroupCollapseOptions, GroupExpansion, GroupExpansionError,
     GroupExpansionOptions, ProtectedGroup, collapse_group_in_place, expand_group_in_place,
@@ -224,6 +226,9 @@ pub struct LayoutConfig {
     pub layout: LayoutOptions,
     pub quality_effort: QualityEffort,
     pub constraints: LayoutConstraints,
+    /// Expanded visual groups that must occupy disjoint keep-out regions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_groups: Vec<ExpandedGroupConstraint>,
 }
 
 impl LayoutConfig {
@@ -249,6 +254,7 @@ impl Default for LayoutConfig {
             layout: LayoutOptions::default(),
             quality_effort: QualityEffort::Quality,
             constraints: LayoutConstraints::default(),
+            expanded_groups: Vec::new(),
         }
     }
 }
@@ -510,6 +516,8 @@ pub enum ConstrainedLayoutError {
     Layout(#[from] LayoutError),
     #[error(transparent)]
     Constraint(#[from] LayoutConstraintError),
+    #[error(transparent)]
+    ExpandedGroup(#[from] ExpandedGroupLayoutError),
 }
 
 /// Lay out a graph. Output ordering depends only on stable identifiers, not input order.
@@ -552,12 +560,13 @@ pub fn layout_with_config(
     graph: &Graph,
     config: &LayoutConfig,
 ) -> Result<Layout, ConstrainedLayoutError> {
-    layout_with_quality_effort_and_constraints(
+    let layout = layout_with_quality_effort_and_constraints(
         graph,
         config.layout,
         config.quality_effort,
         &config.constraints,
-    )
+    )?;
+    groups::apply_expanded_group_constraints(graph, layout, config)
 }
 
 fn layout_indexed(
