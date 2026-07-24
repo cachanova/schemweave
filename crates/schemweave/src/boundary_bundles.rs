@@ -382,14 +382,22 @@ fn same_endpoint_shared_route_candidate(
     let first_tap = geometry.members.first()?.tap;
     let mut unchanged = true;
     for (member, member_geometry) in bundle.members.iter().zip(&geometry.members) {
-        if !consume_shared_route_admission(admission_remaining, 2) {
-            return None;
-        }
-        unchanged &= context
+        let route = context
             .route_index
             .get(&member.edge)
-            .and_then(|index| routes.get(*index))
-            .is_some_and(|route| route.points == first_route.points)
+            .and_then(|index| routes.get(*index))?;
+        let point_comparison_work = first_route
+            .points
+            .len()
+            .min(route.points.len())
+            .saturating_add(1);
+        if !consume_shared_route_admission(
+            admission_remaining,
+            point_comparison_work.saturating_add(2),
+        ) {
+            return None;
+        }
+        unchanged &= route.points == first_route.points
             && preserved_point_matches(member_geometry.tap, first_tap);
     }
     if unchanged {
@@ -3411,7 +3419,60 @@ mod tests {
         );
 
         routes.pop();
-        admission_remaining = 25;
+        let mut no_op_geometry = geometry.clone();
+        no_op_geometry.members[1].tap = no_op_geometry.members[0].tap;
+        let no_op_points = vec![
+            Point { x: 94.0, y: 25.0 },
+            Point { x: 120.0, y: 25.0 },
+            Point { x: 120.0, y: 40.0 },
+            Point { x: 300.0, y: 40.0 },
+        ];
+        let no_op_routes = vec![
+            EdgeGeometry {
+                id: 10,
+                points: no_op_points.clone(),
+            },
+            EdgeGeometry {
+                id: 11,
+                points: no_op_points,
+            },
+        ];
+        admission_remaining = 13;
+        assert!(
+            same_endpoint_shared_route_candidate(
+                &context,
+                &indexed.boundary_bundles[0],
+                &no_op_geometry,
+                &[],
+                &no_op_routes,
+                6,
+                &mut admission_remaining,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            admission_remaining, 6,
+            "one-less no-op comparison work must stop before the second long route"
+        );
+        admission_remaining = 14;
+        assert!(
+            same_endpoint_shared_route_candidate(
+                &context,
+                &indexed.boundary_bundles[0],
+                &no_op_geometry,
+                &[],
+                &no_op_routes,
+                6,
+                &mut admission_remaining,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            admission_remaining, 0,
+            "the exact long-route no-op comparison boundary remains inclusive"
+        );
+
+        admission_remaining = 31;
         assert!(
             same_endpoint_shared_route_candidate(
                 &context,
@@ -3425,7 +3486,7 @@ mod tests {
             .is_none(),
             "admission must charge every route point, member, and nested slot copied"
         );
-        admission_remaining = 26;
+        admission_remaining = 32;
         assert!(
             same_endpoint_shared_route_candidate(
                 &context,
