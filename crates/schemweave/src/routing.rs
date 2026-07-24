@@ -4127,7 +4127,7 @@ pub(crate) fn regional_fanout_candidate(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     baseline: &[EdgeGeometry],
-    baseline_quality: RouteQuality,
+    baseline_quality: impl FnOnce() -> RouteQuality,
     options: LayoutOptions,
 ) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
     fanout_trunk_candidate(
@@ -4153,7 +4153,7 @@ pub(crate) fn ordinary_fanout_candidate(
         plan,
         nodes,
         baseline,
-        baseline_quality,
+        || baseline_quality,
         options,
         MIN_ORDINARY_FANOUT_EDGES,
         MAX_ORDINARY_FANOUT_EDGES,
@@ -4166,7 +4166,7 @@ fn fanout_trunk_candidate(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     baseline: &[EdgeGeometry],
-    baseline_quality: RouteQuality,
+    baseline_quality: impl FnOnce() -> RouteQuality,
     options: LayoutOptions,
     minimum_edges: usize,
     maximum_edges: usize,
@@ -4187,6 +4187,7 @@ fn fanout_trunk_candidate(
     if eligible.is_empty() {
         return None;
     }
+    let baseline_quality = baseline_quality();
     let baseline_segments =
         physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), baseline).0;
     let baseline_congestion = parallel_congestion_ratio(&baseline_segments)?;
