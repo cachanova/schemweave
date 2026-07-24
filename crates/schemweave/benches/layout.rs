@@ -79,7 +79,8 @@ fn layout_benches(c: &mut Criterion) {
 }
 
 use schemweave::{
-    GroupCollapseOptions, GroupExpansionOptions, collapse_group_in_place, expand_group_in_place,
+    GroupCollapseOptions, GroupExpansionOptions, ProtectedGroup, collapse_group_in_place,
+    expand_group_in_place,
 };
 
 fn expand_benches(c: &mut Criterion) {
@@ -120,6 +121,66 @@ fn expand_benches(c: &mut Criterion) {
                             &options,
                         )
                         .expect("expansion")
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+
+    let mut group = c.benchmark_group("expand/protected-peers");
+    for (label, peer_count, peer_members) in [("1x8", 1, 8), ("8x1", 8, 1)] {
+        let bystanders = peer_count * peer_members;
+        let (mut compact, expanded, expansion) = generators::expansion_pair(8, bystanders);
+        compact
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == expansion.anchor)
+            .expect("compact anchor")
+            .width = 2_400.0;
+        for (effort_label, effort) in EFFORTS {
+            let config = config(effort);
+            let compact_layout =
+                layout_with_config(&compact, &config).expect("compact fixture must lay out");
+            let protected_groups = (0..peer_count)
+                .map(|group| ProtectedGroup {
+                    id: 1_000 + group,
+                    members: (0..peer_members)
+                        .map(|member| 3 + group * peer_members + member)
+                        .collect(),
+                    frame_padding: 16.0,
+                })
+                .collect();
+            let options = GroupExpansionOptions {
+                layout: config.layout,
+                quality_effort: config.quality_effort,
+                constraints: config.constraints.clone(),
+                protected_groups,
+            };
+            let first =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("protected expansion");
+            let second =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("protected expansion");
+            assert_eq!(
+                first, second,
+                "protected expansion must be deterministic before measuring"
+            );
+            group.throughput(Throughput::Elements(expanded.edges.len() as u64));
+            group.bench_with_input(
+                BenchmarkId::new(label, effort_label),
+                &(&compact, &compact_layout, &expanded, &expansion),
+                |b, (compact, compact_layout, expanded, expansion)| {
+                    b.iter(|| {
+                        expand_group_in_place(
+                            compact,
+                            compact_layout,
+                            expanded,
+                            expansion,
+                            &options,
+                        )
+                        .expect("protected expansion")
                     })
                 },
             );

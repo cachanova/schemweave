@@ -15,6 +15,8 @@ use crate::{
 
 const MAX_EXPANSION_MEMBERS: usize = 4_096;
 const MAX_EXPANSION_EDGES: usize = 10_000;
+const MAX_PROTECTED_GROUPS: usize = 4_096;
+const MAX_PROTECTED_GROUP_MEMBERS: usize = 4_096;
 const MAX_LAYOUT_SEGMENTS: usize = 100_000;
 const HARD_GATE_EPSILON: f64 = 1e-7;
 const FAST_CANDIDATE_WORK: usize = 10_000_000;
@@ -101,6 +103,10 @@ pub enum GroupExpansionError {
     DuplicateMember(NodeId),
     #[error("protected group {0} has no members")]
     EmptyProtectedGroup(NodeId),
+    #[error("group expansion has {actual} protected groups, maximum is {maximum}")]
+    TooManyProtectedGroups { actual: usize, maximum: usize },
+    #[error("group expansion has {actual} total protected-group members, maximum is {maximum}")]
+    TooManyProtectedGroupMembers { actual: usize, maximum: usize },
     #[error("group expansion repeats protected group id {0}")]
     DuplicateProtectedGroup(NodeId),
     #[error("current expansion group {0} cannot also be a protected peer")]
@@ -212,6 +218,30 @@ struct GraphExpansionContract<'a> {
 struct ProtectedGroupGeometry {
     members: BTreeSet<NodeId>,
     frame_padding: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProtectedGroupPlan {
+    owner_by_member: BTreeMap<NodeId, usize>,
+    frames: Vec<Rect>,
+}
+
+impl ProtectedGroupPlan {
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ExpansionCorridor {
+    layout: Layout,
+    protected_frames: Vec<Rect>,
+}
+
+#[derive(Clone, Copy)]
+struct ProtectedGroupState<'a> {
+    owner_by_member: &'a BTreeMap<NodeId, usize>,
+    frames: &'a [Rect],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -552,6 +582,8 @@ pub fn expand_group_in_place_with_reference_height(
         expansion,
         &options.protected_groups,
     )?;
+    let protected_plan = protected_group_plan(compact_layout, &protected_groups)
+        .ok_or(GroupExpansionError::NeedsFullRelayout)?;
 
     let member_graph = member_graph(expanded_graph, &contract.members);
     let member_constraints = LayoutConstraints {
@@ -642,11 +674,16 @@ pub fn expand_group_in_place_with_reference_height(
         compact_layout,
         expansion.anchor,
         member_layout.width,
-        &protected_groups,
+        &protected_plan,
     );
-    let horizontal_layout = corridor_layout.as_ref().unwrap_or(compact_layout);
-    let horizontal_protected_frames = protected_group_frames(horizontal_layout, &protected_groups)
-        .ok_or(GroupExpansionError::NeedsFullRelayout)?;
+    let horizontal_layout = corridor_layout
+        .as_ref()
+        .map_or(compact_layout, |corridor| &corridor.layout);
+    let horizontal_protected_frames = corridor_layout
+        .as_ref()
+        .map_or(protected_plan.frames.as_slice(), |corridor| {
+            corridor.protected_frames.as_slice()
+        });
     let vertical_layout = insert_local_vertical_expansion_corridor(
         compact_graph,
         horizontal_layout,
@@ -654,7 +691,10 @@ pub fn expand_group_in_place_with_reference_height(
         member_layout.width,
         member_layout.height,
         options.layout,
-        &protected_groups,
+        ProtectedGroupState {
+            owner_by_member: &protected_plan.owner_by_member,
+            frames: horizontal_protected_frames,
+        },
     );
     let contract = validate_contract(
         compact_graph,
@@ -690,7 +730,7 @@ pub fn expand_group_in_place_with_reference_height(
     let vertical_contract = vertical_layout.as_ref().and_then(|vertical_layout| {
         validate_contract(
             compact_graph,
-            vertical_layout,
+            &vertical_layout.layout,
             expanded_graph,
             expansion,
             options.layout,
@@ -702,7 +742,7 @@ pub fn expand_group_in_place_with_reference_height(
         .zip(vertical_contract.as_ref())
         .and_then(|(vertical_layout, vertical_contract)| {
             remap_boundary_bundles(
-                vertical_layout,
+                &vertical_layout.layout,
                 expanded_graph,
                 &expanded_indexed,
                 vertical_contract,
@@ -794,16 +834,14 @@ pub fn expand_group_in_place_with_reference_height(
         let vertical_bundles = vertical_bundles
             .as_ref()
             .expect("usable vertical layout has remapped boundary bundles");
-        let vertical_protected_frames = protected_group_frames(vertical_layout, &protected_groups)
-            .ok_or(GroupExpansionError::NeedsFullRelayout)?;
         let frame = Rect {
             left: anchor_origin.x,
             top: anchor_origin.y,
             right: anchor_origin.x + member_layout.width,
             bottom: anchor_origin.y + member_layout.height,
         };
-        if retained_node_overlap_area(vertical_layout, expansion.anchor, frame, 0.0) == 0.0
-            && !frame_overlaps_protected_group(&vertical_protected_frames, frame)
+        if retained_node_overlap_area(&vertical_layout.layout, expansion.anchor, frame, 0.0) == 0.0
+            && !frame_overlaps_protected_group(&vertical_layout.protected_frames, frame)
         {
             for prefer_direct_boundary_routes in [true, false] {
                 if candidate_attempts_remaining == 0 {
@@ -811,7 +849,7 @@ pub fn expand_group_in_place_with_reference_height(
                 }
                 candidate_attempts_remaining -= 1;
                 if let Some(candidate) = evaluate_expansion_candidate(
-                    vertical_layout,
+                    &vertical_layout.layout,
                     expanded_graph,
                     &expanded_indexed,
                     vertical_contract,
@@ -847,7 +885,7 @@ pub fn expand_group_in_place_with_reference_height(
             bottom: y + member_layout.height,
         };
         if retained_node_overlap_area(horizontal_layout, expansion.anchor, frame, 0.0) > 0.0
-            || frame_overlaps_protected_group(&horizontal_protected_frames, frame)
+            || frame_overlaps_protected_group(horizontal_protected_frames, frame)
         {
             continue;
         }
@@ -1372,6 +1410,24 @@ fn validate_protected_groups(
     if protected_groups.is_empty() {
         return Ok(Vec::new());
     }
+    if protected_groups.len() > MAX_PROTECTED_GROUPS {
+        return Err(GroupExpansionError::TooManyProtectedGroups {
+            actual: protected_groups.len(),
+            maximum: MAX_PROTECTED_GROUPS,
+        });
+    }
+    let total_members = protected_groups
+        .iter()
+        .try_fold(0usize, |total, group| {
+            total.checked_add(group.members.len())
+        })
+        .unwrap_or(usize::MAX);
+    if total_members > MAX_PROTECTED_GROUP_MEMBERS {
+        return Err(GroupExpansionError::TooManyProtectedGroupMembers {
+            actual: total_members,
+            maximum: MAX_PROTECTED_GROUP_MEMBERS,
+        });
+    }
     let compact_nodes = compact_graph
         .nodes
         .iter()
@@ -1453,40 +1509,40 @@ fn validate_protected_groups(
     Ok(validated)
 }
 
-fn protected_group_frames(layout: &Layout, groups: &[ProtectedGroupGeometry]) -> Option<Vec<Rect>> {
+fn protected_group_plan(
+    layout: &Layout,
+    groups: &[ProtectedGroupGeometry],
+) -> Option<ProtectedGroupPlan> {
     if groups.is_empty() {
-        return Some(Vec::new());
+        return Some(ProtectedGroupPlan::default());
     }
-    let geometry_by_id = layout
-        .nodes
+    let owner_by_member = groups
         .iter()
-        .map(|node| (node.id, node))
+        .enumerate()
+        .flat_map(|(index, group)| group.members.iter().map(move |&member| (member, index)))
         .collect::<BTreeMap<_, _>>();
-    groups
-        .iter()
-        .map(|group| {
-            let geometry = group
-                .members
-                .iter()
-                .map(|member| geometry_by_id.get(member).copied())
-                .collect::<Option<Vec<_>>>()?;
-            Some(
-                Rect {
-                    left: geometry.iter().map(|node| node.x).min_by(f64::total_cmp)?,
-                    top: geometry.iter().map(|node| node.y).min_by(f64::total_cmp)?,
-                    right: geometry
-                        .iter()
-                        .map(|node| node.x + node.width)
-                        .max_by(f64::total_cmp)?,
-                    bottom: geometry
-                        .iter()
-                        .map(|node| node.y + node.height)
-                        .max_by(f64::total_cmp)?,
-                }
-                .expanded(group.frame_padding),
-            )
-        })
-        .collect()
+    let mut frames = vec![None::<Rect>; groups.len()];
+    for node in &layout.nodes {
+        let Some(&group) = owner_by_member.get(&node.id) else {
+            continue;
+        };
+        let node = Rect::from_node(node);
+        frames[group] = Some(frames[group].map_or(node, |frame| Rect {
+            left: frame.left.min(node.left),
+            top: frame.top.min(node.top),
+            right: frame.right.max(node.right),
+            bottom: frame.bottom.max(node.bottom),
+        }));
+    }
+    let frames = frames
+        .into_iter()
+        .zip(groups)
+        .map(|(frame, group)| frame.map(|frame| frame.expanded(group.frame_padding)))
+        .collect::<Option<Vec<_>>>()?;
+    Some(ProtectedGroupPlan {
+        owner_by_member,
+        frames,
+    })
 }
 
 fn frame_overlaps_protected_group(protected_frames: &[Rect], frame: Rect) -> bool {
@@ -2002,8 +2058,8 @@ fn insert_horizontal_expansion_corridor(
     compact_layout: &Layout,
     anchor: NodeId,
     member_width: f64,
-    protected_groups: &[ProtectedGroupGeometry],
-) -> Option<Layout> {
+    protected: &ProtectedGroupPlan,
+) -> Option<ExpansionCorridor> {
     let anchor_geometry = compact_layout.nodes.iter().find(|node| node.id == anchor)?;
     let additional_width = member_width - anchor_geometry.width;
     if additional_width <= HARD_GATE_EPSILON {
@@ -2032,7 +2088,7 @@ fn insert_horizontal_expansion_corridor(
             point.x += additional_width;
         }
     };
-    if protected_groups.is_empty() {
+    if protected.is_empty() {
         let mut expanded = compact_layout.clone();
         for node in &mut expanded.nodes {
             if node.id != anchor && node.x + HARD_GATE_EPSILON >= cut {
@@ -2054,17 +2110,14 @@ fn insert_horizontal_expansion_corridor(
             }
         }
         expanded.width += additional_width;
-        return Some(expanded);
+        return Some(ExpansionCorridor {
+            layout: expanded,
+            protected_frames: Vec::new(),
+        });
     }
 
-    let owner_by_member = protected_groups
-        .iter()
-        .enumerate()
-        .flat_map(|(index, group)| group.members.iter().map(move |&member| (member, index)))
-        .collect::<BTreeMap<_, _>>();
-    let protected_frames = protected_group_frames(compact_layout, protected_groups)?;
-    let mut shifted_groups = vec![false; protected_groups.len()];
-    for (index, frame) in protected_frames.iter().copied().enumerate() {
+    let mut shifted_groups = vec![false; protected.frames.len()];
+    for (index, frame) in protected.frames.iter().copied().enumerate() {
         shifted_groups[index] = if frame.right <= cut + HARD_GATE_EPSILON {
             false
         } else if frame.left + HARD_GATE_EPSILON >= cut {
@@ -2077,7 +2130,8 @@ fn insert_horizontal_expansion_corridor(
     }
     let mut expanded = compact_layout.clone();
     for node in &mut expanded.nodes {
-        let shift = owner_by_member
+        let shift = protected
+            .owner_by_member
             .get(&node.id)
             .map_or(node.x + HARD_GATE_EPSILON >= cut, |&group| {
                 shifted_groups[group]
@@ -2093,8 +2147,8 @@ fn insert_horizontal_expansion_corridor(
         .collect::<BTreeMap<_, _>>();
     for route in &mut expanded.edges {
         let edge = edges.get(&route.id).copied()?;
-        let source_group = owner_by_member.get(&edge.source.node).copied();
-        let target_group = owner_by_member.get(&edge.target.node).copied();
+        let source_group = protected.owner_by_member.get(&edge.source.node).copied();
+        let target_group = protected.owner_by_member.get(&edge.target.node).copied();
         if let (Some(source_group), Some(target_group)) = (source_group, target_group)
             && source_group == target_group
         {
@@ -2119,7 +2173,26 @@ fn insert_horizontal_expansion_corridor(
         }
     }
     expanded.width += additional_width;
-    Some(expanded)
+    let protected_frames = protected
+        .frames
+        .iter()
+        .zip(shifted_groups)
+        .map(|(&frame, shifted)| {
+            if shifted {
+                Rect {
+                    left: frame.left + additional_width,
+                    right: frame.right + additional_width,
+                    ..frame
+                }
+            } else {
+                frame
+            }
+        })
+        .collect();
+    Some(ExpansionCorridor {
+        layout: expanded,
+        protected_frames,
+    })
 }
 
 fn insert_local_vertical_expansion_corridor(
@@ -2129,8 +2202,10 @@ fn insert_local_vertical_expansion_corridor(
     member_width: f64,
     member_height: f64,
     options: LayoutOptions,
-    protected_groups: &[ProtectedGroupGeometry],
-) -> Option<Layout> {
+    protected: ProtectedGroupState<'_>,
+) -> Option<ExpansionCorridor> {
+    let owner_by_member = protected.owner_by_member;
+    let protected_frames = protected.frames;
     let anchor_geometry = compact_layout.nodes.iter().find(|node| node.id == anchor)?;
     if member_height <= anchor_geometry.height + HARD_GATE_EPSILON {
         return None;
@@ -2163,7 +2238,6 @@ fn insert_local_vertical_expansion_corridor(
     // expanded frame. This keeps nodes atomic without an all-pairs closure.
     let seed_left = (frame.left - margin).max(0.0);
     let seed_right = frame.right + margin;
-    let protected_frames = protected_group_frames(compact_layout, protected_groups)?;
     let mut intervals = compact_layout
         .nodes
         .iter()
@@ -2210,11 +2284,6 @@ fn insert_local_vertical_expansion_corridor(
         right,
         bottom: f64::INFINITY,
     };
-    let owner_by_member = protected_groups
-        .iter()
-        .enumerate()
-        .flat_map(|(index, group)| group.members.iter().map(move |&member| (member, index)))
-        .collect::<BTreeMap<_, _>>();
     let moved_groups = protected_frames
         .iter()
         .map(|frame| {
@@ -2250,25 +2319,38 @@ fn insert_local_vertical_expansion_corridor(
         .filter(|edge| !anchor_edges.contains(edge))
         .collect::<BTreeSet<_>>();
     let mut moved = false;
-    for node in &mut expanded.nodes {
-        let should_move = owner_by_member.get(&node.id).map_or_else(
-            || {
-                node.id != anchor
-                    && node.y + HARD_GATE_EPSILON >= cut
-                    && node.x >= slab.left - HARD_GATE_EPSILON
-                    && node.x + node.width <= slab.right + HARD_GATE_EPSILON
-            },
-            |&group| moved_groups[group],
-        );
-        if should_move {
-            node.y += delta;
-            moved = true;
+    if protected_frames.is_empty() {
+        for node in &mut expanded.nodes {
+            let should_move = node.id != anchor
+                && node.y + HARD_GATE_EPSILON >= cut
+                && node.x >= slab.left - HARD_GATE_EPSILON
+                && node.x + node.width <= slab.right + HARD_GATE_EPSILON;
+            if should_move {
+                node.y += delta;
+                moved = true;
+            }
+        }
+    } else {
+        for node in &mut expanded.nodes {
+            let should_move = owner_by_member.get(&node.id).map_or_else(
+                || {
+                    node.id != anchor
+                        && node.y + HARD_GATE_EPSILON >= cut
+                        && node.x >= slab.left - HARD_GATE_EPSILON
+                        && node.x + node.width <= slab.right + HARD_GATE_EPSILON
+                },
+                |&group| moved_groups[group],
+            );
+            if should_move {
+                node.y += delta;
+                moved = true;
+            }
         }
     }
     if !moved {
         return None;
     }
-    if protected_groups.is_empty() {
+    if protected_frames.is_empty() {
         for route in &mut expanded.edges {
             let warped = warp_vertical_slab_route(&route.points, slab.left, slab.right, cut, delta);
             if protected_bundle_edges.contains(&route.id) && warped != route.points {
@@ -2336,7 +2418,25 @@ fn insert_local_vertical_expansion_corridor(
         }
     }
     expanded.height = layout_bottom(&expanded).max(compact_layout.height);
-    Some(expanded)
+    let protected_frames = protected_frames
+        .iter()
+        .zip(moved_groups)
+        .map(|(&frame, moved)| {
+            if moved {
+                Rect {
+                    top: frame.top + delta,
+                    bottom: frame.bottom + delta,
+                    ..frame
+                }
+            } else {
+                frame
+            }
+        })
+        .collect();
+    Some(ExpansionCorridor {
+        layout: expanded,
+        protected_frames,
+    })
 }
 
 fn warp_vertical_slab_point(point: Point, left: f64, right: f64, cut: f64, delta: f64) -> Point {
@@ -4996,9 +5096,10 @@ mod tests {
     use super::{
         BoundaryTrunk, ExpansionWork, GroupCollapseOptions, GroupExpansion, GroupExpansionError,
         GroupExpansionOptions, HARD_GATE_EPSILON, ObstacleIndex, ProtectedGroup,
-        ProtectedGroupGeometry, Rect, arrange_member_components, candidate_positions,
-        collapse_group_in_place, expand_group_in_place, insert_local_vertical_expansion_corridor,
-        obstacle_safe_bridge, path_is_clear, protected_group_frames,
+        ProtectedGroupGeometry, ProtectedGroupState, Rect, arrange_member_components,
+        candidate_positions, collapse_group_in_place, expand_group_in_place,
+        insert_horizontal_expansion_corridor, insert_local_vertical_expansion_corridor,
+        obstacle_safe_bridge, path_is_clear, protected_group_plan,
     };
     use crate::{
         BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, EdgeGeometry, Endpoint,
@@ -5134,6 +5235,7 @@ mod tests {
             },
         ];
 
+        let protected = protected_group_plan(&layout, &protected).unwrap();
         let reflowed = insert_local_vertical_expansion_corridor(
             &graph,
             &layout,
@@ -5141,7 +5243,10 @@ mod tests {
             40.0,
             160.0,
             LayoutOptions::default(),
-            &protected,
+            ProtectedGroupState {
+                owner_by_member: &protected.owner_by_member,
+                frames: &protected.frames,
+            },
         )
         .expect("the connected local slab should move");
         let before = layout
@@ -5150,6 +5255,7 @@ mod tests {
             .map(|node| (node.id, node))
             .collect::<BTreeMap<_, _>>();
         let after = reflowed
+            .layout
             .nodes
             .iter()
             .map(|node| (node.id, node))
@@ -5160,7 +5266,7 @@ mod tests {
         assert_eq!(top_delta, bottom_delta);
         assert_eq!(after[&22].y - after[&21].y, before[&22].y - before[&21].y);
         let before_route = &layout.edges[0].points;
-        let after_route = &reflowed.edges[0].points;
+        let after_route = &reflowed.layout.edges[0].points;
         assert_eq!(after_route.len(), before_route.len());
         for (before, after) in before_route.iter().zip(after_route) {
             assert_eq!(after.x, before.x);
@@ -5169,7 +5275,124 @@ mod tests {
         for member in [41, 42] {
             assert_eq!(after[&member], before[&member]);
         }
-        assert_eq!(reflowed.edges[1], layout.edges[1]);
+        assert_eq!(reflowed.layout.edges[1], layout.edges[1]);
+    }
+
+    #[test]
+    fn horizontal_reflow_moves_protected_peers_rigidly_and_rejects_frame_splits() {
+        let mut narrow = node(10);
+        narrow.width = 40.0;
+        narrow.height = 40.0;
+        let graph = Graph {
+            nodes: vec![node(1), node(2), narrow, node(21), node(22)],
+            edges: vec![edge(1, 1, 2, 100), edge(7, 21, 22, 700)],
+        };
+        let layout = Layout {
+            nodes: vec![
+                NodeGeometry {
+                    id: 1,
+                    x: 0.0,
+                    y: 80.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                NodeGeometry {
+                    id: 2,
+                    x: 40.0,
+                    y: 80.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                NodeGeometry {
+                    id: 10,
+                    x: 100.0,
+                    y: 0.0,
+                    width: 40.0,
+                    height: 40.0,
+                },
+                NodeGeometry {
+                    id: 21,
+                    x: 240.0,
+                    y: 80.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+                NodeGeometry {
+                    id: 22,
+                    x: 300.0,
+                    y: 80.0,
+                    width: 20.0,
+                    height: 20.0,
+                },
+            ],
+            edges: vec![
+                EdgeGeometry {
+                    id: 1,
+                    points: vec![Point { x: 20.0, y: 90.0 }, Point { x: 40.0, y: 90.0 }],
+                },
+                EdgeGeometry {
+                    id: 7,
+                    points: vec![Point { x: 260.0, y: 90.0 }, Point { x: 300.0, y: 90.0 }],
+                },
+            ],
+            boundary_bundles: Vec::new(),
+            width: 320.0,
+            height: 100.0,
+        };
+        let groups = [
+            ProtectedGroupGeometry {
+                members: BTreeSet::from([1, 2]),
+                frame_padding: 15.0,
+            },
+            ProtectedGroupGeometry {
+                members: BTreeSet::from([21, 22]),
+                frame_padding: 15.0,
+            },
+        ];
+        let protected = protected_group_plan(&layout, &groups).unwrap();
+        let reflowed = insert_horizontal_expansion_corridor(&graph, &layout, 10, 140.0, &protected)
+            .expect("the right protected peer should move as one region");
+        let before = layout
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<BTreeMap<_, _>>();
+        let after = reflowed
+            .layout
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<BTreeMap<_, _>>();
+        for member in [1, 2] {
+            assert_eq!(after[&member], before[&member]);
+        }
+        for member in [21, 22] {
+            assert_eq!(after[&member].x, before[&member].x + 100.0);
+            assert_eq!(after[&member].y, before[&member].y);
+        }
+        assert_eq!(reflowed.layout.edges[0], layout.edges[0]);
+        for (before, after) in layout.edges[1]
+            .points
+            .iter()
+            .zip(&reflowed.layout.edges[1].points)
+        {
+            assert_eq!(after.x, before.x + 100.0);
+            assert_eq!(after.y, before.y);
+        }
+
+        let mut straddling = layout.clone();
+        for node in &mut straddling.nodes {
+            if node.id == 21 {
+                node.x = 160.0;
+            } else if node.id == 22 {
+                node.x = 220.0;
+            }
+        }
+        let straddling_plan = protected_group_plan(&straddling, &groups).unwrap();
+        assert!(
+            insert_horizontal_expansion_corridor(&graph, &straddling, 10, 140.0, &straddling_plan,)
+                .is_none()
+        );
     }
 
     fn edge(id: u32, source: u32, target: u32, net: u32) -> Edge {
@@ -5241,6 +5464,30 @@ mod tests {
             )
         };
 
+        assert_eq!(
+            run((0..=super::MAX_PROTECTED_GROUPS)
+                .map(|index| ProtectedGroup {
+                    id: 1_000 + index as u32,
+                    members: vec![4],
+                    frame_padding: 0.0,
+                })
+                .collect()),
+            Err(GroupExpansionError::TooManyProtectedGroups {
+                actual: super::MAX_PROTECTED_GROUPS + 1,
+                maximum: super::MAX_PROTECTED_GROUPS,
+            })
+        );
+        assert_eq!(
+            run(vec![ProtectedGroup {
+                id: 20,
+                members: vec![4; super::MAX_PROTECTED_GROUP_MEMBERS + 1],
+                frame_padding: 0.0,
+            }]),
+            Err(GroupExpansionError::TooManyProtectedGroupMembers {
+                actual: super::MAX_PROTECTED_GROUP_MEMBERS + 1,
+                maximum: super::MAX_PROTECTED_GROUP_MEMBERS,
+            })
+        );
         assert_eq!(
             run(vec![ProtectedGroup {
                 id: 20,
@@ -5338,7 +5585,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_group_order_does_not_change_expansion_geometry() {
+    fn protected_group_member_order_does_not_change_expansion_geometry() {
         let (compact, expanded, expansion) = fixture();
         let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
         let expected = expand_group_in_place(
@@ -5977,14 +6224,15 @@ mod tests {
             assert_eq!(after.x, before.x + delta_x);
             assert_eq!(after.y, before.y + delta_y);
         }
-        let peer_frame = protected_group_frames(
+        let peer_frame = protected_group_plan(
             &result,
             &[ProtectedGroupGeometry {
                 members: BTreeSet::from([30, 40]),
                 frame_padding: 15.0,
             }],
         )
-        .unwrap()[0];
+        .unwrap()
+        .frames[0];
         assert!(
             result
                 .nodes
@@ -6948,6 +7196,18 @@ mod tests {
             .iter()
             .find(|node| node.id == 4)
             .unwrap();
+        let protected_groups = vec![
+            ProtectedGroup {
+                id: 20,
+                members: vec![1],
+                frame_padding: 8.0,
+            },
+            ProtectedGroup {
+                id: 30,
+                members: vec![4],
+                frame_padding: 8.0,
+            },
+        ];
 
         let result = expand_group_in_place(
             &compact,
@@ -6969,6 +7229,7 @@ mod tests {
             },
             &GroupExpansionOptions {
                 quality_effort: QualityEffort::Max,
+                protected_groups: protected_groups.clone(),
                 ..GroupExpansionOptions::default()
             },
         )
@@ -6981,6 +7242,46 @@ mod tests {
         assert!(expanded_output.x > compact_output.x);
         assert!(result.width > compact_layout.width);
         assert!(super::hard_geometry_is_clean(&expanded, &result));
+
+        let mut compact_permuted = compact;
+        compact_permuted.nodes.reverse();
+        compact_permuted.edges.reverse();
+        let mut expanded_permuted = expanded;
+        expanded_permuted.nodes.reverse();
+        expanded_permuted.edges.reverse();
+        let mut protected_groups_permuted = protected_groups;
+        protected_groups_permuted.reverse();
+        for group in &mut protected_groups_permuted {
+            group.members.reverse();
+        }
+        assert_eq!(
+            expand_group_in_place(
+                &compact_permuted,
+                &compact_layout,
+                &expanded_permuted,
+                &GroupExpansion {
+                    anchor: 10,
+                    members: vec![3, 2],
+                    boundary_trunks: vec![
+                        BoundaryTrunk {
+                            expanded_edge: 13,
+                            compact_edge: 2,
+                        },
+                        BoundaryTrunk {
+                            expanded_edge: 11,
+                            compact_edge: 1,
+                        },
+                    ],
+                },
+                &GroupExpansionOptions {
+                    quality_effort: QualityEffort::Max,
+                    protected_groups: protected_groups_permuted,
+                    ..GroupExpansionOptions::default()
+                },
+            )
+            .unwrap(),
+            result
+        );
     }
 
     #[test]

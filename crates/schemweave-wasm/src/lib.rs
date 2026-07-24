@@ -196,8 +196,9 @@ mod tests {
         collapse_group_serialized, expand_group_serialized, layout_json, layout_serialized,
     };
     use schemweave::{
-        BoundaryTrunk, Edge, Endpoint, Graph, GroupExpansion, Layout, LayoutOptions, Node, Port,
-        PortSide, layout, layout_with_constraints,
+        BoundaryTrunk, Edge, Endpoint, Graph, GroupExpansion, GroupExpansionOptions, Layout,
+        LayoutOptions, Node, Port, PortSide, ProtectedGroup, expand_group_in_place, layout,
+        layout_with_constraints,
     };
 
     fn decode_expanded_layout(response: String) -> Layout {
@@ -454,6 +455,28 @@ mod tests {
                 },
             ],
         };
+        let options = GroupExpansionOptions {
+            protected_groups: vec![ProtectedGroup {
+                id: 20,
+                members: vec![4],
+                frame_padding: 16.0,
+            }],
+            ..GroupExpansionOptions::default()
+        };
+        let expected =
+            expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                .unwrap();
+        let actual = decode_expanded_layout(
+            expand_group_serialized(
+                &serde_json::to_string(&compact).unwrap(),
+                &serde_json::to_string(&compact_layout).unwrap(),
+                &serde_json::to_string(&expanded).unwrap(),
+                &serde_json::to_string(&expansion).unwrap(),
+                &serde_json::to_string(&options).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(actual, expected);
 
         let error = expand_group_serialized(
             &serde_json::to_string(&compact).unwrap(),
