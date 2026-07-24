@@ -2435,14 +2435,17 @@ fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
         outputs: vec![2, 3],
         boundary_bundles,
     };
+    let options = LayoutOptions {
+        layer_gap: 160.0,
+        ..LayoutOptions::default()
+    };
     let result = layout_with_constraints(
         &graph,
-        LayoutOptions::default(),
+        options,
         &constraints(vec![output.clone(), input.clone()]),
     )
     .unwrap();
-    let minimum_interior_depth =
-        LayoutOptions::default().port_stub + LayoutOptions::default().route_lane_gap;
+    let minimum_interior_depth = options.port_stub + options.route_lane_gap;
     let input_bundle = result
         .boundary_bundles
         .iter()
@@ -2451,6 +2454,19 @@ fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
     assert!(
         (input_bundle.spine.end.x - input_bundle.spine.start.x).abs() > minimum_interior_depth,
         "{input_bundle:#?}"
+    );
+    let output_bundle = result
+        .boundary_bundles
+        .iter()
+        .find(|bundle| bundle.role == BoundaryBundleRole::Output)
+        .unwrap();
+    assert!(
+        (output_bundle.spine.end.x - output_bundle.spine.start.x).abs() > minimum_interior_depth,
+        "{output_bundle:#?}"
+    );
+    assert!(
+        output_bundle.spine.end.x - input_bundle.spine.end.x >= options.route_lane_gap,
+        "{input_bundle:#?}\n{output_bundle:#?}"
     );
     let alias = result.edges.iter().find(|route| route.id == 10).unwrap();
     let input_tap = result
@@ -2478,7 +2494,7 @@ fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
 
     let reordered = layout_with_constraints(
         &graph,
-        LayoutOptions::default(),
+        options,
         &constraints(vec![input.clone(), output.clone()]),
     )
     .unwrap();
@@ -2490,7 +2506,7 @@ fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
     swapped_output.id = 3;
     let swapped = layout_with_constraints(
         &graph,
-        LayoutOptions::default(),
+        options,
         &constraints(vec![swapped_input, swapped_output]),
     )
     .unwrap();

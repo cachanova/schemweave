@@ -379,14 +379,14 @@ fn plan_interior_collectors(
             .iter()
             .filter_map(|&bundle| {
                 let range = ranges[bundle]?;
-                (range.role == BoundaryBundleRole::Input).then_some(range)
+                (range.role == BoundaryBundleRole::Input).then_some(bundle)
             })
             .collect::<Vec<_>>();
         let outputs = component
             .iter()
             .filter_map(|&bundle| {
                 let range = ranges[bundle]?;
-                (range.role == BoundaryBundleRole::Output).then_some(range)
+                (range.role == BoundaryBundleRole::Output).then_some(bundle)
             })
             .collect::<Vec<_>>();
         if inputs.is_empty() || outputs.is_empty() {
@@ -394,13 +394,13 @@ fn plan_interior_collectors(
         }
         let feasible_low = inputs
             .iter()
-            .map(|range| range.minimum_x)
+            .filter_map(|&bundle| ranges[bundle].map(|range| range.minimum_x))
             .fold(f64::NEG_INFINITY, f64::max);
-        let feasible_high = outputs
+        let latest_output_limit = outputs
             .iter()
-            .map(|range| range.maximum_x)
+            .filter_map(|&bundle| ranges[bundle].map(|range| range.maximum_x))
             .fold(f64::INFINITY, f64::min);
-        if feasible_low + context.pitch > feasible_high {
+        if feasible_low + context.pitch > latest_output_limit {
             for bundle in component {
                 planned[bundle] = None;
             }
@@ -408,39 +408,128 @@ fn plan_interior_collectors(
         }
         let deepest_input = inputs
             .iter()
-            .map(|range| range.desired_x)
+            .filter_map(|&bundle| ranges[bundle].map(|range| range.desired_x))
             .fold(f64::NEG_INFINITY, f64::max);
         let earliest_output = outputs
             .iter()
-            .map(|range| range.desired_x)
+            .filter_map(|&bundle| ranges[bundle].map(|range| range.desired_x))
             .fold(f64::INFINITY, f64::min);
-        if deepest_input + context.pitch <= earliest_output {
-            continue;
+        if deepest_input + context.pitch > earliest_output {
+            let earliest_separated_output = earliest_output - context.pitch;
+            let input_split = (earliest_separated_output
+                + (deepest_input - earliest_separated_output) / 2.0)
+                .clamp(feasible_low, latest_output_limit - context.pitch);
+            for &bundle_index in &inputs {
+                let bundle = &context.graph.boundary_bundles[bundle_index];
+                planned[bundle_index] = interior_collector_range_bounded(
+                    context,
+                    bundle,
+                    routes,
+                    f64::NEG_INFINITY,
+                    input_split,
+                    &mut horizontal_tap_visits,
+                )
+                .map(|range| range.desired_x);
+            }
         }
-        let earliest_separated_output = earliest_output - context.pitch;
-        let input_split = (earliest_separated_output
-            + (deepest_input - earliest_separated_output) / 2.0)
-            .clamp(feasible_low, feasible_high - context.pitch);
-        let output_split = input_split + context.pitch;
-        for bundle in component {
-            let Some(range) = ranges[bundle] else {
-                continue;
-            };
-            planned[bundle] = Some(match range.role {
-                BoundaryBundleRole::Input => range.desired_x.min(input_split).max(range.minimum_x),
-                BoundaryBundleRole::Output => {
-                    range.desired_x.max(output_split).min(range.maximum_x)
-                }
-            });
+        let mut required_output_x = required_output_collector_x(context, routes, &inputs, &planned);
+        if required_output_x > latest_output_limit {
+            for &bundle_index in &inputs {
+                let bundle = &context.graph.boundary_bundles[bundle_index];
+                let input_limit = planned[bundle_index]
+                    .unwrap_or(latest_output_limit)
+                    .min(latest_output_limit - context.pitch);
+                planned[bundle_index] = interior_collector_range_bounded(
+                    context,
+                    bundle,
+                    routes,
+                    f64::NEG_INFINITY,
+                    input_limit,
+                    &mut horizontal_tap_visits,
+                )
+                .map(|range| range.desired_x);
+            }
+            required_output_x = required_output_collector_x(context, routes, &inputs, &planned);
+        }
+        for bundle_index in outputs {
+            let bundle = &context.graph.boundary_bundles[bundle_index];
+            planned[bundle_index] = interior_collector_range_bounded(
+                context,
+                bundle,
+                routes,
+                required_output_x,
+                f64::INFINITY,
+                &mut horizontal_tap_visits,
+            )
+            .map(|range| range.desired_x);
         }
     }
     planned
+}
+
+fn required_output_collector_x(
+    context: &BundleGeometryContext<'_, '_>,
+    routes: &[EdgeGeometry],
+    inputs: &[usize],
+    planned: &[Option<f64>],
+) -> f64 {
+    inputs
+        .iter()
+        .filter_map(|&bundle_index| {
+            let collector_x = planned[bundle_index]?;
+            let bundle = &context.graph.boundary_bundles[bundle_index];
+            let divergence_x =
+                input_shared_trunk_divergence_x(context, bundle, routes, collector_x)?;
+            Some((collector_x + context.pitch).max(divergence_x + context.pitch))
+        })
+        .fold(f64::NEG_INFINITY, f64::max)
+}
+
+fn input_shared_trunk_divergence_x(
+    context: &BundleGeometryContext<'_, '_>,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    collector_x: f64,
+) -> Option<f64> {
+    bundle
+        .members
+        .iter()
+        .map(|member| {
+            let route = routes.get(*context.route_index.get(&member.edge)?)?;
+            let (segment, _) = first_shared_trunk_intersection(
+                &route.points,
+                collector_x,
+                bundle.role,
+                context.pitch,
+            )?;
+            route.points.get(segment + 1).map(|point| point.x)
+        })
+        .collect::<Option<Vec<_>>>()
+        .and_then(|divergences| divergences.into_iter().max_by(f64::total_cmp))
 }
 
 fn interior_collector_range(
     context: &BundleGeometryContext<'_, '_>,
     bundle: &IndexedBoundaryBundle,
     routes: &[EdgeGeometry],
+    horizontal_tap_visits: &mut usize,
+) -> Option<InteriorCollectorRange> {
+    interior_collector_range_bounded(
+        context,
+        bundle,
+        routes,
+        f64::NEG_INFINITY,
+        f64::INFINITY,
+        horizontal_tap_visits,
+    )
+}
+
+fn interior_collector_range_bounded(
+    context: &BundleGeometryContext<'_, '_>,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    lower_bound: f64,
+    upper_bound: f64,
     horizontal_tap_visits: &mut usize,
 ) -> Option<InteriorCollectorRange> {
     if bundle.width <= 1 {
@@ -481,13 +570,12 @@ fn interior_collector_range(
         BoundaryBundleRole::Input => (endpoint.x + context.rail_depth + context.pitch, desired_x),
         BoundaryBundleRole::Output => (desired_x, endpoint.x - context.rail_depth - context.pitch),
     };
-    if !minimum_x.is_finite()
-        || !desired_x.is_finite()
-        || !maximum_x.is_finite()
-        || minimum_x > maximum_x
-    {
+    let minimum_x = minimum_x.max(lower_bound);
+    let maximum_x = maximum_x.min(upper_bound);
+    if !minimum_x.is_finite() || !maximum_x.is_finite() || minimum_x > maximum_x {
         return None;
     }
+    let desired_x = desired_x.max(minimum_x).min(maximum_x);
     let desired_x = common_horizontal_collector_x(
         context,
         bundle,
@@ -1773,6 +1861,114 @@ mod tests {
         assert_eq!(rewritten.last(), Some(&tap));
         assert!(rewritten[rewritten.len() - 2].x < tap.x);
         assert_eq!(rewritten[rewritten.len() - 2].y, tap.y);
+    }
+
+    #[test]
+    fn common_horizontal_collector_obeys_the_exact_visit_boundary() {
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1],
+            outputs: vec![2, 3],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 1, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            }],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let nodes = [
+            geometry(1, 0.0),
+            geometry(2, 300.0),
+            geometry_at(3, 300.0, 100.0),
+        ];
+        let node_geometry = HashMap::from([(1, 0), (2, 1), (3, 2)]);
+        let route_index = HashMap::from([(10, 0), (11, 1)]);
+        let empty_corridors = HashMap::new();
+        let context = BundleGeometryContext {
+            graph: &indexed,
+            nodes: &nodes,
+            node_geometry: &node_geometry,
+            route_index: &route_index,
+            input_fallback_corridors: &empty_corridors,
+            output_fallback_corridors: &empty_corridors,
+            pitch: 6.0,
+            rail_depth: 12.0,
+            member_endpoint_reserve: 6.0,
+        };
+        let routes = [
+            EdgeGeometry {
+                id: 10,
+                points: vec![Point { x: 0.0, y: 10.0 }, Point { x: 100.0, y: 10.0 }],
+            },
+            EdgeGeometry {
+                id: 11,
+                points: vec![Point { x: 0.0, y: 20.0 }, Point { x: 100.0, y: 20.0 }],
+            },
+        ];
+        let bundle = &indexed.boundary_bundles[0];
+
+        let mut exact_budget = 4;
+        assert_eq!(
+            common_horizontal_collector_x(
+                &context,
+                bundle,
+                &routes,
+                0.0,
+                50.0,
+                100.0,
+                &mut exact_budget,
+            ),
+            Some(50.0)
+        );
+        assert_eq!(exact_budget, 0);
+
+        let mut exhausted_budget = 3;
+        assert_eq!(
+            common_horizontal_collector_x(
+                &context,
+                bundle,
+                &routes,
+                0.0,
+                50.0,
+                100.0,
+                &mut exhausted_budget,
+            ),
+            None
+        );
+        assert_eq!(exhausted_budget, 0);
     }
 
     #[test]
