@@ -264,6 +264,8 @@ struct ExpansionWork {
     projected_segments: usize,
     boundary_bundles: usize,
     boundary_bundle_members: usize,
+    replanned_boundary_bundles: usize,
+    replanned_boundary_bundle_members: usize,
 }
 
 struct WorkBudget {
@@ -799,23 +801,51 @@ pub fn expand_group_in_place_with_reference_height(
     } else {
         0
     };
-    let expansion_work = |projected_segments| ExpansionWork {
-        nodes: expanded_graph.nodes.len(),
-        edges: expanded_graph.edges.len(),
-        boundary_edges,
-        projected_segments,
-        boundary_bundles: expanded_indexed.boundary_bundles.len(),
-        boundary_bundle_members: expanded_indexed
+    let replan_counts = |bundles: &RemappedBoundaryBundles| {
+        expanded_indexed
             .boundary_bundles
             .iter()
-            .map(|bundle| bundle.members.len())
-            .sum(),
+            .filter(|bundle| !bundles.preserved_ids.contains(&bundle.id))
+            .fold(
+                (0_usize, 0_usize),
+                |(bundle_count, member_count), bundle| {
+                    (
+                        bundle_count.saturating_add(1),
+                        member_count.saturating_add(bundle.members.len()),
+                    )
+                },
+            )
     };
+    let (horizontal_replanned_bundles, horizontal_replanned_members) =
+        replan_counts(&boundary_bundles);
+    let (vertical_replanned_bundles, vertical_replanned_members) =
+        vertical_bundles.as_ref().map_or((0, 0), replan_counts);
+    let expansion_work =
+        |projected_segments, replanned_boundary_bundles, replanned_boundary_bundle_members| {
+            ExpansionWork {
+                nodes: expanded_graph.nodes.len(),
+                edges: expanded_graph.edges.len(),
+                boundary_edges,
+                projected_segments,
+                boundary_bundles: expanded_indexed.boundary_bundles.len(),
+                boundary_bundle_members: expanded_indexed
+                    .boundary_bundles
+                    .iter()
+                    .map(|bundle| bundle.members.len())
+                    .sum(),
+                replanned_boundary_bundles,
+                replanned_boundary_bundle_members,
+            }
+        };
     let mut positions = match candidate_positions(
         horizontal_layout,
         contract.anchor_geometry,
         &member_layout,
-        expansion_work(projected_segments),
+        expansion_work(
+            projected_segments,
+            horizontal_replanned_bundles.max(vertical_replanned_bundles),
+            horizontal_replanned_members.max(vertical_replanned_members),
+        ),
         options.layout,
         options.quality_effort,
         reserved_candidates,
@@ -828,7 +858,11 @@ pub fn expand_group_in_place_with_reference_height(
                 horizontal_layout,
                 contract.anchor_geometry,
                 &member_layout,
-                expansion_work(baseline_projected_segments),
+                expansion_work(
+                    baseline_projected_segments,
+                    horizontal_replanned_bundles,
+                    horizontal_replanned_members,
+                ),
                 options.layout,
                 options.quality_effort,
                 0,
@@ -1009,16 +1043,10 @@ fn evaluate_expansion_candidate(
         &remapped_bundles.preserved_ids,
     ) {
         Ok(candidate) => candidate,
-        Err(
-            LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. }
-            | LayoutError::UnrelatedRouteContactWorkLimitExceeded { .. },
-        ) => {
-            return Err(GroupExpansionError::ExpansionWorkLimitExceeded {
-                required: hard_budget_maximum.saturating_add(1),
-                maximum: hard_budget_maximum,
-            });
+        Err(error) => {
+            classify_boundary_bundle_planner_failure(error, hard_budget_maximum)?;
+            return Ok(None);
         }
-        Err(_) => return Ok(None),
     };
     hard_budget
         .take(expanded_graph.edges.len())
@@ -1091,6 +1119,22 @@ fn charge_expansion_work(
     budget
         .take(amount)
         .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded { required, maximum })
+}
+
+fn classify_boundary_bundle_planner_failure(
+    error: LayoutError,
+    hard_budget_maximum: usize,
+) -> Result<(), GroupExpansionError> {
+    match error {
+        LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. }
+        | LayoutError::UnrelatedRouteContactWorkLimitExceeded { .. } => {
+            Err(GroupExpansionError::ExpansionWorkLimitExceeded {
+                required: hard_budget_maximum.saturating_add(1),
+                maximum: hard_budget_maximum,
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn route_segment_count(layout: &Layout) -> usize {
@@ -1175,6 +1219,12 @@ fn boundary_bundle_replan_work_upper_bound(
         .iter()
         .filter(|bundle| !preserved_bundle_ids.contains(&bundle.id))
         .count();
+    let replanned_bundle_members = indexed
+        .boundary_bundles
+        .iter()
+        .filter(|bundle| !preserved_bundle_ids.contains(&bundle.id))
+        .map(|bundle| bundle.members.len())
+        .sum();
     boundary_bundle_replan_work_upper_bound_from_counts(
         layout.nodes.len(),
         layout.edges.len(),
@@ -1186,6 +1236,7 @@ fn boundary_bundle_replan_work_upper_bound(
             .map(|bundle| bundle.members.len())
             .sum(),
         replanned_bundles,
+        replanned_bundle_members,
         options,
     )
 }
@@ -1198,6 +1249,7 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     bundles: usize,
     bundle_members: usize,
     replanned_bundles: usize,
+    replanned_bundle_members: usize,
     options: LayoutOptions,
 ) -> usize {
     if bundles == 0 {
@@ -1208,16 +1260,22 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
         .saturating_add(edges)
         .saturating_add(bundles)
         .saturating_add(bundle_members);
-    let verification = structure
-        .saturating_add(bundle_segments.saturating_mul(nodes))
-        // Every bundle-member segment may be tested against every node.
-        .saturating_add(route_segments.saturating_mul(nodes))
-        // Both collector and spine are tested against every route segment.
-        .saturating_add(bundle_segments.saturating_mul(route_segments))
-        .saturating_add(bundle_segments.saturating_mul(bundle_segments));
+    let verification = |segments: usize| {
+        structure
+            .saturating_add(bundle_segments.saturating_mul(nodes))
+            // Every bundle-member segment may be tested against every node.
+            .saturating_add(segments.saturating_mul(nodes))
+            // Both collector and spine are tested against every route segment.
+            .saturating_add(bundle_segments.saturating_mul(segments))
+            .saturating_add(bundle_segments.saturating_mul(bundle_segments))
+    };
+    let initial_verification = verification(route_segments);
     if replanned_bundles == 0 {
-        return verification;
+        return initial_verification;
     }
+    let rewritten_segments =
+        route_segments.saturating_add(replanned_bundle_members.saturating_mul(2));
+    let final_verification = verification(rewritten_segments);
 
     let interior_planning = if options.minimum_parallel_wire_spacing == 0.0
         && bundles <= boundary_bundles::MAX_INTERIOR_COLLECTOR_BUNDLES
@@ -1231,12 +1289,12 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     };
     let partial_per_bundle = nodes
         .saturating_mul(2)
-        .saturating_add(route_segments.saturating_mul(nodes))
-        .saturating_add(route_segments.saturating_mul(2))
-        .saturating_add(bundles.saturating_mul(route_segments).saturating_mul(2))
+        .saturating_add(rewritten_segments.saturating_mul(nodes))
+        .saturating_add(rewritten_segments.saturating_mul(2))
+        .saturating_add(bundles.saturating_mul(rewritten_segments).saturating_mul(2))
         .saturating_add(bundles.saturating_mul(4))
         .saturating_add(if options.edge_node_clearance > 0.0 {
-            route_segments.saturating_mul(route_segments)
+            rewritten_segments.saturating_mul(rewritten_segments)
         } else {
             0
         });
@@ -1248,12 +1306,12 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     // geometry is already valid, then verifies the rebuilt result. Charge
     // both passes plus the bounded interior search and partial admission
     // before invoking the planner.
-    verification
-        .saturating_mul(2)
+    initial_verification
+        .saturating_add(final_verification)
         .saturating_add(interior_planning)
         .saturating_add(partial_verification)
         .saturating_add(structure)
-        .saturating_add(route_segments)
+        .saturating_add(rewritten_segments)
 }
 
 fn constraint_x_candidates(
@@ -3588,7 +3646,8 @@ fn candidate_positions(
         work.projected_segments,
         work.boundary_bundles,
         work.boundary_bundle_members,
-        work.boundary_bundles,
+        work.replanned_boundary_bundles,
+        work.replanned_boundary_bundle_members,
         options,
     );
     let work_per_candidate = work
@@ -5164,14 +5223,15 @@ mod tests {
         BoundaryTrunk, ExpansionWork, GroupCollapseOptions, GroupExpansion, GroupExpansionError,
         GroupExpansionOptions, HARD_GATE_EPSILON, ObstacleIndex, ProtectedGroup,
         ProtectedGroupGeometry, ProtectedGroupState, Rect, arrange_member_components,
-        candidate_positions, collapse_group_in_place, expand_group_in_place,
+        boundary_bundle_replan_work_upper_bound_from_counts, candidate_positions,
+        classify_boundary_bundle_planner_failure, collapse_group_in_place, expand_group_in_place,
         insert_horizontal_expansion_corridor, insert_local_vertical_expansion_corridor,
         obstacle_safe_bridge, path_is_clear, protected_group_plan,
     };
     use crate::{
         BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, EdgeGeometry, Endpoint,
-        Graph, Layout, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port, PortSide,
-        QualityEffort, layout, layout_with_constraints,
+        Graph, Layout, LayoutConstraints, LayoutError, LayoutOptions, Node, NodeGeometry, Point,
+        Port, PortSide, QualityEffort, layout, layout_with_constraints,
     };
 
     fn node(id: u32) -> Node {
@@ -8069,6 +8129,8 @@ mod tests {
             projected_segments: 1_600,
             boundary_bundles: 0,
             boundary_bundle_members: 0,
+            replanned_boundary_bundles: 0,
+            replanned_boundary_bundle_members: 0,
         };
         assert_eq!(
             candidate_positions(
@@ -8119,6 +8181,8 @@ mod tests {
             projected_segments: 1_600,
             boundary_bundles: 1,
             boundary_bundle_members: 64,
+            replanned_boundary_bundles: 1,
+            replanned_boundary_bundle_members: 64,
         };
         let bounded_bundle_candidates = candidate_positions(
             &compact,
@@ -8133,11 +8197,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(
-            bounded_bundle_candidates.len() > super::SAFETY_CANDIDATES
-                && bounded_bundle_candidates.len() < 51,
-            "positive-clearance bundle replanning must reserve aggregate work across candidates"
-        );
+        assert_eq!(bounded_bundle_candidates.len(), 21);
         let bundle_replan_over_budget = ExpansionWork {
             nodes: 1_000,
             edges: 2_000,
@@ -8145,8 +8205,10 @@ mod tests {
             projected_segments: 5_000,
             boundary_bundles: 8,
             boundary_bundle_members: 512,
+            replanned_boundary_bundles: 8,
+            replanned_boundary_bundle_members: 512,
         };
-        assert!(matches!(
+        assert_eq!(
             candidate_positions(
                 &compact,
                 &anchor,
@@ -8160,10 +8222,38 @@ mod tests {
                 0,
             ),
             Err(GroupExpansionError::ExpansionWorkLimitExceeded {
+                required: 115_174_440,
                 maximum: super::QUALITY_CANDIDATE_WORK,
-                ..
             })
-        ));
+        );
+        let preserved_boundary_large_graph = ExpansionWork {
+            nodes: 1_000,
+            edges: 2_000,
+            boundary_edges: 128,
+            projected_segments: 4_000,
+            boundary_bundles: 8,
+            boundary_bundle_members: 512,
+            replanned_boundary_bundles: 0,
+            replanned_boundary_bundle_members: 0,
+        };
+        assert_eq!(
+            candidate_positions(
+                &compact,
+                &anchor,
+                &members,
+                preserved_boundary_large_graph,
+                LayoutOptions {
+                    edge_node_clearance: 6.0,
+                    ..options
+                },
+                QualityEffort::Quality,
+                0,
+            )
+            .unwrap()
+            .len(),
+            3,
+            "preserved bundles reserve verification work without paying the replan cap"
+        );
         let maximum = ExpansionWork {
             nodes: 4_098,
             edges: 8_192,
@@ -8171,6 +8261,8 @@ mod tests {
             projected_segments: 65_536,
             boundary_bundles: 0,
             boundary_bundle_members: 0,
+            replanned_boundary_bundles: 0,
+            replanned_boundary_bundle_members: 0,
         };
         assert_eq!(
             candidate_positions(
@@ -8193,6 +8285,8 @@ mod tests {
             projected_segments: 80_000,
             boundary_bundles: 0,
             boundary_bundle_members: 0,
+            replanned_boundary_bundles: 0,
+            replanned_boundary_bundle_members: 0,
         };
         assert_eq!(
             candidate_positions(
@@ -8217,6 +8311,8 @@ mod tests {
             projected_segments: 4_000,
             boundary_bundles: 0,
             boundary_bundle_members: 0,
+            replanned_boundary_bundles: 0,
+            replanned_boundary_bundle_members: 0,
         };
         assert_eq!(
             candidate_positions(
@@ -8236,6 +8332,58 @@ mod tests {
                 maximum: super::MAX_CANDIDATE_WORK,
             })
         );
+    }
+
+    #[test]
+    fn bundle_replan_budget_classifies_limits_and_reserves_fallback_route_growth() {
+        for error in [
+            LayoutError::BoundaryBundleGeometryWorkLimitExceeded { maximum: 20 },
+            LayoutError::UnrelatedRouteContactWorkLimitExceeded { maximum: 30 },
+        ] {
+            assert_eq!(
+                classify_boundary_bundle_planner_failure(error, 100),
+                Err(GroupExpansionError::ExpansionWorkLimitExceeded {
+                    required: 101,
+                    maximum: 100,
+                })
+            );
+        }
+        assert_eq!(
+            classify_boundary_bundle_planner_failure(
+                LayoutError::BoundaryBundleGeometryUnsatisfied,
+                100,
+            ),
+            Ok(())
+        );
+
+        let without_fallback_growth = boundary_bundle_replan_work_upper_bound_from_counts(
+            10,
+            20,
+            30,
+            1,
+            4,
+            1,
+            0,
+            LayoutOptions {
+                edge_node_clearance: 6.0,
+                ..LayoutOptions::default()
+            },
+        );
+        let with_fallback_growth = boundary_bundle_replan_work_upper_bound_from_counts(
+            10,
+            20,
+            30,
+            1,
+            4,
+            1,
+            4,
+            LayoutOptions {
+                edge_node_clearance: 6.0,
+                ..LayoutOptions::default()
+            },
+        );
+        assert_eq!(without_fallback_growth, 2_002_247);
+        assert_eq!(with_fallback_growth, 2_003_007);
     }
 
     #[test]
