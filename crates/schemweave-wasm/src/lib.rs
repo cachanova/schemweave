@@ -410,6 +410,50 @@ mod tests {
     }
 
     #[test]
+    fn compact_height_selects_stack_or_grid_over_the_json_boundary() {
+        let compact = Graph {
+            nodes: vec![node(10)],
+            edges: Vec::new(),
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), node(3)],
+            edges: Vec::new(),
+        };
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: vec![1, 2, 3],
+            boundary_trunks: Vec::new(),
+        };
+        let expand = |layout: &Layout| {
+            decode_expanded_layout(
+                expand_group_serialized(
+                    &serde_json::to_string(&compact).unwrap(),
+                    &serde_json::to_string(layout).unwrap(),
+                    &serde_json::to_string(&expanded).unwrap(),
+                    &serde_json::to_string(&expansion).unwrap(),
+                    "{}",
+                )
+                .unwrap(),
+            )
+        };
+
+        let grid = expand(&compact_layout);
+        let mut tall_compact_layout = compact_layout;
+        tall_compact_layout.height = 200.0;
+        let stack = expand(&tall_compact_layout);
+        let distinct_x_positions = |layout: &Layout| {
+            let mut positions = layout.nodes.iter().map(|node| node.x).collect::<Vec<_>>();
+            positions.sort_unstable_by(f64::total_cmp);
+            positions.dedup();
+            positions.len()
+        };
+
+        assert!(distinct_x_positions(&grid) > 1);
+        assert_eq!(distinct_x_positions(&stack), 1);
+    }
+
+    #[test]
     fn expansion_returns_a_stable_full_relayout_status() {
         let compact = Graph {
             nodes: vec![node(1), node(10), node(4)],

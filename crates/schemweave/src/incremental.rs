@@ -21,6 +21,8 @@ const FAST_CANDIDATE_WORK: usize = 10_000_000;
 const QUALITY_CANDIDATE_WORK: usize = 30_000_000;
 const MAX_CANDIDATE_WORK: usize = 120_000_000;
 const SAFETY_CANDIDATES: usize = 2;
+const EXPANSION_COMPONENT_GAP: f64 = 18.0;
+const EXPANSION_STACK_HEIGHT_FACTOR: f64 = 1.5;
 
 /// One expanded boundary edge and the compact route trunk it replaces.
 ///
@@ -296,11 +298,12 @@ pub fn expand_group_in_place(
     .map_err(GroupExpansionError::MemberLayout)?;
     let member_layout =
         if member_constraints.inputs.is_empty() && member_constraints.outputs.is_empty() {
-            pack_disconnected_components(
+            arrange_member_components(
                 &member_graph,
                 &member_layout,
-                options.layout.node_gap,
-                boundary_horizontal_span(expanded_graph, &contract, options.layout.node_gap),
+                EXPANSION_COMPONENT_GAP,
+                compact_layout.height,
+                boundary_horizontal_span(expanded_graph, &contract, options.layout.port_stub),
             )
         } else {
             member_layout
@@ -1271,10 +1274,11 @@ fn member_graph(expanded_graph: &Graph, members: &BTreeSet<NodeId>) -> Graph {
     Graph { nodes, edges }
 }
 
-fn pack_disconnected_components(
+fn arrange_member_components(
     graph: &Graph,
     layout: &Layout,
     gap: f64,
+    compact_layout_height: f64,
     maximum_width: Option<f64>,
 ) -> Layout {
     let mut adjacency = graph
@@ -1361,14 +1365,20 @@ fn pack_disconnected_components(
         .iter()
         .map(|bounds| bounds.height())
         .fold(0.0, f64::max);
-    let ideal_columns =
-        (((components.len() as f64 * (max_height + gap) / (max_width + gap)).sqrt()).ceil()
-            as usize)
-            .clamp(1, components.len());
-    let maximum_columns = maximum_width.map_or(components.len(), |width| {
-        (((width + gap) / (max_width + gap)).floor() as usize).max(1)
-    });
-    let columns = ideal_columns.min(maximum_columns);
+    let stacked_height = bounds.iter().map(|bounds| bounds.height()).sum::<f64>()
+        + gap * components.len().saturating_sub(1) as f64;
+    let height_limit = compact_layout_height * EXPANSION_STACK_HEIGHT_FACTOR;
+    let columns = if stacked_height <= height_limit + HARD_GATE_EPSILON {
+        1
+    } else {
+        let ideal = (((components.len() as f64 * (max_height + gap) / (max_width + gap)).sqrt())
+            .ceil() as usize)
+            .clamp(2, components.len());
+        let maximum = maximum_width.map_or(components.len(), |width| {
+            (((width + gap) / (max_width + gap)).floor() as usize).clamp(1, components.len())
+        });
+        ideal.min(maximum).max(2.min(maximum))
+    };
     let rows = components.len().div_ceil(columns);
     let mut column_widths = vec![0.0_f64; columns];
     let mut row_heights = vec![0.0_f64; rows];
@@ -1391,8 +1401,8 @@ fn pack_disconnected_components(
         let column = index % columns;
         let row = index / columns;
         let bounds = bounds[index];
-        let x = column_x[column] + (column_widths[column] - bounds.width()) / 2.0 - bounds.left;
-        let y = row_y[row] + (row_heights[row] - bounds.height()) / 2.0 - bounds.top;
+        let x = column_x[column] - bounds.left;
+        let y = row_y[row] - bounds.top;
         for &id in component {
             let node = nodes[&id];
             translated_nodes.push(NodeGeometry {
@@ -1431,7 +1441,7 @@ fn pack_disconnected_components(
 fn boundary_horizontal_span(
     expanded_graph: &Graph,
     contract: &ExpansionContract<'_>,
-    gap: f64,
+    port_stub: f64,
 ) -> Option<f64> {
     let mut incoming_right = None::<f64>;
     let mut outgoing_left = None::<f64>;
@@ -1453,7 +1463,10 @@ fn boundary_horizontal_span(
         }
     }
     incoming_right.zip(outgoing_left).and_then(|(right, left)| {
-        let width = left - right - gap * 2.0;
+        // Each side needs one outward stub from the retained node and one
+        // approaching the expanded member. If those stubs would reverse,
+        // a multi-column grid cannot preserve fixed boundary geometry.
+        let width = left - right - port_stub * 4.0;
         (width > 0.0).then_some(width)
     })
 }
@@ -2770,8 +2783,8 @@ mod tests {
 
     use super::{
         BoundaryTrunk, ExpansionWork, GroupExpansion, GroupExpansionError, GroupExpansionOptions,
-        ObstacleIndex, Rect, candidate_positions, expand_group_in_place, obstacle_safe_bridge,
-        pack_disconnected_components, path_is_clear,
+        ObstacleIndex, Rect, arrange_member_components, candidate_positions, expand_group_in_place,
+        obstacle_safe_bridge, path_is_clear,
     };
     use crate::{
         BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, EdgeGeometry, Endpoint,
@@ -4277,20 +4290,23 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_members_pack_into_a_balanced_deterministic_grid() {
+    fn disconnected_members_use_a_deterministic_grid_above_the_height_limit() {
         let graph = Graph {
             nodes: (1..=64).map(node).collect(),
             edges: Vec::new(),
         };
         let ordinary = layout(&graph, LayoutOptions::default()).unwrap();
-        let packed = pack_disconnected_components(
+        let packed = arrange_member_components(
             &graph,
             &ordinary,
-            LayoutOptions::default().node_gap,
+            super::EXPANSION_COMPONENT_GAP,
+            500.0,
             None,
         );
-        assert!(packed.width < ordinary.width * 10.0);
-        assert!(packed.height < ordinary.height / 4.0);
+        let mut columns = packed.nodes.iter().map(|node| node.x).collect::<Vec<_>>();
+        columns.sort_unstable_by(f64::total_cmp);
+        columns.dedup();
+        assert_eq!(columns.len(), 7);
         assert!(packed.width / packed.height < 2.0);
         assert!(packed.height / packed.width < 2.0);
         for (index, left) in packed.nodes.iter().enumerate() {
@@ -4306,13 +4322,153 @@ mod tests {
         permuted.nodes.reverse();
         let permuted_layout = layout(&permuted, LayoutOptions::default()).unwrap();
         assert_eq!(
-            pack_disconnected_components(
+            arrange_member_components(
                 &permuted,
                 &permuted_layout,
-                LayoutOptions::default().node_gap,
+                super::EXPANSION_COMPONENT_GAP,
+                500.0,
                 None,
             ),
             packed
+        );
+    }
+
+    #[test]
+    fn disconnected_members_stack_through_the_exact_one_point_five_x_limit() {
+        let graph = Graph {
+            nodes: (1..=3).map(node).collect(),
+            edges: Vec::new(),
+        };
+        let member_layout = Layout {
+            nodes: (0..3)
+                .map(|index| NodeGeometry {
+                    id: index + 1,
+                    x: index as f64 * 100.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 50.0,
+                })
+                .collect(),
+            edges: Vec::new(),
+            boundary_bundles: Vec::new(),
+            width: 280.0,
+            height: 50.0,
+        };
+        let gap = 10.0;
+        let stacked_height = 170.0;
+        let stacked = arrange_member_components(
+            &graph,
+            &member_layout,
+            gap,
+            stacked_height / super::EXPANSION_STACK_HEIGHT_FACTOR,
+            None,
+        );
+        assert_eq!(stacked.width, 80.0);
+        assert_eq!(stacked.height, stacked_height);
+        assert!(stacked.nodes.iter().all(|node| node.x == 0.0));
+        assert_eq!(
+            stacked.nodes.iter().map(|node| node.y).collect::<Vec<_>>(),
+            vec![0.0, 60.0, 120.0]
+        );
+
+        let grid = arrange_member_components(
+            &graph,
+            &member_layout,
+            gap,
+            (stacked_height - 1.0) / super::EXPANSION_STACK_HEIGHT_FACTOR,
+            None,
+        );
+        assert_eq!(grid.width, 170.0);
+        assert_eq!(grid.height, 110.0);
+        assert_eq!(
+            grid.nodes
+                .iter()
+                .map(|node| (node.x, node.y))
+                .collect::<Vec<_>>(),
+            vec![(0.0, 0.0), (90.0, 0.0), (0.0, 60.0)]
+        );
+    }
+
+    #[test]
+    fn fixed_boundary_corridor_prevents_an_unroutable_multi_column_grid() {
+        let graph = Graph {
+            nodes: (1..=3).map(node).collect(),
+            edges: Vec::new(),
+        };
+        let member_layout = Layout {
+            nodes: (0..3)
+                .map(|index| NodeGeometry {
+                    id: index + 1,
+                    x: index as f64 * 100.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 50.0,
+                })
+                .collect(),
+            edges: Vec::new(),
+            boundary_bundles: Vec::new(),
+            width: 280.0,
+            height: 50.0,
+        };
+
+        let arranged = arrange_member_components(&graph, &member_layout, 18.0, 50.0, Some(175.0));
+        assert!(arranged.nodes.iter().all(|node| node.x == 0.0));
+        assert_eq!(arranged.width, 80.0);
+        assert_eq!(arranged.height, 186.0);
+    }
+
+    #[test]
+    fn component_arrangement_preserves_connected_left_to_right_geometry() {
+        let graph = Graph {
+            nodes: (1..=3).map(node).collect(),
+            edges: vec![edge(1, 1, 2, 1)],
+        };
+        let member_layout = Layout {
+            nodes: vec![
+                NodeGeometry {
+                    id: 1,
+                    x: 0.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 50.0,
+                },
+                NodeGeometry {
+                    id: 2,
+                    x: 100.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 50.0,
+                },
+                NodeGeometry {
+                    id: 3,
+                    x: 220.0,
+                    y: 0.0,
+                    width: 80.0,
+                    height: 50.0,
+                },
+            ],
+            edges: vec![EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 100.0, y: 25.0 }],
+            }],
+            boundary_bundles: Vec::new(),
+            width: 300.0,
+            height: 50.0,
+        };
+
+        let arranged = arrange_member_components(&graph, &member_layout, 18.0, 200.0, None);
+        let nodes = arranged
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(nodes[&2].x - nodes[&1].x, 100.0);
+        assert_eq!(nodes[&1].y, nodes[&2].y);
+        assert_eq!(nodes[&3].x, 0.0);
+        assert!(nodes[&3].y > nodes[&1].y);
+        assert_eq!(
+            arranged.edges[0].points,
+            vec![Point { x: 80.0, y: 25.0 }, Point { x: 100.0, y: 25.0 }]
         );
     }
 
