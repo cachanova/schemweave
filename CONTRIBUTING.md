@@ -33,6 +33,7 @@ set applicable to the workspace:
 ```bash
 cargo fmt --all -- --check
 cargo test --workspace --locked
+cargo check --locked -p schemweave --benches
 cargo clippy --workspace --locked --all-targets -- -D warnings
 cargo check --locked --package schemweave-wasm --target wasm32-unknown-unknown
 cargo build --locked --release --package schemweave-wasm --target wasm32-unknown-unknown
