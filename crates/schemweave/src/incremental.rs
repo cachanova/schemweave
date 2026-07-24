@@ -289,18 +289,65 @@ pub fn expand_group_in_place(
         &member_constraints,
     )
     .map_err(GroupExpansionError::MemberLayout)?;
-    let member_layout =
-        if member_constraints.inputs.is_empty() && member_constraints.outputs.is_empty() {
-            arrange_member_components(
+    let mut member_layout = if member_constraints.inputs.is_empty()
+        && member_constraints.outputs.is_empty()
+    {
+        let bridge_pitch = options
+            .layout
+            .route_lane_gap
+            .max(options.layout.minimum_parallel_wire_spacing);
+        let shared_boundary_lanes =
+            shared_boundary_group_count(expanded_graph, &contract, &options.constraints);
+        let component_gap = EXPANSION_COMPONENT_GAP.max(
+            crate::outward_obstacle_clearance_stub(options.layout) * 2.0
+                + bridge_pitch * shared_boundary_lanes.max(1) as f64,
+        );
+        let minimum_horizontal_gap = EXPANSION_COMPONENT_GAP
+            .max(crate::outward_obstacle_clearance_stub(options.layout) * 2.0 + bridge_pitch);
+        let mut horizontal_gap = minimum_horizontal_gap;
+        let mut arranged = arrange_member_components(
+            &member_graph,
+            &member_layout,
+            component_gap,
+            horizontal_gap,
+            compact_layout.height,
+            None,
+        );
+        // Changing the gap can change the aspect-ratio-derived column
+        // count. Recompute a bounded number of times so every adjacent
+        // column has disjoint outgoing and incoming boundary-lane banks.
+        for _ in 0..2 {
+            let required =
+                expansion_grid_horizontal_gap(expanded_graph, &contract, &arranged, options.layout)
+                    .max(minimum_horizontal_gap);
+            if required <= horizontal_gap + HARD_GATE_EPSILON {
+                break;
+            }
+            horizontal_gap = required;
+            arranged = arrange_member_components(
                 &member_graph,
                 &member_layout,
-                EXPANSION_COMPONENT_GAP,
+                component_gap,
+                horizontal_gap,
                 compact_layout.height,
-                boundary_horizontal_span(expanded_graph, &contract, options.layout.port_stub),
-            )
-        } else {
-            member_layout
-        };
+                None,
+            );
+        }
+        arranged
+    } else {
+        member_layout
+    };
+    let input_padding = expansion_input_corridor_padding(
+        compact_layout,
+        expanded_graph,
+        &expanded_indexed,
+        &contract,
+        &member_layout,
+        options.layout,
+    );
+    if input_padding > 0.0 {
+        member_layout = add_horizontal_member_padding(member_layout, input_padding, 0.0);
+    }
     let corridor_layout =
         insert_horizontal_expansion_corridor(compact_layout, expansion.anchor, member_layout.width);
     let working_layout = corridor_layout.as_ref().unwrap_or(compact_layout);
@@ -366,6 +413,7 @@ pub fn expand_group_in_place(
     let mut best: Option<(CandidateScore, Layout)> = None;
     let hard_budget_maximum = candidate_work_budget(options.quality_effort);
     let mut hard_budget = WorkBudget::new(hard_budget_maximum);
+    let mut candidate_attempts_remaining = positions.len();
     for (x, y) in positions {
         let frame = Rect {
             left: x,
@@ -376,102 +424,114 @@ pub fn expand_group_in_place(
         if retained_node_overlap_area(working_layout, expansion.anchor, frame, 0.0) > 0.0 {
             continue;
         }
-        let candidate = match compose_candidate(
-            working_layout,
-            expanded_graph,
-            &contract,
-            &member_layout,
-            &boundary_bundles,
-            x,
-            y,
-            options.layout,
-        ) {
-            Ok(candidate) => candidate,
-            Err(GroupExpansionError::NoSafeBoundaryBridge(_)) => continue,
-            Err(error) => return Err(error),
-        };
-        hard_budget
-            .take(expanded_graph.edges.len())
-            .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
-                required,
-                maximum: hard_budget_maximum,
-            })?;
-        let geometry_is_clean =
-            hard_geometry_is_clean_bounded(expanded_graph, &candidate, &mut hard_budget).map_err(
-                |required| GroupExpansionError::ExpansionWorkLimitExceeded {
+        for prefer_direct_boundary_routes in [true, false] {
+            if candidate_attempts_remaining == 0 {
+                break;
+            }
+            candidate_attempts_remaining -= 1;
+            let candidate = match compose_candidate(
+                working_layout,
+                expanded_graph,
+                &contract,
+                &member_layout,
+                &boundary_bundles,
+                x,
+                y,
+                options.layout,
+                prefer_direct_boundary_routes,
+            ) {
+                Ok(candidate) => candidate,
+                Err(GroupExpansionError::NoSafeBoundaryBridge(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            hard_budget
+                .take(expanded_graph.edges.len())
+                .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
                     required,
                     maximum: hard_budget_maximum,
-                },
+                })?;
+            let geometry_is_clean =
+                hard_geometry_is_clean_bounded(expanded_graph, &candidate, &mut hard_budget)
+                    .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
+                        required,
+                        maximum: hard_budget_maximum,
+                    })?;
+            charge_expansion_work(
+                &mut hard_budget,
+                clearance_work_upper_bound(&candidate, options.layout),
+                hard_budget_maximum,
             )?;
-        charge_expansion_work(
-            &mut hard_budget,
-            clearance_work_upper_bound(&candidate, options.layout),
-            hard_budget_maximum,
-        )?;
-        let mut clearance_work_exhausted = false;
-        let clearance_is_clean = crate::candidate_satisfies_edge_node_clearance_bounded(
-            &expanded_indexed,
-            &candidate,
-            options.layout,
-            crate::MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
-            &mut clearance_work_exhausted,
-        );
-        charge_expansion_work(
-            &mut hard_budget,
-            parallel_spacing_work_upper_bound(&candidate, options.layout),
-            hard_budget_maximum,
-        )?;
-        let parallel_spacing_is_clean = if options.layout.minimum_parallel_wire_spacing > 0.0 {
-            matches!(
-                routing::route_family_satisfies_parallel_spacing_bounded(
-                    &expanded_indexed,
-                    &candidate.edges,
-                    options.layout.minimum_parallel_wire_spacing,
-                    crate::outward_obstacle_clearance_stub(options.layout),
-                    crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
-                    crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
+            let mut clearance_work_exhausted = false;
+            let clearance_is_clean = crate::candidate_satisfies_edge_node_clearance_bounded(
+                &expanded_indexed,
+                &candidate,
+                options.layout,
+                crate::MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
+                &mut clearance_work_exhausted,
+            );
+            charge_expansion_work(
+                &mut hard_budget,
+                parallel_spacing_work_upper_bound(&candidate, options.layout),
+                hard_budget_maximum,
+            )?;
+            let parallel_spacing_is_clean = if options.layout.minimum_parallel_wire_spacing > 0.0 {
+                matches!(
+                    routing::route_family_satisfies_parallel_spacing_bounded(
+                        &expanded_indexed,
+                        &candidate.edges,
+                        options.layout.minimum_parallel_wire_spacing,
+                        crate::outward_obstacle_clearance_stub(options.layout),
+                        crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
+                        crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
+                    ),
+                    Ok(true)
+                )
+            } else {
+                true
+            };
+            charge_expansion_work(
+                &mut hard_budget,
+                boundary_bundle_work_upper_bound(&expanded_indexed, &candidate),
+                hard_budget_maximum,
+            )?;
+            let boundary_bundle_geometry_is_clean =
+                boundary_bundles::verify_geometry(&expanded_indexed, &candidate, options.layout)
+                    .is_ok();
+            if ranking_direction_violations(expanded_graph, &candidate) != 0
+                || !constraints_are_satisfied(&candidate, &options.constraints)
+                || !geometry_is_clean
+                || !clearance_is_clean
+                || clearance_work_exhausted
+                || !parallel_spacing_is_clean
+                || !boundary_bundle_geometry_is_clean
+            {
+                continue;
+            }
+            let score = CandidateScore {
+                quality: routing::route_quality(&expanded_indexed, &candidate.edges),
+                displacement: squared_distance(
+                    Point {
+                        x: x + member_layout.width / 2.0,
+                        y: y + member_layout.height / 2.0,
+                    },
+                    anchor_center,
                 ),
-                Ok(true)
-            )
-        } else {
-            true
-        };
-        charge_expansion_work(
-            &mut hard_budget,
-            boundary_bundle_work_upper_bound(&expanded_indexed, &candidate),
-            hard_budget_maximum,
-        )?;
-        let boundary_bundle_geometry_is_clean =
-            boundary_bundles::verify_geometry(&expanded_indexed, &candidate, options.layout)
-                .is_ok();
-        if ranking_direction_violations(expanded_graph, &candidate) != 0
-            || !constraints_are_satisfied(&candidate, &options.constraints)
-            || !geometry_is_clean
-            || !clearance_is_clean
-            || clearance_work_exhausted
-            || !parallel_spacing_is_clean
-            || !boundary_bundle_geometry_is_clean
-        {
-            continue;
+                area: candidate.width * candidate.height,
+                x,
+                y,
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(current, _)| score.cmp(*current).is_lt())
+            {
+                best = Some((score, candidate));
+            }
+            if prefer_direct_boundary_routes {
+                break;
+            }
         }
-        let score = CandidateScore {
-            quality: routing::route_quality(&expanded_indexed, &candidate.edges),
-            displacement: squared_distance(
-                Point {
-                    x: x + member_layout.width / 2.0,
-                    y: y + member_layout.height / 2.0,
-                },
-                anchor_center,
-            ),
-            area: candidate.width * candidate.height,
-            x,
-            y,
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(current, _)| score.cmp(*current).is_lt())
-        {
-            best = Some((score, candidate));
+        if candidate_attempts_remaining == 0 {
+            break;
         }
     }
     best.map(|(_, layout)| layout)
@@ -983,7 +1043,12 @@ fn remap_boundary_bundles(
             }
             used_compact_members.insert(compact_edge);
             affected |= compact_edge != expanded_member.edge;
-            mapped_members.push((expanded_member, compact_edge, compact_member));
+            mapped_members.push((
+                expanded_member,
+                compact_edge,
+                compact_member,
+                source_member ^ target_member,
+            ));
         }
         if used_compact_members.len() != compact_members.len() {
             return Err(GroupExpansionError::NeedsFullRelayout);
@@ -1006,19 +1071,18 @@ fn remap_boundary_bundles(
             .map_or(0, |member| member.tap_lane + 1);
         let center = lane_count.saturating_sub(1) as f64 / 2.0;
         let mut members = Vec::with_capacity(mapped_members.len());
-        for (expanded_member, compact_edge, compact_member) in mapped_members {
+        for (expanded_member, compact_edge, compact_member, affected_member) in mapped_members {
             let tap = Point {
                 x: compact_bundle.spine.end.x,
                 y: compact_bundle.spine.end.y + (expanded_member.tap_lane as f64 - center) * pitch,
             };
-            let retained_member = expanded_member.edge == compact_edge;
+            let retained_member = !affected_member && expanded_member.edge == compact_edge;
             let corridor_changed = expanded_corridor_offset != compact_corridor_offset;
             let tap_changed = !boundary_bundles::preserved_point_matches(tap, compact_member.tap);
             if retained_member && (tap_changed || corridor_changed) {
                 return Err(GroupExpansionError::NeedsFullRelayout);
             }
-            if !retained_member
-                && (tap_changed || corridor_changed)
+            if affected_member
                 && retaps
                     .insert(
                         expanded_member.edge,
@@ -1292,6 +1356,41 @@ fn member_graph(expanded_graph: &Graph, members: &BTreeSet<NodeId>) -> Graph {
     Graph { nodes, edges }
 }
 
+fn shared_boundary_group_count(
+    graph: &Graph,
+    contract: &ExpansionContract<'_>,
+    constraints: &LayoutConstraints,
+) -> usize {
+    let bundled = constraints
+        .boundary_bundles
+        .iter()
+        .flat_map(|bundle| bundle.members.iter().map(|member| member.edge))
+        .collect::<BTreeSet<_>>();
+    let mut incoming = BTreeMap::<(EndpointKey, NetId), usize>::new();
+    let mut outgoing = BTreeMap::<(EndpointKey, NetId), usize>::new();
+    for edge in &graph.edges {
+        if bundled.contains(&edge.id) {
+            continue;
+        }
+        let source_member = contract.members.contains(&edge.source.node);
+        let target_member = contract.members.contains(&edge.target.node);
+        if !source_member && target_member {
+            *incoming
+                .entry(((edge.source.node, edge.source.port), edge.net))
+                .or_default() += 1;
+        } else if source_member && !target_member {
+            *outgoing
+                .entry(((edge.target.node, edge.target.port), edge.net))
+                .or_default() += 1;
+        }
+    }
+    incoming
+        .into_values()
+        .chain(outgoing.into_values())
+        .filter(|&members| members > 1)
+        .count()
+}
+
 fn insert_horizontal_expansion_corridor(
     compact_layout: &Layout,
     anchor: NodeId,
@@ -1352,7 +1451,8 @@ fn insert_horizontal_expansion_corridor(
 fn arrange_member_components(
     graph: &Graph,
     layout: &Layout,
-    gap: f64,
+    vertical_gap: f64,
+    horizontal_gap: f64,
     compact_layout_height: f64,
     maximum_width: Option<f64>,
 ) -> Layout {
@@ -1441,16 +1541,19 @@ fn arrange_member_components(
         .map(|bounds| bounds.height())
         .fold(0.0, f64::max);
     let stacked_height = bounds.iter().map(|bounds| bounds.height()).sum::<f64>()
-        + gap * components.len().saturating_sub(1) as f64;
+        + vertical_gap * components.len().saturating_sub(1) as f64;
     let height_limit = compact_layout_height * EXPANSION_STACK_HEIGHT_FACTOR;
     let columns = if stacked_height <= height_limit + HARD_GATE_EPSILON {
         1
     } else {
-        let ideal = (((components.len() as f64 * (max_height + gap) / (max_width + gap)).sqrt())
-            .ceil() as usize)
+        let ideal = (((components.len() as f64 * (max_height + vertical_gap)
+            / (max_width + horizontal_gap))
+            .sqrt())
+        .ceil() as usize)
             .clamp(2, components.len());
         let maximum = maximum_width.map_or(components.len(), |width| {
-            (((width + gap) / (max_width + gap)).floor() as usize).clamp(1, components.len())
+            (((width + horizontal_gap) / (max_width + horizontal_gap)).floor() as usize)
+                .clamp(1, components.len())
         });
         ideal.min(maximum).max(2.min(maximum))
     };
@@ -1463,11 +1566,11 @@ fn arrange_member_components(
     }
     let mut column_x = vec![0.0; columns];
     for index in 1..columns {
-        column_x[index] = column_x[index - 1] + column_widths[index - 1] + gap;
+        column_x[index] = column_x[index - 1] + column_widths[index - 1] + horizontal_gap;
     }
     let mut row_y = vec![0.0; rows];
     for index in 1..rows {
-        row_y[index] = row_y[index - 1] + row_heights[index - 1] + gap;
+        row_y[index] = row_y[index - 1] + row_heights[index - 1] + vertical_gap;
     }
 
     let mut translated_nodes = Vec::with_capacity(layout.nodes.len());
@@ -1508,42 +1611,177 @@ fn arrange_member_components(
         nodes: translated_nodes,
         edges: translated_edges,
         boundary_bundles: Vec::new(),
-        width: column_widths.iter().sum::<f64>() + gap * columns.saturating_sub(1) as f64,
-        height: row_heights.iter().sum::<f64>() + gap * rows.saturating_sub(1) as f64,
+        width: column_widths.iter().sum::<f64>()
+            + horizontal_gap * columns.saturating_sub(1) as f64,
+        height: row_heights.iter().sum::<f64>() + vertical_gap * rows.saturating_sub(1) as f64,
     }
 }
 
-fn boundary_horizontal_span(
+fn expansion_grid_horizontal_gap(
     expanded_graph: &Graph,
     contract: &ExpansionContract<'_>,
-    port_stub: f64,
-) -> Option<f64> {
-    let mut incoming_right = None::<f64>;
-    let mut outgoing_left = None::<f64>;
-    for edge in expanded_graph
-        .edges
+    arranged: &Layout,
+    options: LayoutOptions,
+) -> f64 {
+    let geometry = arranged
+        .nodes
         .iter()
-        .filter(|edge| edge.participates_in_ranking)
-    {
-        let source_member = contract.members.contains(&edge.source.node);
-        let target_member = contract.members.contains(&edge.target.node);
-        if !source_member && target_member {
-            let source = contract.compact_node_geometry[&edge.source.node];
-            incoming_right = Some(incoming_right.map_or(source.x + source.width, |right| {
-                right.max(source.x + source.width)
-            }));
-        } else if source_member && !target_member {
-            let target = contract.compact_node_geometry[&edge.target.node];
-            outgoing_left = Some(outgoing_left.map_or(target.x, |left| left.min(target.x)));
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let mut columns = contract
+        .members
+        .iter()
+        .map(|member| FloatKey(geometry[member].x))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    columns.sort();
+    if columns.len() <= 1 {
+        return 0.0;
+    }
+
+    let clearance = crate::outward_obstacle_clearance_stub(options);
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let mut required = 0.0_f64;
+    for adjacent in columns.windows(2) {
+        let outgoing = expanded_graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                contract.members.contains(&edge.source.node)
+                    && !contract.members.contains(&edge.target.node)
+                    && FloatKey(geometry[&edge.source.node].x) == adjacent[0]
+            })
+            .map(|edge| edge.net)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let incoming = expanded_graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                !contract.members.contains(&edge.source.node)
+                    && contract.members.contains(&edge.target.node)
+                    && FloatKey(geometry[&edge.target.node].x) == adjacent[1]
+            })
+            .map(|edge| edge.net)
+            .collect::<BTreeSet<_>>()
+            .len();
+        let occupied_lanes = outgoing.saturating_add(incoming);
+        if occupied_lanes != 0 {
+            required = required.max(
+                clearance * 2.0 + pitch * occupied_lanes.saturating_sub(1) as f64 + pitch * 2.0,
+            );
         }
     }
-    incoming_right.zip(outgoing_left).and_then(|(right, left)| {
-        // Each side needs one outward stub from the retained node and one
-        // approaching the expanded member. If those stubs would reverse,
-        // a multi-column grid cannot preserve fixed boundary geometry.
-        let width = left - right - port_stub * 4.0;
-        (width > 0.0).then_some(width)
-    })
+    required
+}
+
+fn expansion_input_corridor_padding(
+    compact_layout: &Layout,
+    expanded_graph: &Graph,
+    expanded_indexed: &validation::IndexedGraph<'_>,
+    contract: &ExpansionContract<'_>,
+    arranged: &Layout,
+    options: LayoutOptions,
+) -> f64 {
+    let geometry = arranged
+        .nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let Some(first_column) = contract
+        .members
+        .iter()
+        .map(|member| geometry[member].x)
+        .min_by(f64::total_cmp)
+    else {
+        return 0.0;
+    };
+    let incoming = expanded_graph
+        .edges
+        .iter()
+        .filter(|edge| {
+            !contract.members.contains(&edge.source.node)
+                && contract.members.contains(&edge.target.node)
+                && (geometry[&edge.target.node].x - first_column).abs() <= HARD_GATE_EPSILON
+        })
+        .collect::<Vec<_>>();
+    if incoming.is_empty() {
+        return 0.0;
+    }
+
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let bundle_geometry = compact_layout
+        .boundary_bundles
+        .iter()
+        .map(|bundle| (bundle.id, bundle))
+        .collect::<BTreeMap<_, _>>();
+    let bundle_offsets =
+        expanded_indexed
+            .boundary_bundles
+            .iter()
+            .zip(boundary_bundles::corridor_depth_offsets(
+                expanded_indexed,
+                options,
+            ));
+    let mut bundle_corridor_by_edge = BTreeMap::new();
+    for (bundle, offset) in bundle_offsets {
+        if bundle.role != BoundaryBundleRole::Input {
+            continue;
+        }
+        let Some(geometry) = bundle_geometry.get(&bundle.id).copied() else {
+            continue;
+        };
+        for member in &bundle.members {
+            bundle_corridor_by_edge.insert(
+                member.edge,
+                geometry.spine.end.x + offset + (member.tap_lane + 1) as f64 * pitch,
+            );
+        }
+    }
+
+    let furthest_corridor = incoming
+        .iter()
+        .filter_map(|edge| {
+            bundle_corridor_by_edge.get(&edge.id).copied().or_else(|| {
+                let compact_edge = contract.boundary_trunks[&edge.id];
+                contract.compact_edge_geometry[&compact_edge]
+                    .points
+                    .iter()
+                    .filter(|point| point.x < contract.anchor_geometry.x - HARD_GATE_EPSILON)
+                    .map(|point| point.x)
+                    .max_by(f64::total_cmp)
+            })
+        })
+        .max_by(f64::total_cmp)
+        .unwrap_or(contract.anchor_geometry.x);
+    let approach_lanes = incoming
+        .iter()
+        .map(|edge| edge.net)
+        .collect::<BTreeSet<_>>()
+        .len();
+    let approach_depth = crate::outward_obstacle_clearance_stub(options)
+        + approach_lanes.saturating_sub(1) as f64 * pitch
+        // One lane separates the two banks; the second keeps a non-bundled
+        // boundary net from landing on the final bundle-member corridor.
+        + pitch * 2.0;
+    let first_node_x = contract.anchor_geometry.x + first_column;
+    (furthest_corridor + approach_depth - first_node_x).max(0.0)
+}
+
+fn add_horizontal_member_padding(mut layout: Layout, left: f64, right: f64) -> Layout {
+    for node in &mut layout.nodes {
+        node.x += left;
+    }
+    for point in layout.edges.iter_mut().flat_map(|edge| &mut edge.points) {
+        point.x += left;
+    }
+    layout.width += left + right;
+    layout
 }
 
 fn ranking_direction_violations(graph: &Graph, layout: &Layout) -> usize {
@@ -2214,6 +2452,7 @@ fn compose_candidate(
     offset_x: f64,
     offset_y: f64,
     options: LayoutOptions,
+    prefer_direct_boundary_routes: bool,
 ) -> Result<Layout, GroupExpansionError> {
     let local_nodes = member_layout
         .nodes
@@ -2252,55 +2491,115 @@ fn compose_candidate(
     let mut edges = Vec::with_capacity(expanded_graph.edges.len());
     let mut expanded_edges = expanded_graph.edges.iter().collect::<Vec<_>>();
     expanded_edges.sort_unstable_by_key(|edge| edge.id);
+    let expanded_edge_by_id = expanded_edges
+        .iter()
+        .map(|edge| (edge.id, *edge))
+        .collect::<BTreeMap<_, _>>();
+    let mut incoming_groups = BTreeMap::<(EndpointKey, NetId), Vec<EdgeId>>::new();
+    let mut outgoing_groups = BTreeMap::<(EndpointKey, NetId), Vec<EdgeId>>::new();
+    for edge in expanded_edges.iter().copied() {
+        let source_member = contract.members.contains(&edge.source.node);
+        let target_member = contract.members.contains(&edge.target.node);
+        if !source_member && target_member && !boundary_bundles.retaps.contains_key(&edge.id) {
+            incoming_groups
+                .entry(((edge.source.node, edge.source.port), edge.net))
+                .or_default()
+                .push(edge.id);
+        } else if source_member && !target_member && !boundary_bundles.retaps.contains_key(&edge.id)
+        {
+            outgoing_groups
+                .entry(((edge.target.node, edge.target.port), edge.net))
+                .or_default()
+                .push(edge.id);
+        }
+    }
+    let incoming_groups = incoming_groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect::<Vec<_>>();
+    let outgoing_groups = outgoing_groups
+        .into_values()
+        .filter(|group| group.len() > 1)
+        .collect::<Vec<_>>();
+    let shared_lane_count = incoming_groups.len() + outgoing_groups.len();
+    let mut shared_incoming_by_edge = BTreeMap::<EdgeId, (Vec<EdgeId>, usize, usize)>::new();
+    for (lane, group) in incoming_groups.into_iter().enumerate() {
+        for &edge in &group {
+            shared_incoming_by_edge.insert(edge, (group.clone(), lane, shared_lane_count));
+        }
+    }
+    let mut shared_outgoing_by_edge = BTreeMap::<EdgeId, (Vec<EdgeId>, usize, usize)>::new();
+    for (offset, group) in outgoing_groups.into_iter().enumerate() {
+        let lane = shared_incoming_by_edge
+            .values()
+            .map(|(_, lane, _)| *lane)
+            .max()
+            .map_or(0, |lane| lane + 1)
+            + offset;
+        for &edge in &group {
+            shared_outgoing_by_edge.insert(edge, (group.clone(), lane, shared_lane_count));
+        }
+    }
     let bridge_pitch = options
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
-    let mut outgoing_nets = BTreeMap::<NetId, f64>::new();
-    let mut incoming_nets = BTreeMap::<NetId, f64>::new();
+    let mut outgoing_nets = BTreeMap::<FloatKey, BTreeSet<NetId>>::new();
+    let mut incoming_nets = BTreeMap::<FloatKey, BTreeSet<NetId>>::new();
     for edge in expanded_edges.iter().filter(|edge| {
         contract.members.contains(&edge.source.node) ^ contract.members.contains(&edge.target.node)
     }) {
         if contract.members.contains(&edge.source.node) {
             let right = node_geometry[&edge.source.node].x + node_geometry[&edge.source.node].width;
             outgoing_nets
-                .entry(edge.net)
-                .and_modify(|current| *current = current.max(right))
-                .or_insert(right);
+                .entry(FloatKey(right))
+                .or_default()
+                .insert(edge.net);
         } else {
             let left = node_geometry[&edge.target.node].x;
             incoming_nets
-                .entry(edge.net)
-                .and_modify(|current| *current = current.min(left))
-                .or_insert(left);
+                .entry(FloatKey(left))
+                .or_default()
+                .insert(edge.net);
         }
     }
-    let mut outgoing_nets = outgoing_nets.into_iter().collect::<Vec<_>>();
-    outgoing_nets.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    let mut incoming_nets = incoming_nets.into_iter().collect::<Vec<_>>();
-    incoming_nets.sort_by(|left, right| {
-        left.1
-            .total_cmp(&right.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    let outgoing_lane_by_net = outgoing_nets
+    let outgoing_bridge_lane_by_net = outgoing_nets
+        .values()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .enumerate()
-        .map(|(lane, (net, _))| (net, lane as f64 * bridge_pitch))
+        .map(|(lane, net)| (net, lane as f64 * bridge_pitch))
         .collect::<BTreeMap<_, _>>();
-    let incoming_lane_by_net = incoming_nets
+    let incoming_bridge_lane_by_net = incoming_nets
+        .values()
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>()
         .into_iter()
         .enumerate()
-        .map(|(lane, (net, _))| (net, lane as f64 * bridge_pitch))
+        .map(|(lane, net)| (net, lane as f64 * bridge_pitch))
+        .collect::<BTreeMap<_, _>>();
+    let outgoing_lane_by_column_net = outgoing_nets
+        .into_iter()
+        .flat_map(|(column, nets)| {
+            nets.into_iter()
+                .enumerate()
+                .map(move |(lane, net)| ((column, net), lane as f64 * bridge_pitch))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let incoming_lane_by_column_net = incoming_nets
+        .into_iter()
+        .flat_map(|(column, nets)| {
+            nets.into_iter()
+                .enumerate()
+                .map(move |(lane, net)| ((column, net), lane as f64 * bridge_pitch))
+        })
         .collect::<BTreeMap<_, _>>();
     for edge in expanded_edges {
         let source_member = contract.members.contains(&edge.source.node);
         let target_member = contract.members.contains(&edge.target.node);
-        let mut route = match (source_member, target_member) {
+        let route = match (source_member, target_member) {
             (false, false) => contract.compact_edge_geometry[&edge.id].clone(),
             (true, true) => {
                 let local = local_edges[&edge.id];
@@ -2316,34 +2615,81 @@ fn compose_candidate(
                         .collect(),
                 }
             }
-            _ => boundary_route(
-                edge,
-                contract,
-                &node_geometry,
-                &obstacles,
-                options,
-                if source_member {
-                    outgoing_lane_by_net[&edge.net]
+            _ => {
+                let bridge_lane_offset = if source_member {
+                    outgoing_bridge_lane_by_net[&edge.net]
                 } else {
-                    incoming_lane_by_net[&edge.net]
-                },
-                compact_layout.height,
-            )?,
+                    incoming_bridge_lane_by_net[&edge.net]
+                };
+                let approach_lane_offset = if source_member {
+                    let source = node_geometry[&edge.source.node];
+                    outgoing_lane_by_column_net[&(FloatKey(source.x + source.width), edge.net)]
+                } else {
+                    incoming_lane_by_column_net
+                        [&(FloatKey(node_geometry[&edge.target.node].x), edge.net)]
+                };
+                if let Some((group, trunk_lane, trunk_lanes)) =
+                    shared_incoming_by_edge.get(&edge.id)
+                {
+                    shared_boundary_trunk_route(
+                        edge,
+                        group,
+                        &expanded_edge_by_id,
+                        contract,
+                        &node_geometry,
+                        &obstacles,
+                        options,
+                        BoundaryBundleRole::Input,
+                        approach_lane_offset,
+                        &incoming_lane_by_column_net,
+                        *trunk_lane,
+                        *trunk_lanes,
+                    )?
+                } else if let Some((group, trunk_lane, trunk_lanes)) =
+                    shared_outgoing_by_edge.get(&edge.id)
+                {
+                    shared_boundary_trunk_route(
+                        edge,
+                        group,
+                        &expanded_edge_by_id,
+                        contract,
+                        &node_geometry,
+                        &obstacles,
+                        options,
+                        BoundaryBundleRole::Output,
+                        approach_lane_offset,
+                        &outgoing_lane_by_column_net,
+                        *trunk_lane,
+                        *trunk_lanes,
+                    )?
+                } else if let Some(bundle) = boundary_bundles.retaps.get(&edge.id).copied() {
+                    bundled_boundary_route(
+                        edge,
+                        contract,
+                        &node_geometry,
+                        &obstacles,
+                        options,
+                        bundle,
+                        bridge_lane_offset,
+                        approach_lane_offset,
+                        compact_layout.height,
+                        prefer_direct_boundary_routes,
+                    )?
+                } else {
+                    boundary_route(
+                        edge,
+                        contract,
+                        &node_geometry,
+                        &obstacles,
+                        options,
+                        bridge_lane_offset,
+                        approach_lane_offset,
+                        compact_layout.height,
+                        prefer_direct_boundary_routes,
+                    )?
+                }
+            }
         };
-        if let Some(retap) = boundary_bundles.retaps.get(&edge.id).copied() {
-            debug_assert_ne!(source_member, target_member);
-            boundary_bundles::rewrite_preserved_member_route(
-                &mut route,
-                retap.role,
-                retap.tap,
-                retap.tap_lane,
-                options
-                    .route_lane_gap
-                    .max(options.minimum_parallel_wire_spacing),
-                retap.corridor_offset,
-            )
-            .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
-        }
         edges.push(route);
     }
 
@@ -2366,6 +2712,295 @@ fn compose_candidate(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn shared_boundary_trunk_route(
+    edge: &Edge,
+    group: &[EdgeId],
+    edges: &BTreeMap<EdgeId, &Edge>,
+    contract: &ExpansionContract<'_>,
+    node_geometry: &BTreeMap<NodeId, &NodeGeometry>,
+    obstacles: &ObstacleIndex,
+    options: LayoutOptions,
+    role: BoundaryBundleRole,
+    approach_lane_offset: f64,
+    approach_lane_by_column_net: &BTreeMap<(FloatKey, NetId), f64>,
+    trunk_lane: usize,
+    trunk_lanes: usize,
+) -> Result<EdgeGeometry, GroupExpansionError> {
+    let clearance = crate::outward_obstacle_clearance_stub(options);
+    let member_nodes = contract
+        .members
+        .iter()
+        .map(|member| node_geometry[member])
+        .collect::<Vec<_>>();
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let Some(trunk_y) =
+        central_member_corridor_y(&member_nodes, clearance, pitch, trunk_lane, trunk_lanes)
+    else {
+        return Err(GroupExpansionError::NoSafeBoundaryBridge(edge.id));
+    };
+    let gap = (options.node_gap / 2.0).max(options.edge_node_clearance);
+
+    let points = match role {
+        BoundaryBundleRole::Input => {
+            let target_node = contract.expanded_nodes[&edge.target.node];
+            let target_port = port(target_node, edge.target);
+            if target_port.side != PortSide::West {
+                return Err(GroupExpansionError::NoSafeBoundaryBridge(edge.id));
+            }
+            let target = endpoint_point(node_geometry[&edge.target.node], target_node, edge.target);
+            let target_stub =
+                outward_stub(target, target_port.side, clearance + approach_lane_offset);
+            let entry_x = group
+                .iter()
+                .map(|id| {
+                    let grouped = edges[id];
+                    let node = contract.expanded_nodes[&grouped.target.node];
+                    let endpoint =
+                        endpoint_point(node_geometry[&grouped.target.node], node, grouped.target);
+                    let offset = approach_lane_by_column_net
+                        [&(FloatKey(node_geometry[&grouped.target.node].x), grouped.net)];
+                    outward_stub(
+                        endpoint,
+                        port(node, grouped.target).side,
+                        clearance + offset,
+                    )
+                    .x
+                })
+                .min_by(f64::total_cmp)
+                .expect("shared boundary group is non-empty");
+            let source_node = contract.expanded_nodes[&edge.source.node];
+            let source_port = port(source_node, edge.source);
+            let source = endpoint_point(node_geometry[&edge.source.node], source_node, edge.source);
+            let source_stub = outward_stub(source, source_port.side, clearance);
+            let entry = Point {
+                x: entry_x,
+                y: trunk_y,
+            };
+            let bridge = simplify_orthogonal(vec![
+                source_stub,
+                Point {
+                    x: entry_x,
+                    y: source_stub.y,
+                },
+                entry,
+            ]);
+            if !path_is_clear(&bridge, obstacles) {
+                return Err(GroupExpansionError::NoSafeBoundaryBridge(edge.id));
+            }
+            let mut points = vec![source, source_stub];
+            points.extend(bridge.into_iter().skip(1));
+            points.push(Point {
+                x: target_stub.x,
+                y: trunk_y,
+            });
+            points.push(target_stub);
+            points.push(target);
+            points
+        }
+        BoundaryBundleRole::Output => {
+            let source_node = contract.expanded_nodes[&edge.source.node];
+            let source_port = port(source_node, edge.source);
+            if source_port.side != PortSide::East {
+                return Err(GroupExpansionError::NoSafeBoundaryBridge(edge.id));
+            }
+            let source = endpoint_point(node_geometry[&edge.source.node], source_node, edge.source);
+            let source_stub =
+                outward_stub(source, source_port.side, clearance + approach_lane_offset);
+            let exit_x = group
+                .iter()
+                .map(|id| {
+                    let grouped = edges[id];
+                    let node = contract.expanded_nodes[&grouped.source.node];
+                    let endpoint =
+                        endpoint_point(node_geometry[&grouped.source.node], node, grouped.source);
+                    let source = node_geometry[&grouped.source.node];
+                    let offset = approach_lane_by_column_net
+                        [&(FloatKey(source.x + source.width), grouped.net)];
+                    outward_stub(
+                        endpoint,
+                        port(node, grouped.source).side,
+                        clearance + offset,
+                    )
+                    .x
+                })
+                .max_by(f64::total_cmp)
+                .expect("shared boundary group is non-empty");
+            let target_node = contract.expanded_nodes[&edge.target.node];
+            let target_port = port(target_node, edge.target);
+            let target = endpoint_point(node_geometry[&edge.target.node], target_node, edge.target);
+            let target_stub = outward_stub(target, target_port.side, clearance);
+            let exit = Point {
+                x: exit_x,
+                y: trunk_y,
+            };
+            let bridge = obstacle_safe_bridge(exit, target_stub, obstacles, gap, 0.0)
+                .ok_or(GroupExpansionError::NoSafeBoundaryBridge(edge.id))?;
+            let mut points = vec![source, source_stub];
+            points.push(Point {
+                x: source_stub.x,
+                y: trunk_y,
+            });
+            points.push(exit);
+            points.extend(bridge.into_iter().skip(1));
+            points.push(target);
+            points
+        }
+    };
+    let points = simplify_orthogonal(points);
+    path_is_clear(&points, obstacles)
+        .then_some(EdgeGeometry {
+            id: edge.id,
+            points,
+        })
+        .ok_or(GroupExpansionError::NoSafeBoundaryBridge(edge.id))
+}
+
+fn central_member_corridor_y(
+    nodes: &[&NodeGeometry],
+    clearance: f64,
+    pitch: f64,
+    lane: usize,
+    lanes: usize,
+) -> Option<f64> {
+    let mut bands = nodes
+        .iter()
+        .map(|node| (node.y, node.y + node.height))
+        .collect::<Vec<_>>();
+    bands.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
+    let mut merged = Vec::<(f64, f64)>::new();
+    for band in bands {
+        if let Some(last) = merged.last_mut()
+            && band.0 <= last.1 + HARD_GATE_EPSILON
+        {
+            last.1 = last.1.max(band.1);
+        } else {
+            merged.push(band);
+        }
+    }
+    let frame_center = merged
+        .first()
+        .zip(merged.last())
+        .map(|(first, last)| (first.0 + last.1) / 2.0)?;
+    merged
+        .windows(2)
+        .filter_map(|bands| {
+            let gap = bands[1].0 - bands[0].1;
+            let required = clearance * 2.0 + pitch * lanes.saturating_sub(1) as f64;
+            (gap + HARD_GATE_EPSILON >= required).then_some(
+                (bands[0].1 + bands[1].0) / 2.0
+                    + (lane as f64 - lanes.saturating_sub(1) as f64 / 2.0) * pitch,
+            )
+        })
+        .min_by(|left, right| {
+            (left - frame_center)
+                .abs()
+                .total_cmp(&(right - frame_center).abs())
+                .then(left.total_cmp(right))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bundled_boundary_route(
+    edge: &Edge,
+    contract: &ExpansionContract<'_>,
+    node_geometry: &BTreeMap<NodeId, &NodeGeometry>,
+    obstacles: &ObstacleIndex,
+    options: LayoutOptions,
+    bundle: BoundaryBundleRetap,
+    bridge_lane_offset: f64,
+    approach_lane_offset: f64,
+    preserved_bottom: f64,
+    prefer_direct: bool,
+) -> Result<EdgeGeometry, GroupExpansionError> {
+    let source_member = contract.members.contains(&edge.source.node);
+    let target_member = contract.members.contains(&edge.target.node);
+    debug_assert_ne!(source_member, target_member);
+    let pitch = options
+        .route_lane_gap
+        .max(options.minimum_parallel_wire_spacing);
+    let corridor_depth = bundle.corridor_offset + (bundle.tap_lane + 1) as f64 * pitch;
+    let gap = (options.node_gap / 2.0).max(options.edge_node_clearance);
+
+    let points = match bundle.role {
+        BoundaryBundleRole::Input => {
+            debug_assert!(target_member);
+            let target_node = contract.expanded_nodes[&edge.target.node];
+            let target_port = port(target_node, edge.target);
+            let target = endpoint_point(node_geometry[&edge.target.node], target_node, edge.target);
+            let target_stub = outward_stub(
+                target,
+                target_port.side,
+                crate::outward_obstacle_clearance_stub(options) + approach_lane_offset,
+            );
+            let corridor = Point {
+                x: bundle.tap.x + corridor_depth,
+                y: bundle.tap.y,
+            };
+            let bridge = if target_port.side == PortSide::West {
+                boundary_bridge(
+                    corridor,
+                    target_stub,
+                    obstacles,
+                    gap,
+                    bridge_lane_offset,
+                    false,
+                    preserved_bottom,
+                    prefer_direct,
+                )
+            } else {
+                obstacle_safe_bridge(corridor, target_stub, obstacles, gap, bridge_lane_offset)
+            }
+            .ok_or(GroupExpansionError::NoSafeBoundaryBridge(edge.id))?;
+            let mut points = vec![bundle.tap, corridor];
+            points.extend(bridge.into_iter().skip(1));
+            points.push(target);
+            points
+        }
+        BoundaryBundleRole::Output => {
+            debug_assert!(source_member);
+            let source_node = contract.expanded_nodes[&edge.source.node];
+            let source_port = port(source_node, edge.source);
+            let source = endpoint_point(node_geometry[&edge.source.node], source_node, edge.source);
+            let source_stub = outward_stub(
+                source,
+                source_port.side,
+                crate::outward_obstacle_clearance_stub(options) + approach_lane_offset,
+            );
+            let corridor = Point {
+                x: bundle.tap.x - corridor_depth,
+                y: bundle.tap.y,
+            };
+            let bridge = if source_port.side == PortSide::East {
+                boundary_bridge(
+                    source_stub,
+                    corridor,
+                    obstacles,
+                    gap,
+                    bridge_lane_offset,
+                    true,
+                    preserved_bottom,
+                    prefer_direct,
+                )
+            } else {
+                obstacle_safe_bridge(source_stub, corridor, obstacles, gap, bridge_lane_offset)
+            }
+            .ok_or(GroupExpansionError::NoSafeBoundaryBridge(edge.id))?;
+            let mut points = vec![source, source_stub];
+            points.extend(bridge.into_iter().skip(1));
+            points.push(bundle.tap);
+            points
+        }
+    };
+    Ok(EdgeGeometry {
+        id: edge.id,
+        points: simplify_orthogonal(points),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn boundary_route(
     edge: &Edge,
     contract: &ExpansionContract<'_>,
@@ -2373,7 +3008,9 @@ fn boundary_route(
     obstacles: &ObstacleIndex,
     options: LayoutOptions,
     bridge_lane_offset: f64,
+    approach_lane_offset: f64,
     preserved_bottom: f64,
+    prefer_direct: bool,
 ) -> Result<EdgeGeometry, GroupExpansionError> {
     let source_member = contract.members.contains(&edge.source.node);
     let target_member = contract.members.contains(&edge.target.node);
@@ -2407,7 +3044,11 @@ fn boundary_route(
             route.id = edge.id;
             return Ok(route);
         }
-        let source_stub = outward_stub(source, source_port.side, options.port_stub);
+        let source_stub = outward_stub(
+            source,
+            source_port.side,
+            crate::outward_obstacle_clearance_stub(options) + approach_lane_offset,
+        );
         let target_node = contract.expanded_nodes[&edge.target.node];
         let target_port = port(target_node, edge.target);
         let graph_target =
@@ -2418,7 +3059,11 @@ fn boundary_route(
             } else {
                 (trunk_end, PortSide::West)
             };
-        let target_stub = outward_stub(target, target_side, options.port_stub);
+        let target_stub = outward_stub(
+            target,
+            target_side,
+            crate::outward_obstacle_clearance_stub(options),
+        );
         let splice_index = if source_port.side == PortSide::East {
             trunk_geometry
                 .points
@@ -2447,7 +3092,7 @@ fn boundary_route(
         let mut points = vec![source, source_stub];
         let gap = (options.node_gap / 2.0).max(options.edge_node_clearance);
         if source_port.side == PortSide::East {
-            let splice_bridge = outer_lane_bridge(
+            let splice_bridge = boundary_bridge(
                 source_stub,
                 splice,
                 obstacles,
@@ -2455,6 +3100,7 @@ fn boundary_route(
                 bridge_lane_offset,
                 true,
                 preserved_bottom,
+                prefer_direct,
             )
             .ok_or(GroupExpansionError::NoSafeBoundaryBridge(edge.id))?;
             points.extend(splice_bridge.into_iter().skip(1));
@@ -2481,7 +3127,11 @@ fn boundary_route(
             route.id = edge.id;
             return Ok(route);
         }
-        let target_stub = outward_stub(target, target_port.side, options.port_stub);
+        let target_stub = outward_stub(
+            target,
+            target_port.side,
+            crate::outward_obstacle_clearance_stub(options) + approach_lane_offset,
+        );
         let splice_index = if target_port.side == PortSide::West {
             trunk_geometry
                 .points
@@ -2501,7 +3151,11 @@ fn boundary_route(
             } else {
                 (trunk_start, PortSide::East)
             };
-        let source_stub = outward_stub(source, source_side, options.port_stub);
+        let source_stub = outward_stub(
+            source,
+            source_side,
+            crate::outward_obstacle_clearance_stub(options),
+        );
         let preserved_prefix = &trunk_geometry.points[..=splice_index];
         let prefix_preserves_source_departure = preserved_prefix.len() >= 2
             && boundary_bundles::preserved_point_matches(preserved_prefix[0], source)
@@ -2514,7 +3168,7 @@ fn boundary_route(
         let splice = *points.last().expect("boundary route has a source");
         let gap = (options.node_gap / 2.0).max(options.edge_node_clearance);
         if target_port.side == PortSide::West {
-            let escape_bridge = outer_lane_bridge(
+            let escape_bridge = boundary_bridge(
                 splice,
                 target_stub,
                 obstacles,
@@ -2522,6 +3176,7 @@ fn boundary_route(
                 bridge_lane_offset,
                 false,
                 preserved_bottom,
+                prefer_direct,
             )
             .ok_or(GroupExpansionError::NoSafeBoundaryBridge(edge.id))?;
             points.extend(escape_bridge.into_iter().skip(1));
@@ -2658,14 +3313,25 @@ fn outer_lane_bridge(
             + gap
             + lane_offset
     } else {
-        (obstacles
+        let top_lane = obstacles
             .rects
             .iter()
             .map(|obstacle| obstacle.top)
             .fold(start.y.min(end.y), f64::min)
             - gap
-            - lane_offset)
-            .max(0.0)
+            - lane_offset;
+        if top_lane >= 0.0 {
+            top_lane
+        } else {
+            obstacles
+                .rects
+                .iter()
+                .map(|obstacle| obstacle.bottom)
+                .fold(start.y.max(end.y), f64::max)
+                .max(preserved_bottom)
+                + gap * 2.0
+                + lane_offset
+        }
     };
     let points = simplify_orthogonal(vec![
         start,
@@ -2680,6 +3346,32 @@ fn outer_lane_bridge(
         end,
     ]);
     path_is_clear(&points, obstacles).then_some(points)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn boundary_bridge(
+    start: Point,
+    end: Point,
+    obstacles: &ObstacleIndex,
+    gap: f64,
+    lane_offset: f64,
+    below: bool,
+    preserved_bottom: f64,
+    prefer_direct: bool,
+) -> Option<Vec<Point>> {
+    if prefer_direct {
+        obstacle_safe_bridge(start, end, obstacles, gap, lane_offset)
+    } else {
+        outer_lane_bridge(
+            start,
+            end,
+            obstacles,
+            gap,
+            lane_offset,
+            below,
+            preserved_bottom,
+        )
+    }
 }
 
 fn bridge_path_cmp(left: &[Point], right: &[Point]) -> Ordering {
@@ -4698,6 +5390,7 @@ mod tests {
             &graph,
             &ordinary,
             super::EXPANSION_COMPONENT_GAP,
+            super::EXPANSION_COMPONENT_GAP,
             500.0,
             None,
         );
@@ -4723,6 +5416,7 @@ mod tests {
             arrange_member_components(
                 &permuted,
                 &permuted_layout,
+                super::EXPANSION_COMPONENT_GAP,
                 super::EXPANSION_COMPONENT_GAP,
                 500.0,
                 None,
@@ -4758,6 +5452,7 @@ mod tests {
             &graph,
             &member_layout,
             gap,
+            gap,
             stacked_height / super::EXPANSION_STACK_HEIGHT_FACTOR,
             None,
         );
@@ -4772,6 +5467,7 @@ mod tests {
         let grid = arrange_member_components(
             &graph,
             &member_layout,
+            gap,
             gap,
             (stacked_height - 1.0) / super::EXPANSION_STACK_HEIGHT_FACTOR,
             None,
@@ -4809,7 +5505,8 @@ mod tests {
             height: 50.0,
         };
 
-        let arranged = arrange_member_components(&graph, &member_layout, 18.0, 50.0, Some(175.0));
+        let arranged =
+            arrange_member_components(&graph, &member_layout, 18.0, 18.0, 50.0, Some(175.0));
         assert!(arranged.nodes.iter().all(|node| node.x == 0.0));
         assert_eq!(arranged.width, 80.0);
         assert_eq!(arranged.height, 186.0);
@@ -4854,7 +5551,7 @@ mod tests {
             height: 50.0,
         };
 
-        let arranged = arrange_member_components(&graph, &member_layout, 18.0, 200.0, None);
+        let arranged = arrange_member_components(&graph, &member_layout, 18.0, 18.0, 200.0, None);
         let nodes = arranged
             .nodes
             .iter()

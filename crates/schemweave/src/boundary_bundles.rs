@@ -225,29 +225,6 @@ fn rewrite_member_routes(
     Ok(())
 }
 
-pub(crate) fn rewrite_preserved_member_route(
-    route: &mut EdgeGeometry,
-    role: BoundaryBundleRole,
-    tap: Point,
-    tap_lane: usize,
-    pitch: f64,
-    corridor_offset: f64,
-) -> Result<(), LayoutError> {
-    if route.points.len() < 2 {
-        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
-    }
-    let corridor_depth = corridor_offset + (tap_lane + 1) as f64 * pitch;
-    route.points = match role {
-        BoundaryBundleRole::Input => rewrite_input_route(&route.points, tap, corridor_depth),
-        BoundaryBundleRole::Output => rewrite_output_route(&route.points, tap, corridor_depth),
-    }
-    .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
-    if route.points.len() < 2 {
-        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
-    }
-    Ok(())
-}
-
 fn rewrite_input_route(points: &[Point], tap: Point, pitch: f64) -> Option<Vec<Point>> {
     let corridor_x = tap.x + pitch;
     let (segment, intersection) = first_vertical_line_intersection(points, corridor_x)?;
