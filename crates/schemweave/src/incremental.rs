@@ -1287,11 +1287,11 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     } else {
         0
     };
-    let shared_route_overlap_planning = if replanned_bundles > 0
+    let shared_route_admission_planning = if replanned_bundles > 0
         && options.minimum_parallel_wire_spacing == 0.0
         && bundles <= boundary_bundles::MAX_INTERIOR_COLLECTOR_BUNDLES
     {
-        boundary_bundles::MAX_SHARED_ROUTE_OVERLAP_VISITS
+        boundary_bundles::MAX_SHARED_ROUTE_ADMISSION_VISITS
     } else {
         0
     };
@@ -1317,7 +1317,7 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     initial_verification
         .saturating_add(final_verification)
         .saturating_add(interior_planning)
-        .saturating_add(shared_route_overlap_planning)
+        .saturating_add(shared_route_admission_planning)
         .saturating_add(partial_verification)
         .saturating_add(structure)
         .saturating_add(rewritten_segments)

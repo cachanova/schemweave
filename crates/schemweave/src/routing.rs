@@ -475,6 +475,14 @@ struct RawRouteSegment {
     target_escape: Option<(f64, f64)>,
 }
 
+#[derive(Clone, Copy)]
+struct RouteSegmentGeometry {
+    horizontal: bool,
+    fixed: f64,
+    start: f64,
+    end: f64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteContactError {
     SegmentLimitExceeded,
@@ -5184,25 +5192,105 @@ fn raw_route_segments_have_unrelated_contact(
     {
         return false;
     }
+    route_segment_geometry_has_contact(
+        RouteSegmentGeometry {
+            horizontal: left.horizontal,
+            fixed: left.fixed,
+            start: left.start,
+            end: left.end,
+        },
+        RouteSegmentGeometry {
+            horizontal: right.horizontal,
+            fixed: right.fixed,
+            start: right.start,
+            end: right.end,
+        },
+    )
+}
+
+fn route_segment_geometry_has_contact(
+    left: RouteSegmentGeometry,
+    right: RouteSegmentGeometry,
+) -> bool {
     if left.horizontal == right.horizontal {
         return left.fixed == right.fixed && left.start <= right.end && right.start <= left.end;
     }
-    let (horizontal, vertical) = if left.horizontal {
-        (left, right)
+    let (
+        horizontal_fixed,
+        horizontal_start,
+        horizontal_end,
+        vertical_fixed,
+        vertical_start,
+        vertical_end,
+    ) = if left.horizontal {
+        (
+            left.fixed,
+            left.start,
+            left.end,
+            right.fixed,
+            right.start,
+            right.end,
+        )
     } else {
-        (right, left)
+        (
+            right.fixed,
+            right.start,
+            right.end,
+            left.fixed,
+            left.start,
+            left.end,
+        )
     };
-    if vertical.fixed < horizontal.start
-        || vertical.fixed > horizontal.end
-        || horizontal.fixed < vertical.start
-        || horizontal.fixed > vertical.end
+    if vertical_fixed < horizontal_start
+        || vertical_fixed > horizontal_end
+        || horizontal_fixed < vertical_start
+        || horizontal_fixed > vertical_end
     {
         return false;
     }
-    vertical.fixed == horizontal.start
-        || vertical.fixed == horizontal.end
-        || horizontal.fixed == vertical.start
-        || horizontal.fixed == vertical.end
+    vertical_fixed == horizontal_start
+        || vertical_fixed == horizontal_end
+        || horizontal_fixed == vertical_start
+        || horizontal_fixed == vertical_end
+}
+
+/// Reports the exact geometric contact relation used by the authoritative unrelated-route gate.
+///
+/// Interior perpendicular crossings remain electrically unrelated. Collinear endpoint contact and
+/// perpendicular T/corner contact count because rendering them without a junction is ambiguous.
+pub(crate) fn orthogonal_segments_have_route_contact(
+    left_start: Point,
+    left_end: Point,
+    right_start: Point,
+    right_end: Point,
+) -> Result<bool, RouteContactError> {
+    let canonical = |start: Point, end: Point| {
+        let horizontal = start.y == end.y;
+        let vertical = start.x == end.x;
+        match (horizontal, vertical) {
+            (true, false) => Ok(Some(RouteSegmentGeometry {
+                horizontal: true,
+                fixed: start.y,
+                start: start.x.min(end.x),
+                end: start.x.max(end.x),
+            })),
+            (false, true) => Ok(Some(RouteSegmentGeometry {
+                horizontal: false,
+                fixed: start.x,
+                start: start.y.min(end.y),
+                end: start.y.max(end.y),
+            })),
+            (true, true) => Ok(None),
+            (false, false) => Err(RouteContactError::InvalidInput),
+        }
+    };
+    let Some(left) = canonical(left_start, left_end)? else {
+        return Ok(false);
+    };
+    let Some(right) = canonical(right_start, right_end)? else {
+        return Ok(false);
+    };
+    Ok(route_segment_geometry_has_contact(left, right))
 }
 
 fn raw_route_segments_share_mandatory_escape(
@@ -14886,6 +14974,52 @@ mod tests {
                 Some(true),
             );
         }
+    }
+
+    #[test]
+    fn route_contact_primitive_matches_authoritative_endpoint_and_t_semantics() {
+        let horizontal_start = Point { x: 0.0, y: 5.0 };
+        let horizontal_end = Point { x: 10.0, y: 5.0 };
+
+        assert_eq!(
+            super::orthogonal_segments_have_route_contact(
+                horizontal_start,
+                horizontal_end,
+                Point { x: 10.0, y: 5.0 },
+                Point { x: 20.0, y: 5.0 },
+            ),
+            Ok(true),
+            "collinear endpoint-only contact is electrically ambiguous"
+        );
+        assert_eq!(
+            super::orthogonal_segments_have_route_contact(
+                horizontal_start,
+                horizontal_end,
+                Point { x: 5.0, y: 0.0 },
+                Point { x: 5.0, y: 5.0 },
+            ),
+            Ok(true),
+            "a perpendicular T contact is electrically ambiguous"
+        );
+        assert_eq!(
+            super::orthogonal_segments_have_route_contact(
+                horizontal_start,
+                horizontal_end,
+                Point { x: 5.0, y: 0.0 },
+                Point { x: 5.0, y: 10.0 },
+            ),
+            Ok(false),
+            "an interior perpendicular crossing remains a non-contact"
+        );
+        assert_eq!(
+            super::orthogonal_segments_have_route_contact(
+                horizontal_start,
+                horizontal_end,
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 1.0, y: 1.0 },
+            ),
+            Err(RouteContactError::InvalidInput),
+        );
     }
 
     #[test]
