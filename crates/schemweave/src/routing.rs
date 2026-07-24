@@ -941,8 +941,8 @@ fn route_edges_with_lane_rounds_and_refined_global(
         && route_family_candidate_shape_within_budget(node_count, plan.edges.len(), &sparse_spans);
     let RoutedLaneState {
         mut routes,
-        route_quality: spacing_quality,
-        retained_crossing_profile,
+        route_quality: mut spacing_quality,
+        mut retained_crossing_profile,
         gap_spacing,
         spacing_alternatives,
         gap_lanes,
@@ -996,209 +996,277 @@ fn route_edges_with_lane_rounds_and_refined_global(
             )
         })
         .flatten();
-    let build_sparse_alternative = |candidate_lanes: Vec<BTreeMap<u32, usize>>| {
-        if !route_family_candidate_within_budget(node_count, plan.edges.len(), &routes) {
-            return Vec::new();
-        }
-        let candidate_endpoint_tracks = build_endpoint_tracks(
+    let has_global_lane_delta_candidate = global_gap_lanes.is_some()
+        || preserved_refined_global_gap_lanes.is_some()
+        || refined_global_gap_lanes.is_some();
+    if has_global_lane_delta_candidate {
+        let profile = retained_spacing_route_profile(
             plan,
-            nodes,
-            ranks,
-            &sparse_spans,
+            &routes,
+            spacing_quality,
+            retained_crossing_profile.take(),
+        );
+        spacing_quality = Some(profile.quality);
+        retained_crossing_profile = Some(profile);
+    }
+    let global_lane_delta_baseline = has_global_lane_delta_candidate.then(|| {
+        global_lane_delta_baseline(
+            plan,
+            &routes,
+            &gap_lanes,
+            &baseline_outer_lanes,
             &layer_left,
             &layer_right,
-            &candidate_lanes,
-            &baseline_outer_lanes,
             options,
-            GapTrackSpacing::Compact,
-        );
-        let candidate_crossing_paths_match_endpoint_tracks =
-            crossing_paths_match_endpoint_tracks && candidate_endpoint_tracks == endpoint_tracks;
-        let candidate_spacing_plan = SpacingRoutePlan {
-            gap_lanes: &candidate_lanes,
-            endpoint_tracks: &candidate_endpoint_tracks,
-            crossing_paths: &crossing_paths,
-            outer_lanes: &baseline_outer_lanes,
-        };
-        let compact_candidate_routes = emit_routes(
-            plan,
-            nodes,
-            &sparse_spans,
-            &crossing_paths,
-            &layer_left,
-            &layer_right,
-            &candidate_lanes,
-            &candidate_endpoint_tracks,
-            &baseline_outer_lanes,
-            top,
-            bottom,
-            options,
-            GapTrackSpacing::Compact,
-        );
-        let adaptive_candidate_routes = (adaptive_gap_spacing
-            && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| SpacingRouteCandidate {
-            routes: emit_routes(
-                plan,
-                nodes,
-                &sparse_spans,
-                &crossing_paths,
-                &layer_left,
-                &layer_right,
-                &candidate_lanes,
-                &candidate_endpoint_tracks,
-                &baseline_outer_lanes,
-                top,
-                bottom,
-                options,
-                GapTrackSpacing::Adaptive,
-            ),
-            spacing: GapTrackSpacing::Adaptive,
-            plan: candidate_spacing_plan,
-        });
-        let mut selected = select_gap_spacing_candidate(
-            plan,
-            SpacingRouteCandidate {
-                routes: compact_candidate_routes,
-                spacing: GapTrackSpacing::Compact,
-                plan: candidate_spacing_plan,
-            },
-            None,
-            None,
-            adaptive_candidate_routes,
-            requires_exact_candidate_admission(options),
-        );
-        let mut candidate_alternatives = selected.rejected.take().into_iter().collect::<Vec<_>>();
-        let expanded_candidate_routes = (expanded_gap_spacing_enabled(
-            adaptive_gap_spacing,
-            deeper_crossing_repair,
-            node_count,
-            plan.edges.len(),
-            baseline_outer_lanes.is_empty(),
-        ) && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| SpacingRouteCandidate {
-            routes: emit_routes(
-                plan,
-                nodes,
-                &sparse_spans,
-                &crossing_paths,
-                &layer_left,
-                &layer_right,
-                &candidate_lanes,
-                &candidate_endpoint_tracks,
-                &baseline_outer_lanes,
-                top,
-                bottom,
-                options,
-                GapTrackSpacing::Expanded,
-            ),
-            spacing: GapTrackSpacing::Expanded,
-            plan: candidate_spacing_plan,
-        });
-        let selected = if let Some(expanded_candidate_routes) = expanded_candidate_routes {
-            let mut selected = select_gap_spacing_candidate(
-                plan,
-                SpacingRouteCandidate {
-                    routes: selected.routes,
-                    spacing: selected.spacing,
-                    plan: candidate_spacing_plan,
-                },
-                selected.quality,
-                selected.retained_crossing_profile,
-                Some(expanded_candidate_routes),
-                requires_exact_candidate_admission(options),
-            );
-            candidate_alternatives.extend(selected.rejected.take());
-            selected
-        } else {
-            selected
-        };
-        let candidate_routes = selected.routes;
-        let spacing_quality = selected.quality;
-        let candidate_crossing_profile = selected.retained_crossing_profile;
-        let candidate_gap_spacing = selected.spacing;
-        if !route_family_candidate_within_budget(node_count, plan.edges.len(), &candidate_routes) {
-            return Vec::new();
-        }
-        let large_gap = gap_lanes
-            .iter()
-            .any(|lanes| lanes.len() > MAX_GLOBAL_GAP_LANES);
-        if large_gap {
-            let candidate_crossing_profile = candidate_crossing_profile
-                .filter(|profile| {
-                    retained_crossing_profile_is_applicable(plan, &candidate_routes, profile)
-                })
-                .map(RetainedHorizontalCrossingProfile::into_parts);
-            let mut candidate = finish_route_family(
+            gap_spacing,
+            retained_crossing_profile
+                .as_ref()
+                .expect("global lane candidates retain one exact baseline profile"),
+        )
+    });
+    let build_sparse_alternative =
+        |candidate_lanes: Vec<BTreeMap<u32, usize>>, lane_delta_family: GlobalLaneDeltaFamily| {
+            if !route_family_candidate_within_budget(node_count, plan.edges.len(), &routes) {
+                return Vec::new();
+            }
+            let candidate_endpoint_tracks = build_endpoint_tracks(
                 plan,
                 nodes,
                 ranks,
                 &sparse_spans,
-                &crossing_lanes,
-                &crossing_tie_lanes,
-                crossing_tie_lane_count,
-                &free_by_rank,
                 &layer_left,
                 &layer_right,
                 &candidate_lanes,
+                &baseline_outer_lanes,
+                options,
+                GapTrackSpacing::Compact,
+            );
+            let candidate_crossing_paths_match_endpoint_tracks =
+                crossing_paths_match_endpoint_tracks
+                    && candidate_endpoint_tracks == endpoint_tracks;
+            let candidate_spacing_plan = SpacingRoutePlan {
+                gap_lanes: &candidate_lanes,
+                endpoint_tracks: &candidate_endpoint_tracks,
+                crossing_paths: &crossing_paths,
+                outer_lanes: &baseline_outer_lanes,
+            };
+            let compact_candidate_routes = emit_routes(
+                plan,
+                nodes,
+                &sparse_spans,
                 &crossing_paths,
-                candidate_endpoint_tracks,
-                candidate_crossing_paths_match_endpoint_tracks,
-                &stable_channel_lanes,
-                baseline_outer_lanes.clone(),
+                &layer_left,
+                &layer_right,
+                &candidate_lanes,
+                &candidate_endpoint_tracks,
+                &baseline_outer_lanes,
                 top,
                 bottom,
                 options,
-                outer_lane_rounds,
-                repair_crossings,
-                false,
-                horizontal_overrides,
-                candidate_crossing_profile,
-                candidate_routes,
-                candidate_gap_spacing,
+                GapTrackSpacing::Compact,
             );
-            if requires_exact_candidate_admission(options) {
-                candidate_alternatives.extend(candidate.alternatives);
-                push_distinct_route_candidate(
-                    &mut candidate_alternatives,
-                    (candidate.primary_quality, candidate.primary),
+            let adaptive_candidate_routes = (adaptive_gap_spacing
+                && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
+            .then(|| SpacingRouteCandidate {
+                routes: emit_routes(
+                    plan,
+                    nodes,
+                    &sparse_spans,
+                    &crossing_paths,
+                    &layer_left,
+                    &layer_right,
+                    &candidate_lanes,
+                    &candidate_endpoint_tracks,
+                    &baseline_outer_lanes,
+                    top,
+                    bottom,
+                    options,
+                    GapTrackSpacing::Adaptive,
+                ),
+                spacing: GapTrackSpacing::Adaptive,
+                plan: candidate_spacing_plan,
+            });
+            let lane_delta_profile = match global_lane_delta_baseline
+                .as_ref()
+                .expect("each global lane candidate has baseline delta state")
+            {
+                Ok(baseline) => global_lane_delta_candidate_profile(
+                    plan,
+                    baseline,
+                    &gap_lanes,
+                    &candidate_lanes,
+                    &endpoint_tracks,
+                    &candidate_endpoint_tracks,
+                    &crossing_paths,
+                    &baseline_outer_lanes,
+                    &routes,
+                    &compact_candidate_routes,
+                    &layer_left,
+                    &layer_right,
+                    options,
+                    gap_spacing,
+                    GapTrackSpacing::Compact,
+                    retained_crossing_profile
+                        .as_ref()
+                        .expect("global lane candidates retain one exact baseline profile"),
+                ),
+                Err(reason) => Err(reason.clone()),
+            };
+            record_global_lane_delta_result(lane_delta_family, &lane_delta_profile);
+            let compact_quality = lane_delta_profile
+                .as_ref()
+                .ok()
+                .map(|profile| profile.quality);
+            let compact_profile = lane_delta_profile.ok();
+            let mut selected = select_gap_spacing_candidate_retaining_compact_profile(
+                plan,
+                SpacingRouteCandidate {
+                    routes: compact_candidate_routes,
+                    spacing: GapTrackSpacing::Compact,
+                    plan: candidate_spacing_plan,
+                },
+                compact_quality,
+                compact_profile,
+                adaptive_candidate_routes,
+                requires_exact_candidate_admission(options),
+            );
+            let mut candidate_alternatives =
+                selected.rejected.take().into_iter().collect::<Vec<_>>();
+            let expanded_candidate_routes =
+                (expanded_gap_spacing_enabled(
+                    adaptive_gap_spacing,
+                    deeper_crossing_repair,
+                    node_count,
+                    plan.edges.len(),
+                    baseline_outer_lanes.is_empty(),
+                ) && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
+                .then(|| SpacingRouteCandidate {
+                    routes: emit_routes(
+                        plan,
+                        nodes,
+                        &sparse_spans,
+                        &crossing_paths,
+                        &layer_left,
+                        &layer_right,
+                        &candidate_lanes,
+                        &candidate_endpoint_tracks,
+                        &baseline_outer_lanes,
+                        top,
+                        bottom,
+                        options,
+                        GapTrackSpacing::Expanded,
+                    ),
+                    spacing: GapTrackSpacing::Expanded,
+                    plan: candidate_spacing_plan,
+                });
+            let selected = if let Some(expanded_candidate_routes) = expanded_candidate_routes {
+                let mut selected = select_gap_spacing_candidate_retaining_compact_profile(
+                    plan,
+                    SpacingRouteCandidate {
+                        routes: selected.routes,
+                        spacing: selected.spacing,
+                        plan: candidate_spacing_plan,
+                    },
+                    selected.quality,
+                    selected.retained_crossing_profile,
+                    Some(expanded_candidate_routes),
+                    requires_exact_candidate_admission(options),
                 );
-                if let Some(repair) = candidate.repair {
-                    push_distinct_route_candidate(&mut candidate_alternatives, repair);
-                }
-                if let Some(repair) = candidate.deeper_repair {
-                    push_distinct_route_candidate(&mut candidate_alternatives, repair);
+                candidate_alternatives.extend(selected.rejected.take());
+                selected
+            } else {
+                selected
+            };
+            let candidate_routes = selected.routes;
+            let spacing_quality = selected.quality;
+            let candidate_crossing_profile = selected.retained_crossing_profile;
+            let candidate_gap_spacing = selected.spacing;
+            if !route_family_candidate_within_budget(
+                node_count,
+                plan.edges.len(),
+                &candidate_routes,
+            ) {
+                return Vec::new();
+            }
+            let large_gap = gap_lanes
+                .iter()
+                .any(|lanes| lanes.len() > MAX_GLOBAL_GAP_LANES);
+            if large_gap {
+                let candidate_crossing_profile = candidate_crossing_profile
+                    .filter(|profile| {
+                        retained_crossing_profile_is_applicable(plan, &candidate_routes, profile)
+                    })
+                    .map(RetainedHorizontalCrossingProfile::into_parts);
+                let mut candidate = finish_route_family(
+                    plan,
+                    nodes,
+                    ranks,
+                    &sparse_spans,
+                    &crossing_lanes,
+                    &crossing_tie_lanes,
+                    crossing_tie_lane_count,
+                    &free_by_rank,
+                    &layer_left,
+                    &layer_right,
+                    &candidate_lanes,
+                    &crossing_paths,
+                    candidate_endpoint_tracks,
+                    candidate_crossing_paths_match_endpoint_tracks,
+                    &stable_channel_lanes,
+                    baseline_outer_lanes.clone(),
+                    top,
+                    bottom,
+                    options,
+                    outer_lane_rounds,
+                    repair_crossings,
+                    false,
+                    horizontal_overrides,
+                    candidate_crossing_profile,
+                    candidate_routes,
+                    candidate_gap_spacing,
+                );
+                if requires_exact_candidate_admission(options) {
+                    candidate_alternatives.extend(candidate.alternatives);
+                    push_distinct_route_candidate(
+                        &mut candidate_alternatives,
+                        (candidate.primary_quality, candidate.primary),
+                    );
+                    if let Some(repair) = candidate.repair {
+                        push_distinct_route_candidate(&mut candidate_alternatives, repair);
+                    }
+                    if let Some(repair) = candidate.deeper_repair {
+                        push_distinct_route_candidate(&mut candidate_alternatives, repair);
+                    }
+                } else {
+                    let selected = candidate
+                        .repair
+                        .take()
+                        .filter(|(quality, _)| {
+                            route_quality_cmp(*quality, candidate.primary_quality).is_lt()
+                        })
+                        .unwrap_or((candidate.primary_quality, candidate.primary));
+                    push_distinct_route_candidate(&mut candidate_alternatives, selected);
                 }
             } else {
-                let selected = candidate
-                    .repair
-                    .take()
-                    .filter(|(quality, _)| {
-                        route_quality_cmp(*quality, candidate.primary_quality).is_lt()
-                    })
-                    .unwrap_or((candidate.primary_quality, candidate.primary));
-                push_distinct_route_candidate(&mut candidate_alternatives, selected);
+                push_distinct_route_candidate(
+                    &mut candidate_alternatives,
+                    (
+                        spacing_quality
+                            .unwrap_or_else(|| route_quality_for_plan(plan, &candidate_routes)),
+                        candidate_routes,
+                    ),
+                );
             }
-        } else {
-            push_distinct_route_candidate(
-                &mut candidate_alternatives,
-                (
-                    spacing_quality
-                        .unwrap_or_else(|| route_quality_for_plan(plan, &candidate_routes)),
-                    candidate_routes,
-                ),
-            );
-        }
-        candidate_alternatives
-    };
+            candidate_alternatives
+        };
     let sparse_alternatives = global_gap_lanes
-        .map(&build_sparse_alternative)
+        .map(|lanes| build_sparse_alternative(lanes, GlobalLaneDeltaFamily::Global))
         .unwrap_or_default();
     let preserved_refined_sparse_alternatives = preserved_refined_global_gap_lanes
-        .map(&build_sparse_alternative)
+        .map(|lanes| build_sparse_alternative(lanes, GlobalLaneDeltaFamily::PreservedRefined))
         .unwrap_or_default();
     let refined_sparse_alternatives = refined_global_gap_lanes
-        .map(build_sparse_alternative)
+        .map(|lanes| build_sparse_alternative(lanes, GlobalLaneDeltaFamily::Refined))
         .unwrap_or_default();
     let fanout_within_budget = fanout_candidates
         && repair_crossings
@@ -6982,11 +7050,13 @@ fn prepare_repair_crossing_profile(
     rebuild_if_missing.then(|| horizontal_crossing_profile_by_net(plan, routes))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_gap_spacing_candidate_without_profile_reuse(
     plan: &RoutingPlan<'_>,
     compact: Vec<EdgeGeometry>,
     compact_spacing: GapTrackSpacing,
     compact_quality: Option<RouteQuality>,
+    compact_profile: Option<RetainedHorizontalCrossingProfile>,
     adaptive: Vec<EdgeGeometry>,
     adaptive_spacing: GapTrackSpacing,
     retain_rejected: bool,
@@ -7010,7 +7080,7 @@ fn select_gap_spacing_candidate_without_profile_reuse(
             GapSpacingSelection {
                 routes: compact,
                 quality: Some(compact_quality),
-                retained_crossing_profile: None,
+                retained_crossing_profile: compact_profile,
                 spacing: compact_spacing,
                 rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
             }
@@ -7053,7 +7123,7 @@ fn select_gap_spacing_candidate_without_profile_reuse(
         GapSpacingSelection {
             routes: compact,
             quality: Some(compact_quality),
-            retained_crossing_profile: None,
+            retained_crossing_profile: compact_profile,
             spacing: compact_spacing,
             rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
         }
@@ -7092,12 +7162,53 @@ fn select_gap_spacing_candidate(
     adaptive: Option<SpacingRouteCandidate<'_>>,
     retain_rejected: bool,
 ) -> GapSpacingSelection {
+    select_gap_spacing_candidate_inner(
+        plan,
+        compact,
+        compact_quality,
+        compact_profile,
+        adaptive,
+        retain_rejected,
+        false,
+    )
+}
+
+fn select_gap_spacing_candidate_retaining_compact_profile(
+    plan: &RoutingPlan<'_>,
+    compact: SpacingRouteCandidate<'_>,
+    compact_quality: Option<RouteQuality>,
+    compact_profile: Option<RetainedHorizontalCrossingProfile>,
+    adaptive: Option<SpacingRouteCandidate<'_>>,
+    retain_rejected: bool,
+) -> GapSpacingSelection {
+    select_gap_spacing_candidate_inner(
+        plan,
+        compact,
+        compact_quality,
+        compact_profile,
+        adaptive,
+        retain_rejected,
+        true,
+    )
+}
+
+fn select_gap_spacing_candidate_inner(
+    plan: &RoutingPlan<'_>,
+    compact: SpacingRouteCandidate<'_>,
+    compact_quality: Option<RouteQuality>,
+    compact_profile: Option<RetainedHorizontalCrossingProfile>,
+    adaptive: Option<SpacingRouteCandidate<'_>>,
+    retain_rejected: bool,
+    retain_compact_profile_below_reuse_threshold: bool,
+) -> GapSpacingSelection {
+    let compact_profile = compact_profile.filter(|_| {
+        retain_compact_profile_below_reuse_threshold
+            || route_set_point_total(&compact.routes) >= MIN_SCORE_REUSE_ROUTE_POINTS
+    });
     let Some(adaptive) = adaptive else {
-        let retained_crossing_profile = compact_profile
-            .filter(|_| route_set_point_total(&compact.routes) >= MIN_SCORE_REUSE_ROUTE_POINTS)
-            .filter(|profile| {
-                retained_crossing_profile_is_applicable(plan, &compact.routes, profile)
-            });
+        let retained_crossing_profile = compact_profile.filter(|profile| {
+            retained_crossing_profile_is_applicable(plan, &compact.routes, profile)
+        });
         debug_assert!(
             retained_crossing_profile
                 .as_ref()
@@ -7132,6 +7243,7 @@ fn select_gap_spacing_candidate(
             compact,
             compact_spacing,
             compact_quality,
+            compact_profile,
             adaptive,
             adaptive_spacing,
             retain_rejected,
@@ -7746,6 +7858,19 @@ mod lane_pair_contribution {
         }
     }
 
+    /// Inputs whose release-mode truth is the caller's responsibility.
+    ///
+    /// In addition to the checks below, soundness requires complete gap classification: every net
+    /// with segments that interact with a gap's x-range at a gap ordinate must either occur in
+    /// that gap's lane map or span the gap entirely. The global-family caller discharges this in
+    /// `route_edges_with_lane_rounds_and_refined_global`: `gap_lanes` comes from every
+    /// `sparse_spans` edge through `gap_preferences`, and delta admission requires
+    /// `baseline_outer_lanes` to be empty, so no unclassified outer route remains. That caller also
+    /// derives `gap_bounds` from the same `layer_right[gap]..layer_left[gap + 1]` interval consumed
+    /// by `sparse_gap_x`. Finally, its candidate builder reuses the same `crossing_paths` value and
+    /// the same outer/channel assignments, which is why it may truthfully pass `paths_reused =
+    /// true`, `outer_side_reassigned = false`, and `channel_indices_changed = false`. Future call
+    /// sites must discharge all four obligations independently rather than copying those booleans.
     pub(super) struct LaneDeltaEligibilityInput<'a> {
         pub(super) baseline_gap_lanes: &'a [BTreeMap<NetId, usize>],
         pub(super) candidate_gap_lanes: &'a [BTreeMap<NetId, usize>],
@@ -7835,6 +7960,10 @@ mod lane_pair_contribution {
         left: &CanonicalLaneContact,
         right: &CanonicalLaneContact,
     ) -> bool {
+        // `span_start`/`span_end` are deliberately absent: a net's horizontal span legitimately
+        // changes when that net moves to another track. Soundness instead comes from
+        // `arms_span_gap` running on both the baseline and candidate accesses below; do not add
+        // spans to this signature or remove either extent check.
         left.ordinate_or_low.to_bits() == right.ordinate_or_low.to_bits()
             && left.high.to_bits() == right.high.to_bits()
             && left.source == right.source
@@ -8810,6 +8939,197 @@ mod lane_pair_contribution {
     }
 }
 
+use lane_pair_contribution::{
+    CanonicalLaneGapAccess, CanonicalLaneTrack, LaneDeltaEligibilityInput, LaneDeltaEngine,
+    LaneDeltaFallbackReason, LaneDeltaInvocationIdentity, LaneDeltaLimits,
+    canonical_lane_gap_accesses_from_sorted_segments, lane_delta_eligibility,
+};
+
+struct GlobalLaneDeltaBaseline {
+    invocation: LaneDeltaInvocationIdentity,
+    gap_bounds: Vec<(f64, f64)>,
+    gap_accesses: Vec<CanonicalLaneGapAccess>,
+}
+
+type GlobalLaneDeltaGapGeometry = (Vec<(f64, f64)>, Vec<Vec<CanonicalLaneTrack>>);
+
+fn global_lane_delta_gap_geometry(
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    options: LayoutOptions,
+    gap_spacing: GapTrackSpacing,
+) -> Result<GlobalLaneDeltaGapGeometry, LaneDeltaFallbackReason> {
+    if layer_right.len() < gap_lanes.len() || layer_left.len() <= gap_lanes.len() {
+        return Err(LaneDeltaFallbackReason::GapVectorLengthMismatch);
+    }
+    let mut bounds = Vec::new();
+    bounds
+        .try_reserve_exact(gap_lanes.len())
+        .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+    let mut tracks = Vec::new();
+    tracks
+        .try_reserve_exact(gap_lanes.len())
+        .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+    for (gap, lanes) in gap_lanes.iter().enumerate() {
+        let gap_bounds = (layer_right[gap], layer_left[gap + 1]);
+        if !gap_bounds.0.is_finite() || !gap_bounds.1.is_finite() || gap_bounds.0 >= gap_bounds.1 {
+            return Err(LaneDeltaFallbackReason::InvalidTrackCoordinates { gap });
+        }
+        bounds.push(gap_bounds);
+        let mut gap_tracks = Vec::new();
+        gap_tracks
+            .try_reserve_exact(lanes.len())
+            .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+        for (&net, &lane) in lanes {
+            gap_tracks.push(CanonicalLaneTrack {
+                net,
+                lane,
+                fixed: sparse_gap_x(
+                    net,
+                    gap,
+                    layer_left,
+                    layer_right,
+                    gap_lanes,
+                    options,
+                    gap_spacing,
+                ),
+            });
+        }
+        tracks.push(gap_tracks);
+    }
+    Ok((bounds, tracks))
+}
+
+fn global_lane_delta_gap_accesses(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+    gap_tracks: &[Vec<CanonicalLaneTrack>],
+) -> Result<(Vec<PhysicalSegment>, Vec<CanonicalLaneGapAccess>), LaneDeltaFallbackReason> {
+    canonical_lane_gap_accesses_from_sorted_segments(
+        sorted_unmerged_physical_route_segments(
+            plan.edges.iter().map(|resolved| resolved.edge),
+            routes,
+            None,
+        ),
+        gap_tracks,
+        &plan.shared_endpoints,
+    )
+    .ok_or(LaneDeltaFallbackReason::AllocationFailure)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn global_lane_delta_baseline(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+    gap_lanes: &[BTreeMap<NetId, usize>],
+    outer_lanes: &BTreeMap<EdgeId, OuterLane>,
+    layer_left: &[f64],
+    layer_right: &[f64],
+    options: LayoutOptions,
+    gap_spacing: GapTrackSpacing,
+    base_profile: &RetainedHorizontalCrossingProfile,
+) -> Result<GlobalLaneDeltaBaseline, LaneDeltaFallbackReason> {
+    if !outer_lanes.is_empty() {
+        return Err(LaneDeltaFallbackReason::OuterLanesPresent);
+    }
+    let (gap_bounds, gap_tracks) =
+        global_lane_delta_gap_geometry(gap_lanes, layer_left, layer_right, options, gap_spacing)?;
+    let (segments, gap_accesses) = global_lane_delta_gap_accesses(plan, routes, &gap_tracks)?;
+    debug_assert_eq!(segments, base_profile.segments);
+    Ok(GlobalLaneDeltaBaseline {
+        invocation: LaneDeltaInvocationIdentity::new(),
+        gap_bounds,
+        gap_accesses,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn global_lane_delta_candidate_profile(
+    plan: &RoutingPlan<'_>,
+    baseline: &GlobalLaneDeltaBaseline,
+    baseline_gap_lanes: &[BTreeMap<NetId, usize>],
+    candidate_gap_lanes: &[BTreeMap<NetId, usize>],
+    baseline_endpoint_tracks: &EndpointTracks,
+    candidate_endpoint_tracks: &EndpointTracks,
+    crossing_paths: &[Option<Vec<f64>>],
+    baseline_outer_lanes: &BTreeMap<EdgeId, OuterLane>,
+    baseline_routes: &[EdgeGeometry],
+    candidate_routes: &[EdgeGeometry],
+    layer_left: &[f64],
+    layer_right: &[f64],
+    options: LayoutOptions,
+    baseline_spacing: GapTrackSpacing,
+    candidate_spacing: GapTrackSpacing,
+    base_profile: &RetainedHorizontalCrossingProfile,
+) -> Result<RetainedHorizontalCrossingProfile, LaneDeltaFallbackReason> {
+    let (_, candidate_tracks) = global_lane_delta_gap_geometry(
+        candidate_gap_lanes,
+        layer_left,
+        layer_right,
+        options,
+        candidate_spacing,
+    )?;
+    let (candidate_segments, candidate_gap_accesses) =
+        global_lane_delta_gap_accesses(plan, candidate_routes, &candidate_tracks)?;
+    let candidate_invocation = baseline.invocation.clone();
+    let eligibility = lane_delta_eligibility(&LaneDeltaEligibilityInput {
+        baseline_gap_lanes,
+        candidate_gap_lanes,
+        baseline_endpoint_tracks,
+        candidate_endpoint_tracks,
+        baseline_crossing_paths: crossing_paths,
+        candidate_crossing_paths: crossing_paths,
+        paths_reused: true,
+        baseline_spacing,
+        candidate_spacing,
+        baseline_outer_lanes,
+        candidate_outer_lanes: baseline_outer_lanes,
+        outer_side_reassigned: false,
+        channel_indices_changed: false,
+        baseline_routes,
+        candidate_routes,
+        gap_bounds: &baseline.gap_bounds,
+        baseline_gap_accesses: &baseline.gap_accesses,
+        candidate_gap_accesses: &candidate_gap_accesses,
+        base_profile,
+        base_invocation: &baseline.invocation,
+        candidate_invocation: &candidate_invocation,
+    })?;
+    let engine = LaneDeltaEngine::build(
+        baseline_gap_lanes,
+        &baseline.gap_accesses,
+        std::slice::from_ref(&eligibility),
+        LaneDeltaLimits::default(),
+    )?;
+    let score = engine.apply(0)?;
+    let route_length = route_length_from_physical_segments(&candidate_segments);
+    let profile = RetainedHorizontalCrossingProfile::new(
+        candidate_routes,
+        candidate_segments,
+        score.horizontal_by_net,
+        RouteQuality {
+            crossings: score.total,
+            bends: base_profile.quality.bends,
+            route_length,
+        },
+    );
+    #[cfg(debug_assertions)]
+    {
+        let (fresh_segments, fresh_counts, fresh_quality) =
+            compute_horizontal_crossing_profile_by_net(plan, candidate_routes);
+        debug_assert_eq!(profile.quality.crossings, fresh_quality.crossings);
+        debug_assert_eq!(profile.quality.bends, fresh_quality.bends);
+        debug_assert_eq!(
+            profile.quality.route_length.to_bits(),
+            fresh_quality.route_length.to_bits()
+        );
+        debug_assert_eq!(&*profile.crossing_counts, &fresh_counts);
+        debug_assert_eq!(profile.segments, fresh_segments);
+    }
+    Ok(profile)
+}
+
 #[cfg(test)]
 fn physical_route_segments_btree_reference<'a>(
     edges: impl Iterator<Item = &'a Edge>,
@@ -9117,6 +9437,103 @@ fn compute_horizontal_crossing_profile_by_net(
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LaneDeltaFallbackCounts {
+    gap_vector_length_mismatch: usize,
+    gap_net_set_or_lane_count_mismatch: usize,
+    lane_map_not_bijection: usize,
+    endpoint_tracks_changed: usize,
+    crossing_paths_changed_or_not_reused: usize,
+    gap_spacing_changed: usize,
+    outer_lanes_present: usize,
+    outer_or_channel_assignment_changed: usize,
+    route_topology_changed: usize,
+    invalid_track_coordinates: usize,
+    track_coordinates_changed: usize,
+    canonical_contact_signature_changed: usize,
+    arm_extent_does_not_span_gap: usize,
+    profile_invocation_or_route_identity_mismatch: usize,
+    pair_storage_cap_exceeded: usize,
+    work_budget_exceeded: usize,
+    invalid_candidate_index: usize,
+    missing_pair_contribution: usize,
+    arithmetic_overflow: usize,
+    arithmetic_underflow: usize,
+    allocation_failure: usize,
+}
+
+#[cfg(test)]
+impl LaneDeltaFallbackCounts {
+    fn record(&mut self, reason: &LaneDeltaFallbackReason) {
+        match reason {
+            LaneDeltaFallbackReason::GapVectorLengthMismatch => {
+                self.gap_vector_length_mismatch += 1;
+            }
+            LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { .. } => {
+                self.gap_net_set_or_lane_count_mismatch += 1;
+            }
+            LaneDeltaFallbackReason::LaneMapNotBijection { .. } => {
+                self.lane_map_not_bijection += 1;
+            }
+            LaneDeltaFallbackReason::EndpointTracksChanged => {
+                self.endpoint_tracks_changed += 1;
+            }
+            LaneDeltaFallbackReason::CrossingPathsChangedOrNotReused => {
+                self.crossing_paths_changed_or_not_reused += 1;
+            }
+            LaneDeltaFallbackReason::GapSpacingChanged => {
+                self.gap_spacing_changed += 1;
+            }
+            LaneDeltaFallbackReason::OuterLanesPresent => {
+                self.outer_lanes_present += 1;
+            }
+            LaneDeltaFallbackReason::OuterOrChannelAssignmentChanged => {
+                self.outer_or_channel_assignment_changed += 1;
+            }
+            LaneDeltaFallbackReason::RouteTopologyChanged => {
+                self.route_topology_changed += 1;
+            }
+            LaneDeltaFallbackReason::InvalidTrackCoordinates { .. } => {
+                self.invalid_track_coordinates += 1;
+            }
+            LaneDeltaFallbackReason::TrackCoordinatesChanged { .. } => {
+                self.track_coordinates_changed += 1;
+            }
+            LaneDeltaFallbackReason::CanonicalContactSignatureChanged { .. } => {
+                self.canonical_contact_signature_changed += 1;
+            }
+            LaneDeltaFallbackReason::ArmExtentDoesNotSpanGap { .. } => {
+                self.arm_extent_does_not_span_gap += 1;
+            }
+            LaneDeltaFallbackReason::ProfileInvocationOrRouteIdentityMismatch => {
+                self.profile_invocation_or_route_identity_mismatch += 1;
+            }
+            LaneDeltaFallbackReason::PairStorageCapExceeded { .. } => {
+                self.pair_storage_cap_exceeded += 1;
+            }
+            LaneDeltaFallbackReason::WorkBudgetExceeded { .. } => {
+                self.work_budget_exceeded += 1;
+            }
+            LaneDeltaFallbackReason::InvalidCandidateIndex => {
+                self.invalid_candidate_index += 1;
+            }
+            LaneDeltaFallbackReason::MissingPairContribution { .. } => {
+                self.missing_pair_contribution += 1;
+            }
+            LaneDeltaFallbackReason::ArithmeticOverflow => {
+                self.arithmetic_overflow += 1;
+            }
+            LaneDeltaFallbackReason::ArithmeticUnderflow => {
+                self.arithmetic_underflow += 1;
+            }
+            LaneDeltaFallbackReason::AllocationFailure => {
+                self.allocation_failure += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RoutingReuseCounts {
     final_endpoint_tracks: usize,
     coherent_endpoint_tracks: usize,
@@ -9128,13 +9545,19 @@ struct RoutingReuseCounts {
     small_spacing_fallbacks: usize,
     retained_repair_profiles: usize,
     fanout_baseline_qualities: usize,
+    lane_delta_global_eligible: usize,
+    lane_delta_preserved_refined_eligible: usize,
+    lane_delta_refined_eligible: usize,
+    lane_delta_global_eliminated_sweeps: usize,
+    lane_delta_preserved_refined_eliminated_sweeps: usize,
+    lane_delta_refined_eliminated_sweeps: usize,
+    lane_delta_fallbacks: LaneDeltaFallbackCounts,
 }
 
 #[cfg(test)]
-thread_local! {
-    static HORIZONTAL_CROSSING_PROFILE_CALLS: Cell<usize> = const { Cell::new(0) };
-    static ROUTING_REUSE_COUNTS: Cell<RoutingReuseCounts> = const {
-        Cell::new(RoutingReuseCounts {
+impl RoutingReuseCounts {
+    const fn empty() -> Self {
+        Self {
             final_endpoint_tracks: 0,
             coherent_endpoint_tracks: 0,
             outer_repair_endpoint_tracks: 0,
@@ -9145,7 +9568,44 @@ thread_local! {
             small_spacing_fallbacks: 0,
             retained_repair_profiles: 0,
             fanout_baseline_qualities: 0,
-        })
+            lane_delta_global_eligible: 0,
+            lane_delta_preserved_refined_eligible: 0,
+            lane_delta_refined_eligible: 0,
+            lane_delta_global_eliminated_sweeps: 0,
+            lane_delta_preserved_refined_eliminated_sweeps: 0,
+            lane_delta_refined_eliminated_sweeps: 0,
+            lane_delta_fallbacks: LaneDeltaFallbackCounts {
+                gap_vector_length_mismatch: 0,
+                gap_net_set_or_lane_count_mismatch: 0,
+                lane_map_not_bijection: 0,
+                endpoint_tracks_changed: 0,
+                crossing_paths_changed_or_not_reused: 0,
+                gap_spacing_changed: 0,
+                outer_lanes_present: 0,
+                outer_or_channel_assignment_changed: 0,
+                route_topology_changed: 0,
+                invalid_track_coordinates: 0,
+                track_coordinates_changed: 0,
+                canonical_contact_signature_changed: 0,
+                arm_extent_does_not_span_gap: 0,
+                profile_invocation_or_route_identity_mismatch: 0,
+                pair_storage_cap_exceeded: 0,
+                work_budget_exceeded: 0,
+                invalid_candidate_index: 0,
+                missing_pair_contribution: 0,
+                arithmetic_overflow: 0,
+                arithmetic_underflow: 0,
+                allocation_failure: 0,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static HORIZONTAL_CROSSING_PROFILE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTING_REUSE_COUNTS: Cell<RoutingReuseCounts> = const {
+        Cell::new(RoutingReuseCounts::empty())
     };
 }
 
@@ -9166,6 +9626,39 @@ fn update_routing_reuse_counts(update: impl FnOnce(&mut RoutingReuseCounts)) {
 #[cfg(test)]
 fn take_routing_reuse_counts() -> RoutingReuseCounts {
     ROUTING_REUSE_COUNTS.with(|counts| counts.replace(RoutingReuseCounts::default()))
+}
+
+#[derive(Clone, Copy)]
+enum GlobalLaneDeltaFamily {
+    Global,
+    PreservedRefined,
+    Refined,
+}
+
+fn record_global_lane_delta_result(
+    family: GlobalLaneDeltaFamily,
+    result: &Result<RetainedHorizontalCrossingProfile, LaneDeltaFallbackReason>,
+) {
+    #[cfg(not(test))]
+    let _ = (family, result);
+    #[cfg(test)]
+    update_routing_reuse_counts(|counts| match result {
+        Ok(_) => match family {
+            GlobalLaneDeltaFamily::Global => {
+                counts.lane_delta_global_eligible += 1;
+                counts.lane_delta_global_eliminated_sweeps += 1;
+            }
+            GlobalLaneDeltaFamily::PreservedRefined => {
+                counts.lane_delta_preserved_refined_eligible += 1;
+                counts.lane_delta_preserved_refined_eliminated_sweeps += 1;
+            }
+            GlobalLaneDeltaFamily::Refined => {
+                counts.lane_delta_refined_eligible += 1;
+                counts.lane_delta_refined_eliminated_sweeps += 1;
+            }
+        },
+        Err(reason) => counts.lane_delta_fallbacks.record(reason),
+    });
 }
 
 struct CrossingFenwick {
@@ -14697,15 +15190,17 @@ mod tests {
         );
     }
 
-    fn global_gap_route_fixture() -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
-        let patterns = [(0.0, 40.0), (40.0, 80.0), (80.0, 0.0)];
+    fn global_gap_route_fixture_with_patterns(
+        patterns: [(f64, f64); 3],
+        branch_count: u32,
+    ) -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
         let mut nodes = Vec::new();
         let mut geometry = Vec::new();
         let mut ranks = Vec::new();
         let mut edges = Vec::new();
         for (net, &(source_y, target_y)) in patterns.iter().enumerate() {
-            for branch in 0..16u32 {
-                let source_id = (net as u32 * 16 + branch) * 2;
+            for branch in 0..branch_count {
+                let source_id = (net as u32 * branch_count + branch) * 2;
                 let target_id = source_id + 1;
                 nodes.push(Node {
                     id: source_id,
@@ -14746,7 +15241,7 @@ mod tests {
                 });
                 ranks.push(1);
                 edges.push(Edge {
-                    id: net as u32 * 16 + branch,
+                    id: net as u32 * branch_count + branch,
                     source: Endpoint {
                         node: source_id,
                         port: 0,
@@ -14761,6 +15256,10 @@ mod tests {
             }
         }
         (Graph { nodes, edges }, geometry, ranks)
+    }
+
+    fn global_gap_route_fixture() -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
+        global_gap_route_fixture_with_patterns([(0.0, 40.0), (40.0, 80.0), (80.0, 0.0)], 16)
     }
 
     fn large_global_gap_route_fixture() -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
@@ -14957,6 +15456,68 @@ mod tests {
     }
 
     #[test]
+    fn global_lane_delta_eliminates_one_sweep_for_an_eligible_emitted_family() {
+        let (graph, geometry, ranks) =
+            global_gap_route_fixture_with_patterns([(0.0, 80.0), (20.0, 40.0), (60.0, 100.0)], 16);
+        let options = LayoutOptions {
+            port_stub: 1e-3,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+
+        take_routing_reuse_counts();
+        let routed = route_planned_candidates_with_sparse_global(
+            &plan, &geometry, options, false, true, false,
+        );
+        let counts = take_routing_reuse_counts();
+
+        assert_eq!(routed.alternatives.len(), 1);
+        assert_eq!(counts.lane_delta_global_eligible, 1);
+        assert_eq!(counts.lane_delta_global_eliminated_sweeps, 1);
+        assert_eq!(
+            counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts::default()
+        );
+        assert_eq!(
+            routed.alternatives[0].0,
+            route_quality(&indexed, &routed.alternatives[0].1)
+        );
+    }
+
+    #[test]
+    fn global_lane_delta_reports_endpoint_track_changing_fallback() {
+        let (graph, geometry, ranks) = global_gap_route_fixture();
+        let options = LayoutOptions {
+            port_stub: 1e-3,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+
+        take_routing_reuse_counts();
+        let routed = route_planned_candidates_with_sparse_global(
+            &plan, &geometry, options, false, true, false,
+        );
+        let counts = take_routing_reuse_counts();
+
+        assert_eq!(routed.alternatives.len(), 1);
+        assert_eq!(counts.lane_delta_global_eligible, 0);
+        assert_eq!(counts.lane_delta_global_eliminated_sweeps, 0);
+        assert_eq!(
+            counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts {
+                endpoint_tracks_changed: 1,
+                ..super::LaneDeltaFallbackCounts::default()
+            }
+        );
+        assert_eq!(
+            routed.alternatives[0].0,
+            route_quality(&indexed, &routed.alternatives[0].1)
+        );
+    }
+
+    #[test]
     fn large_global_gap_route_candidate_is_finished_exactly_and_deterministically() {
         let (graph, geometry, ranks) = large_global_gap_route_fixture();
         let options = LayoutOptions {
@@ -14966,11 +15527,19 @@ mod tests {
         let indexed = validate_and_index(&graph, options).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
         let stable = route_planned_candidates(&plan, &geometry, options, false);
+        take_routing_reuse_counts();
         let routed = route_planned_candidates_with_sparse_global(
             &plan, &geometry, options, false, true, true,
         );
+        let lane_delta_counts = take_routing_reuse_counts();
 
         assert_eq!(routed.primary, stable.primary);
+        assert_eq!(lane_delta_counts.lane_delta_global_eligible, 1);
+        assert_eq!(lane_delta_counts.lane_delta_global_eliminated_sweeps, 1);
+        assert_eq!(
+            lane_delta_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts::default()
+        );
         assert_eq!(routed.alternatives.len(), 1);
         let (candidate_quality, candidate) = &routed.alternatives[0];
         assert_ne!(candidate, &routed.primary);
