@@ -10,6 +10,16 @@ use crate::{
 
 pub(crate) const MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS: usize = 20_000_000;
 const BUNDLE_CLEARANCE_NET_BASE: u32 = 0x8000_0000;
+const PRESERVED_GEOMETRY_EPSILON: f64 = 1e-7;
+
+pub(crate) fn preserved_point_matches(left: Point, right: Point) -> bool {
+    (left.x - right.x).abs() <= PRESERVED_GEOMETRY_EPSILON
+        && (left.y - right.y).abs() <= PRESERVED_GEOMETRY_EPSILON
+}
+
+fn preserved_segment_matches(left: BoundaryBundleSegment, right: BoundaryBundleSegment) -> bool {
+    preserved_point_matches(left.start, right.start) && preserved_point_matches(left.end, right.end)
+}
 
 /// Additional horizontal depth assigned to each bundle's member-route corridors.
 ///
@@ -309,7 +319,11 @@ fn segment_vertical_line_intersection(
 }
 
 fn push_point(points: &mut Vec<Point>, point: Point) {
-    if points.last() == Some(&point) {
+    if points
+        .last()
+        .is_some_and(|last| preserved_point_matches(*last, point))
+    {
+        *points.last_mut().expect("point exists") = point;
         return;
     }
     if points.len() >= 2 {
@@ -477,12 +491,13 @@ pub(crate) fn verify_preserved_geometry_structure(
             x: endpoint.x + direction * rail_depth,
             y: endpoint.y,
         };
-        if geometry.spine
-            != (BoundaryBundleSegment {
+        if !preserved_segment_matches(
+            geometry.spine,
+            BoundaryBundleSegment {
                 start: endpoint,
                 end: collector_center,
-            })
-        {
+            },
+        ) {
             return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
         }
         let lane_count = bundle
@@ -498,7 +513,7 @@ pub(crate) fn verify_preserved_geometry_structure(
             };
             if declared.edge != member.edge
                 || declared.slots != member.slots
-                || declared.tap != expected_tap
+                || !preserved_point_matches(declared.tap, expected_tap)
                 || !seen_edges.insert((bundle.role as u8, declared.edge))
             {
                 return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
@@ -507,8 +522,14 @@ pub(crate) fn verify_preserved_geometry_structure(
                 return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
             };
             let route_connects = match bundle.role {
-                BoundaryBundleRole::Input => route.points.first() == Some(&expected_tap),
-                BoundaryBundleRole::Output => route.points.last() == Some(&expected_tap),
+                BoundaryBundleRole::Input => route
+                    .points
+                    .first()
+                    .is_some_and(|point| preserved_point_matches(*point, expected_tap)),
+                BoundaryBundleRole::Output => route
+                    .points
+                    .last()
+                    .is_some_and(|point| preserved_point_matches(*point, expected_tap)),
             };
             if !route_connects {
                 return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
@@ -529,7 +550,7 @@ pub(crate) fn verify_preserved_geometry_structure(
                     .map_or(collector_center.y, |tap| tap.y.max(collector_center.y)),
             },
         };
-        if geometry.collector != expected_collector {
+        if !preserved_segment_matches(geometry.collector, expected_collector) {
             return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
         }
     }
