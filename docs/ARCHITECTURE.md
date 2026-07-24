@@ -1,83 +1,72 @@
 # Architecture
 
-SchemWeave is a reusable engine, not a Synth Explorer subsystem. The core
-crate accepts a directed graph of sized nodes, fixed boundary ports, electrical
-net identities, and cycle-break hints. It returns positioned node rectangles and
-orthogonal edge polylines. It has no DOM, JavaScript, HDL, Yosys, or application
-model dependency.
+SchemWeave is a reusable geometry engine. It accepts a directed graph of sized
+nodes, fixed ports, net identities, and optional constraints; it returns node
+rectangles and orthogonal edge polylines. It has no DOM, HDL, Yosys, or
+application-model dependency.
 
-The current pipeline validates and compacts stable caller identifiers, cuts
-feedback dependencies at explicit cycle breakers while retaining acyclic root
-constraints, condenses remaining strongly connected components, and assigns
-left-to-right ranks. Deterministic barycentric ordering operates over real and
-net-scoped virtual items from both forward and reverse stable seeds. The core
-compares the conservative baseline against the better-seeded, stronger
-port-alignment candidate with a near-linear physical crossing scorer. Placement
-uses bounded bidirectional sweeps and weighted isotonic projection, preserving
-node order and minimum gaps.
+```text
+Graph + LayoutConfig
+  -> validate and index stable IDs
+  -> rank left-to-right components
+  -> order layers and place nodes
+  -> route bounded candidates
+  -> admit exact valid geometry
+  -> optionally refine within budget
+  -> Layout
+```
 
-Ordinary forward nets route through sparse inter-layer channels and
-obstacle-free vertical corridors. Eligible single-driver multi-terminal nets
-share one median-guided corridor backbone and branch only in their final gap.
-Inter-layer and outer-trunk lanes use bounded crossing-cost transposition.
-Unsupported port directions, feedback, and extremely large nets retain unique
-channel tracks and may branch onto deterministic top and bottom outer trunks as
-a correctness backstop.
+## Components
 
-`schemweave-wasm` exposes the same engine through a JSON function designed
-to run inside a reusable Web Worker. Cancellation, cache policy, worker lifetime,
-and rendering remain responsibilities of the consuming application.
+| Component | Responsibility |
+| --- | --- |
+| `schemweave` | Validation, layout, routing, deterministic selection, group expansion. |
+| `schemweave-wasm` | JSON/WASM boundary over the same core. |
+| `schemweave-eval` | Development-only correctness and readability scoring. |
+| `tools/visual-review` | Corpus conversion, worker orchestration, ELK comparison, rendering. |
 
-Incremental group expansion is also a core geometry operation. The consumer
-supplies a compact graph and layout, an expanded graph, and the stable identity
-of the replaced anchor and its members. Every expanded boundary edge explicitly
-names the compact trunk it replaces, so separate named pins are never inferred
-from net identity. SchemWeave preserves unrelated geometry, propagates input and
-output boundary constraints, packs unconstrained disconnected member components,
-lays out connected member logic with the canonical engine, and admits a composed
-result only when every hard geometry and left-to-right invariant remains clean.
-If exact preservation is impossible or exceeds the deterministic work budget,
-the typed result requires a full relayout. Grouping semantics, focus state, and
-expansion policy remain consumer concerns.
+Consumers own rendering, labels, caching, request supersession, and worker
+lifetime. Native and WASM callers execute the same core implementation.
 
-`schemweave-eval` remains the development-only full quality scorer. It validates
-the public geometry contract and measures node overlap, route/node intersections,
-unrelated segment overlap and contact, physical net crossings, unique physical
-net bends, union wire length, and area. Hard gates operate on the original edge
-routes; same-net merging affects only physical quality measurements. The scorer
-is not a dependency of either runtime crate.
+## Layout pipeline
+
+1. **Validate and index.** IDs, dimensions, ports, endpoints, options, and
+   constraints are checked. Nodes and edges are sorted by stable ID, which makes
+   tie-breaking independent of caller input order.
+2. **Rank.** The engine condenses strongly connected components and assigns
+   left-to-right ranks. Ranking can exclude explicit non-flow edges or true
+   feedback edges entering a cycle breaker; those edges remain routable.
+3. **Order and place.** Forward/reverse barycentric ordering, optional
+   max-effort alternatives, port alignment, and isotonic projection produce
+   bounded placement candidates.
+4. **Route.** Forward east-to-west edges use inter-layer channels; eligible
+   same-net fanout can share a trunk. Feedback, unsupported directions, and
+   very large nets can use deterministic outer lanes.
+5. **Admit.** Candidates must meet applicable bundle, node-clearance,
+   unrelated-contact, and parallel-wire-spacing checks before comparison by
+   crossings, bends, route length, and area; deterministic candidate order
+   breaks exact ties.
+6. **Refine.** `Fast`, default `Quality`, and `Max` choose bounded work.
+   `Max` may add deeper ordering/routing repair, demand-aware spacing, and
+   lane-pitch refinements, subject to configured area and route-length budgets.
+
+## Group expansion
+
+Expansion receives a compact graph and layout, an expanded graph, the replaced
+anchor/members, and explicit boundary-trunk replacements. It preserves unrelated
+geometry, lays out the new members with the canonical engine, and accepts the
+composition only when all hard geometry and left-to-right invariants hold.
+Native callers receive `GroupExpansionError`; the WASM boundary converts selected
+safe fallbacks into a tagged full-relayout response.
 
 ## Invariants
 
-- Stable identifiers determine output order and tie-breaking.
-- Ports are fixed points on node boundaries.
-- Every route begins and ends at its declared ports and contains only
-  axis-aligned segments.
-- Routes never pass through node interiors.
-- Unrelated nets may cross but only share endpoint escape segments when they
-  attach to the same fixed port.
-- Native and WebAssembly builds execute the same core implementation.
-- The implementation uses compact numeric indices internally and avoids graph
-  cloning between phases.
+- Stable IDs define output order and ties.
+- Ports are fixed boundary points; routes begin/end at their declared ports.
+- Routes are axis-aligned and never cross node interiors.
+- Same-net sharing is explicit; unrelated nets never silently merge.
+- Hot paths use compact indexes and bounded work counts.
 
-## Routing resources
-
-The router constructs only layer gaps, free vertical intervals, endpoint escape
-tracks, and the lanes actually used by the graph. Dynamic programming chooses a
-consistent free interval across each forward span. Net-aware ordering and
-bounded adjacent transposition minimize predicted crossings without allocating
-a dense visibility grid or performing order-dependent global reroute rounds.
-
-Electrical `net` identities are explicit in the API. Shared trunks are legal
-within one net; multiple nets may also share the minimum escape segment when
-they attach to the same fixed endpoint. Geometric coincidence elsewhere never
-silently turns unrelated edges into a shared route.
-
-## Consumer boundary
-
-Synth Explorer will map its compact layout input to this graph contract in its
-layout worker and map the returned geometry back to existing renderer types. It
-will pin a reviewed crate revision. ELK remains its only production layout path
-until the Rust/WASM engine satisfies the application corpus's semantic,
-geometric, visual-quality, browser-latency, memory, cancellation, and
-determinism gates.
+SchemWeave targets port-based schematics and directed data-flow. It can suit
+hardware block diagrams and similar pipelines, but is not a general UML,
+timing-diagram, arbitrary-graph, or floorplan engine. See [Usage](USAGE.md).
