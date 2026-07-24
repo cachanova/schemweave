@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::Entry},
+    rc::Rc,
 };
 
 #[cfg(test)]
@@ -109,6 +110,11 @@ const MAX_CROSSING_REPAIR_NODES: usize = 2_000;
 const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
 const MAX_CROSSING_REPAIR_PATH_STATES: usize = 500_000;
+// Below this total route-point count, full crossing sweeps cost less than the reuse bookkeeping
+// (RouteSetIdentity allocation plus per-point eligibility walks), so score reuse is skipped and the
+// full recompute/rebuild path is taken instead. Measured on the microsecond-scale expansion member
+// layouts that regressed under reuse, versus the multi-millisecond DAG cells the reuse targets.
+const MIN_SCORE_REUSE_ROUTE_POINTS: usize = 2048;
 // Small nets keep the historical stable-ID order. For a single-source outer fanout, higher channel
 // indices usually shorten the many sink escapes at the cost of one shared source arm; the exact
 // route scorer below still rejects the heuristic whenever that trade is not beneficial.
@@ -220,6 +226,7 @@ pub(crate) struct FanoutCandidateTrace {
 struct RoutedLaneState {
     routes: Vec<EdgeGeometry>,
     route_quality: Option<RouteQuality>,
+    retained_crossing_profile: Option<RetainedHorizontalCrossingProfile>,
     gap_spacing: GapTrackSpacing,
     spacing_alternatives: Vec<(RouteQuality, Vec<EdgeGeometry>)>,
     gap_lanes: Vec<BTreeMap<u32, usize>>,
@@ -273,9 +280,24 @@ enum GapTrackSpacing {
     Expanded,
 }
 
+#[derive(Clone, Copy)]
+struct SpacingRoutePlan<'a> {
+    gap_lanes: &'a [BTreeMap<NetId, usize>],
+    endpoint_tracks: &'a EndpointTracks,
+    crossing_paths: &'a [Option<Vec<f64>>],
+    outer_lanes: &'a BTreeMap<EdgeId, OuterLane>,
+}
+
+struct SpacingRouteCandidate<'a> {
+    routes: Vec<EdgeGeometry>,
+    spacing: GapTrackSpacing,
+    plan: SpacingRoutePlan<'a>,
+}
+
 struct GapSpacingSelection {
     routes: Vec<EdgeGeometry>,
     quality: Option<RouteQuality>,
+    retained_crossing_profile: Option<RetainedHorizontalCrossingProfile>,
     spacing: GapTrackSpacing,
     rejected: Option<(RouteQuality, Vec<EdgeGeometry>)>,
 }
@@ -324,7 +346,7 @@ struct CrossingRepair {
     candidate_emitted: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct PhysicalSegment {
     net: u32,
     source: Endpoint,
@@ -333,6 +355,110 @@ struct PhysicalSegment {
     fixed: f64,
     start: f64,
     end: f64,
+}
+
+/// Fingerprint of a route set used to decide whether a retained crossing
+/// profile may be reused instead of recomputed.
+///
+/// Precondition: identity proves only that the ROUTES match bit-for-bit; it
+/// does not compare the `RoutingPlan` that produced the retained profile.
+/// Retention and reuse are sound only because both occur within a single
+/// `route_edges_with_lane_rounds_and_refined_global` invocation sharing one
+/// plan. A future refactor that threads retained profiles across different
+/// plans must add a plan-identity check: debug builds would catch a violation
+/// via the fresh-profile assert, but release builds would not.
+#[derive(Debug, PartialEq)]
+struct RouteSetIdentity {
+    routes: Vec<(EdgeId, usize)>,
+    points: Vec<(u64, u64)>,
+}
+
+impl RouteSetIdentity {
+    fn new(routes: &[EdgeGeometry]) -> Self {
+        #[cfg(test)]
+        update_routing_reuse_counts(|counts| counts.retained_route_identities += 1);
+        Self {
+            routes: routes
+                .iter()
+                .map(|route| (route.id, route.points.len()))
+                .collect(),
+            points: routes
+                .iter()
+                .flat_map(|route| {
+                    route
+                        .points
+                        .iter()
+                        .map(|point| (point.x.to_bits(), point.y.to_bits()))
+                })
+                .collect(),
+        }
+    }
+
+    fn matches(&self, routes: &[EdgeGeometry]) -> bool {
+        self.routes
+            .iter()
+            .copied()
+            .eq(routes.iter().map(|route| (route.id, route.points.len())))
+            && self
+                .points
+                .iter()
+                .copied()
+                .eq(routes.iter().flat_map(|route| {
+                    route
+                        .points
+                        .iter()
+                        .map(|point| (point.x.to_bits(), point.y.to_bits()))
+                }))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct RetainedHorizontalCrossingProfile {
+    route_identity: RouteSetIdentity,
+    segments: Vec<PhysicalSegment>,
+    crossing_counts: Rc<BTreeMap<NetId, usize>>,
+    quality: RouteQuality,
+}
+
+impl RetainedHorizontalCrossingProfile {
+    fn new(
+        routes: &[EdgeGeometry],
+        segments: Vec<PhysicalSegment>,
+        crossing_counts: impl Into<Rc<BTreeMap<NetId, usize>>>,
+        quality: RouteQuality,
+    ) -> Self {
+        Self {
+            route_identity: RouteSetIdentity::new(routes),
+            segments,
+            crossing_counts: crossing_counts.into(),
+            quality,
+        }
+    }
+
+    fn matches_routes(&self, routes: &[EdgeGeometry]) -> bool {
+        self.route_identity.matches(routes)
+    }
+
+    fn into_parts(self) -> (Vec<PhysicalSegment>, BTreeMap<NetId, usize>, RouteQuality) {
+        (
+            self.segments,
+            Rc::try_unwrap(self.crossing_counts)
+                .unwrap_or_else(|shared_counts| (*shared_counts).clone()),
+            self.quality,
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UnmergedPhysicalSegment {
+    net: u32,
+    source: Endpoint,
+    target: Endpoint,
+    horizontal: bool,
+    fixed: f64,
+    start: f64,
+    end: f64,
+    edge: EdgeId,
 }
 
 #[derive(Clone, Copy)]
@@ -816,6 +942,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
     let RoutedLaneState {
         mut routes,
         route_quality: spacing_quality,
+        retained_crossing_profile,
         gap_spacing,
         spacing_alternatives,
         gap_lanes,
@@ -887,6 +1014,12 @@ fn route_edges_with_lane_rounds_and_refined_global(
         );
         let candidate_crossing_paths_match_endpoint_tracks =
             crossing_paths_match_endpoint_tracks && candidate_endpoint_tracks == endpoint_tracks;
+        let candidate_spacing_plan = SpacingRoutePlan {
+            gap_lanes: &candidate_lanes,
+            endpoint_tracks: &candidate_endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &baseline_outer_lanes,
+        };
         let compact_candidate_routes = emit_routes(
             plan,
             nodes,
@@ -904,30 +1037,33 @@ fn route_edges_with_lane_rounds_and_refined_global(
         );
         let adaptive_candidate_routes = (adaptive_gap_spacing
             && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| {
-            (
-                emit_routes(
-                    plan,
-                    nodes,
-                    &sparse_spans,
-                    &crossing_paths,
-                    &layer_left,
-                    &layer_right,
-                    &candidate_lanes,
-                    &candidate_endpoint_tracks,
-                    &baseline_outer_lanes,
-                    top,
-                    bottom,
-                    options,
-                    GapTrackSpacing::Adaptive,
-                ),
+        .then(|| SpacingRouteCandidate {
+            routes: emit_routes(
+                plan,
+                nodes,
+                &sparse_spans,
+                &crossing_paths,
+                &layer_left,
+                &layer_right,
+                &candidate_lanes,
+                &candidate_endpoint_tracks,
+                &baseline_outer_lanes,
+                top,
+                bottom,
+                options,
                 GapTrackSpacing::Adaptive,
-            )
+            ),
+            spacing: GapTrackSpacing::Adaptive,
+            plan: candidate_spacing_plan,
         });
         let mut selected = select_gap_spacing_candidate(
             plan,
-            compact_candidate_routes,
-            GapTrackSpacing::Compact,
+            SpacingRouteCandidate {
+                routes: compact_candidate_routes,
+                spacing: GapTrackSpacing::Compact,
+                plan: candidate_spacing_plan,
+            },
+            None,
             None,
             adaptive_candidate_routes,
             requires_exact_candidate_admission(options),
@@ -940,32 +1076,35 @@ fn route_edges_with_lane_rounds_and_refined_global(
             plan.edges.len(),
             baseline_outer_lanes.is_empty(),
         ) && candidate_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| {
-            (
-                emit_routes(
-                    plan,
-                    nodes,
-                    &sparse_spans,
-                    &crossing_paths,
-                    &layer_left,
-                    &layer_right,
-                    &candidate_lanes,
-                    &candidate_endpoint_tracks,
-                    &baseline_outer_lanes,
-                    top,
-                    bottom,
-                    options,
-                    GapTrackSpacing::Expanded,
-                ),
+        .then(|| SpacingRouteCandidate {
+            routes: emit_routes(
+                plan,
+                nodes,
+                &sparse_spans,
+                &crossing_paths,
+                &layer_left,
+                &layer_right,
+                &candidate_lanes,
+                &candidate_endpoint_tracks,
+                &baseline_outer_lanes,
+                top,
+                bottom,
+                options,
                 GapTrackSpacing::Expanded,
-            )
+            ),
+            spacing: GapTrackSpacing::Expanded,
+            plan: candidate_spacing_plan,
         });
         let selected = if let Some(expanded_candidate_routes) = expanded_candidate_routes {
             let mut selected = select_gap_spacing_candidate(
                 plan,
-                selected.routes,
-                selected.spacing,
+                SpacingRouteCandidate {
+                    routes: selected.routes,
+                    spacing: selected.spacing,
+                    plan: candidate_spacing_plan,
+                },
                 selected.quality,
+                selected.retained_crossing_profile,
                 Some(expanded_candidate_routes),
                 requires_exact_candidate_admission(options),
             );
@@ -976,6 +1115,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         };
         let candidate_routes = selected.routes;
         let spacing_quality = selected.quality;
+        let candidate_crossing_profile = selected.retained_crossing_profile;
         let candidate_gap_spacing = selected.spacing;
         if !route_family_candidate_within_budget(node_count, plan.edges.len(), &candidate_routes) {
             return Vec::new();
@@ -984,6 +1124,11 @@ fn route_edges_with_lane_rounds_and_refined_global(
             .iter()
             .any(|lanes| lanes.len() > MAX_GLOBAL_GAP_LANES);
         if large_gap {
+            let candidate_crossing_profile = candidate_crossing_profile
+                .filter(|profile| {
+                    retained_crossing_profile_is_applicable(plan, &candidate_routes, profile)
+                })
+                .map(RetainedHorizontalCrossingProfile::into_parts);
             let mut candidate = finish_route_family(
                 plan,
                 nodes,
@@ -1008,7 +1153,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
                 repair_crossings,
                 false,
                 horizontal_overrides,
-                None,
+                candidate_crossing_profile,
                 candidate_routes,
                 candidate_gap_spacing,
             );
@@ -1088,6 +1233,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
             repair_crossings,
             deeper_crossing_repair,
             horizontal_overrides,
+            retained_crossing_profile,
             routes,
             sparse_alternatives,
             gap_spacing,
@@ -1232,9 +1378,17 @@ fn route_edges_with_lane_rounds_and_refined_global(
             &sparse_spans,
             &free_by_rank,
         );
-    let shared_repair_profile =
-        deeper_repair_within_budget.then(|| horizontal_crossing_profile_by_net(plan, &routes));
-    let precomputed_repair_profile = shared_repair_profile
+    let repair_profile = repair_crossings
+        .then(|| {
+            prepare_repair_crossing_profile(
+                plan,
+                &routes,
+                retained_crossing_profile,
+                deeper_repair_within_budget,
+            )
+        })
+        .flatten();
+    let precomputed_repair_profile = repair_profile
         .as_ref()
         .map(|(segments, counts, quality)| (segments.as_slice(), counts, *quality));
     let mut repair = if repair_crossings {
@@ -1971,6 +2125,7 @@ fn finish_fanout_route_families(
     repair_crossings: bool,
     deeper_crossing_repair: bool,
     horizontal_overrides: Option<&HorizontalCrossingOverrides>,
+    stable_retained_crossing_profile: Option<RetainedHorizontalCrossingProfile>,
     stable_routes: Vec<EdgeGeometry>,
     sparse_alternatives: Vec<(RouteQuality, Vec<EdgeGeometry>)>,
     gap_spacing: GapTrackSpacing,
@@ -2040,7 +2195,10 @@ fn finish_fanout_route_families(
         options,
         gap_spacing,
     );
-    let baseline_profile = horizontal_crossing_profile_by_net(plan, &stable_routes);
+    let baseline_profile = stable_retained_crossing_profile
+        .filter(|profile| retained_crossing_profile_is_applicable(plan, &stable_routes, profile))
+        .map(RetainedHorizontalCrossingProfile::into_parts)
+        .unwrap_or_else(|| horizontal_crossing_profile_by_net(plan, &stable_routes));
     let candidate_profile = horizontal_crossing_profile_by_net(plan, &adaptive_routes);
     let baseline_quality = baseline_profile.2;
     let candidate_quality = candidate_profile.2;
@@ -2581,6 +2739,12 @@ fn emit_routes_with_outer_lanes(
         let matches = endpoint_tracks == initial_endpoint_tracks;
         (endpoint_tracks, matches)
     };
+    let spacing_plan = SpacingRoutePlan {
+        gap_lanes: &gap_lanes,
+        endpoint_tracks: &endpoint_tracks,
+        crossing_paths: &crossing_paths,
+        outer_lanes,
+    };
     let compact_routes = emit_routes(
         plan,
         nodes,
@@ -2602,45 +2766,8 @@ fn emit_routes_with_outer_lanes(
     // require its exact congestion gain to pay for any added length.
     let node_count = plan.nodes_by_rank.iter().map(Vec::len).sum::<usize>();
     let adaptive_routes = (adaptive_gap_spacing && gap_lanes.iter().any(|lanes| lanes.len() > 1))
-        .then(|| {
-            (
-                emit_routes(
-                    plan,
-                    nodes,
-                    sparse_spans,
-                    &crossing_paths,
-                    layer_left,
-                    layer_right,
-                    &gap_lanes,
-                    &endpoint_tracks,
-                    outer_lanes,
-                    top,
-                    bottom,
-                    options,
-                    GapTrackSpacing::Adaptive,
-                ),
-                GapTrackSpacing::Adaptive,
-            )
-        });
-    let mut selected = select_gap_spacing_candidate(
-        plan,
-        compact_routes,
-        GapTrackSpacing::Compact,
-        None,
-        adaptive_routes,
-        requires_exact_candidate_admission(options),
-    );
-    let mut spacing_alternatives = selected.rejected.take().into_iter().collect::<Vec<_>>();
-    let expanded_routes = (expanded_gap_spacing_enabled(
-        adaptive_gap_spacing,
-        max_quality_effort,
-        node_count,
-        plan.edges.len(),
-        outer_lanes.is_empty(),
-    ) && gap_lanes.iter().any(|lanes| lanes.len() > 1))
-    .then(|| {
-        (
-            emit_routes(
+        .then(|| SpacingRouteCandidate {
+            routes: emit_routes(
                 plan,
                 nodes,
                 sparse_spans,
@@ -2653,17 +2780,60 @@ fn emit_routes_with_outer_lanes(
                 top,
                 bottom,
                 options,
-                GapTrackSpacing::Expanded,
+                GapTrackSpacing::Adaptive,
             ),
+            spacing: GapTrackSpacing::Adaptive,
+            plan: spacing_plan,
+        });
+    let mut selected = select_gap_spacing_candidate(
+        plan,
+        SpacingRouteCandidate {
+            routes: compact_routes,
+            spacing: GapTrackSpacing::Compact,
+            plan: spacing_plan,
+        },
+        None,
+        None,
+        adaptive_routes,
+        requires_exact_candidate_admission(options),
+    );
+    let mut spacing_alternatives = selected.rejected.take().into_iter().collect::<Vec<_>>();
+    let expanded_routes = (expanded_gap_spacing_enabled(
+        adaptive_gap_spacing,
+        max_quality_effort,
+        node_count,
+        plan.edges.len(),
+        outer_lanes.is_empty(),
+    ) && gap_lanes.iter().any(|lanes| lanes.len() > 1))
+    .then(|| SpacingRouteCandidate {
+        routes: emit_routes(
+            plan,
+            nodes,
+            sparse_spans,
+            &crossing_paths,
+            layer_left,
+            layer_right,
+            &gap_lanes,
+            &endpoint_tracks,
+            outer_lanes,
+            top,
+            bottom,
+            options,
             GapTrackSpacing::Expanded,
-        )
+        ),
+        spacing: GapTrackSpacing::Expanded,
+        plan: spacing_plan,
     });
     let selected = if let Some(expanded_routes) = expanded_routes {
         let mut selected = select_gap_spacing_candidate(
             plan,
-            selected.routes,
-            selected.spacing,
+            SpacingRouteCandidate {
+                routes: selected.routes,
+                spacing: selected.spacing,
+                plan: spacing_plan,
+            },
             selected.quality,
+            selected.retained_crossing_profile,
             Some(expanded_routes),
             requires_exact_candidate_admission(options),
         );
@@ -2675,6 +2845,7 @@ fn emit_routes_with_outer_lanes(
     RoutedLaneState {
         routes: selected.routes,
         route_quality: selected.quality,
+        retained_crossing_profile: selected.retained_crossing_profile,
         gap_spacing: selected.spacing,
         spacing_alternatives,
         gap_lanes,
@@ -4127,7 +4298,7 @@ pub(crate) fn regional_fanout_candidate(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     baseline: &[EdgeGeometry],
-    baseline_quality: RouteQuality,
+    baseline_quality: impl FnOnce() -> RouteQuality,
     options: LayoutOptions,
 ) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
     fanout_trunk_candidate(
@@ -4146,7 +4317,7 @@ pub(crate) fn ordinary_fanout_candidate(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     baseline: &[EdgeGeometry],
-    baseline_quality: RouteQuality,
+    baseline_quality: impl FnOnce() -> RouteQuality,
     options: LayoutOptions,
 ) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
     fanout_trunk_candidate(
@@ -4166,7 +4337,7 @@ fn fanout_trunk_candidate(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     baseline: &[EdgeGeometry],
-    baseline_quality: RouteQuality,
+    baseline_quality: impl FnOnce() -> RouteQuality,
     options: LayoutOptions,
     minimum_edges: usize,
     maximum_edges: usize,
@@ -4187,6 +4358,9 @@ fn fanout_trunk_candidate(
     if eligible.is_empty() {
         return None;
     }
+    #[cfg(test)]
+    update_routing_reuse_counts(|counts| counts.fanout_baseline_qualities += 1);
+    let baseline_quality = baseline_quality();
     let baseline_segments =
         physical_route_segments(plan.edges.iter().map(|resolved| resolved.edge), baseline).0;
     let baseline_congestion = parallel_congestion_ratio(&baseline_segments)?;
@@ -6686,22 +6860,139 @@ fn expanded_spacing_readability_is_better(
         && expanded_congestion <= compact_congestion * MAX_ADAPTIVE_SPACING_CONGESTION_FACTOR
 }
 
-fn select_gap_spacing_candidate(
+fn same_plan_component<T>(left: &T, right: &T) -> bool
+where
+    T: ?Sized + PartialEq,
+{
+    std::ptr::eq(left, right) || left == right
+}
+
+fn per_edge_bend_structure_matches(left: &[EdgeGeometry], right: &[EdgeGeometry]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            left.id == right.id
+                && left
+                    .points
+                    .windows(2)
+                    .map(|points| {
+                        (
+                            points[0].y == points[1].y,
+                            points[0].x == points[1].x && points[0].y == points[1].y,
+                        )
+                    })
+                    .eq(right.points.windows(2).map(|points| {
+                        (
+                            points[0].y == points[1].y,
+                            points[0].x == points[1].x && points[0].y == points[1].y,
+                        )
+                    }))
+        })
+}
+
+fn route_set_point_total(routes: &[EdgeGeometry]) -> usize {
+    routes.iter().map(|route| route.points.len()).sum()
+}
+
+fn spacing_score_reuse_is_eligible(
+    base: &SpacingRouteCandidate<'_>,
+    sibling: &SpacingRouteCandidate<'_>,
+) -> bool {
+    // Below the reuse threshold the full crossing sweep is cheaper than the reuse bookkeeping, so
+    // skip reuse before any per-point walking. Summing point counts is O(#routes), not O(points).
+    if route_set_point_total(&base.routes) < MIN_SCORE_REUSE_ROUTE_POINTS {
+        return false;
+    }
+    // Current emission sites copy one SpacingRoutePlan into both candidates, so these component
+    // identity checks are guards for future call sites. The substantive proof today is the
+    // pure-sparse outer-lane exclusion plus unchanged per-edge physical segment topology.
+    base.plan.outer_lanes.is_empty()
+        && sibling.plan.outer_lanes.is_empty()
+        && same_plan_component(base.plan.gap_lanes, sibling.plan.gap_lanes)
+        && same_plan_component(base.plan.endpoint_tracks, sibling.plan.endpoint_tracks)
+        && same_plan_component(base.plan.crossing_paths, sibling.plan.crossing_paths)
+        && same_plan_component(base.plan.outer_lanes, sibling.plan.outer_lanes)
+        && per_edge_bend_structure_matches(&base.routes, &sibling.routes)
+}
+
+fn retained_horizontal_crossing_profile(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+) -> RetainedHorizontalCrossingProfile {
+    let (segments, crossing_counts, quality) = horizontal_crossing_profile_by_net(plan, routes);
+    debug_assert_eq!(quality, route_quality_for_plan(plan, routes));
+    RetainedHorizontalCrossingProfile::new(routes, segments, crossing_counts, quality)
+}
+
+fn reused_spacing_route_profile(
+    plan: &RoutingPlan<'_>,
+    base: &RetainedHorizontalCrossingProfile,
+    sibling: &[EdgeGeometry],
+) -> RetainedHorizontalCrossingProfile {
+    #[cfg(test)]
+    update_routing_reuse_counts(|counts| counts.reused_spacing_profiles += 1);
+    let (segments, route_length) = canonical_route_segments_and_length_for_plan(plan, sibling);
+    let reused = RetainedHorizontalCrossingProfile::new(
+        sibling,
+        segments,
+        base.crossing_counts.clone(),
+        RouteQuality {
+            crossings: base.quality.crossings,
+            bends: base.quality.bends,
+            route_length,
+        },
+    );
+    debug_assert_eq!(reused.quality, route_quality_for_plan(plan, sibling));
+    debug_assert_eq!(
+        reused,
+        computed_retained_horizontal_crossing_profile(plan, sibling)
+    );
+    reused
+}
+
+fn retained_spacing_route_profile(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+    expected_quality: Option<RouteQuality>,
+    retained: Option<RetainedHorizontalCrossingProfile>,
+) -> RetainedHorizontalCrossingProfile {
+    let retained = retained
+        .filter(|profile| retained_crossing_profile_is_applicable(plan, routes, profile))
+        .unwrap_or_else(|| retained_horizontal_crossing_profile(plan, routes));
+    debug_assert!(
+        expected_quality.is_none_or(|expected_quality| expected_quality == retained.quality)
+    );
+    retained
+}
+
+fn prepare_repair_crossing_profile(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+    retained: Option<RetainedHorizontalCrossingProfile>,
+    rebuild_if_missing: bool,
+) -> Option<(Vec<PhysicalSegment>, BTreeMap<NetId, usize>, RouteQuality)> {
+    if let Some(profile) =
+        retained.filter(|profile| retained_crossing_profile_is_applicable(plan, routes, profile))
+    {
+        #[cfg(test)]
+        update_routing_reuse_counts(|counts| counts.retained_repair_profiles += 1);
+        // The route identity is needed only for the applicability check. Drop its copied point
+        // payload before either repair pass starts allocating candidate state.
+        return Some(profile.into_parts());
+    }
+    rebuild_if_missing.then(|| horizontal_crossing_profile_by_net(plan, routes))
+}
+
+fn select_gap_spacing_candidate_without_profile_reuse(
     plan: &RoutingPlan<'_>,
     compact: Vec<EdgeGeometry>,
     compact_spacing: GapTrackSpacing,
     compact_quality: Option<RouteQuality>,
-    adaptive: Option<(Vec<EdgeGeometry>, GapTrackSpacing)>,
+    adaptive: Vec<EdgeGeometry>,
+    adaptive_spacing: GapTrackSpacing,
     retain_rejected: bool,
 ) -> GapSpacingSelection {
-    let Some((adaptive, adaptive_spacing)) = adaptive else {
-        return GapSpacingSelection {
-            routes: compact,
-            quality: compact_quality,
-            spacing: compact_spacing,
-            rejected: None,
-        };
-    };
+    #[cfg(test)]
+    update_routing_reuse_counts(|counts| counts.small_spacing_fallbacks += 1);
     let distinct = compact != adaptive;
     if adaptive_spacing != GapTrackSpacing::Expanded {
         let compact_quality =
@@ -6711,6 +7002,7 @@ fn select_gap_spacing_candidate(
             GapSpacingSelection {
                 routes: adaptive,
                 quality: Some(adaptive_quality),
+                retained_crossing_profile: None,
                 spacing: adaptive_spacing,
                 rejected: (retain_rejected && distinct).then_some((compact_quality, compact)),
             }
@@ -6718,6 +7010,7 @@ fn select_gap_spacing_candidate(
             GapSpacingSelection {
                 routes: compact,
                 quality: Some(compact_quality),
+                retained_crossing_profile: None,
                 spacing: compact_spacing,
                 rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
             }
@@ -6752,6 +7045,7 @@ fn select_gap_spacing_candidate(
         GapSpacingSelection {
             routes: adaptive,
             quality: Some(adaptive_quality),
+            retained_crossing_profile: None,
             spacing: adaptive_spacing,
             rejected: (retain_rejected && distinct).then_some((compact_quality, compact)),
         }
@@ -6759,6 +7053,169 @@ fn select_gap_spacing_candidate(
         GapSpacingSelection {
             routes: compact,
             quality: Some(compact_quality),
+            retained_crossing_profile: None,
+            spacing: compact_spacing,
+            rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
+        }
+    }
+}
+
+fn retained_crossing_profile_is_applicable(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+    retained: &RetainedHorizontalCrossingProfile,
+) -> bool {
+    if !retained.matches_routes(routes) {
+        return false;
+    }
+    debug_assert_eq!(
+        retained,
+        &computed_retained_horizontal_crossing_profile(plan, routes)
+    );
+    true
+}
+
+fn computed_retained_horizontal_crossing_profile(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+) -> RetainedHorizontalCrossingProfile {
+    let (segments, crossing_counts, quality) =
+        compute_horizontal_crossing_profile_by_net(plan, routes);
+    RetainedHorizontalCrossingProfile::new(routes, segments, crossing_counts, quality)
+}
+
+fn select_gap_spacing_candidate(
+    plan: &RoutingPlan<'_>,
+    compact: SpacingRouteCandidate<'_>,
+    compact_quality: Option<RouteQuality>,
+    compact_profile: Option<RetainedHorizontalCrossingProfile>,
+    adaptive: Option<SpacingRouteCandidate<'_>>,
+    retain_rejected: bool,
+) -> GapSpacingSelection {
+    let Some(adaptive) = adaptive else {
+        let retained_crossing_profile = compact_profile
+            .filter(|_| route_set_point_total(&compact.routes) >= MIN_SCORE_REUSE_ROUTE_POINTS)
+            .filter(|profile| {
+                retained_crossing_profile_is_applicable(plan, &compact.routes, profile)
+            });
+        debug_assert!(
+            retained_crossing_profile
+                .as_ref()
+                .is_none_or(|profile| compact_quality == Some(profile.quality))
+        );
+        return GapSpacingSelection {
+            routes: compact.routes,
+            quality: compact_quality,
+            retained_crossing_profile,
+            spacing: compact.spacing,
+            rejected: None,
+        };
+    };
+    let SpacingRouteCandidate {
+        routes: compact,
+        spacing: compact_spacing,
+        plan: compact_plan,
+    } = compact;
+    let SpacingRouteCandidate {
+        routes: adaptive,
+        spacing: adaptive_spacing,
+        plan: adaptive_plan,
+    } = adaptive;
+    // Retain a selected profile for downstream repair reuse only when the route set is large enough
+    // that the reuse bookkeeping (identity match walks, propagation) pays off; below the threshold
+    // downstream falls back to its rebuild path, which is behaviorally identical. O(#routes).
+    let compact_reuse = route_set_point_total(&compact) >= MIN_SCORE_REUSE_ROUTE_POINTS;
+    let adaptive_reuse = route_set_point_total(&adaptive) >= MIN_SCORE_REUSE_ROUTE_POINTS;
+    if !compact_reuse || !adaptive_reuse {
+        return select_gap_spacing_candidate_without_profile_reuse(
+            plan,
+            compact,
+            compact_spacing,
+            compact_quality,
+            adaptive,
+            adaptive_spacing,
+            retain_rejected,
+        );
+    }
+    let compact_candidate = SpacingRouteCandidate {
+        routes: compact,
+        spacing: compact_spacing,
+        plan: compact_plan,
+    };
+    let adaptive_candidate = SpacingRouteCandidate {
+        routes: adaptive,
+        spacing: adaptive_spacing,
+        plan: adaptive_plan,
+    };
+    let reuse_is_eligible =
+        spacing_score_reuse_is_eligible(&compact_candidate, &adaptive_candidate);
+    let SpacingRouteCandidate {
+        routes: compact,
+        spacing: compact_spacing,
+        ..
+    } = compact_candidate;
+    let SpacingRouteCandidate {
+        routes: adaptive,
+        spacing: adaptive_spacing,
+        ..
+    } = adaptive_candidate;
+    let distinct = compact != adaptive;
+    let compact_profile =
+        retained_spacing_route_profile(plan, &compact, compact_quality, compact_profile);
+    let adaptive_profile = if reuse_is_eligible {
+        reused_spacing_route_profile(plan, &compact_profile, &adaptive)
+    } else {
+        retained_horizontal_crossing_profile(plan, &adaptive)
+    };
+    let compact_quality = compact_profile.quality;
+    let adaptive_quality = adaptive_profile.quality;
+    if adaptive_spacing != GapTrackSpacing::Expanded {
+        return if route_quality_cmp(adaptive_quality, compact_quality).is_lt() {
+            GapSpacingSelection {
+                routes: adaptive,
+                quality: Some(adaptive_quality),
+                retained_crossing_profile: adaptive_reuse.then_some(adaptive_profile),
+                spacing: adaptive_spacing,
+                rejected: (retain_rejected && distinct).then_some((compact_quality, compact)),
+            }
+        } else {
+            GapSpacingSelection {
+                routes: compact,
+                quality: Some(compact_quality),
+                retained_crossing_profile: compact_reuse.then_some(compact_profile),
+                spacing: compact_spacing,
+                rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
+            }
+        };
+    }
+    let ordinary_quality_is_better = route_quality_cmp(adaptive_quality, compact_quality).is_lt();
+    let readability_is_better = if ordinary_quality_is_better {
+        false
+    } else {
+        parallel_congestion_ratio(&compact_profile.segments)
+            .zip(parallel_congestion_ratio(&adaptive_profile.segments))
+            .is_some_and(|(compact_congestion, adaptive_congestion)| {
+                expanded_spacing_readability_is_better(
+                    compact_quality,
+                    compact_congestion,
+                    adaptive_quality,
+                    adaptive_congestion,
+                )
+            })
+    };
+    if ordinary_quality_is_better || readability_is_better {
+        GapSpacingSelection {
+            routes: adaptive,
+            quality: Some(adaptive_quality),
+            retained_crossing_profile: adaptive_reuse.then_some(adaptive_profile),
+            spacing: adaptive_spacing,
+            rejected: (retain_rejected && distinct).then_some((compact_quality, compact)),
+        }
+    } else {
+        GapSpacingSelection {
+            routes: compact,
+            quality: Some(compact_quality),
+            retained_crossing_profile: compact_reuse.then_some(compact_profile),
             spacing: compact_spacing,
             rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
         }
@@ -6769,25 +7226,44 @@ fn physical_route_segments<'a>(
     edges: impl Iterator<Item = &'a Edge>,
     routes: &[EdgeGeometry],
 ) -> (Vec<PhysicalSegment>, usize, f64) {
-    struct RawSegment {
-        net: u32,
-        source: Endpoint,
-        target: Endpoint,
-        horizontal: bool,
-        fixed: f64,
-        start: f64,
-        end: f64,
-        edge: EdgeId,
-    }
-
-    let mut segments = Vec::<RawSegment>::new();
     let mut bends = Vec::new();
+    let segments = sorted_unmerged_physical_route_segments(edges, routes, Some(&mut bends));
+    bends.sort_unstable();
+    bends.dedup();
+    let merged = merge_sorted_physical_route_segments(segments);
+    let route_length = route_length_from_physical_segments(&merged);
+    (merged, bends.len(), route_length)
+}
+
+fn canonical_route_segments_and_length_for_plan(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+) -> (Vec<PhysicalSegment>, f64) {
+    // Share the exact raw-segment sort, merge, and length fold used by physical_route_segments.
+    let segments = sorted_unmerged_physical_route_segments(
+        plan.edges.iter().map(|edge| edge.edge),
+        routes,
+        None,
+    );
+    let merged = merge_sorted_physical_route_segments(segments);
+    let route_length = route_length_from_physical_segments(&merged);
+    (merged, route_length)
+}
+
+fn sorted_unmerged_physical_route_segments<'a>(
+    edges: impl Iterator<Item = &'a Edge>,
+    routes: &[EdgeGeometry],
+    mut bends: Option<&mut Vec<(u32, FloatKey, FloatKey)>>,
+) -> Vec<UnmergedPhysicalSegment> {
+    let mut segments = Vec::new();
     for (edge, route) in edges.zip(routes) {
-        for points in route.points.windows(3) {
-            let first_horizontal = points[0].y == points[1].y;
-            let second_horizontal = points[1].y == points[2].y;
-            if first_horizontal != second_horizontal {
-                bends.push((edge.net, FloatKey(points[1].x), FloatKey(points[1].y)));
+        if let Some(bends) = &mut bends {
+            for points in route.points.windows(3) {
+                let first_horizontal = points[0].y == points[1].y;
+                let second_horizontal = points[1].y == points[2].y;
+                if first_horizontal != second_horizontal {
+                    bends.push((edge.net, FloatKey(points[1].x), FloatKey(points[1].y)));
+                }
             }
         }
         for points in route.points.windows(2) {
@@ -6803,7 +7279,7 @@ fn physical_route_segments<'a>(
             if start == end {
                 continue;
             }
-            segments.push(RawSegment {
+            segments.push(UnmergedPhysicalSegment {
                 net: edge.net,
                 source: edge.source,
                 target: edge.target,
@@ -6816,8 +7292,6 @@ fn physical_route_segments<'a>(
         }
     }
 
-    bends.sort_unstable();
-    bends.dedup();
     segments.sort_unstable_by(|left, right| {
         left.net
             .cmp(&right.net)
@@ -6827,6 +7301,12 @@ fn physical_route_segments<'a>(
             .then(left.end.total_cmp(&right.end))
             .then(left.edge.cmp(&right.edge))
     });
+    segments
+}
+
+fn merge_sorted_physical_route_segments(
+    segments: Vec<UnmergedPhysicalSegment>,
+) -> Vec<PhysicalSegment> {
     let mut merged = Vec::<PhysicalSegment>::new();
     for segment in segments {
         if let Some(prior) = merged.last_mut()
@@ -6848,11 +7328,14 @@ fn physical_route_segments<'a>(
             });
         }
     }
-    let route_length = merged
+    merged
+}
+
+fn route_length_from_physical_segments(segments: &[PhysicalSegment]) -> f64 {
+    segments
         .iter()
         .map(|segment| segment.end - segment.start)
-        .sum();
-    (merged, bends.len(), route_length)
+        .sum()
 }
 
 #[cfg(test)]
@@ -7137,6 +7620,13 @@ fn horizontal_crossing_profile_by_net(
 ) -> (Vec<PhysicalSegment>, BTreeMap<NetId, usize>, RouteQuality) {
     #[cfg(test)]
     HORIZONTAL_CROSSING_PROFILE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    compute_horizontal_crossing_profile_by_net(plan, routes)
+}
+
+fn compute_horizontal_crossing_profile_by_net(
+    plan: &RoutingPlan<'_>,
+    routes: &[EdgeGeometry],
+) -> (Vec<PhysicalSegment>, BTreeMap<NetId, usize>, RouteQuality) {
     let (segments, bends, route_length) =
         physical_route_segments(plan.edges.iter().map(|edge| edge.edge), routes);
     let mut counts = BTreeMap::<NetId, usize>::new();
@@ -7161,6 +7651,11 @@ struct RoutingReuseCounts {
     outer_repair_endpoint_tracks: usize,
     repair_crossing_paths: usize,
     repair_crossing_paths_recomputed: usize,
+    retained_route_identities: usize,
+    reused_spacing_profiles: usize,
+    small_spacing_fallbacks: usize,
+    retained_repair_profiles: usize,
+    fanout_baseline_qualities: usize,
 }
 
 #[cfg(test)]
@@ -7173,6 +7668,11 @@ thread_local! {
             outer_repair_endpoint_tracks: 0,
             repair_crossing_paths: 0,
             repair_crossing_paths_recomputed: 0,
+            retained_route_identities: 0,
+            reused_spacing_profiles: 0,
+            small_spacing_fallbacks: 0,
+            retained_repair_profiles: 0,
+            fanout_baseline_qualities: 0,
         })
     };
 }
@@ -9781,11 +10281,14 @@ fn push_point(points: &mut Vec<Point>, point: Point) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::{
+        cell::Cell,
+        collections::{BTreeMap, BTreeSet, HashSet},
+    };
 
     use crate::{
-        Edge, EdgeGeometry, Endpoint, Graph, LayoutOptions, Node, NodeGeometry, Point, Port,
-        PortSide, validation::validate_and_index,
+        Edge, EdgeGeometry, Endpoint, Graph, LayoutConfig, LayoutOptions, Node, NodeGeometry,
+        Point, Port, PortSide, QualityEffort, validation::validate_and_index,
     };
 
     use super::{
@@ -9799,8 +10302,8 @@ mod tests {
         MAX_REGIONAL_FANOUT_ROUTE_POINTS, MAX_REGIONAL_FANOUT_SAFETY_VISITS,
         MAX_REGIONAL_FANOUT_SCORE_VISITS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
         OuterLane, OuterNetAccess, OuterSide, ParallelWireSpacingError, PhysicalSegment,
-        RouteContactError, RouteQuality, RoutingPlan, align_crossing_path_staircases,
-        build_endpoint_tracks, build_regional_fanout_candidate,
+        RouteContactError, RouteQuality, RoutingPlan, SpacingRouteCandidate, SpacingRoutePlan,
+        align_crossing_path_staircases, build_endpoint_tracks, build_regional_fanout_candidate,
         candidate_route_points_within_budget, charge_negotiated_relations, charge_negotiated_work,
         charge_regional_relation, charge_regional_work, common_free_intervals,
         crossing_aware_gap_lane_indices, crossing_aware_gap_lane_indices_btree_reference,
@@ -9867,6 +10370,188 @@ mod tests {
             lane_count,
             approximate_offset,
         }
+    }
+
+    fn spacing_score_graph() -> Graph {
+        Graph {
+            nodes: vec![
+                Node {
+                    id: 1,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::East,
+                        offset: 5.0,
+                    }],
+                },
+                Node {
+                    id: 2,
+                    width: 10.0,
+                    height: 10.0,
+                    cycle_breaker: false,
+                    ports: vec![Port {
+                        id: 0,
+                        side: PortSide::West,
+                        offset: 5.0,
+                    }],
+                },
+            ],
+            edges: vec![Edge {
+                id: 0,
+                source: Endpoint { node: 1, port: 0 },
+                target: Endpoint { node: 2, port: 0 },
+                net: 0,
+                participates_in_ranking: true,
+            }],
+        }
+    }
+
+    fn horizontal_score_route(point_count: usize, scale: f64) -> Vec<EdgeGeometry> {
+        vec![EdgeGeometry {
+            id: 0,
+            points: (0..point_count)
+                .map(|point| Point {
+                    x: point as f64 * scale,
+                    y: 0.0,
+                })
+                .collect(),
+        }]
+    }
+
+    fn public_fanout_graph(sinks: u32) -> Graph {
+        let source = Node {
+            id: 0,
+            width: 80.0,
+            height: 24.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: PortSide::East,
+                offset: 12.0,
+            }],
+        };
+        let sink = |id| Node {
+            id,
+            width: 80.0,
+            height: 24.0,
+            cycle_breaker: false,
+            ports: vec![Port {
+                id: 0,
+                side: PortSide::West,
+                offset: 12.0,
+            }],
+        };
+        Graph {
+            nodes: std::iter::once(source)
+                .chain((1..=sinks).map(sink))
+                .collect(),
+            edges: (1..=sinks)
+                .map(|target| Edge {
+                    id: target - 1,
+                    source: Endpoint { node: 0, port: 0 },
+                    target: Endpoint {
+                        node: target,
+                        port: 0,
+                    },
+                    net: 0,
+                    participates_in_ranking: true,
+                })
+                .collect(),
+        }
+    }
+
+    fn pure_sparse_reuse_graph() -> Graph {
+        const LAYERS: u32 = 12;
+        const WIDTH: u32 = 25;
+        let id = |layer: u32, slot: u32| layer * WIDTH + slot;
+        let nodes = (0..LAYERS)
+            .flat_map(|layer| {
+                (0..WIDTH).map(move |slot| Node {
+                    id: id(layer, slot),
+                    width: 80.0,
+                    height: 48.0,
+                    cycle_breaker: false,
+                    ports: vec![
+                        Port {
+                            id: 0,
+                            side: PortSide::West,
+                            offset: 16.0,
+                        },
+                        Port {
+                            id: 1,
+                            side: PortSide::West,
+                            offset: 32.0,
+                        },
+                        Port {
+                            id: 2,
+                            side: PortSide::East,
+                            offset: 16.0,
+                        },
+                        Port {
+                            id: 3,
+                            side: PortSide::East,
+                            offset: 32.0,
+                        },
+                    ],
+                })
+            })
+            .collect();
+        let mut edges = Vec::new();
+        for layer in 0..LAYERS - 1 {
+            for slot in 0..WIDTH {
+                for (output, target) in [slot, (slot * 7 + layer * 3 + 5) % WIDTH]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let edge_id = edges.len() as u32;
+                    edges.push(Edge {
+                        id: edge_id,
+                        source: Endpoint {
+                            node: id(layer, slot),
+                            port: 2 + output as u32,
+                        },
+                        target: Endpoint {
+                            node: id(layer + 1, target),
+                            port: output as u32,
+                        },
+                        net: edge_id,
+                        participates_in_ranking: true,
+                    });
+                }
+            }
+        }
+        Graph { nodes, edges }
+    }
+
+    fn orthogonal_routes_for_plan(
+        plan: &RoutingPlan<'_>,
+        nodes: &[NodeGeometry],
+    ) -> Vec<EdgeGeometry> {
+        plan.edges
+            .iter()
+            .map(|resolved| {
+                let source = port_point(&nodes[resolved.source_index], resolved.source_port);
+                let target = port_point(&nodes[resolved.target_index], resolved.target_port);
+                let middle_x = (source.x + target.x) * 0.5;
+                EdgeGeometry {
+                    id: resolved.edge.id,
+                    points: vec![
+                        source,
+                        Point {
+                            x: middle_x,
+                            y: source.y,
+                        },
+                        Point {
+                            x: middle_x,
+                            y: target.y,
+                        },
+                        target,
+                    ],
+                }
+            })
+            .collect()
     }
 
     fn shared_sparse_paths(
@@ -13828,6 +14513,130 @@ mod tests {
     }
 
     #[test]
+    fn fanout_quality_closures_are_strictly_lazy_at_both_boundary_families() {
+        let baseline_quality = RouteQuality {
+            crossings: 0,
+            bends: 0,
+            route_length: 0.0,
+        };
+        for (branches, expected_calls) in [(2, 0), (3, 1), (20, 1), (21, 0)] {
+            let (graph, geometry, ranks) = fanout_candidate_fixture(branches, 0);
+            let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            let routes = orthogonal_routes_for_plan(&plan, &geometry);
+            let calls = Cell::new(0);
+            let _ = super::ordinary_fanout_candidate(
+                &plan,
+                &geometry,
+                &routes,
+                || {
+                    calls.set(calls.get() + 1);
+                    baseline_quality
+                },
+                LayoutOptions::default(),
+            );
+            assert_eq!(
+                calls.get(),
+                expected_calls,
+                "ordinary fanout closure calls at {branches} branches",
+            );
+        }
+
+        for (branches, expected_calls) in [(300, 0), (301, 1), (512, 1), (513, 0)] {
+            let (graph, geometry, ranks) = fanout_candidate_fixture(branches, 0);
+            let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            let routes = orthogonal_routes_for_plan(&plan, &geometry);
+            let calls = Cell::new(0);
+            let _ = super::regional_fanout_candidate(
+                &plan,
+                &geometry,
+                &routes,
+                || {
+                    calls.set(calls.get() + 1);
+                    baseline_quality
+                },
+                LayoutOptions::default(),
+            );
+            assert_eq!(
+                calls.get(),
+                expected_calls,
+                "regional fanout closure calls at {branches} branches",
+            );
+        }
+    }
+
+    #[test]
+    fn optimized_score_paths_are_active_and_permutation_invariant_in_full_layouts() {
+        for (name, graph, effort) in [
+            (
+                "ordinary fanout",
+                public_fanout_graph(8),
+                QualityEffort::Quality,
+            ),
+            (
+                "regional fanout",
+                public_fanout_graph(512),
+                QualityEffort::Max,
+            ),
+        ] {
+            let config = LayoutConfig {
+                quality_effort: effort,
+                ..LayoutConfig::default()
+            };
+            take_routing_reuse_counts();
+            let layout = crate::layout_with_config(&graph, &config).expect("layout");
+            let counts = take_routing_reuse_counts();
+            assert!(
+                counts.fanout_baseline_qualities > 0,
+                "{name} optimized scoring path was not active",
+            );
+
+            let mut permuted = graph;
+            permuted.nodes.reverse();
+            permuted.edges.reverse();
+            take_routing_reuse_counts();
+            let permuted_layout =
+                crate::layout_with_config(&permuted, &config).expect("permuted layout");
+            let permuted_counts = take_routing_reuse_counts();
+            assert!(
+                permuted_counts.fanout_baseline_qualities > 0,
+                "{name} optimized scoring path was not active after permutation",
+            );
+            assert_eq!(permuted_layout, layout, "{name} changed under permutation");
+        }
+
+        let graph = pure_sparse_reuse_graph();
+        let config = LayoutConfig {
+            quality_effort: QualityEffort::Quality,
+            ..LayoutConfig::default()
+        };
+        take_routing_reuse_counts();
+        let layout = crate::layout_with_config(&graph, &config).expect("pure sparse layout");
+        let counts = take_routing_reuse_counts();
+        assert!(
+            counts.reused_spacing_profiles > 0,
+            "spacing-score reuse path was not active",
+        );
+
+        let mut permuted = graph;
+        permuted.nodes.reverse();
+        permuted.edges.reverse();
+        take_routing_reuse_counts();
+        let permuted_layout =
+            crate::layout_with_config(&permuted, &config).expect("permuted pure sparse layout");
+        let permuted_counts = take_routing_reuse_counts();
+        assert!(
+            permuted_counts.reused_spacing_profiles > 0,
+            "spacing-score reuse path was not active after permutation",
+        );
+        assert_eq!(
+            permuted_layout, layout,
+            "spacing-score reuse changed under permutation"
+        );
+    }
+
+    #[test]
     fn common_free_intervals_intersect_every_rank_deterministically() {
         assert_eq!(
             common_free_intervals(&[
@@ -16068,6 +16877,296 @@ mod tests {
     }
 
     #[test]
+    fn spacing_score_reuse_has_an_exact_point_threshold_without_small_profile_allocations() {
+        let graph = spacing_score_graph();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1]);
+        let gap_lanes = Vec::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let spacing_plan = SpacingRoutePlan {
+            gap_lanes: &gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
+
+        for (point_count, expect_reuse) in [
+            (super::MIN_SCORE_REUSE_ROUTE_POINTS - 1, false),
+            (super::MIN_SCORE_REUSE_ROUTE_POINTS, true),
+        ] {
+            let compact = horizontal_score_route(point_count, 1.0);
+            let adaptive = horizontal_score_route(point_count, 0.5);
+            take_routing_reuse_counts();
+            let selected = select_gap_spacing_candidate(
+                &plan,
+                SpacingRouteCandidate {
+                    routes: compact,
+                    spacing: GapTrackSpacing::Compact,
+                    plan: spacing_plan,
+                },
+                None,
+                None,
+                Some(SpacingRouteCandidate {
+                    routes: adaptive.clone(),
+                    spacing: GapTrackSpacing::Adaptive,
+                    plan: spacing_plan,
+                }),
+                false,
+            );
+            let counts = take_routing_reuse_counts();
+
+            assert_eq!(selected.routes, adaptive);
+            assert_eq!(selected.spacing, GapTrackSpacing::Adaptive);
+            assert_eq!(selected.retained_crossing_profile.is_some(), expect_reuse);
+            assert_eq!(counts.small_spacing_fallbacks, usize::from(!expect_reuse));
+            assert_eq!(counts.reused_spacing_profiles, usize::from(expect_reuse));
+            if expect_reuse {
+                assert!(counts.retained_route_identities >= 2);
+            } else {
+                assert_eq!(counts.retained_route_identities, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn spacing_score_reuse_guards_every_proof_precondition() {
+        let routes = horizontal_score_route(super::MIN_SCORE_REUSE_ROUTE_POINTS, 1.0);
+        let sibling = horizontal_score_route(super::MIN_SCORE_REUSE_ROUTE_POINTS, 0.5);
+        let empty_gap_lanes = Vec::new();
+        let different_gap_lanes = vec![BTreeMap::from([(0, 0)])];
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let nonempty_outer_lanes = BTreeMap::from([(
+            0,
+            OuterLane {
+                side: OuterSide::Top,
+                side_index: 0,
+                channel_index: 0,
+                channel_count: 1,
+            },
+        )]);
+        let base_plan = SpacingRoutePlan {
+            gap_lanes: &empty_gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
+        let different_plan = SpacingRoutePlan {
+            gap_lanes: &different_gap_lanes,
+            ..base_plan
+        };
+        let outer_plan = SpacingRoutePlan {
+            outer_lanes: &nonempty_outer_lanes,
+            ..base_plan
+        };
+        let eligible = |base_routes, sibling_routes, base_plan, sibling_plan| {
+            super::spacing_score_reuse_is_eligible(
+                &SpacingRouteCandidate {
+                    routes: base_routes,
+                    spacing: GapTrackSpacing::Compact,
+                    plan: base_plan,
+                },
+                &SpacingRouteCandidate {
+                    routes: sibling_routes,
+                    spacing: GapTrackSpacing::Adaptive,
+                    plan: sibling_plan,
+                },
+            )
+        };
+
+        assert!(eligible(
+            routes.clone(),
+            sibling.clone(),
+            base_plan,
+            base_plan
+        ));
+        assert!(!eligible(
+            horizontal_score_route(super::MIN_SCORE_REUSE_ROUTE_POINTS - 1, 1.0),
+            sibling.clone(),
+            base_plan,
+            base_plan,
+        ));
+        assert!(!eligible(
+            routes.clone(),
+            sibling.clone(),
+            outer_plan,
+            outer_plan
+        ));
+        assert!(!eligible(
+            routes.clone(),
+            sibling.clone(),
+            base_plan,
+            different_plan,
+        ));
+        let mut different_bends = sibling;
+        different_bends[0].points[1].y = 1.0;
+        assert!(!eligible(routes, different_bends, base_plan, base_plan));
+    }
+
+    #[test]
+    fn retained_spacing_profiles_follow_each_winner_and_rebuild_on_identity_mismatch() {
+        let graph = spacing_score_graph();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1]);
+        let gap_lanes = Vec::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let spacing_plan = SpacingRoutePlan {
+            gap_lanes: &gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
+        let points = super::MIN_SCORE_REUSE_ROUTE_POINTS;
+
+        for (compact_scale, sibling_scale, sibling_spacing, expected_spacing) in [
+            (
+                1.0,
+                0.5,
+                GapTrackSpacing::Adaptive,
+                GapTrackSpacing::Adaptive,
+            ),
+            (
+                1.0,
+                2.0,
+                GapTrackSpacing::Adaptive,
+                GapTrackSpacing::Compact,
+            ),
+            (
+                1.0,
+                0.5,
+                GapTrackSpacing::Expanded,
+                GapTrackSpacing::Expanded,
+            ),
+        ] {
+            let compact = horizontal_score_route(points, compact_scale);
+            let sibling = horizontal_score_route(points, sibling_scale);
+            let selected = select_gap_spacing_candidate(
+                &plan,
+                SpacingRouteCandidate {
+                    routes: compact,
+                    spacing: GapTrackSpacing::Compact,
+                    plan: spacing_plan,
+                },
+                None,
+                None,
+                Some(SpacingRouteCandidate {
+                    routes: sibling,
+                    spacing: sibling_spacing,
+                    plan: spacing_plan,
+                }),
+                false,
+            );
+            let profile = selected
+                .retained_crossing_profile
+                .as_ref()
+                .expect("large selected route retains its crossing profile");
+            assert_eq!(selected.spacing, expected_spacing);
+            assert!(profile.matches_routes(&selected.routes));
+        }
+
+        let original = horizontal_score_route(points, 1.0);
+        let changed = horizontal_score_route(points, 0.75);
+        let stale = super::retained_horizontal_crossing_profile(&plan, &original);
+        take_horizontal_crossing_profile_calls();
+        let rebuilt = super::retained_spacing_route_profile(&plan, &changed, None, Some(stale));
+        assert_eq!(take_horizontal_crossing_profile_calls(), 1);
+        assert!(rebuilt.matches_routes(&changed));
+    }
+
+    #[test]
+    fn retained_profile_is_consumed_by_repair_without_a_second_crossing_sweep() {
+        let graph = spacing_score_graph();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1]);
+        let routes = horizontal_score_route(super::MIN_SCORE_REUSE_ROUTE_POINTS, 1.0);
+        let retained = super::retained_horizontal_crossing_profile(&plan, &routes);
+
+        take_horizontal_crossing_profile_calls();
+        take_routing_reuse_counts();
+        let prepared = super::prepare_repair_crossing_profile(&plan, &routes, Some(retained), true)
+            .expect("matching retained profile");
+        let counts = take_routing_reuse_counts();
+
+        assert_eq!(take_horizontal_crossing_profile_calls(), 0);
+        assert_eq!(counts.retained_repair_profiles, 1);
+        assert_eq!(prepared.2, route_quality_for_plan(&plan, &routes));
+    }
+
+    #[test]
+    fn adaptive_none_retains_only_large_matching_profiles() {
+        let graph = spacing_score_graph();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 1]);
+        let gap_lanes = Vec::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let spacing_plan = SpacingRoutePlan {
+            gap_lanes: &gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
+        let large = horizontal_score_route(super::MIN_SCORE_REUSE_ROUTE_POINTS, 1.0);
+        let quality = route_quality_for_plan(&plan, &large);
+        let matching = super::retained_horizontal_crossing_profile(&plan, &large);
+        let selected = select_gap_spacing_candidate(
+            &plan,
+            SpacingRouteCandidate {
+                routes: large.clone(),
+                spacing: GapTrackSpacing::Adaptive,
+                plan: spacing_plan,
+            },
+            Some(quality),
+            Some(matching),
+            None,
+            false,
+        );
+        assert!(selected.retained_crossing_profile.is_some());
+
+        let stale = super::retained_horizontal_crossing_profile(
+            &plan,
+            &horizontal_score_route(super::MIN_SCORE_REUSE_ROUTE_POINTS, 0.5),
+        );
+        let selected = select_gap_spacing_candidate(
+            &plan,
+            SpacingRouteCandidate {
+                routes: large,
+                spacing: GapTrackSpacing::Adaptive,
+                plan: spacing_plan,
+            },
+            Some(quality),
+            Some(stale),
+            None,
+            false,
+        );
+        assert!(selected.retained_crossing_profile.is_none());
+
+        let small =
+            horizontal_score_route(super::MIN_SCORE_REUSE_ROUTE_POINTS.saturating_sub(1), 1.0);
+        let small_quality = route_quality_for_plan(&plan, &small);
+        let small_profile = super::retained_horizontal_crossing_profile(&plan, &small);
+        let selected = select_gap_spacing_candidate(
+            &plan,
+            SpacingRouteCandidate {
+                routes: small,
+                spacing: GapTrackSpacing::Adaptive,
+                plan: spacing_plan,
+            },
+            Some(small_quality),
+            Some(small_profile),
+            None,
+            false,
+        );
+        assert!(selected.retained_crossing_profile.is_none());
+    }
+
+    #[test]
     fn rejected_expanded_spacing_preserves_the_retained_adaptive_label() {
         let graph = Graph {
             nodes: vec![
@@ -16109,13 +17208,31 @@ mod tests {
             points: vec![Point { x: 0.0, y: 0.0 }, Point { x: 10.0, y: 0.0 }],
         }];
         let retained_quality = route_quality_for_plan(&plan, &retained);
+        let gap_lanes = Vec::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let spacing_plan = SpacingRoutePlan {
+            gap_lanes: &gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
 
         let selected = select_gap_spacing_candidate(
             &plan,
-            retained.clone(),
-            GapTrackSpacing::Adaptive,
+            SpacingRouteCandidate {
+                routes: retained.clone(),
+                spacing: GapTrackSpacing::Adaptive,
+                plan: spacing_plan,
+            },
             Some(retained_quality),
-            Some((retained.clone(), GapTrackSpacing::Expanded)),
+            None,
+            Some(SpacingRouteCandidate {
+                routes: retained.clone(),
+                spacing: GapTrackSpacing::Expanded,
+                plan: spacing_plan,
+            }),
             false,
         );
 
@@ -16178,13 +17295,31 @@ mod tests {
         let compact_quality = route_quality_for_plan(&plan, &compact);
         let adaptive_quality = route_quality_for_plan(&plan, &adaptive);
         assert!(route_quality_cmp(compact_quality, adaptive_quality).is_lt());
+        let gap_lanes = Vec::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = Vec::new();
+        let outer_lanes = BTreeMap::new();
+        let spacing_plan = SpacingRoutePlan {
+            gap_lanes: &gap_lanes,
+            endpoint_tracks: &endpoint_tracks,
+            crossing_paths: &crossing_paths,
+            outer_lanes: &outer_lanes,
+        };
 
         let selected = select_gap_spacing_candidate(
             &plan,
-            compact.clone(),
-            GapTrackSpacing::Compact,
+            SpacingRouteCandidate {
+                routes: compact.clone(),
+                spacing: GapTrackSpacing::Compact,
+                plan: spacing_plan,
+            },
             Some(compact_quality),
-            Some((adaptive.clone(), GapTrackSpacing::Adaptive)),
+            None,
+            Some(SpacingRouteCandidate {
+                routes: adaptive.clone(),
+                spacing: GapTrackSpacing::Adaptive,
+                plan: spacing_plan,
+            }),
             true,
         );
 
