@@ -1,6 +1,8 @@
 use schemweave::{
-    Graph, GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConfig,
-    LayoutConstraints, expand_group_in_place, expand_group_in_place_with_reference_height,
+    BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Graph, GroupCollapseOptions,
+    GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConfig,
+    LayoutConstraints, collapse_group_in_place, expand_group_in_place,
+    expand_group_in_place_with_reference_height,
 };
 use serde::Deserialize;
 
@@ -52,6 +54,49 @@ fn expand_without_a_full_relayout(captured: &CapturedExpansion) -> Layout {
     assert_eq!(expanded.nodes.len(), captured.expanded_graph.nodes.len());
     assert_eq!(expanded.edges.len(), captured.expanded_graph.edges.len());
     expanded
+}
+
+fn constraints_from_layout(layout: &Layout, source: &LayoutConstraints) -> LayoutConstraints {
+    let inputs = source.inputs.clone();
+    let outputs = source.outputs.clone();
+    let boundary_bundles = layout
+        .boundary_bundles
+        .iter()
+        .map(|bundle| BoundaryBundleConstraint {
+            id: bundle.id,
+            endpoint: bundle.endpoint,
+            width: bundle.width,
+            members: bundle
+                .members
+                .iter()
+                .map(|member| BoundaryBundleMemberConstraint {
+                    edge: member.edge,
+                    slots: member.slots.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    LayoutConstraints {
+        inputs,
+        outputs,
+        boundary_bundles,
+    }
+}
+
+fn collapse_without_a_full_relayout(captured: &CapturedExpansion, expanded: &Layout) -> Layout {
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints = constraints_from_layout(&captured.compact_layout, &captured.constraints);
+    collapse_group_in_place(
+        &captured.expanded_graph,
+        expanded,
+        &captured.compact_graph,
+        &captured.expansion,
+        &GroupCollapseOptions {
+            layout: config.layout,
+            constraints: config.constraints,
+        },
+    )
+    .expect("a grouped vector should collapse without moving unrelated nodes")
 }
 
 #[test]
@@ -108,8 +153,61 @@ fn captured_register_vector_expands_without_a_full_relayout() {
 }
 
 #[test]
+fn captured_register_vector_collapses_without_moving_unrelated_nodes() {
+    let captured = captured_register_vector_expansion();
+    let expanded = expand_without_a_full_relayout(&captured);
+    let collapsed = collapse_without_a_full_relayout(&captured, &expanded);
+
+    for retained in captured
+        .compact_graph
+        .nodes
+        .iter()
+        .filter(|node| node.id != captured.expansion.anchor)
+    {
+        assert_eq!(
+            collapsed.nodes.iter().find(|node| node.id == retained.id),
+            expanded.nodes.iter().find(|node| node.id == retained.id),
+        );
+    }
+    assert!(
+        collapsed
+            .nodes
+            .iter()
+            .any(|node| node.id == captured.expansion.anchor)
+    );
+    assert!(
+        collapsed
+            .nodes
+            .iter()
+            .all(|node| !captured.expansion.members.contains(&node.id))
+    );
+    assert_eq!(
+        collapsed.boundary_bundles.len(),
+        captured.compact_layout.boundary_bundles.len()
+    );
+}
+
+#[test]
 fn captured_mux_vector_expands_without_a_full_relayout() {
     expand_without_a_full_relayout(&captured_mux_vector_expansion());
+}
+
+#[test]
+fn captured_mux_vector_collapses_without_moving_unrelated_nodes() {
+    let captured = captured_mux_vector_expansion();
+    let expanded = expand_without_a_full_relayout(&captured);
+    let collapsed = collapse_without_a_full_relayout(&captured, &expanded);
+    for retained in captured
+        .compact_graph
+        .nodes
+        .iter()
+        .filter(|node| node.id != captured.expansion.anchor)
+    {
+        assert_eq!(
+            collapsed.nodes.iter().find(|node| node.id == retained.id),
+            expanded.nodes.iter().find(|node| node.id == retained.id),
+        );
+    }
 }
 
 #[test]

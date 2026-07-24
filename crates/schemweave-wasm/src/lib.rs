@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use schemweave::{
-    Graph, GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConfig,
+    Graph, GroupCollapseOptions, GroupExpansion, GroupExpansionError, GroupExpansionOptions,
+    Layout, LayoutConfig,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -101,6 +102,79 @@ pub fn expand_group_serialized(
         .map_err(|error| format!("failed to encode expanded layout: {error}"))
 }
 
+/// Collapse one expanded group through the same JSON boundary used by Web Workers.
+#[wasm_bindgen]
+pub fn collapse_group_json(
+    expanded_graph_json: &str,
+    expanded_layout_json: &str,
+    compact_graph_json: &str,
+    expansion_json: &str,
+    options_json: &str,
+) -> Result<String, JsValue> {
+    collapse_group_serialized(
+        expanded_graph_json,
+        expanded_layout_json,
+        compact_graph_json,
+        expansion_json,
+        options_json,
+    )
+    .map_err(js_error)
+}
+
+/// Execute incremental group collapse without converting errors to JavaScript values.
+pub fn collapse_group_serialized(
+    expanded_graph_json: &str,
+    expanded_layout_json: &str,
+    compact_graph_json: &str,
+    expansion_json: &str,
+    options_json: &str,
+) -> Result<String, String> {
+    let expanded_graph: Graph = serde_json::from_str(expanded_graph_json)
+        .map_err(|error| format!("invalid expanded graph JSON: {error}"))?;
+    let expanded_layout: Layout = serde_json::from_str(expanded_layout_json)
+        .map_err(|error| format!("invalid expanded layout JSON: {error}"))?;
+    let compact_graph: Graph = serde_json::from_str(compact_graph_json)
+        .map_err(|error| format!("invalid compact graph JSON: {error}"))?;
+    let expansion: GroupExpansion = serde_json::from_str(expansion_json)
+        .map_err(|error| format!("invalid group expansion JSON: {error}"))?;
+    let options = if options_json.trim().is_empty() {
+        LayoutConfig::default()
+    } else {
+        serde_json::from_str(options_json)
+            .map_err(|error| format!("invalid options JSON: {error}"))?
+    };
+    let result = match schemweave::collapse_group_in_place(
+        &expanded_graph,
+        &expanded_layout,
+        &compact_graph,
+        &expansion,
+        &GroupCollapseOptions {
+            layout: options.layout,
+            constraints: options.constraints,
+        },
+    ) {
+        Ok(layout) => SerializedGroupExpansionResult::Layout { layout },
+        Err(GroupExpansionError::NeedsFullRelayout) => {
+            SerializedGroupExpansionResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::Geometry,
+            }
+        }
+        Err(GroupExpansionError::ExpansionWorkLimitExceeded { .. }) => {
+            SerializedGroupExpansionResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::WorkLimit,
+            }
+        }
+        Err(GroupExpansionError::PreservedGeometryTooLarge { .. }) => {
+            SerializedGroupExpansionResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::PreservedGeometryTooLarge,
+            }
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    serde_json::to_string(&result)
+        .map_err(|error| format!("failed to encode collapsed layout: {error}"))
+}
+
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum SerializedGroupExpansionResult {
@@ -122,7 +196,9 @@ fn js_error(message: impl AsRef<str>) -> JsValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_group_serialized, layout_json, layout_serialized};
+    use super::{
+        collapse_group_serialized, expand_group_serialized, layout_json, layout_serialized,
+    };
     use schemweave::{
         BoundaryTrunk, Edge, Endpoint, Graph, GroupExpansion, Layout, LayoutOptions, Node, Port,
         PortSide, layout, layout_with_constraints,
@@ -354,6 +430,76 @@ mod tests {
         assert_eq!(
             result.edges.iter().map(|edge| edge.id).collect::<Vec<_>>(),
             vec![11, 12, 13]
+        );
+    }
+
+    #[test]
+    fn collapses_a_group_over_the_json_boundary() {
+        let mut anchor = node(10);
+        anchor.width = 260.0;
+        let compact = Graph {
+            nodes: vec![node(1), anchor, node(4)],
+            edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), node(3), node(4)],
+            edges: vec![
+                edge(11, 1, 2, 100),
+                edge(12, 2, 3, 150),
+                edge(13, 3, 4, 200),
+            ],
+        };
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: vec![2, 3],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 11,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 13,
+                    compact_edge: 2,
+                },
+            ],
+        };
+        let expanded_layout = decode_expanded_layout(
+            expand_group_serialized(
+                &serde_json::to_string(&compact).unwrap(),
+                &serde_json::to_string(&compact_layout).unwrap(),
+                &serde_json::to_string(&expanded).unwrap(),
+                &serde_json::to_string(&expansion).unwrap(),
+                r#"{"quality_effort":"max"}"#,
+            )
+            .unwrap(),
+        );
+        let collapsed = decode_expanded_layout(
+            collapse_group_serialized(
+                &serde_json::to_string(&expanded).unwrap(),
+                &serde_json::to_string(&expanded_layout).unwrap(),
+                &serde_json::to_string(&compact).unwrap(),
+                &serde_json::to_string(&expansion).unwrap(),
+                "{}",
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            collapsed
+                .nodes
+                .iter()
+                .map(|node| node.id)
+                .collect::<Vec<_>>(),
+            vec![1, 4, 10]
+        );
+        assert_eq!(
+            collapsed
+                .edges
+                .iter()
+                .map(|edge| edge.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
         );
     }
 

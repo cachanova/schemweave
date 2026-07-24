@@ -78,7 +78,9 @@ fn layout_benches(c: &mut Criterion) {
     );
 }
 
-use schemweave::{GroupExpansionOptions, expand_group_in_place};
+use schemweave::{
+    GroupCollapseOptions, GroupExpansionOptions, collapse_group_in_place, expand_group_in_place,
+};
 
 fn expand_benches(c: &mut Criterion) {
     let mut group = c.benchmark_group("expand/chain");
@@ -125,6 +127,72 @@ fn expand_benches(c: &mut Criterion) {
     group.finish();
 }
 
+fn collapse_benches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("collapse/chain");
+    for (label, members, bystanders) in [("4m-6b", 4, 6), ("8m-40b", 8, 40)] {
+        let (compact, expanded, expansion) = generators::expansion_pair(members, bystanders);
+        for (effort_label, effort) in EFFORTS {
+            let config = config(effort);
+            let compact_layout =
+                layout_with_config(&compact, &config).expect("compact fixture must lay out");
+            let expansion_options = GroupExpansionOptions {
+                layout: config.layout,
+                quality_effort: config.quality_effort,
+                constraints: config.constraints.clone(),
+            };
+            let expanded_layout = expand_group_in_place(
+                &compact,
+                &compact_layout,
+                &expanded,
+                &expansion,
+                &expansion_options,
+            )
+            .expect("expansion");
+            let collapse_options = GroupCollapseOptions {
+                layout: config.layout,
+                constraints: config.constraints.clone(),
+            };
+            let first = collapse_group_in_place(
+                &expanded,
+                &expanded_layout,
+                &compact,
+                &expansion,
+                &collapse_options,
+            )
+            .expect("collapse");
+            let second = collapse_group_in_place(
+                &expanded,
+                &expanded_layout,
+                &compact,
+                &expansion,
+                &collapse_options,
+            )
+            .expect("collapse");
+            assert_eq!(
+                first, second,
+                "collapse must be deterministic before measuring"
+            );
+            group.bench_with_input(
+                BenchmarkId::new(label, effort_label),
+                &(&expanded, &expanded_layout, &compact, &expansion),
+                |b, (expanded, expanded_layout, compact, expansion)| {
+                    b.iter(|| {
+                        collapse_group_in_place(
+                            expanded,
+                            expanded_layout,
+                            compact,
+                            expansion,
+                            &collapse_options,
+                        )
+                        .expect("collapse")
+                    })
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 fn tuned() -> Criterion {
     Criterion::default().sample_size(20)
 }
@@ -132,6 +200,6 @@ fn tuned() -> Criterion {
 criterion_group! {
     name = benches;
     config = tuned();
-    targets = layout_benches, expand_benches
+    targets = layout_benches, expand_benches, collapse_benches
 }
 criterion_main!(benches);

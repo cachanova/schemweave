@@ -54,6 +54,20 @@ pub struct GroupExpansionOptions {
     pub constraints: LayoutConstraints,
 }
 
+/// Layout policy for replacing expanded members with their compact anchor.
+///
+/// Collapse is stability-first: unrelated geometry remains at its current
+/// coordinates and the vacated member frame is intentionally left available.
+/// A later explicit compaction can close that space without coupling a
+/// responsive visibility toggle to unrelated movement.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+pub struct GroupCollapseOptions {
+    #[serde(flatten)]
+    pub layout: LayoutOptions,
+    pub constraints: LayoutConstraints,
+}
+
 /// Invalid compact-to-expanded graph or geometry contract.
 #[derive(Clone, Debug, Error, PartialEq)]
 #[non_exhaustive]
@@ -150,6 +164,12 @@ struct ExpansionContract<'a> {
     compact_node_geometry: BTreeMap<NodeId, &'a NodeGeometry>,
     compact_edge_geometry: BTreeMap<EdgeId, &'a EdgeGeometry>,
     compact_boundary_bundle_offsets: BTreeMap<BoundaryBundleId, f64>,
+    boundary_trunks: BTreeMap<EdgeId, EdgeId>,
+}
+
+struct GraphExpansionContract<'a> {
+    members: BTreeSet<NodeId>,
+    expanded_nodes: BTreeMap<NodeId, &'a Node>,
     boundary_trunks: BTreeMap<EdgeId, EdgeId>,
 }
 
@@ -256,6 +276,174 @@ pub fn expand_group_in_place(
         compact_layout.height,
         options,
     )
+}
+
+/// Collapse one expanded group while preserving every unrelated geometry.
+///
+/// The graph pair and [`GroupExpansion`] use the same stable-ID contract as
+/// [`expand_group_in_place`], with their direction reversed. Member nodes and
+/// internal routes are removed, the compact anchor is restored at the member
+/// frame origin, and each compact boundary trunk is reverse-spliced onto one
+/// mapped expanded route. The result is admitted only after the complete hard
+/// geometry, constraint, bundle, spacing, and left-to-right gates pass.
+pub fn collapse_group_in_place(
+    expanded_graph: &Graph,
+    expanded_layout: &Layout,
+    compact_graph: &Graph,
+    expansion: &GroupExpansion,
+    options: &GroupCollapseOptions,
+) -> Result<Layout, GroupExpansionError> {
+    validation::validate_and_index(expanded_graph, options.layout)
+        .map_err(GroupExpansionError::InvalidCompactGraph)?;
+    let compact_indexed = validation::validate_and_index_with_constraints(
+        compact_graph,
+        options.layout,
+        &options.constraints,
+    )
+    .map_err(GroupExpansionError::InvalidExpandedGraph)?;
+    if expanded_graph.edges.len() > MAX_EXPANSION_EDGES {
+        return Err(GroupExpansionError::TooManyEdges {
+            actual: expanded_graph.edges.len(),
+            maximum: MAX_EXPANSION_EDGES,
+        });
+    }
+    let contract = validate_graph_contract(compact_graph, expanded_graph, expansion)?;
+    validate_compact_boundary_bundles(expanded_graph, expanded_layout, options.layout)?;
+    let expanded_node_geometry = index_node_geometry(expanded_graph, expanded_layout)?;
+    let expanded_edge_geometry = index_edge_geometry(expanded_graph, expanded_layout)?;
+    validate_layout_bounds(expanded_layout)?;
+    if route_segment_count(expanded_layout) > MAX_LAYOUT_SEGMENTS {
+        return Err(GroupExpansionError::TooManyCompactRouteSegments {
+            actual: route_segment_count(expanded_layout),
+            maximum: MAX_LAYOUT_SEGMENTS,
+        });
+    }
+    let hard_budget_maximum = MAX_CANDIDATE_WORK;
+    let mut hard_budget = WorkBudget::new(hard_budget_maximum);
+    match hard_geometry_is_clean_bounded(expanded_graph, expanded_layout, &mut hard_budget) {
+        Ok(true) => {}
+        Ok(false) => return Err(GroupExpansionError::InvalidCompactHardGeometry),
+        Err(required) => {
+            return Err(GroupExpansionError::ExpansionWorkLimitExceeded {
+                required,
+                maximum: hard_budget_maximum,
+            });
+        }
+    }
+
+    let candidate = compose_collapse_candidate(
+        expanded_graph,
+        expanded_layout,
+        compact_graph,
+        expansion,
+        &contract,
+        &expanded_node_geometry,
+        &expanded_edge_geometry,
+        options.layout,
+    )?;
+    let candidate =
+        boundary_bundles::apply_and_normalize(&compact_indexed, candidate, options.layout)
+            .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
+    if route_segment_count(&candidate) > MAX_LAYOUT_SEGMENTS {
+        return Err(GroupExpansionError::PreservedGeometryTooLarge {
+            actual: route_segment_count(&candidate),
+            maximum: MAX_LAYOUT_SEGMENTS,
+        });
+    }
+    hard_budget
+        .take(compact_graph.edges.len())
+        .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
+            required,
+            maximum: hard_budget_maximum,
+        })?;
+    let geometry_is_clean =
+        hard_geometry_is_clean_bounded(compact_graph, &candidate, &mut hard_budget).map_err(
+            |required| GroupExpansionError::ExpansionWorkLimitExceeded {
+                required,
+                maximum: hard_budget_maximum,
+            },
+        )?;
+    charge_expansion_work(
+        &mut hard_budget,
+        clearance_work_upper_bound(&candidate, options.layout),
+        hard_budget_maximum,
+    )?;
+    let mut clearance_work_exhausted = false;
+    let clearance_is_clean = crate::candidate_satisfies_edge_node_clearance_bounded(
+        &compact_indexed,
+        &candidate,
+        options.layout,
+        crate::MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
+        &mut clearance_work_exhausted,
+    );
+    charge_expansion_work(
+        &mut hard_budget,
+        parallel_spacing_work_upper_bound(&candidate, options.layout),
+        hard_budget_maximum,
+    )?;
+    let parallel_spacing_is_clean = if options.layout.minimum_parallel_wire_spacing > 0.0 {
+        matches!(
+            routing::route_family_satisfies_parallel_spacing_bounded(
+                &compact_indexed,
+                &candidate.edges,
+                options.layout.minimum_parallel_wire_spacing,
+                crate::outward_obstacle_clearance_stub(options.layout),
+                crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
+                crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
+            ),
+            Ok(true)
+        )
+    } else {
+        true
+    };
+    charge_expansion_work(
+        &mut hard_budget,
+        boundary_bundle_work_upper_bound(&compact_indexed, &candidate),
+        hard_budget_maximum,
+    )?;
+    let bundles_are_clean =
+        boundary_bundles::verify_geometry(&compact_indexed, &candidate, options.layout).is_ok();
+    if ranking_direction_violations(compact_graph, &candidate) != 0
+        || !constraints_are_satisfied(&candidate, &options.constraints)
+        || !geometry_is_clean
+        || !clearance_is_clean
+        || clearance_work_exhausted
+        || !parallel_spacing_is_clean
+        || !bundles_are_clean
+    {
+        return Err(GroupExpansionError::NeedsFullRelayout);
+    }
+    let collapsed_nodes = candidate
+        .nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    if compact_graph
+        .nodes
+        .iter()
+        .filter(|node| node.id != expansion.anchor)
+        .any(|node| {
+            collapsed_nodes.get(&node.id).copied() != expanded_node_geometry.get(&node.id).copied()
+        })
+    {
+        return Err(GroupExpansionError::NeedsFullRelayout);
+    }
+    let collapsed_edges = candidate
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<BTreeMap<_, _>>();
+    if compact_graph
+        .edges
+        .iter()
+        .filter(|edge| edge.source.node != expansion.anchor && edge.target.node != expansion.anchor)
+        .any(|edge| {
+            collapsed_edges.get(&edge.id).copied() != expanded_edge_geometry.get(&edge.id).copied()
+        })
+    {
+        return Err(GroupExpansionError::NeedsFullRelayout);
+    }
+    Ok(candidate)
 }
 
 /// Expand one quotient node using a stable schematic height to choose the
@@ -894,6 +1082,45 @@ fn validate_contract<'a>(
     expansion: &GroupExpansion,
     options: LayoutOptions,
 ) -> Result<ExpansionContract<'a>, GroupExpansionError> {
+    let GraphExpansionContract {
+        members,
+        expanded_nodes,
+        boundary_trunks,
+    } = validate_graph_contract(compact_graph, expanded_graph, expansion)?;
+    let compact_boundary_bundle_offsets =
+        validate_compact_boundary_bundles(compact_graph, compact_layout, options)?;
+    let compact_node_geometry = index_node_geometry(compact_graph, compact_layout)?;
+    let compact_edge_geometry = index_edge_geometry(compact_graph, compact_layout)?;
+    validate_layout_bounds(compact_layout)?;
+    let mut hard_budget = WorkBudget::new(MAX_CANDIDATE_WORK);
+    match hard_geometry_is_clean_bounded(compact_graph, compact_layout, &mut hard_budget) {
+        Ok(true) => {}
+        Ok(false) => return Err(GroupExpansionError::InvalidCompactHardGeometry),
+        Err(required) => {
+            return Err(GroupExpansionError::ExpansionWorkLimitExceeded {
+                required,
+                maximum: MAX_CANDIDATE_WORK,
+            });
+        }
+    }
+    let anchor_geometry = compact_node_geometry[&expansion.anchor];
+
+    Ok(ExpansionContract {
+        anchor_geometry,
+        members,
+        expanded_nodes,
+        compact_node_geometry,
+        compact_edge_geometry,
+        compact_boundary_bundle_offsets,
+        boundary_trunks,
+    })
+}
+
+fn validate_graph_contract<'a>(
+    compact_graph: &'a Graph,
+    expanded_graph: &'a Graph,
+    expansion: &GroupExpansion,
+) -> Result<GraphExpansionContract<'a>, GroupExpansionError> {
     if expansion.members.is_empty() {
         return Err(GroupExpansionError::EmptyMembers);
     }
@@ -955,23 +1182,6 @@ fn validate_contract<'a>(
         }
     }
 
-    let compact_boundary_bundle_offsets =
-        validate_compact_boundary_bundles(compact_graph, compact_layout, options)?;
-    let compact_node_geometry = index_node_geometry(compact_graph, compact_layout)?;
-    let compact_edge_geometry = index_edge_geometry(compact_graph, compact_layout)?;
-    validate_layout_bounds(compact_layout)?;
-    let mut hard_budget = WorkBudget::new(MAX_CANDIDATE_WORK);
-    match hard_geometry_is_clean_bounded(compact_graph, compact_layout, &mut hard_budget) {
-        Ok(true) => {}
-        Ok(false) => return Err(GroupExpansionError::InvalidCompactHardGeometry),
-        Err(required) => {
-            return Err(GroupExpansionError::ExpansionWorkLimitExceeded {
-                required,
-                maximum: MAX_CANDIDATE_WORK,
-            });
-        }
-    }
-    let anchor_geometry = compact_node_geometry[&expansion.anchor];
     let compact_edges = compact_graph
         .edges
         .iter()
@@ -1067,13 +1277,9 @@ fn validate_contract<'a>(
         return Err(GroupExpansionError::UnusedCompactTrunk(unused));
     }
 
-    Ok(ExpansionContract {
-        anchor_geometry,
+    Ok(GraphExpansionContract {
         members,
         expanded_nodes,
-        compact_node_geometry,
-        compact_edge_geometry,
-        compact_boundary_bundle_offsets,
         boundary_trunks,
     })
 }
@@ -2901,6 +3107,211 @@ fn candidate_work_budget(effort: QualityEffort) -> usize {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn compose_collapse_candidate(
+    expanded_graph: &Graph,
+    expanded_layout: &Layout,
+    compact_graph: &Graph,
+    expansion: &GroupExpansion,
+    contract: &GraphExpansionContract<'_>,
+    expanded_node_geometry: &BTreeMap<NodeId, &NodeGeometry>,
+    expanded_edge_geometry: &BTreeMap<EdgeId, &EdgeGeometry>,
+    options: LayoutOptions,
+) -> Result<Layout, GroupExpansionError> {
+    let member_frame = contract
+        .members
+        .iter()
+        .map(|member| Rect::from_node(expanded_node_geometry[member]))
+        .reduce(|left, right| Rect {
+            left: left.left.min(right.left),
+            top: left.top.min(right.top),
+            right: left.right.max(right.right),
+            bottom: left.bottom.max(right.bottom),
+        })
+        .expect("validated collapse contains members");
+    let anchor = compact_graph
+        .nodes
+        .iter()
+        .find(|node| node.id == expansion.anchor)
+        .expect("validated collapse contains its compact anchor");
+    let anchor_geometry = NodeGeometry {
+        id: anchor.id,
+        x: member_frame.left,
+        y: member_frame.top,
+        width: anchor.width,
+        height: anchor.height,
+    };
+    let mut nodes = expanded_layout
+        .nodes
+        .iter()
+        .filter(|node| !contract.members.contains(&node.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    nodes.push(anchor_geometry);
+    nodes.sort_unstable_by_key(|node| node.id);
+    let node_geometry = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let obstacles = ObstacleIndex::new(nodes.iter().map(Rect::from_node).collect());
+    let expanded_edges = expanded_graph
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<BTreeMap<_, _>>();
+    let mut expanded_by_compact_trunk = BTreeMap::<EdgeId, Vec<EdgeId>>::new();
+    for (&expanded, &compact) in &contract.boundary_trunks {
+        expanded_by_compact_trunk
+            .entry(compact)
+            .or_default()
+            .push(expanded);
+    }
+    for mapped in expanded_by_compact_trunk.values_mut() {
+        mapped.sort_unstable();
+    }
+    let mut compact_edges = compact_graph.edges.iter().collect::<Vec<_>>();
+    compact_edges.sort_unstable_by_key(|edge| edge.id);
+    let mut edges = Vec::with_capacity(compact_edges.len());
+    for edge in compact_edges {
+        let touches_anchor =
+            edge.source.node == expansion.anchor || edge.target.node == expansion.anchor;
+        if !touches_anchor {
+            edges.push(expanded_edge_geometry[&edge.id].clone());
+            continue;
+        }
+        let mapped = expanded_by_compact_trunk
+            .get(&edge.id)
+            .and_then(|mapped| mapped.first())
+            .copied()
+            .ok_or(GroupExpansionError::UnusedCompactTrunk(edge.id))?;
+        edges.push(collapse_boundary_route(
+            edge,
+            expanded_edges[&mapped],
+            expanded_edge_geometry[&mapped],
+            anchor,
+            &node_geometry,
+            &contract.expanded_nodes,
+            member_frame,
+            &obstacles,
+            options,
+        )?);
+    }
+    Ok(Layout {
+        nodes,
+        edges,
+        boundary_bundles: Vec::new(),
+        width: expanded_layout.width,
+        height: expanded_layout.height,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collapse_boundary_route(
+    compact_edge: &Edge,
+    expanded_edge: &Edge,
+    expanded_route: &EdgeGeometry,
+    anchor: &Node,
+    node_geometry: &BTreeMap<NodeId, &NodeGeometry>,
+    expanded_nodes: &BTreeMap<NodeId, &Node>,
+    member_frame: Rect,
+    obstacles: &ObstacleIndex,
+    options: LayoutOptions,
+) -> Result<EdgeGeometry, GroupExpansionError> {
+    if expanded_route.points.len() < 2 {
+        return Err(GroupExpansionError::EmptyBoundaryTrunk(expanded_edge.id));
+    }
+    let clearance = crate::outward_obstacle_clearance_stub(options);
+    let gap = (options.node_gap / 2.0).max(options.edge_node_clearance);
+    let anchor_is_source = compact_edge.source.node == anchor.id;
+    let points = if anchor_is_source {
+        let source_port = port(anchor, compact_edge.source);
+        let source = endpoint_point(node_geometry[&anchor.id], anchor, compact_edge.source);
+        let source_stub = outward_stub(source, source_port.side, clearance);
+        let target_node = expanded_nodes[&compact_edge.target.node];
+        let target_port = port(target_node, compact_edge.target);
+        let target = endpoint_point(
+            node_geometry[&compact_edge.target.node],
+            target_node,
+            compact_edge.target,
+        );
+        let target_stub = outward_stub(target, target_port.side, clearance);
+        let splice_index = expanded_route
+            .points
+            .iter()
+            .position(|point| point.x > member_frame.right + HARD_GATE_EPSILON);
+        let preserved_suffix = splice_index.map(|index| &expanded_route.points[index..]);
+        let suffix_is_usable = preserved_suffix.is_some_and(|suffix| {
+            suffix.len() >= 2
+                && boundary_bundles::preserved_point_matches(
+                    *suffix.last().expect("non-empty suffix"),
+                    target,
+                )
+                && correct_direction(target, suffix[suffix.len() - 2], target_port.side)
+        });
+        let splice = if suffix_is_usable {
+            preserved_suffix.expect("usable suffix exists")[0]
+        } else {
+            target_stub
+        };
+        let bridge = obstacle_safe_bridge(source_stub, splice, obstacles, gap, 0.0)
+            .ok_or(GroupExpansionError::NoSafeBoundaryBridge(expanded_edge.id))?;
+        let mut points = vec![source, source_stub];
+        points.extend(bridge.into_iter().skip(1));
+        if suffix_is_usable {
+            points.extend(
+                preserved_suffix
+                    .expect("usable suffix exists")
+                    .iter()
+                    .copied()
+                    .skip(1),
+            );
+        } else {
+            points.push(target);
+        }
+        points
+    } else {
+        let source_node = expanded_nodes[&compact_edge.source.node];
+        let source_port = port(source_node, compact_edge.source);
+        let source = endpoint_point(
+            node_geometry[&compact_edge.source.node],
+            source_node,
+            compact_edge.source,
+        );
+        let source_stub = outward_stub(source, source_port.side, clearance);
+        let target_port = port(anchor, compact_edge.target);
+        let target = endpoint_point(node_geometry[&anchor.id], anchor, compact_edge.target);
+        let target_stub = outward_stub(target, target_port.side, clearance);
+        let splice_index = expanded_route
+            .points
+            .iter()
+            .rposition(|point| point.x < member_frame.left - HARD_GATE_EPSILON);
+        let preserved_prefix = splice_index.map(|index| &expanded_route.points[..=index]);
+        let prefix_is_usable = preserved_prefix.is_some_and(|prefix| {
+            prefix.len() >= 2
+                && boundary_bundles::preserved_point_matches(prefix[0], source)
+                && correct_direction(source, prefix[1], source_port.side)
+        });
+        let mut points = if prefix_is_usable {
+            preserved_prefix.expect("usable prefix exists").to_vec()
+        } else {
+            vec![source, source_stub]
+        };
+        let splice = *points.last().expect("collapse route has a source");
+        let bridge = obstacle_safe_bridge(splice, target_stub, obstacles, gap, 0.0)
+            .ok_or(GroupExpansionError::NoSafeBoundaryBridge(expanded_edge.id))?;
+        points.extend(bridge.into_iter().skip(1));
+        points.push(target);
+        points
+    };
+    let points = simplify_orthogonal(points);
+    path_is_clear(&points, obstacles)
+        .then_some(EdgeGeometry {
+            id: compact_edge.id,
+            points,
+        })
+        .ok_or(GroupExpansionError::NoSafeBoundaryBridge(expanded_edge.id))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compose_candidate(
     compact_layout: &Layout,
     expanded_graph: &Graph,
@@ -4226,9 +4637,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        BoundaryTrunk, ExpansionWork, GroupExpansion, GroupExpansionError, GroupExpansionOptions,
-        ObstacleIndex, Rect, arrange_member_components, candidate_positions, expand_group_in_place,
-        obstacle_safe_bridge, path_is_clear,
+        BoundaryTrunk, ExpansionWork, GroupCollapseOptions, GroupExpansion, GroupExpansionError,
+        GroupExpansionOptions, ObstacleIndex, Rect, arrange_member_components, candidate_positions,
+        collapse_group_in_place, expand_group_in_place, obstacle_safe_bridge, path_is_clear,
     };
     use crate::{
         BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, EdgeGeometry, Endpoint,
@@ -4377,6 +4788,230 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn collapse_restores_anchor_without_moving_retained_geometry() {
+        let (compact, expanded, expansion) = fixture();
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let expanded_layout = expand_group_in_place(
+            &compact,
+            &compact_layout,
+            &expanded,
+            &expansion,
+            &GroupExpansionOptions {
+                quality_effort: QualityEffort::Max,
+                ..GroupExpansionOptions::default()
+            },
+        )
+        .unwrap();
+
+        let collapsed = collapse_group_in_place(
+            &expanded,
+            &expanded_layout,
+            &compact,
+            &expansion,
+            &GroupCollapseOptions::default(),
+        )
+        .unwrap();
+
+        for retained in [1, 4, 5] {
+            assert_eq!(
+                collapsed.nodes.iter().find(|node| node.id == retained),
+                expanded_layout
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == retained)
+            );
+        }
+        assert_eq!(
+            collapsed.edges.iter().find(|edge| edge.id == 3),
+            expanded_layout.edges.iter().find(|edge| edge.id == 3)
+        );
+        assert!(collapsed.nodes.iter().any(|node| node.id == 10));
+        assert!(
+            collapsed
+                .nodes
+                .iter()
+                .all(|node| ![2, 3].contains(&node.id))
+        );
+        assert_eq!(collapsed.nodes.len(), compact.nodes.len());
+        assert_eq!(collapsed.edges.len(), compact.edges.len());
+        assert!(super::hard_geometry_is_clean(&compact, &collapsed));
+        assert_eq!(super::ranking_direction_violations(&compact, &collapsed), 0);
+    }
+
+    #[test]
+    fn collapse_is_deterministic_across_graph_and_contract_permutations() {
+        let (compact, expanded, expansion) = fixture();
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let expanded_layout = expand_group_in_place(
+            &compact,
+            &compact_layout,
+            &expanded,
+            &expansion,
+            &GroupExpansionOptions::default(),
+        )
+        .unwrap();
+        let expected = collapse_group_in_place(
+            &expanded,
+            &expanded_layout,
+            &compact,
+            &expansion,
+            &GroupCollapseOptions::default(),
+        )
+        .unwrap();
+
+        let mut permuted_compact = compact;
+        permuted_compact.nodes.reverse();
+        permuted_compact.edges.reverse();
+        let mut permuted_expanded = expanded;
+        permuted_expanded.nodes.reverse();
+        permuted_expanded.edges.reverse();
+        let mut permuted_layout = expanded_layout;
+        permuted_layout.nodes.reverse();
+        permuted_layout.edges.reverse();
+        let mut permuted_expansion = expansion;
+        permuted_expansion.members.reverse();
+        permuted_expansion.boundary_trunks.reverse();
+        let actual = collapse_group_in_place(
+            &permuted_expanded,
+            &permuted_layout,
+            &permuted_compact,
+            &permuted_expansion,
+            &GroupCollapseOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn collapsing_one_group_preserves_another_expanded_group() {
+        let mut anchor_a = node(10);
+        anchor_a.width = 260.0;
+        let mut anchor_b = node(30);
+        anchor_b.width = 260.0;
+        let base = Graph {
+            nodes: vec![
+                node(1),
+                anchor_a.clone(),
+                node(20),
+                anchor_b.clone(),
+                node(40),
+            ],
+            edges: vec![
+                edge(1, 1, 10, 100),
+                edge(2, 10, 20, 200),
+                edge(3, 20, 30, 300),
+                edge(4, 30, 40, 400),
+            ],
+        };
+        let group_a = GroupExpansion {
+            anchor: 10,
+            members: vec![11, 12],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 11,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 13,
+                    compact_edge: 2,
+                },
+            ],
+        };
+        let group_b = GroupExpansion {
+            anchor: 30,
+            members: vec![31, 32],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 31,
+                    compact_edge: 3,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 33,
+                    compact_edge: 4,
+                },
+            ],
+        };
+        let expanded_a = Graph {
+            nodes: vec![node(1), node(11), node(12), node(20), anchor_b, node(40)],
+            edges: vec![
+                edge(11, 1, 11, 100),
+                edge(12, 11, 12, 150),
+                edge(13, 12, 20, 200),
+                edge(3, 20, 30, 300),
+                edge(4, 30, 40, 400),
+            ],
+        };
+        let expanded_both = Graph {
+            nodes: vec![
+                node(1),
+                node(11),
+                node(12),
+                node(20),
+                node(31),
+                node(32),
+                node(40),
+            ],
+            edges: vec![
+                edge(11, 1, 11, 100),
+                edge(12, 11, 12, 150),
+                edge(13, 12, 20, 200),
+                edge(31, 20, 31, 300),
+                edge(32, 31, 32, 350),
+                edge(33, 32, 40, 400),
+            ],
+        };
+        let only_b = Graph {
+            nodes: vec![node(1), anchor_a, node(20), node(31), node(32), node(40)],
+            edges: vec![
+                edge(1, 1, 10, 100),
+                edge(2, 10, 20, 200),
+                edge(31, 20, 31, 300),
+                edge(32, 31, 32, 350),
+                edge(33, 32, 40, 400),
+            ],
+        };
+        let options = GroupExpansionOptions {
+            quality_effort: QualityEffort::Max,
+            ..GroupExpansionOptions::default()
+        };
+        let base_layout = layout(&base, LayoutOptions::default()).unwrap();
+        let layout_a =
+            expand_group_in_place(&base, &base_layout, &expanded_a, &group_a, &options).unwrap();
+        let layout_both =
+            expand_group_in_place(&expanded_a, &layout_a, &expanded_both, &group_b, &options)
+                .unwrap();
+        let collapsed_a = collapse_group_in_place(
+            &expanded_both,
+            &layout_both,
+            &only_b,
+            &group_a,
+            &GroupCollapseOptions::default(),
+        )
+        .unwrap();
+
+        for retained in [20, 31, 32, 40] {
+            assert_eq!(
+                collapsed_a.nodes.iter().find(|node| node.id == retained),
+                layout_both.nodes.iter().find(|node| node.id == retained),
+            );
+        }
+        assert_eq!(
+            collapsed_a.edges.iter().find(|edge| edge.id == 32),
+            layout_both.edges.iter().find(|edge| edge.id == 32),
+        );
+        assert!(collapsed_a.nodes.iter().any(|node| node.id == 10));
+        assert!(
+            collapsed_a
+                .nodes
+                .iter()
+                .all(|node| ![11, 12].contains(&node.id))
+        );
+        assert!(collapsed_a.nodes.iter().any(|node| node.id == 31));
+        assert!(collapsed_a.nodes.iter().any(|node| node.id == 32));
     }
 
     #[test]
