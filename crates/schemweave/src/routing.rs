@@ -1010,7 +1010,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         retained_crossing_profile = Some(profile);
     }
     let global_lane_delta_baseline = has_global_lane_delta_candidate.then(|| {
-        global_lane_delta_baseline(
+        lane_delta_baseline(
             plan,
             &routes,
             &gap_lanes,
@@ -1097,7 +1097,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
                 .as_ref()
                 .expect("each global lane candidate has baseline delta state")
             {
-                Ok(baseline) => global_lane_delta_candidate_profile(
+                Ok(baseline) => lane_delta_candidate_profile(
                     plan,
                     baseline,
                     &gap_lanes,
@@ -1105,7 +1105,12 @@ fn route_edges_with_lane_rounds_and_refined_global(
                     &endpoint_tracks,
                     &candidate_endpoint_tracks,
                     &crossing_paths,
+                    &crossing_paths,
+                    true,
                     &baseline_outer_lanes,
+                    &baseline_outer_lanes,
+                    false,
+                    false,
                     &routes,
                     &compact_candidate_routes,
                     &layer_left,
@@ -3339,19 +3344,85 @@ fn repair_crossing_heavy_net(
                 )
             })
             .flatten();
+        // Keep repair scoring after negotiated-corridor construction, matching the historical
+        // candidate evaluation order. Only a sparse selected-net move may reach the full
+        // permutation gate: outer-side work is rejected here, while empty outer lanes, equal
+        // endpoint tracks, reused paths, unchanged spacing, and route/contact topology are
+        // checked by the shared lane-delta baseline and eligibility engine below.
+        let candidate = sum_within_limit(
+            candidate.iter().map(|route| route.points.len()),
+            MAX_CROSSING_REPAIR_ROUTE_POINTS,
+        )
+        .then(|| {
+            let lane_delta_profile = if selected_nets.is_empty() || !selected_outer_sides.is_empty()
+            {
+                Err(LaneDeltaFallbackReason::OuterOrChannelAssignmentChanged)
+            } else {
+                let base_profile = RetainedHorizontalCrossingProfile::new(
+                    routes,
+                    physical_segments.to_vec(),
+                    crossing_counts.clone(),
+                    quality,
+                );
+                lane_delta_baseline(
+                    plan,
+                    routes,
+                    gap_lanes,
+                    outer_lanes,
+                    layer_left,
+                    layer_right,
+                    options,
+                    gap_spacing,
+                    &base_profile,
+                )
+                .and_then(|baseline| {
+                    lane_delta_candidate_profile(
+                        plan,
+                        &baseline,
+                        gap_lanes,
+                        &candidate_lanes,
+                        endpoint_tracks,
+                        &candidate_endpoint_tracks,
+                        crossing_paths,
+                        candidate_crossing_paths,
+                        reuse_crossing_paths,
+                        outer_lanes,
+                        &candidate_outer_lanes,
+                        !selected_outer_sides.is_empty(),
+                        !outer_lane_channels_match(outer_lanes, &candidate_outer_lanes),
+                        routes,
+                        &candidate,
+                        layer_left,
+                        layer_right,
+                        options,
+                        gap_spacing,
+                        gap_spacing,
+                        &base_profile,
+                    )
+                })
+            };
+            #[cfg(debug_assertions)]
+            if let Ok(profile) = &lane_delta_profile {
+                debug_assert_eq!(
+                    profile,
+                    &computed_retained_horizontal_crossing_profile(plan, &candidate)
+                );
+            }
+            let family = if max_repair_nets <= MAX_BATCHED_CROSSING_REPAIR_NETS {
+                RepairLaneDeltaFamily::Standard
+            } else {
+                RepairLaneDeltaFamily::Deep
+            };
+            record_repair_lane_delta_result(family, &lane_delta_profile);
+            let candidate_quality = lane_delta_profile.map_or_else(
+                |_| horizontal_crossing_profile_by_net(plan, &candidate).2,
+                |profile| profile.quality,
+            );
+            (candidate_quality, candidate)
+        });
         Some((candidate, negotiated_candidate))
     })();
-    let (repair, negotiated_candidate) =
-        repair.map_or((None, None), |(routes, negotiated_candidate)| {
-            (
-                sum_within_limit(
-                    routes.iter().map(|route| route.points.len()),
-                    MAX_CROSSING_REPAIR_ROUTE_POINTS,
-                )
-                .then(|| (route_quality_for_plan(plan, &routes), routes)),
-                negotiated_candidate,
-            )
-        });
+    let (repair, negotiated_candidate) = repair.unwrap_or((None, None));
     CrossingRepair {
         baseline_quality: quality,
         candidate: repair,
@@ -8971,7 +9042,7 @@ use lane_pair_contribution::{
     canonical_lane_gap_accesses_from_sorted_segments, lane_delta_eligibility,
 };
 
-struct GlobalLaneDeltaBaseline {
+struct LaneDeltaBaseline {
     invocation: LaneDeltaInvocationIdentity,
     gap_bounds: Vec<(f64, f64)>,
     gap_accesses: Vec<CanonicalLaneGapAccess>,
@@ -8979,7 +9050,7 @@ struct GlobalLaneDeltaBaseline {
 
 type GlobalLaneDeltaGapGeometry = (Vec<(f64, f64)>, Vec<Vec<CanonicalLaneTrack>>);
 
-fn global_lane_delta_gap_geometry(
+fn lane_delta_gap_geometry(
     gap_lanes: &[BTreeMap<NetId, usize>],
     layer_left: &[f64],
     layer_right: &[f64],
@@ -9027,7 +9098,7 @@ fn global_lane_delta_gap_geometry(
     Ok((bounds, tracks))
 }
 
-fn global_lane_delta_gap_accesses(
+fn lane_delta_gap_accesses(
     plan: &RoutingPlan<'_>,
     routes: &[EdgeGeometry],
     gap_tracks: &[Vec<CanonicalLaneTrack>],
@@ -9045,7 +9116,7 @@ fn global_lane_delta_gap_accesses(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn global_lane_delta_baseline(
+fn lane_delta_baseline(
     plan: &RoutingPlan<'_>,
     routes: &[EdgeGeometry],
     gap_lanes: &[BTreeMap<NetId, usize>],
@@ -9055,15 +9126,15 @@ fn global_lane_delta_baseline(
     options: LayoutOptions,
     gap_spacing: GapTrackSpacing,
     base_profile: &RetainedHorizontalCrossingProfile,
-) -> Result<GlobalLaneDeltaBaseline, LaneDeltaFallbackReason> {
+) -> Result<LaneDeltaBaseline, LaneDeltaFallbackReason> {
     if !outer_lanes.is_empty() {
         return Err(LaneDeltaFallbackReason::OuterLanesPresent);
     }
     let (gap_bounds, gap_tracks) =
-        global_lane_delta_gap_geometry(gap_lanes, layer_left, layer_right, options, gap_spacing)?;
-    let (segments, gap_accesses) = global_lane_delta_gap_accesses(plan, routes, &gap_tracks)?;
+        lane_delta_gap_geometry(gap_lanes, layer_left, layer_right, options, gap_spacing)?;
+    let (segments, gap_accesses) = lane_delta_gap_accesses(plan, routes, &gap_tracks)?;
     debug_assert_eq!(segments, base_profile.segments);
-    Ok(GlobalLaneDeltaBaseline {
+    Ok(LaneDeltaBaseline {
         invocation: LaneDeltaInvocationIdentity::new(),
         gap_bounds,
         gap_accesses,
@@ -9071,15 +9142,20 @@ fn global_lane_delta_baseline(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn global_lane_delta_candidate_profile(
+fn lane_delta_candidate_profile(
     plan: &RoutingPlan<'_>,
-    baseline: &GlobalLaneDeltaBaseline,
+    baseline: &LaneDeltaBaseline,
     baseline_gap_lanes: &[BTreeMap<NetId, usize>],
     candidate_gap_lanes: &[BTreeMap<NetId, usize>],
     baseline_endpoint_tracks: &EndpointTracks,
     candidate_endpoint_tracks: &EndpointTracks,
-    crossing_paths: &[Option<Vec<f64>>],
+    baseline_crossing_paths: &[Option<Vec<f64>>],
+    candidate_crossing_paths: &[Option<Vec<f64>>],
+    paths_reused: bool,
     baseline_outer_lanes: &BTreeMap<EdgeId, OuterLane>,
+    candidate_outer_lanes: &BTreeMap<EdgeId, OuterLane>,
+    outer_side_reassigned: bool,
+    channel_indices_changed: bool,
     baseline_routes: &[EdgeGeometry],
     candidate_routes: &[EdgeGeometry],
     layer_left: &[f64],
@@ -9089,7 +9165,7 @@ fn global_lane_delta_candidate_profile(
     candidate_spacing: GapTrackSpacing,
     base_profile: &RetainedHorizontalCrossingProfile,
 ) -> Result<RetainedHorizontalCrossingProfile, LaneDeltaFallbackReason> {
-    let (_, candidate_tracks) = global_lane_delta_gap_geometry(
+    let (_, candidate_tracks) = lane_delta_gap_geometry(
         candidate_gap_lanes,
         layer_left,
         layer_right,
@@ -9097,22 +9173,22 @@ fn global_lane_delta_candidate_profile(
         candidate_spacing,
     )?;
     let (candidate_segments, candidate_gap_accesses) =
-        global_lane_delta_gap_accesses(plan, candidate_routes, &candidate_tracks)?;
+        lane_delta_gap_accesses(plan, candidate_routes, &candidate_tracks)?;
     let candidate_invocation = baseline.invocation.clone();
     let eligibility = lane_delta_eligibility(&LaneDeltaEligibilityInput {
         baseline_gap_lanes,
         candidate_gap_lanes,
         baseline_endpoint_tracks,
         candidate_endpoint_tracks,
-        baseline_crossing_paths: crossing_paths,
-        candidate_crossing_paths: crossing_paths,
-        paths_reused: true,
+        baseline_crossing_paths,
+        candidate_crossing_paths,
+        paths_reused,
         baseline_spacing,
         candidate_spacing,
         baseline_outer_lanes,
-        candidate_outer_lanes: baseline_outer_lanes,
-        outer_side_reassigned: false,
-        channel_indices_changed: false,
+        candidate_outer_lanes,
+        outer_side_reassigned,
+        channel_indices_changed,
         baseline_routes,
         candidate_routes,
         gap_bounds: &baseline.gap_bounds,
@@ -9421,8 +9497,9 @@ fn physical_crossing_sweep_lines(
 
 /// Attribute each crossing to its original horizontal participant.
 ///
-/// This deliberately uses one sweep: attribution only selects a bounded repair candidate, while
-/// complete layouts are accepted using the orientation-independent exact crossing score.
+/// This deliberately uses one sweep: its total is the same orientation-independent exact crossing
+/// score used for candidate acceptance, while the per-horizontal-net split selects bounded repairs
+/// and supplies the retained profile updated by eligible lane deltas.
 #[cfg(test)]
 fn horizontal_crossing_counts_by_net(
     plan: &RoutingPlan<'_>,
@@ -9574,6 +9651,8 @@ struct RoutingReuseCounts {
     lane_delta_global_eligible: usize,
     lane_delta_preserved_refined_eligible: usize,
     lane_delta_refined_eligible: usize,
+    lane_delta_standard_repair_eligible: usize,
+    lane_delta_deep_repair_eligible: usize,
     lane_delta_fallbacks: LaneDeltaFallbackCounts,
 }
 
@@ -9594,6 +9673,8 @@ impl RoutingReuseCounts {
             lane_delta_global_eligible: 0,
             lane_delta_preserved_refined_eligible: 0,
             lane_delta_refined_eligible: 0,
+            lane_delta_standard_repair_eligible: 0,
+            lane_delta_deep_repair_eligible: 0,
             lane_delta_fallbacks: LaneDeltaFallbackCounts {
                 gap_vector_length_mismatch: 0,
                 gap_net_set_or_lane_count_mismatch: 0,
@@ -9661,6 +9742,12 @@ enum GlobalLaneDeltaFamily {
     Refined,
 }
 
+#[derive(Clone, Copy)]
+enum RepairLaneDeltaFamily {
+    Standard,
+    Deep,
+}
+
 // Records only the eligibility outcome of a lane-delta attempt. Deliberately does NOT
 // increment an "eliminated sweep" counter: doing so in this same `Ok` arm would be
 // tautological with eligibility (it could never disagree) and would over-report when the
@@ -9688,6 +9775,26 @@ fn record_global_lane_delta_result(
             }
             GlobalLaneDeltaFamily::Refined => {
                 counts.lane_delta_refined_eligible += 1;
+            }
+        },
+        Err(reason) => counts.lane_delta_fallbacks.record(reason),
+    });
+}
+
+fn record_repair_lane_delta_result(
+    family: RepairLaneDeltaFamily,
+    result: &Result<RetainedHorizontalCrossingProfile, LaneDeltaFallbackReason>,
+) {
+    #[cfg(not(test))]
+    let _ = (family, result);
+    #[cfg(test)]
+    update_routing_reuse_counts(|counts| match result {
+        Ok(_) => match family {
+            RepairLaneDeltaFamily::Standard => {
+                counts.lane_delta_standard_repair_eligible += 1;
+            }
+            RepairLaneDeltaFamily::Deep => {
+                counts.lane_delta_deep_repair_eligible += 1;
             }
         },
         Err(reason) => counts.lane_delta_fallbacks.record(reason),
@@ -14838,12 +14945,27 @@ mod tests {
         let indexed = validate_and_index(&graph, options).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
         take_routing_reuse_counts();
+        take_horizontal_crossing_profile_calls();
         let routed = route_planned_candidates(&plan, &geometry, options, true);
         let reuse_counts = take_routing_reuse_counts();
+        let profile_calls = take_horizontal_crossing_profile_calls();
         assert_eq!(reuse_counts.final_endpoint_tracks, 1);
         assert_eq!(reuse_counts.outer_repair_endpoint_tracks, 1);
         assert_eq!(reuse_counts.repair_crossing_paths, 1);
         assert_eq!(reuse_counts.repair_crossing_paths_recomputed, 0);
+        assert_eq!(reuse_counts.lane_delta_standard_repair_eligible, 0);
+        assert_eq!(reuse_counts.lane_delta_deep_repair_eligible, 0);
+        assert_eq!(
+            reuse_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts {
+                outer_or_channel_assignment_changed: 1,
+                ..super::LaneDeltaFallbackCounts::default()
+            }
+        );
+        assert_eq!(
+            profile_calls, 2,
+            "outer-side repair must retain baseline attribution and fully score its candidate"
+        );
         let baseline = routed.primary_quality.unwrap();
         let (candidate, repair) = routed.repair.as_ref().expect("fixture activates repair");
 
@@ -15629,6 +15751,69 @@ mod tests {
     }
 
     #[test]
+    fn large_global_lane_delta_eliminates_one_attributed_repair_profile_sweep() {
+        let options = LayoutOptions {
+            port_stub: 1e-3,
+            ..LayoutOptions::default()
+        };
+        let route_and_measure = |graph: Graph, geometry: Vec<NodeGeometry>, ranks: Vec<usize>| {
+            let indexed = validate_and_index(&graph, options).unwrap();
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            take_routing_reuse_counts();
+            take_horizontal_crossing_profile_calls();
+            let routed = route_planned_candidates_with_sparse_global(
+                &plan, &geometry, options, true, true, true,
+            );
+            let counts = take_routing_reuse_counts();
+            let calls = take_horizontal_crossing_profile_calls();
+            assert_eq!(routed.alternatives.len(), 1);
+            assert!(routed.repair.is_none());
+            assert_eq!(
+                routed.alternatives[0].0,
+                route_quality(&indexed, &routed.alternatives[0].1)
+            );
+            (routed.alternatives.len(), counts, calls)
+        };
+
+        let eligible_fixture = large_global_gap_route_fixture();
+        let (mut fallback_graph, fallback_geometry, fallback_ranks) =
+            large_global_gap_route_fixture();
+        fallback_graph.edges.push(Edge {
+            id: 10_000,
+            source: Endpoint { node: 1, port: 0 },
+            target: Endpoint { node: 3, port: 0 },
+            net: 10_000,
+            participates_in_ranking: false,
+        });
+
+        let (eligible_families, eligible_counts, eligible_calls) =
+            route_and_measure(eligible_fixture.0, eligible_fixture.1, eligible_fixture.2);
+        let (fallback_families, fallback_counts, fallback_calls) =
+            route_and_measure(fallback_graph, fallback_geometry, fallback_ranks);
+
+        assert_eq!(eligible_families, 1);
+        assert_eq!(fallback_families, 1);
+        assert_eq!(eligible_counts.lane_delta_global_eligible, 1);
+        assert_eq!(
+            eligible_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts::default()
+        );
+        assert_eq!(fallback_counts.lane_delta_global_eligible, 0);
+        assert_eq!(
+            fallback_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts {
+                outer_lanes_present: 1,
+                ..super::LaneDeltaFallbackCounts::default()
+            }
+        );
+
+        // Both runs retain one baseline attributed profile and emit one large-global family.
+        // The eligible family carries its delta-updated profile into repair selection; the
+        // outer-lane-gated family must rebuild that profile with one full attributed sweep.
+        assert_eq!(fallback_calls, eligible_calls + 1);
+    }
+
+    #[test]
     fn global_gap_order_enforces_per_gap_and_aggregate_work_gates() {
         let candidates = |count: u32| {
             let current = (0..count)
@@ -16187,11 +16372,13 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn supplemental_routing_generates_and_exactly_scores_a_crossing_repair() {
-        const SIDE: u32 = 70;
+    fn crossing_repair_route_fixture(
+        target_y_order: &[u32],
+        target_y_offset: f64,
+    ) -> (Graph, Vec<NodeGeometry>, Vec<usize>) {
+        let side = target_y_order.len() as u32;
         let graph = Graph {
-            nodes: (0..SIDE * 2)
+            nodes: (0..side * 2)
                 .map(|id| Node {
                     id,
                     width: 10.0,
@@ -16199,7 +16386,7 @@ mod tests {
                     cycle_breaker: false,
                     ports: vec![Port {
                         id: 0,
-                        side: if id < SIDE {
+                        side: if id < side {
                             PortSide::East
                         } else {
                             PortSide::West
@@ -16208,12 +16395,12 @@ mod tests {
                     }],
                 })
                 .collect(),
-            edges: (0..SIDE)
+            edges: (0..side)
                 .map(|id| Edge {
                     id,
                     source: Endpoint { node: id, port: 0 },
                     target: Endpoint {
-                        node: SIDE * 2 - 1 - id,
+                        node: side + id,
                         port: 0,
                     },
                     net: id,
@@ -16221,19 +16408,142 @@ mod tests {
                 })
                 .collect(),
         };
-        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
-        let ranks = (0..SIDE * 2)
-            .map(|id| usize::from(id >= SIDE))
+        let ranks = (0..side * 2)
+            .map(|id| usize::from(id >= side))
             .collect::<Vec<_>>();
-        let nodes = (0..SIDE * 2)
+        let nodes = (0..side * 2)
             .map(|id| NodeGeometry {
                 id,
-                x: if id < SIDE { 0.0 } else { 200.0 },
-                y: f64::from(id % SIDE) * 30.0,
+                x: if id < side { 0.0 } else { 200.0 },
+                y: if id < side {
+                    f64::from(id) * 30.0
+                } else {
+                    f64::from(target_y_order[(id - side) as usize]) * 30.0 + target_y_offset
+                },
                 width: 10.0,
                 height: 10.0,
             })
             .collect::<Vec<_>>();
+        (graph, nodes, ranks)
+    }
+
+    fn measured_crossing_repair_fixture(
+        side: u32,
+        target_y_offset: f64,
+        deeper_repair: bool,
+    ) -> (super::RoutedEdges, super::RoutingReuseCounts, usize) {
+        let target_y_order = (0..side).rev().collect::<Vec<_>>();
+        let (graph, nodes, ranks) = crossing_repair_route_fixture(&target_y_order, target_y_offset);
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index(&graph, options).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        take_routing_reuse_counts();
+        take_horizontal_crossing_profile_calls();
+        let routed = route_planned_candidates_with_quality_options(
+            &plan,
+            &nodes,
+            options,
+            true,
+            false,
+            false,
+            false,
+            false,
+            deeper_repair,
+        );
+        let counts = take_routing_reuse_counts();
+        let profile_calls = take_horizontal_crossing_profile_calls();
+
+        assert_eq!(
+            routed.primary_quality,
+            Some(route_quality(&indexed, &routed.primary))
+        );
+        if let Some((quality, routes)) = &routed.repair {
+            assert_eq!(*quality, route_quality(&indexed, routes));
+        }
+        for (quality, routes) in &routed.alternatives {
+            assert_eq!(*quality, route_quality(&indexed, routes));
+        }
+        (routed, counts, profile_calls)
+    }
+
+    #[test]
+    fn repair_lane_delta_scores_an_eligible_single_net() {
+        // Sixty-five reversed nets put exactly one movable horizontal participant at the
+        // per-net repair threshold. The target-row offset prevents source/target arm overlap, so
+        // endpoint tracks stay empty and the repair reuses its crossing paths.
+        let (eligible, eligible_counts, eligible_calls) =
+            measured_crossing_repair_fixture(65, 10.0, false);
+
+        assert_eq!(eligible.repair_nets.len(), 1);
+        assert!(eligible.repair.is_some());
+        assert_eq!(eligible.alternatives.len(), 0);
+
+        assert_eq!(eligible_counts.repair_crossing_paths, 1);
+        assert_eq!(eligible_counts.repair_crossing_paths_recomputed, 0);
+        assert_eq!(eligible_counts.lane_delta_standard_repair_eligible, 1);
+        assert_eq!(eligible_counts.lane_delta_deep_repair_eligible, 0);
+        assert_eq!(
+            eligible_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts::default()
+        );
+        assert_eq!(
+            eligible_calls, 1,
+            "the eligible candidate must add no sweep beyond baseline attribution"
+        );
+    }
+
+    #[test]
+    fn repair_lane_delta_scores_eligible_batched_standard_and_deep_candidates_once_each() {
+        // At 70 nets the standard selector chooses two movable nets and the deep selector four.
+        // As above, the paired no-offset fixture preserves topology and selection but rebuilds
+        // endpoint tracks and paths, forcing both candidates through the full attributed scorer.
+        let (eligible, eligible_counts, eligible_calls) =
+            measured_crossing_repair_fixture(70, 10.0, true);
+        let (fallback, fallback_counts, fallback_calls) =
+            measured_crossing_repair_fixture(70, 0.0, true);
+
+        assert_eq!(eligible.repair_nets.len(), 2);
+        assert_eq!(fallback.repair_nets, eligible.repair_nets);
+        assert!(eligible.repair.is_some());
+        assert!(fallback.repair.is_some());
+        assert_eq!(eligible.alternatives.len(), 1);
+        assert_eq!(fallback.alternatives.len(), 1);
+
+        assert_eq!(eligible_counts.repair_crossing_paths, 2);
+        assert_eq!(eligible_counts.repair_crossing_paths_recomputed, 0);
+        assert_eq!(eligible_counts.lane_delta_standard_repair_eligible, 1);
+        assert_eq!(eligible_counts.lane_delta_deep_repair_eligible, 1);
+        assert_eq!(
+            eligible_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts::default()
+        );
+
+        assert_eq!(fallback_counts.repair_crossing_paths, 0);
+        assert_eq!(fallback_counts.repair_crossing_paths_recomputed, 2);
+        assert_eq!(fallback_counts.lane_delta_standard_repair_eligible, 0);
+        assert_eq!(fallback_counts.lane_delta_deep_repair_eligible, 0);
+        assert_eq!(
+            fallback_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts {
+                endpoint_tracks_changed: 1,
+                crossing_paths_changed_or_not_reused: 1,
+                ..super::LaneDeltaFallbackCounts::default()
+            }
+        );
+
+        // Standard and deep each replace at most their one existing exact candidate sweep.
+        assert_eq!(fallback_calls, eligible_calls + 2);
+    }
+
+    #[test]
+    fn supplemental_routing_generates_and_exactly_scores_a_crossing_repair() {
+        const SIDE: u32 = 70;
+        let target_y_order = (0..SIDE).collect::<Vec<_>>();
+        let (mut graph, nodes, ranks) = crossing_repair_route_fixture(&target_y_order, 0.0);
+        for edge in &mut graph.edges {
+            edge.target.node = SIDE * 2 - 1 - edge.id;
+        }
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
         let plan = RoutingPlan::new(&indexed, &ranks);
 
         let routed = route_planned_candidates(&plan, &nodes, LayoutOptions::default(), true);
@@ -16381,8 +16691,8 @@ mod tests {
         );
         assert_eq!(
             take_horizontal_crossing_profile_calls(),
-            1,
-            "both repairs must share one baseline attribution profile",
+            3,
+            "both fallbacks must share one baseline profile and fully score one candidate each",
         );
         assert_eq!(deeper.primary, routed.primary);
         assert_eq!(deeper.primary_quality, routed.primary_quality);
