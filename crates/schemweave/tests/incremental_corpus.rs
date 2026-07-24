@@ -1,6 +1,6 @@
 use schemweave::{
-    Graph, GroupExpansion, GroupExpansionOptions, Layout, LayoutConfig, LayoutConstraints,
-    expand_group_in_place,
+    Graph, GroupExpansion, GroupExpansionError, GroupExpansionOptions, Layout, LayoutConfig,
+    LayoutConstraints, expand_group_in_place, expand_group_in_place_with_reference_height,
 };
 use serde::Deserialize;
 
@@ -154,4 +154,71 @@ fn captured_focused_register_vector_expands_without_a_full_relayout() {
             || node.y >= bottom
             || node.y + node.height <= top
     }));
+}
+
+#[test]
+fn focused_register_vector_keeps_its_original_grid_shape() {
+    let original = captured_register_vector_expansion();
+    let focused = captured_focused_register_vector_expansion();
+    let original_expanded = expand_without_a_full_relayout(&original);
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints = focused.constraints.clone();
+    let focused_expanded = expand_group_in_place_with_reference_height(
+        &focused.compact_graph,
+        &focused.compact_layout,
+        &focused.expanded_graph,
+        &focused.expansion,
+        original.compact_layout.height,
+        &GroupExpansionOptions {
+            layout: config.layout,
+            quality_effort: config.quality_effort,
+            constraints: config.constraints,
+        },
+    )
+    .expect("focused expansion should retain the original arrangement decision");
+    let grid_shape = |layout: &Layout, expansion: &GroupExpansion| {
+        let members = layout
+            .nodes
+            .iter()
+            .filter(|node| expansion.members.contains(&node.id))
+            .collect::<Vec<_>>();
+        let columns = members
+            .iter()
+            .map(|node| node.x.to_bits())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let rows = members
+            .iter()
+            .map(|node| node.y.to_bits())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        (columns, rows)
+    };
+
+    assert_eq!(
+        grid_shape(&focused_expanded, &focused.expansion),
+        grid_shape(&original_expanded, &original.expansion),
+    );
+}
+
+#[test]
+fn expansion_rejects_an_invalid_reference_height() {
+    let captured = captured_focused_register_vector_expansion();
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints = captured.constraints.clone();
+    let error = expand_group_in_place_with_reference_height(
+        &captured.compact_graph,
+        &captured.compact_layout,
+        &captured.expanded_graph,
+        &captured.expansion,
+        0.0,
+        &GroupExpansionOptions {
+            layout: config.layout,
+            quality_effort: config.quality_effort,
+            constraints: config.constraints,
+        },
+    )
+    .expect_err("a non-positive reference height must be rejected");
+
+    assert_eq!(error, GroupExpansionError::InvalidReferenceHeight(0.0));
 }

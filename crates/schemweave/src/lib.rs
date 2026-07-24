@@ -27,7 +27,7 @@ use thiserror::Error;
 
 pub use incremental::{
     BoundaryTrunk, GroupExpansion, GroupExpansionError, GroupExpansionOptions,
-    expand_group_in_place,
+    expand_group_in_place, expand_group_in_place_with_reference_height,
 };
 pub use placement::place;
 pub(crate) use readability::measure_parallel_congestion_profile_bounded;
