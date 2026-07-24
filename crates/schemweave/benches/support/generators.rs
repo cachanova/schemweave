@@ -253,6 +253,85 @@ pub fn expansion_pair(members: u32, bystanders: u32) -> (Graph, Graph, GroupExpa
     (compact, expanded, expansion)
 }
 
+fn shared_boundary_expansion_pair(members: u32, incoming: bool) -> (Graph, Graph, GroupExpansion) {
+    assert!(members >= 2);
+    let anchor = if incoming {
+        block(1, 1, 0)
+    } else {
+        block(1, 0, 1)
+    };
+    let retained = if incoming {
+        block(0, 0, 1)
+    } else {
+        block(2, 1, 0)
+    };
+    let compact_edge = if incoming {
+        edge(1, (0, 0), (1, 0), 1)
+    } else {
+        edge(1, (1, 0), (2, 0), 1)
+    };
+    let compact = Graph {
+        nodes: vec![retained.clone(), anchor],
+        edges: vec![compact_edge],
+    };
+    let member_ids = (0..members).map(|index| 200 + index).collect::<Vec<_>>();
+    let member_nodes = member_ids
+        .iter()
+        .map(|&id| {
+            if incoming {
+                block(id, 1, 0)
+            } else {
+                block(id, 0, 1)
+            }
+        })
+        .collect::<Vec<_>>();
+    let expanded_edges = member_ids
+        .iter()
+        .enumerate()
+        .map(|(index, &member)| {
+            let id = 10 + index as u32;
+            if incoming {
+                edge(id, (0, 0), (member, 0), 1)
+            } else {
+                edge(id, (member, 0), (2, 0), 1)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut expanded_nodes = vec![retained];
+    expanded_nodes.extend(member_nodes);
+    let expansion = GroupExpansion {
+        anchor: 1,
+        members: member_ids,
+        boundary_trunks: expanded_edges
+            .iter()
+            .map(|edge| BoundaryTrunk {
+                expanded_edge: edge.id,
+                compact_edge: 1,
+            })
+            .collect(),
+    };
+    (
+        compact,
+        Graph {
+            nodes: expanded_nodes,
+            edges: expanded_edges,
+        },
+        expansion,
+    )
+}
+
+/// One retained driver feeding every expanded member through a shared input
+/// boundary trunk.
+pub fn boundary_fanout_expansion_pair(members: u32) -> (Graph, Graph, GroupExpansion) {
+    shared_boundary_expansion_pair(members, true)
+}
+
+/// Every expanded member converging on one retained consumer through a shared
+/// output boundary trunk.
+pub fn boundary_fanin_expansion_pair(members: u32) -> (Graph, Graph, GroupExpansion) {
+    shared_boundary_expansion_pair(members, false)
+}
+
 /// A wider expansion followed by one retained peer chain. The peer lies
 /// entirely to the right of the compact anchor, so opening the horizontal
 /// corridor must translate every peer node and internal route rigidly.

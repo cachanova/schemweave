@@ -128,6 +128,69 @@ fn expand_benches(c: &mut Criterion) {
     }
     group.finish();
 
+    let mut group = c.benchmark_group("expand/shared-boundary");
+    for (role, fixture) in [
+        (
+            "fanout",
+            generators::boundary_fanout_expansion_pair
+                as fn(u32) -> (Graph, Graph, schemweave::GroupExpansion),
+        ),
+        ("fanin", generators::boundary_fanin_expansion_pair),
+    ] {
+        for members in [64, 256] {
+            let (compact, expanded, expansion) = fixture(members);
+            for (effort_label, effort) in EFFORTS {
+                let config = config(effort);
+                let compact_layout =
+                    layout_with_config(&compact, &config).expect("compact fixture must lay out");
+                let options = GroupExpansionOptions {
+                    layout: config.layout,
+                    quality_effort: config.quality_effort,
+                    constraints: config.constraints.clone(),
+                    protected_groups: Vec::new(),
+                };
+                let first = expand_group_in_place(
+                    &compact,
+                    &compact_layout,
+                    &expanded,
+                    &expansion,
+                    &options,
+                )
+                .expect("shared-boundary expansion");
+                let second = expand_group_in_place(
+                    &compact,
+                    &compact_layout,
+                    &expanded,
+                    &expansion,
+                    &options,
+                )
+                .expect("shared-boundary expansion");
+                assert_eq!(
+                    first, second,
+                    "shared-boundary expansion must be deterministic before measuring"
+                );
+                group.throughput(Throughput::Elements(expanded.edges.len() as u64));
+                group.bench_with_input(
+                    BenchmarkId::new(format!("{role}-{members}"), effort_label),
+                    &(&compact, &compact_layout, &expanded, &expansion),
+                    |b, (compact, compact_layout, expanded, expansion)| {
+                        b.iter(|| {
+                            expand_group_in_place(
+                                compact,
+                                compact_layout,
+                                expanded,
+                                expansion,
+                                &options,
+                            )
+                            .expect("shared-boundary expansion")
+                        })
+                    },
+                );
+            }
+        }
+    }
+    group.finish();
+
     let mut group = c.benchmark_group("expand/protected-peers");
     for (label, peer_count, peer_members) in [("1x8", 1, 8), ("8x1", 8, 1)] {
         let (compact, expanded, expansion, peer_ids) =

@@ -25,6 +25,14 @@ fn generators_are_deterministic() {
         generators::protected_horizontal_expansion_pair(8, 8),
         generators::protected_horizontal_expansion_pair(8, 8)
     );
+    assert_eq!(
+        generators::boundary_fanout_expansion_pair(64),
+        generators::boundary_fanout_expansion_pair(64)
+    );
+    assert_eq!(
+        generators::boundary_fanin_expansion_pair(64),
+        generators::boundary_fanin_expansion_pair(64)
+    );
 }
 
 #[test]
@@ -140,5 +148,50 @@ fn expansion_fixture_expands_without_full_relayout() {
             compact.edges.len(),
             "({members}, {bystanders}) collapsed edge count"
         );
+    }
+}
+
+#[test]
+fn shared_boundary_expansion_fixtures_are_reproducible() {
+    use schemweave::{GroupExpansionOptions, expand_group_in_place};
+
+    for (name, fixture) in [
+        (
+            "fanout",
+            generators::boundary_fanout_expansion_pair
+                as fn(
+                    u32,
+                ) -> (
+                    schemweave::Graph,
+                    schemweave::Graph,
+                    schemweave::GroupExpansion,
+                ),
+        ),
+        ("fanin", generators::boundary_fanin_expansion_pair),
+    ] {
+        for members in [64, 256] {
+            let (compact, expanded, expansion) = fixture(members);
+            let config = fast();
+            let compact_layout =
+                layout_with_config(&compact, &config).expect("compact boundary fixture");
+            let options = GroupExpansionOptions {
+                layout: config.layout,
+                quality_effort: config.quality_effort,
+                constraints: config.constraints,
+                protected_groups: Vec::new(),
+            };
+            let first =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .unwrap_or_else(|error| {
+                        panic!("{name}-{members} shared-boundary expansion failed: {error:?}")
+                    });
+            let second =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("second shared-boundary expansion");
+            assert_eq!(
+                first, second,
+                "{name}-{members} expansion is not reproducible"
+            );
+        }
     }
 }
