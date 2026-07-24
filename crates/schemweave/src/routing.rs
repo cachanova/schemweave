@@ -109,6 +109,11 @@ const MAX_CROSSING_REPAIR_NODES: usize = 2_000;
 const MAX_CROSSING_REPAIR_ROUTE_POINTS: usize = 100_000;
 const MAX_CROSSING_REPAIR_LANE_MEMBERSHIPS: usize = 100_000;
 const MAX_CROSSING_REPAIR_PATH_STATES: usize = 500_000;
+// Below this total route-point count, full crossing sweeps cost less than the reuse bookkeeping
+// (RouteSetIdentity allocation plus per-point eligibility walks), so score reuse is skipped and the
+// full recompute/rebuild path is taken instead. Measured on the microsecond-scale expansion member
+// layouts that regressed under reuse, versus the multi-millisecond DAG cells the reuse targets.
+const MIN_SCORE_REUSE_ROUTE_POINTS: usize = 2048;
 // Small nets keep the historical stable-ID order. For a single-source outer fanout, higher channel
 // indices usually shorten the many sink escapes at the cost of one shared source arm; the exact
 // route scorer below still rejects the heuristic whenever that trade is not beneficial.
@@ -6871,10 +6876,19 @@ fn per_edge_bend_structure_matches(left: &[EdgeGeometry], right: &[EdgeGeometry]
         })
 }
 
+fn route_set_point_total(routes: &[EdgeGeometry]) -> usize {
+    routes.iter().map(|route| route.points.len()).sum()
+}
+
 fn spacing_score_reuse_is_eligible(
     base: &SpacingRouteCandidate<'_>,
     sibling: &SpacingRouteCandidate<'_>,
 ) -> bool {
+    // Below the reuse threshold the full crossing sweep is cheaper than the reuse bookkeeping, so
+    // skip reuse before any per-point walking. Summing point counts is O(#routes), not O(points).
+    if route_set_point_total(&base.routes) < MIN_SCORE_REUSE_ROUTE_POINTS {
+        return false;
+    }
     // Current emission sites copy one SpacingRoutePlan into both candidates, so these component
     // identity checks are guards for future call sites. The substantive proof today is the
     // pure-sparse outer-lane exclusion plus unchanged per-edge physical segment topology.
@@ -6968,9 +6982,11 @@ fn select_gap_spacing_candidate(
     retain_rejected: bool,
 ) -> GapSpacingSelection {
     let Some(adaptive) = adaptive else {
-        let retained_crossing_profile = compact_profile.filter(|profile| {
-            retained_crossing_profile_is_applicable(plan, &compact.routes, profile)
-        });
+        let retained_crossing_profile = compact_profile
+            .filter(|_| route_set_point_total(&compact.routes) >= MIN_SCORE_REUSE_ROUTE_POINTS)
+            .filter(|profile| {
+                retained_crossing_profile_is_applicable(plan, &compact.routes, profile)
+            });
         debug_assert!(
             retained_crossing_profile
                 .as_ref()
@@ -6996,6 +7012,11 @@ fn select_gap_spacing_candidate(
         ..
     } = adaptive;
     let distinct = compact != adaptive;
+    // Retain a selected profile for downstream repair reuse only when the route set is large enough
+    // that the reuse bookkeeping (identity match walks, propagation) pays off; below the threshold
+    // downstream falls back to its rebuild path, which is behaviorally identical. O(#routes).
+    let compact_reuse = route_set_point_total(&compact) >= MIN_SCORE_REUSE_ROUTE_POINTS;
+    let adaptive_reuse = route_set_point_total(&adaptive) >= MIN_SCORE_REUSE_ROUTE_POINTS;
     let compact_profile =
         retained_spacing_route_profile(plan, &compact, compact_quality, compact_profile);
     let adaptive_profile = if reuse_is_eligible {
@@ -7010,7 +7031,7 @@ fn select_gap_spacing_candidate(
             GapSpacingSelection {
                 routes: adaptive,
                 quality: Some(adaptive_quality),
-                retained_crossing_profile: Some(adaptive_profile),
+                retained_crossing_profile: adaptive_reuse.then_some(adaptive_profile),
                 spacing: adaptive_spacing,
                 rejected: (retain_rejected && distinct).then_some((compact_quality, compact)),
             }
@@ -7018,7 +7039,7 @@ fn select_gap_spacing_candidate(
             GapSpacingSelection {
                 routes: compact,
                 quality: Some(compact_quality),
-                retained_crossing_profile: Some(compact_profile),
+                retained_crossing_profile: compact_reuse.then_some(compact_profile),
                 spacing: compact_spacing,
                 rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
             }
@@ -7043,7 +7064,7 @@ fn select_gap_spacing_candidate(
         GapSpacingSelection {
             routes: adaptive,
             quality: Some(adaptive_quality),
-            retained_crossing_profile: Some(adaptive_profile),
+            retained_crossing_profile: adaptive_reuse.then_some(adaptive_profile),
             spacing: adaptive_spacing,
             rejected: (retain_rejected && distinct).then_some((compact_quality, compact)),
         }
@@ -7051,7 +7072,7 @@ fn select_gap_spacing_candidate(
         GapSpacingSelection {
             routes: compact,
             quality: Some(compact_quality),
-            retained_crossing_profile: Some(compact_profile),
+            retained_crossing_profile: compact_reuse.then_some(compact_profile),
             spacing: compact_spacing,
             rejected: (retain_rejected && distinct).then_some((adaptive_quality, adaptive)),
         }
