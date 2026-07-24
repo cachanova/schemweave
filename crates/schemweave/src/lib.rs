@@ -195,7 +195,9 @@ pub struct LayoutConstraints {
 ///
 /// Members retain independent edge identity. `slots` name occupied positions
 /// within the graphical bus. Same-net members with identical slot sets form a
-/// fanout cohort and share one physical tap; every other overlap is invalid.
+/// fanout cohort. A boundary-local collector shares one tap per cohort; an
+/// interior collector may expose multiple declared branch taps along the same
+/// full-width bus. Every other slot overlap is invalid.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoundaryBundleConstraint {
     pub id: BoundaryBundleId,

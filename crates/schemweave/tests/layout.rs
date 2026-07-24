@@ -1635,7 +1635,7 @@ fn highest_quality_routes_captured_reg_mux_boundary_bundles_with_positive_cleara
 }
 
 #[test]
-fn input_boundary_bundle_emits_a_pitched_collector_and_unique_horizontal_taps() {
+fn input_boundary_bundle_advances_one_collector_to_the_first_interior_divergence() {
     let graph = Graph {
         nodes: vec![
             node(1, false),
@@ -1697,11 +1697,14 @@ fn input_boundary_bundle_emits_a_pitched_collector_and_unique_horizontal_taps() 
     );
     assert_eq!(bundle.collector.start.x, bundle.collector.end.x);
     assert_eq!(bundle.spine.start.y, bundle.spine.end.y);
-    assert_eq!(
-        bundle.members[1].tap.y - bundle.members[0].tap.y,
-        LayoutOptions::default().route_lane_gap
+    let default_options = LayoutOptions::default();
+    assert!(
+        bundle.spine.end.x - bundle.spine.start.x
+            > default_options.port_stub + default_options.route_lane_gap
     );
     for member in &bundle.members {
+        assert_eq!(member.tap.x, bundle.collector.start.x);
+        assert!(member.tap.y >= bundle.collector.start.y && member.tap.y <= bundle.collector.end.y);
         let route = result
             .edges
             .iter()
@@ -1750,10 +1753,13 @@ fn input_boundary_bundle_emits_a_pitched_collector_and_unique_horizontal_taps() 
         &constraints,
     )
     .unwrap();
-    assert_eq!(
-        wider_pitch.boundary_bundles[0].members[1].tap.y
-            - wider_pitch.boundary_bundles[0].members[0].tap.y,
-        6.0
+    let wider_options = LayoutOptions {
+        route_lane_gap: 6.0,
+        ..LayoutOptions::default()
+    };
+    assert!(
+        wider_pitch.boundary_bundles[0].spine.end.x - wider_pitch.boundary_bundles[0].spine.start.x
+            > wider_options.port_stub + wider_options.route_lane_gap
     );
 
     let mut sparse_declared_width = constraints.clone();
@@ -2182,7 +2188,7 @@ fn wide_live_shape_bundles_reserve_distinct_boundary_corridors() {
 }
 
 #[test]
-fn same_net_fanout_with_identical_slots_shares_one_visible_tap_deterministically() {
+fn same_net_fanout_can_branch_at_multiple_declared_interior_taps_deterministically() {
     let graph = Graph {
         nodes: vec![
             node(1, false),
@@ -2238,15 +2244,14 @@ fn same_net_fanout_with_identical_slots_shares_one_visible_tap_deterministically
             .unwrap()
             .tap
     };
-    assert_eq!(tap(10), tap(11));
-    assert_ne!(tap(10), tap(12));
+    assert_ne!(tap(10), tap(11));
     let distinct_taps = bundle
         .members
         .iter()
         .map(|member| (member.tap.x.to_bits(), member.tap.y.to_bits()))
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(distinct_taps.len(), 2);
-    for edge in [10, 11] {
+    assert!(distinct_taps.len() >= 2);
+    for edge in [10, 11, 12] {
         assert_eq!(
             result
                 .edges
@@ -2257,20 +2262,16 @@ fn same_net_fanout_with_identical_slots_shares_one_visible_tap_deterministically
             tap(edge)
         );
     }
-    let corridor_x = |edge| {
+    let first_departure = |edge| {
         result
             .edges
             .iter()
             .find(|route| route.id == edge)
             .unwrap()
             .points[1]
-            .x
     };
-    assert_eq!(corridor_x(10), corridor_x(11));
-    assert_eq!(
-        corridor_x(12) - corridor_x(10),
-        LayoutOptions::default().route_lane_gap
-    );
+    assert_ne!(first_departure(10), tap(10));
+    assert_ne!(first_departure(11), tap(11));
 
     let mut permuted_graph = graph.clone();
     permuted_graph.nodes.reverse();
