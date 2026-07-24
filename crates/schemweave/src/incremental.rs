@@ -3876,25 +3876,8 @@ fn compose_candidate(
         .into_values()
         .filter(|group| group.len() > 1)
         .collect::<Vec<_>>();
-    let shared_lane_count = incoming_groups.len() + outgoing_groups.len();
-    let mut shared_incoming_by_edge = BTreeMap::<EdgeId, (Vec<EdgeId>, usize, usize)>::new();
-    for (lane, group) in incoming_groups.into_iter().enumerate() {
-        for &edge in &group {
-            shared_incoming_by_edge.insert(edge, (group.clone(), lane, shared_lane_count));
-        }
-    }
-    let mut shared_outgoing_by_edge = BTreeMap::<EdgeId, (Vec<EdgeId>, usize, usize)>::new();
-    for (offset, group) in outgoing_groups.into_iter().enumerate() {
-        let lane = shared_incoming_by_edge
-            .values()
-            .map(|(_, lane, _)| *lane)
-            .max()
-            .map_or(0, |lane| lane + 1)
-            + offset;
-        for &edge in &group {
-            shared_outgoing_by_edge.insert(edge, (group.clone(), lane, shared_lane_count));
-        }
-    }
+    let (mut shared_groups, shared_group_by_edge) =
+        shared_boundary_groups(incoming_groups, outgoing_groups);
     let bridge_pitch = options
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
@@ -3983,39 +3966,36 @@ fn compose_candidate(
                     incoming_lane_by_column_net
                         [&(FloatKey(node_geometry[&edge.target.node].x), edge.net)]
                 };
-                if let Some((group, trunk_lane, trunk_lanes)) =
-                    shared_incoming_by_edge.get(&edge.id)
-                {
+                if let Some(&group_index) = shared_group_by_edge.get(&edge.id) {
+                    let group = &mut shared_groups[group_index];
+                    let geometry = if let Some(geometry) = group.geometry {
+                        geometry
+                    } else {
+                        let geometry = shared_boundary_group_geometry(
+                            group,
+                            edge.id,
+                            &expanded_edge_by_id,
+                            contract,
+                            &node_geometry,
+                            options,
+                            if group.role == BoundaryBundleRole::Input {
+                                &incoming_lane_by_column_net
+                            } else {
+                                &outgoing_lane_by_column_net
+                            },
+                        )?;
+                        group.geometry = Some(geometry);
+                        geometry
+                    };
                     shared_boundary_trunk_route(
                         edge,
-                        group,
-                        &expanded_edge_by_id,
                         contract,
                         &node_geometry,
                         &obstacles,
                         options,
-                        BoundaryBundleRole::Input,
+                        group.role,
+                        geometry,
                         approach_lane_offset,
-                        &incoming_lane_by_column_net,
-                        *trunk_lane,
-                        *trunk_lanes,
-                    )?
-                } else if let Some((group, trunk_lane, trunk_lanes)) =
-                    shared_outgoing_by_edge.get(&edge.id)
-                {
-                    shared_boundary_trunk_route(
-                        edge,
-                        group,
-                        &expanded_edge_by_id,
-                        contract,
-                        &node_geometry,
-                        &obstacles,
-                        options,
-                        BoundaryBundleRole::Output,
-                        approach_lane_offset,
-                        &outgoing_lane_by_column_net,
-                        *trunk_lane,
-                        *trunk_lanes,
                     )?
                 } else if let Some(bundle) = boundary_bundles.retaps.get(&edge.id).copied() {
                     bundled_boundary_route(
@@ -4067,21 +4047,59 @@ fn compose_candidate(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SharedBoundaryGeometry {
+    trunk_y: f64,
+    junction_x: f64,
+}
+
+#[derive(Debug)]
+struct SharedBoundaryGroup {
+    edges: Vec<EdgeId>,
+    role: BoundaryBundleRole,
+    lane: usize,
+    lanes: usize,
+    geometry: Option<SharedBoundaryGeometry>,
+}
+
+fn shared_boundary_groups(
+    incoming: Vec<Vec<EdgeId>>,
+    outgoing: Vec<Vec<EdgeId>>,
+) -> (Vec<SharedBoundaryGroup>, BTreeMap<EdgeId, usize>) {
+    let lanes = incoming.len() + outgoing.len();
+    let mut groups = Vec::with_capacity(lanes);
+    let mut group_by_edge = BTreeMap::new();
+    for (role, role_groups) in [
+        (BoundaryBundleRole::Input, incoming),
+        (BoundaryBundleRole::Output, outgoing),
+    ] {
+        for edges in role_groups {
+            let index = groups.len();
+            for &edge in &edges {
+                group_by_edge.insert(edge, index);
+            }
+            groups.push(SharedBoundaryGroup {
+                edges,
+                role,
+                lane: index,
+                lanes,
+                geometry: None,
+            });
+        }
+    }
+    (groups, group_by_edge)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn shared_boundary_trunk_route(
-    edge: &Edge,
-    group: &[EdgeId],
+fn shared_boundary_group_geometry(
+    group: &SharedBoundaryGroup,
+    failing_edge: EdgeId,
     edges: &BTreeMap<EdgeId, &Edge>,
     contract: &ExpansionContract<'_>,
     node_geometry: &BTreeMap<NodeId, &NodeGeometry>,
-    obstacles: &ObstacleIndex,
     options: LayoutOptions,
-    role: BoundaryBundleRole,
-    approach_lane_offset: f64,
     approach_lane_by_column_net: &BTreeMap<(FloatKey, NetId), f64>,
-    trunk_lane: usize,
-    trunk_lanes: usize,
-) -> Result<EdgeGeometry, GroupExpansionError> {
+) -> Result<SharedBoundaryGeometry, GroupExpansionError> {
     let clearance = crate::outward_obstacle_clearance_stub(options);
     let member_nodes = contract
         .members
@@ -4092,10 +4110,70 @@ fn shared_boundary_trunk_route(
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
     let Some(trunk_y) =
-        central_member_corridor_y(&member_nodes, clearance, pitch, trunk_lane, trunk_lanes)
+        central_member_corridor_y(&member_nodes, clearance, pitch, group.lane, group.lanes)
     else {
-        return Err(GroupExpansionError::NoSafeBoundaryBridge(edge.id));
+        return Err(GroupExpansionError::NoSafeBoundaryBridge(failing_edge));
     };
+    let junction_x = match group.role {
+        BoundaryBundleRole::Input => group
+            .edges
+            .iter()
+            .map(|id| {
+                let grouped = edges[id];
+                let node = contract.expanded_nodes[&grouped.target.node];
+                let endpoint =
+                    endpoint_point(node_geometry[&grouped.target.node], node, grouped.target);
+                let offset = approach_lane_by_column_net
+                    [&(FloatKey(node_geometry[&grouped.target.node].x), grouped.net)];
+                outward_stub(
+                    endpoint,
+                    port(node, grouped.target).side,
+                    clearance + offset,
+                )
+                .x
+            })
+            .min_by(f64::total_cmp)
+            .expect("shared boundary group is non-empty"),
+        BoundaryBundleRole::Output => group
+            .edges
+            .iter()
+            .map(|id| {
+                let grouped = edges[id];
+                let node = contract.expanded_nodes[&grouped.source.node];
+                let endpoint =
+                    endpoint_point(node_geometry[&grouped.source.node], node, grouped.source);
+                let source = node_geometry[&grouped.source.node];
+                let offset =
+                    approach_lane_by_column_net[&(FloatKey(source.x + source.width), grouped.net)];
+                outward_stub(
+                    endpoint,
+                    port(node, grouped.source).side,
+                    clearance + offset,
+                )
+                .x
+            })
+            .max_by(f64::total_cmp)
+            .expect("shared boundary group is non-empty"),
+    };
+    Ok(SharedBoundaryGeometry {
+        trunk_y,
+        junction_x,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shared_boundary_trunk_route(
+    edge: &Edge,
+    contract: &ExpansionContract<'_>,
+    node_geometry: &BTreeMap<NodeId, &NodeGeometry>,
+    obstacles: &ObstacleIndex,
+    options: LayoutOptions,
+    role: BoundaryBundleRole,
+    geometry: SharedBoundaryGeometry,
+    approach_lane_offset: f64,
+) -> Result<EdgeGeometry, GroupExpansionError> {
+    let clearance = crate::outward_obstacle_clearance_stub(options);
+    let trunk_y = geometry.trunk_y;
     let gap = (options.node_gap / 2.0).max(options.edge_node_clearance);
 
     let points = match role {
@@ -4108,24 +4186,7 @@ fn shared_boundary_trunk_route(
             let target = endpoint_point(node_geometry[&edge.target.node], target_node, edge.target);
             let target_stub =
                 outward_stub(target, target_port.side, clearance + approach_lane_offset);
-            let entry_x = group
-                .iter()
-                .map(|id| {
-                    let grouped = edges[id];
-                    let node = contract.expanded_nodes[&grouped.target.node];
-                    let endpoint =
-                        endpoint_point(node_geometry[&grouped.target.node], node, grouped.target);
-                    let offset = approach_lane_by_column_net
-                        [&(FloatKey(node_geometry[&grouped.target.node].x), grouped.net)];
-                    outward_stub(
-                        endpoint,
-                        port(node, grouped.target).side,
-                        clearance + offset,
-                    )
-                    .x
-                })
-                .min_by(f64::total_cmp)
-                .expect("shared boundary group is non-empty");
+            let entry_x = geometry.junction_x;
             let source_node = contract.expanded_nodes[&edge.source.node];
             let source_port = port(source_node, edge.source);
             let source = endpoint_point(node_geometry[&edge.source.node], source_node, edge.source);
@@ -4164,25 +4225,7 @@ fn shared_boundary_trunk_route(
             let source = endpoint_point(node_geometry[&edge.source.node], source_node, edge.source);
             let source_stub =
                 outward_stub(source, source_port.side, clearance + approach_lane_offset);
-            let exit_x = group
-                .iter()
-                .map(|id| {
-                    let grouped = edges[id];
-                    let node = contract.expanded_nodes[&grouped.source.node];
-                    let endpoint =
-                        endpoint_point(node_geometry[&grouped.source.node], node, grouped.source);
-                    let source = node_geometry[&grouped.source.node];
-                    let offset = approach_lane_by_column_net
-                        [&(FloatKey(source.x + source.width), grouped.net)];
-                    outward_stub(
-                        endpoint,
-                        port(node, grouped.source).side,
-                        clearance + offset,
-                    )
-                    .x
-                })
-                .max_by(f64::total_cmp)
-                .expect("shared boundary group is non-empty");
+            let exit_x = geometry.junction_x;
             let target_node = contract.expanded_nodes[&edge.target.node];
             let target_port = port(target_node, edge.target);
             let target = endpoint_point(node_geometry[&edge.target.node], target_node, edge.target);
