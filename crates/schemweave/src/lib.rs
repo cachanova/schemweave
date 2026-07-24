@@ -195,7 +195,9 @@ pub struct LayoutConstraints {
 ///
 /// Members retain independent edge identity. `slots` name occupied positions
 /// within the graphical bus. Same-net members with identical slot sets form a
-/// fanout cohort and share one physical tap; every other overlap is invalid.
+/// fanout cohort. A boundary-local collector shares one tap per cohort; an
+/// interior collector may expose multiple declared branch taps along the same
+/// full-width bus. Every other slot overlap is invalid.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoundaryBundleConstraint {
     pub id: BoundaryBundleId,
@@ -1208,8 +1210,6 @@ fn hard_geometry_failure(
         LayoutError::BoundaryBundleGeometryWorkLimitExceeded {
             maximum: boundary_bundles::MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
         }
-    } else if admission_state.boundary_bundle_rejected {
-        LayoutError::BoundaryBundleGeometryUnsatisfied
     } else if admission_state.contact_segment_exhausted {
         LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
             maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
@@ -1218,6 +1218,8 @@ fn hard_geometry_failure(
         LayoutError::UnrelatedRouteContactWorkLimitExceeded {
             maximum: MAX_LAYOUT_ROUTE_CONTACT_VISITS,
         }
+    } else if admission_state.boundary_bundle_rejected {
+        LayoutError::BoundaryBundleGeometryUnsatisfied
     } else if admission_state.clearance_work_exhausted {
         LayoutError::EdgeNodeClearanceWorkLimitExceeded {
             maximum: MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
@@ -1404,12 +1406,8 @@ fn prepare_owned_candidate(
     if !indexed.boundary_bundles.is_empty() {
         candidate = match boundary_bundles::apply_and_normalize(indexed, candidate, options) {
             Ok(candidate) => candidate,
-            Err(LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. }) => {
-                admission_state.boundary_bundle_work_exhausted = true;
-                return None;
-            }
-            Err(_) => {
-                admission_state.boundary_bundle_rejected = true;
+            Err(error) => {
+                record_boundary_bundle_application_error(&error, admission_state);
                 return None;
             }
         };
@@ -1428,6 +1426,26 @@ fn prepare_owned_candidate(
         raw_layout,
         layout: candidate,
     })
+}
+
+fn record_boundary_bundle_application_error(
+    error: &LayoutError,
+    admission_state: &mut CandidateAdmissionState,
+) {
+    match error {
+        LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. } => {
+            admission_state.boundary_bundle_work_exhausted = true;
+        }
+        LayoutError::UnrelatedRouteContactSegmentLimitExceeded { .. } => {
+            admission_state.contact_segment_exhausted = true;
+        }
+        LayoutError::UnrelatedRouteContactWorkLimitExceeded { .. } => {
+            admission_state.contact_work_exhausted = true;
+        }
+        _ => {
+            admission_state.boundary_bundle_rejected = true;
+        }
+    }
 }
 
 fn exact_layout_route_quality(
@@ -1671,12 +1689,13 @@ mod tests {
         AdmittedCandidate, BoundaryBundleConstraint, BoundaryBundleMemberConstraint,
         CandidateAdmissionState, CandidateRouting, Edge, EdgeGeometry, EdgeId, Endpoint, Graph,
         Layout, LayoutConstraints, LayoutError, LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
-        Node, NodeGeometry, Point, Port, PortSide, QualityEffort, boundary_bundle_rail_depth,
-        candidate_quality_cmp, candidate_satisfies_edge_node_clearance_bounded,
-        composite_pitched_quality_is_admissible, demand_aware_quality_is_better,
-        demand_aware_scale_is_eligible, effective_layout_options, effective_ranking_edges,
-        evaluate_candidate, full_family_pitched_spacing_enabled, hard_geometry_failure, layout,
-        outward_obstacle_clearance_stub, placement, retain_better_admitted_candidate,
+        MAX_LAYOUT_ROUTE_CONTACT_VISITS, Node, NodeGeometry, Point, Port, PortSide, QualityEffort,
+        boundary_bundle_rail_depth, candidate_quality_cmp,
+        candidate_satisfies_edge_node_clearance_bounded, composite_pitched_quality_is_admissible,
+        demand_aware_quality_is_better, demand_aware_scale_is_eligible, effective_layout_options,
+        effective_ranking_edges, evaluate_candidate, full_family_pitched_spacing_enabled,
+        hard_geometry_failure, layout, outward_obstacle_clearance_stub, placement,
+        record_boundary_bundle_application_error, retain_better_admitted_candidate,
         retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
         routing::RouteQuality, straight_chain_cost_is_bounded,
         straight_chain_large_gain_is_significant, topology, validation,
@@ -2732,6 +2751,44 @@ mod tests {
             ),
             LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
                 maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+            },
+        );
+    }
+
+    #[test]
+    fn boundary_bundle_contact_limits_preserve_public_failure_classification() {
+        let options = LayoutOptions::default();
+        let mut segment_state = CandidateAdmissionState {
+            boundary_bundle_rejected: true,
+            ..CandidateAdmissionState::default()
+        };
+        record_boundary_bundle_application_error(
+            &LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
+                maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+            },
+            &mut segment_state,
+        );
+        assert_eq!(
+            hard_geometry_failure(options, &segment_state),
+            LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
+                maximum: MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+            },
+        );
+
+        let mut work_state = CandidateAdmissionState {
+            boundary_bundle_rejected: true,
+            ..CandidateAdmissionState::default()
+        };
+        record_boundary_bundle_application_error(
+            &LayoutError::UnrelatedRouteContactWorkLimitExceeded {
+                maximum: MAX_LAYOUT_ROUTE_CONTACT_VISITS,
+            },
+            &mut work_state,
+        );
+        assert_eq!(
+            hard_geometry_failure(options, &work_state),
+            LayoutError::UnrelatedRouteContactWorkLimitExceeded {
+                maximum: MAX_LAYOUT_ROUTE_CONTACT_VISITS,
             },
         );
     }

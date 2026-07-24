@@ -402,7 +402,7 @@ pub fn collapse_group_in_place(
         }
     }
 
-    let candidate = compose_collapse_candidate(
+    let mut candidate = compose_collapse_candidate(
         expanded_graph,
         expanded_layout,
         compact_graph,
@@ -412,13 +412,8 @@ pub fn collapse_group_in_place(
         &expanded_edge_geometry,
         options.layout,
     )?;
-    let mut candidate =
-        boundary_bundles::apply_and_normalize(&compact_indexed, candidate, options.layout)
-            .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
-    // Bundle normalization may recompute an equivalent tap coordinate with a
-    // few ULPs of floating-point drift. Restore unrelated routes from the
-    // validated expanded layout before admission so collapse keeps its exact
-    // retained-geometry contract rather than falling back on numeric noise.
+    // Restore unrelated routes before bundle planning so an interior collector
+    // is admitted against the exact geometry that collapse promises to retain.
     if candidate.edges.len() != compact_indexed.edges.len() {
         return Err(GroupExpansionError::NeedsFullRelayout);
     }
@@ -433,6 +428,49 @@ pub fn collapse_group_in_place(
             *candidate_edge = (*expanded_edge).clone();
         }
     }
+    let compact_edges_by_id = compact_graph
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<BTreeMap<_, _>>();
+    let preserved_bundle_ids = compact_indexed
+        .boundary_bundles
+        .iter()
+        .filter(|bundle| {
+            bundle.endpoint.node != expansion.anchor
+                && bundle.members.iter().all(|member| {
+                    let edge = compact_edges_by_id[&member.edge];
+                    edge.source.node != expansion.anchor && edge.target.node != expansion.anchor
+                })
+        })
+        .map(|bundle| bundle.id)
+        .collect::<BTreeSet<_>>();
+    candidate.boundary_bundles = expanded_layout
+        .boundary_bundles
+        .iter()
+        .filter(|bundle| preserved_bundle_ids.contains(&bundle.id))
+        .cloned()
+        .collect();
+    candidate
+        .boundary_bundles
+        .sort_unstable_by_key(|bundle| bundle.id);
+    for bundle in &mut candidate.boundary_bundles {
+        bundle.members.sort_unstable_by(|left, right| {
+            left.slots
+                .cmp(&right.slots)
+                .then(left.edge.cmp(&right.edge))
+        });
+    }
+    if candidate.boundary_bundles.len() != preserved_bundle_ids.len() {
+        return Err(GroupExpansionError::NeedsFullRelayout);
+    }
+    let candidate = boundary_bundles::apply_and_normalize_preserving(
+        &compact_indexed,
+        candidate,
+        options.layout,
+        &preserved_bundle_ids,
+    )
+    .map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
     if route_segment_count(&candidate) > MAX_LAYOUT_SEGMENTS {
         return Err(GroupExpansionError::PreservedGeometryTooLarge {
             actual: route_segment_count(&candidate),
@@ -1684,6 +1722,7 @@ fn remap_boundary_bundles(
         let mut used_compact_members = BTreeSet::new();
         let mut mapped_members = Vec::with_capacity(expanded_bundle.members.len());
         let mut expanded_slots_by_compact_edge = BTreeMap::<EdgeId, BTreeSet<u32>>::new();
+        let mut expanded_members_by_compact_edge = BTreeMap::<EdgeId, usize>::new();
         let mut affected = false;
         for expanded_member in &expanded_bundle.members {
             let edge = expanded_edges[&expanded_member.edge];
@@ -1700,6 +1739,9 @@ fn remap_boundary_bundles(
             let union = expanded_slots_by_compact_edge
                 .entry(compact_edge)
                 .or_default();
+            *expanded_members_by_compact_edge
+                .entry(compact_edge)
+                .or_default() += 1;
             for &slot in &expanded_member.slots {
                 union.insert(slot);
             }
@@ -1734,9 +1776,16 @@ fn remap_boundary_bundles(
         let center = lane_count.saturating_sub(1) as f64 / 2.0;
         let mut members = Vec::with_capacity(mapped_members.len());
         for (expanded_member, compact_edge, compact_member, affected_member) in mapped_members {
-            let tap = Point {
-                x: compact_bundle.spine.end.x,
-                y: compact_bundle.spine.end.y + (expanded_member.tap_lane as f64 - center) * pitch,
+            let one_to_one = expanded_members_by_compact_edge[&compact_edge] == 1
+                && expanded_member.slots == compact_member.slots;
+            let tap = if one_to_one {
+                compact_member.tap
+            } else {
+                Point {
+                    x: compact_bundle.spine.end.x,
+                    y: compact_bundle.spine.end.y
+                        + (expanded_member.tap_lane as f64 - center) * pitch,
+                }
             };
             let retained_member = !affected_member && expanded_member.edge == compact_edge;
             let corridor_changed = expanded_corridor_offset != compact_corridor_offset;
