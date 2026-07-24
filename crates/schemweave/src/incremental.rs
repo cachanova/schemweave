@@ -992,6 +992,16 @@ fn evaluate_expansion_candidate(
         Err(GroupExpansionError::NoSafeBoundaryBridge(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
+    charge_expansion_work(
+        hard_budget,
+        boundary_bundle_replan_work_upper_bound(
+            expanded_indexed,
+            &candidate,
+            options.layout,
+            &remapped_bundles.preserved_ids,
+        ),
+        hard_budget_maximum,
+    )?;
     let candidate = match boundary_bundles::apply_and_normalize_preserving(
         expanded_indexed,
         candidate,
@@ -999,6 +1009,15 @@ fn evaluate_expansion_candidate(
         &remapped_bundles.preserved_ids,
     ) {
         Ok(candidate) => candidate,
+        Err(
+            LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. }
+            | LayoutError::UnrelatedRouteContactWorkLimitExceeded { .. },
+        ) => {
+            return Err(GroupExpansionError::ExpansionWorkLimitExceeded {
+                required: hard_budget_maximum.saturating_add(1),
+                maximum: hard_budget_maximum,
+            });
+        }
         Err(_) => return Ok(None),
     };
     hard_budget
@@ -1045,20 +1064,12 @@ fn evaluate_expansion_candidate(
     } else {
         true
     };
-    charge_expansion_work(
-        hard_budget,
-        boundary_bundle_work_upper_bound(expanded_indexed, &candidate),
-        hard_budget_maximum,
-    )?;
-    let boundary_bundle_geometry_is_clean =
-        boundary_bundles::verify_geometry(expanded_indexed, &candidate, options.layout).is_ok();
     if ranking_direction_violations(expanded_graph, &candidate) != 0
         || !constraints_are_satisfied(&candidate, &options.constraints)
         || !geometry_is_clean
         || !clearance_is_clean
         || clearance_work_exhausted
         || !parallel_spacing_is_clean
-        || !boundary_bundle_geometry_is_clean
     {
         return Ok(None);
     }
@@ -1148,6 +1159,101 @@ fn boundary_bundle_work_upper_bound(
         .saturating_add(member_segments.saturating_mul(layout.nodes.len()))
         .saturating_add(bundle_segments.saturating_mul(all_segments))
         .saturating_add(bundle_segments.saturating_mul(bundle_segments))
+}
+
+fn boundary_bundle_replan_work_upper_bound(
+    indexed: &validation::IndexedGraph<'_>,
+    layout: &Layout,
+    options: LayoutOptions,
+    preserved_bundle_ids: &BTreeSet<BoundaryBundleId>,
+) -> usize {
+    if indexed.boundary_bundles.is_empty() {
+        return 0;
+    }
+    let replanned_bundles = indexed
+        .boundary_bundles
+        .iter()
+        .filter(|bundle| !preserved_bundle_ids.contains(&bundle.id))
+        .count();
+    boundary_bundle_replan_work_upper_bound_from_counts(
+        layout.nodes.len(),
+        layout.edges.len(),
+        route_segment_count(layout),
+        indexed.boundary_bundles.len(),
+        indexed
+            .boundary_bundles
+            .iter()
+            .map(|bundle| bundle.members.len())
+            .sum(),
+        replanned_bundles,
+        options,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn boundary_bundle_replan_work_upper_bound_from_counts(
+    nodes: usize,
+    edges: usize,
+    route_segments: usize,
+    bundles: usize,
+    bundle_members: usize,
+    replanned_bundles: usize,
+    options: LayoutOptions,
+) -> usize {
+    if bundles == 0 {
+        return 0;
+    }
+    let bundle_segments = bundles.saturating_mul(2);
+    let structure = nodes
+        .saturating_add(edges)
+        .saturating_add(bundles)
+        .saturating_add(bundle_members);
+    let verification = structure
+        .saturating_add(bundle_segments.saturating_mul(nodes))
+        // Every bundle-member segment may be tested against every node.
+        .saturating_add(route_segments.saturating_mul(nodes))
+        // Both collector and spine are tested against every route segment.
+        .saturating_add(bundle_segments.saturating_mul(route_segments))
+        .saturating_add(bundle_segments.saturating_mul(bundle_segments));
+    if replanned_bundles == 0 {
+        return verification;
+    }
+
+    let interior_planning = if options.minimum_parallel_wire_spacing == 0.0
+        && bundles <= boundary_bundles::MAX_INTERIOR_COLLECTOR_BUNDLES
+    {
+        // Collector discovery has one shared hard cap across its initial and
+        // coordinated input/output searches. Reserve the complete cap because
+        // the number of rescans is topology-dependent.
+        boundary_bundles::MAX_INTERIOR_HORIZONTAL_TAP_VISITS
+    } else {
+        0
+    };
+    let partial_per_bundle = nodes
+        .saturating_mul(2)
+        .saturating_add(route_segments.saturating_mul(nodes))
+        .saturating_add(route_segments.saturating_mul(2))
+        .saturating_add(bundles.saturating_mul(route_segments).saturating_mul(2))
+        .saturating_add(bundles.saturating_mul(4))
+        .saturating_add(if options.edge_node_clearance > 0.0 {
+            route_segments.saturating_mul(route_segments)
+        } else {
+            0
+        });
+    let partial_verification = replanned_bundles
+        .saturating_mul(partial_per_bundle)
+        .min(boundary_bundles::MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS);
+
+    // `apply_and_normalize_preserving` first tests whether the supplied
+    // geometry is already valid, then verifies the rebuilt result. Charge
+    // both passes plus the bounded interior search and partial admission
+    // before invoking the planner.
+    verification
+        .saturating_mul(2)
+        .saturating_add(interior_planning)
+        .saturating_add(partial_verification)
+        .saturating_add(structure)
+        .saturating_add(route_segments)
 }
 
 fn constraint_x_candidates(
@@ -3473,19 +3579,18 @@ fn candidate_positions(
     } else {
         0
     };
-    let projected_bundle_work = if work.boundary_bundles > 0 {
-        let bundle_segments = work.boundary_bundles.saturating_mul(2);
-        work.nodes
-            .saturating_add(work.edges)
-            .saturating_add(work.boundary_bundles)
-            .saturating_add(work.boundary_bundle_members)
-            .saturating_add(bundle_segments.saturating_mul(work.nodes))
-            .saturating_add(work.projected_segments.saturating_mul(work.nodes))
-            .saturating_add(bundle_segments.saturating_mul(work.projected_segments))
-            .saturating_add(bundle_segments.saturating_mul(bundle_segments))
-    } else {
-        0
-    };
+    // Candidate placement reserves the same conservative bundle-planner
+    // charge used at execution time. Assume every boundary bundle needs
+    // replanning because the exact preserved set is candidate-specific.
+    let projected_bundle_work = boundary_bundle_replan_work_upper_bound_from_counts(
+        work.nodes,
+        work.edges,
+        work.projected_segments,
+        work.boundary_bundles,
+        work.boundary_bundle_members,
+        work.boundary_bundles,
+        options,
+    );
     let work_per_candidate = work
         .nodes
         .saturating_add(work.edges)
@@ -8007,6 +8112,58 @@ mod tests {
             .len(),
             51
         );
+        let affected_bundles_with_clearance = ExpansionWork {
+            nodes: 100,
+            edges: 200,
+            boundary_edges: 20,
+            projected_segments: 1_600,
+            boundary_bundles: 1,
+            boundary_bundle_members: 64,
+        };
+        let bounded_bundle_candidates = candidate_positions(
+            &compact,
+            &anchor,
+            &members,
+            affected_bundles_with_clearance,
+            LayoutOptions {
+                edge_node_clearance: 6.0,
+                ..options
+            },
+            QualityEffort::Max,
+            0,
+        )
+        .unwrap();
+        assert!(
+            bounded_bundle_candidates.len() > super::SAFETY_CANDIDATES
+                && bounded_bundle_candidates.len() < 51,
+            "positive-clearance bundle replanning must reserve aggregate work across candidates"
+        );
+        let bundle_replan_over_budget = ExpansionWork {
+            nodes: 1_000,
+            edges: 2_000,
+            boundary_edges: 128,
+            projected_segments: 5_000,
+            boundary_bundles: 8,
+            boundary_bundle_members: 512,
+        };
+        assert!(matches!(
+            candidate_positions(
+                &compact,
+                &anchor,
+                &members,
+                bundle_replan_over_budget,
+                LayoutOptions {
+                    edge_node_clearance: 6.0,
+                    ..options
+                },
+                QualityEffort::Quality,
+                0,
+            ),
+            Err(GroupExpansionError::ExpansionWorkLimitExceeded {
+                maximum: super::QUALITY_CANDIDATE_WORK,
+                ..
+            })
+        ));
         let maximum = ExpansionWork {
             nodes: 4_098,
             edges: 8_192,
