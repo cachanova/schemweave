@@ -34,7 +34,9 @@ cargo bench --locked -p schemweave --bench layout -- --baseline before
 ```
 
 Criterion prints median estimates and change ratios. For tail latency,
-derive per-iteration percentiles from the saved samples:
+derive per-sample percentiles from the saved samples. Each criterion sample
+is a batch mean (`times[i] / iters[i]`), not a single iteration, so these are
+per-sample rather than per-iteration figures:
 
 ```bash
 jq -r '[.times as $t | .iters as $i | range(0; $t | length) | $t[.] / $i[.]]
@@ -45,6 +47,10 @@ jq -r '[.times as $t | .iters as $i | range(0; $t | length) | $t[.] / $i[.]]
 
 (Adjust the path to the group/bench/parameter under `target/criterion/`;
 criterion sanitizes `/` in group names to `_`.)
+
+Tail resolution is bounded by the sample count: at the configured
+`sample_size(20)` the p95 and p99 indices both floor to the largest sample, so
+p95 == p99 — raise the sample size for finer tail resolution.
 
 Baselines and reports live in `target/criterion` and are never committed.
 Keep benchmark histories out of tracked docs; cite numbers in PR

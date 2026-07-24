@@ -211,14 +211,14 @@ pub fn expansion_pair(members: u32, bystanders: u32) -> (Graph, Graph, GroupExpa
         edges: compact_edges,
     };
 
-    // Expanded: anchor replaced by member chain 100..100 + members.
+    // Expanded: anchor replaced by member chain 200..200 + members.
     let member_ids: Vec<u32> = (0..members).map(|index| 200 + index).collect();
     let member_nodes: Vec<Node> = member_ids.iter().map(|&id| block(id, 1, 1)).collect();
     let mut expanded_nodes = vec![driver, consumer];
     expanded_nodes.extend(bystander_nodes);
     expanded_nodes.extend(member_nodes);
     // Boundary edges keep the compact nets; internal member edges get fresh
-    // ids/nets from 300.
+    // ids/nets from 300 + position (the first is 301).
     let mut expanded_edges = vec![edge(10, (0, 0), (member_ids[0], 0), 1)];
     for window in member_ids.windows(2) {
         let id = 300 + expanded_edges.len() as u32;

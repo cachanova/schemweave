@@ -44,21 +44,34 @@ fn every_fixture_lays_out_and_layout_is_reproducible() {
 fn expansion_fixture_expands_without_full_relayout() {
     use schemweave::{GroupExpansionOptions, expand_group_in_place};
 
-    let (compact, expanded, expansion) = generators::expansion_pair(4, 6);
-    let config = fast();
-    let compact_layout = layout_with_config(&compact, &config).expect("compact layout");
-    let result = expand_group_in_place(
-        &compact,
-        &compact_layout,
-        &expanded,
-        &expansion,
-        &GroupExpansionOptions {
-            layout: config.layout,
-            quality_effort: config.quality_effort,
-            constraints: config.constraints,
-        },
-    );
-    let layout = result.expect("synthetic expansion must succeed in place");
-    assert_eq!(layout.nodes.len(), expanded.nodes.len());
-    assert_eq!(layout.edges.len(), expanded.edges.len());
+    for (members, bystanders) in [(4, 6), (8, 40)] {
+        let (compact, expanded, expansion) = generators::expansion_pair(members, bystanders);
+        let config = fast();
+        let compact_layout = layout_with_config(&compact, &config)
+            .unwrap_or_else(|error| panic!("({members}, {bystanders}) compact layout: {error:?}"));
+        let result = expand_group_in_place(
+            &compact,
+            &compact_layout,
+            &expanded,
+            &expansion,
+            &GroupExpansionOptions {
+                layout: config.layout,
+                quality_effort: config.quality_effort,
+                constraints: config.constraints,
+            },
+        );
+        let layout = result.unwrap_or_else(|error| {
+            panic!("({members}, {bystanders}) synthetic expansion must succeed in place: {error:?}")
+        });
+        assert_eq!(
+            layout.nodes.len(),
+            expanded.nodes.len(),
+            "({members}, {bystanders}) node count"
+        );
+        assert_eq!(
+            layout.edges.len(),
+            expanded.edges.len(),
+            "({members}, {bystanders}) edge count"
+        );
+    }
 }

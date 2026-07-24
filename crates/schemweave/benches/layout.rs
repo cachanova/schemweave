@@ -86,6 +86,7 @@ fn expand_benches(c: &mut Criterion) {
         let (compact, expanded, expansion) = generators::expansion_pair(members, bystanders);
         for (effort_label, effort) in EFFORTS {
             let config = config(effort);
+            assert_reproducible(&compact, &config);
             let compact_layout =
                 layout_with_config(&compact, &config).expect("compact fixture must lay out");
             let options = GroupExpansionOptions {
@@ -93,6 +94,16 @@ fn expand_benches(c: &mut Criterion) {
                 quality_effort: config.quality_effort,
                 constraints: config.constraints.clone(),
             };
+            let first =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("expansion");
+            let second =
+                expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
+                    .expect("expansion");
+            assert_eq!(
+                first, second,
+                "expansion must be deterministic before measuring"
+            );
             group.bench_with_input(
                 BenchmarkId::new(label, effort_label),
                 &(&compact, &compact_layout, &expanded, &expansion),
