@@ -356,6 +356,16 @@ struct PhysicalSegment {
     end: f64,
 }
 
+/// Fingerprint of a route set used to decide whether a retained crossing
+/// profile may be reused instead of recomputed.
+///
+/// Precondition: identity proves only that the ROUTES match bit-for-bit; it
+/// does not compare the `RoutingPlan` that produced the retained profile.
+/// Retention and reuse are sound only because both occur within a single
+/// `route_edges_with_lane_rounds_and_refined_global` invocation sharing one
+/// plan. A future refactor that threads retained profiles across different
+/// plans must add a plan-identity check: debug builds would catch a violation
+/// via the fresh-profile assert, but release builds would not.
 #[derive(Debug, PartialEq)]
 struct RouteSetIdentity {
     routes: Vec<(EdgeId, usize)>,
