@@ -1019,6 +1019,9 @@ fn route_edges_with_lane_rounds_and_refined_global(
             &layer_right,
             options,
             gap_spacing,
+            // Invariant: `has_global_lane_delta_candidate` is true here, so the block above set
+            // `retained_crossing_profile = Some(..)` this call; the closure runs only under that
+            // same guard.
             retained_crossing_profile
                 .as_ref()
                 .expect("global lane candidates retain one exact baseline profile"),
@@ -1086,6 +1089,10 @@ fn route_edges_with_lane_rounds_and_refined_global(
                 spacing: GapTrackSpacing::Adaptive,
                 plan: candidate_spacing_plan,
             });
+            // Invariant: this closure is only reachable through the three
+            // `build_sparse_alternative` call sites below, each gated on a `Some` lane-candidate
+            // family; every such family sets `has_global_lane_delta_candidate`, which is the same
+            // guard that made `global_lane_delta_baseline` `Some` above.
             let lane_delta_profile = match global_lane_delta_baseline
                 .as_ref()
                 .expect("each global lane candidate has baseline delta state")
@@ -1106,6 +1113,10 @@ fn route_edges_with_lane_rounds_and_refined_global(
                     options,
                     gap_spacing,
                     GapTrackSpacing::Compact,
+                    // Invariant: same guard as the baseline construction above -- reaching an
+                    // `Ok` baseline for this family means `has_global_lane_delta_candidate` held,
+                    // so `retained_crossing_profile` is still the `Some` profile retained once per
+                    // invocation.
                     retained_crossing_profile
                         .as_ref()
                         .expect("global lane candidates retain one exact baseline profile"),
@@ -4349,6 +4360,8 @@ fn route_quality_profile_for_plan(
     plan: &RoutingPlan<'_>,
     routes: &[EdgeGeometry],
 ) -> (RouteQuality, Vec<PhysicalSegment>) {
+    #[cfg(test)]
+    ROUTE_QUALITY_PROFILE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let (segments, bends, route_length) =
         physical_route_segments(plan.edges.iter().map(|edge| edge.edge), routes);
     let crossings = physical_crossings(&plan.shared_endpoints, &segments);
@@ -7050,6 +7063,13 @@ fn prepare_repair_crossing_profile(
     rebuild_if_missing.then(|| horizontal_crossing_profile_by_net(plan, routes))
 }
 
+// Consumer-discipline invariant: the returned `retained_crossing_profile` (the passed-through
+// `compact_profile`) is NOT applicability-checked here. It is only ever the delta-produced compact
+// profile, and every terminal consumer re-filters it through
+// `retained_crossing_profile_is_applicable` before use (the large-family finish at the
+// `finish_route_family` call site, `prepare_repair_crossing_profile`, and the
+// `select_gap_spacing_candidate_inner` no-adaptive/retain paths). Do not consume this profile
+// without that re-filter.
 #[allow(clippy::too_many_arguments)]
 fn select_gap_spacing_candidate_without_profile_reuse(
     plan: &RoutingPlan<'_>,
@@ -7450,7 +7470,6 @@ fn route_length_from_physical_segments(segments: &[PhysicalSegment]) -> f64 {
         .sum()
 }
 
-#[allow(dead_code)]
 mod lane_pair_contribution {
     use super::{
         BTreeMap, BTreeSet, EdgeGeometry, EdgeId, Endpoint, EndpointTracks, GapTrackSpacing,
@@ -7515,6 +7534,9 @@ mod lane_pair_contribution {
         }
     }
 
+    // Test-support: the dense contribution table and its accessor exist only to cross-check the
+    // exact/on-demand pair contributions in tests; production uses the on-demand path.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) struct DenseOrderedLanePairContributions {
         pub(super) nets: Vec<NetId>,
         width: usize,
@@ -7522,6 +7544,7 @@ mod lane_pair_contribution {
     }
 
     impl DenseOrderedLanePairContributions {
+        #[cfg_attr(not(test), allow(dead_code))]
         pub(super) fn get(
             &self,
             first: usize,
@@ -7716,6 +7739,7 @@ mod lane_pair_contribution {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn dense_ordered_lane_pair_contributions(
         gap: &CanonicalLaneGapAccess,
     ) -> Option<DenseOrderedLanePairContributions> {
@@ -8400,6 +8424,7 @@ mod lane_pair_contribution {
     }
 
     impl LaneDeltaPairStorage {
+        #[cfg_attr(not(test), allow(dead_code))]
         fn kind(&self) -> LaneDeltaStorageKind {
             match self {
                 Self::Small(_) => LaneDeltaStorageKind::SmallTriangular,
@@ -8840,6 +8865,7 @@ mod lane_pair_contribution {
             })
         }
 
+        #[cfg_attr(not(test), allow(dead_code))]
         pub(super) fn storage_kinds(&self) -> Vec<LaneDeltaStorageKind> {
             self.pair_storage
                 .iter()
@@ -9548,9 +9574,6 @@ struct RoutingReuseCounts {
     lane_delta_global_eligible: usize,
     lane_delta_preserved_refined_eligible: usize,
     lane_delta_refined_eligible: usize,
-    lane_delta_global_eliminated_sweeps: usize,
-    lane_delta_preserved_refined_eliminated_sweeps: usize,
-    lane_delta_refined_eliminated_sweeps: usize,
     lane_delta_fallbacks: LaneDeltaFallbackCounts,
 }
 
@@ -9571,9 +9594,6 @@ impl RoutingReuseCounts {
             lane_delta_global_eligible: 0,
             lane_delta_preserved_refined_eligible: 0,
             lane_delta_refined_eligible: 0,
-            lane_delta_global_eliminated_sweeps: 0,
-            lane_delta_preserved_refined_eliminated_sweeps: 0,
-            lane_delta_refined_eliminated_sweeps: 0,
             lane_delta_fallbacks: LaneDeltaFallbackCounts {
                 gap_vector_length_mismatch: 0,
                 gap_net_set_or_lane_count_mismatch: 0,
@@ -9604,6 +9624,7 @@ impl RoutingReuseCounts {
 #[cfg(test)]
 thread_local! {
     static HORIZONTAL_CROSSING_PROFILE_CALLS: Cell<usize> = const { Cell::new(0) };
+    static ROUTE_QUALITY_PROFILE_CALLS: Cell<usize> = const { Cell::new(0) };
     static ROUTING_REUSE_COUNTS: Cell<RoutingReuseCounts> = const {
         Cell::new(RoutingReuseCounts::empty())
     };
@@ -9612,6 +9633,11 @@ thread_local! {
 #[cfg(test)]
 fn take_horizontal_crossing_profile_calls() -> usize {
     HORIZONTAL_CROSSING_PROFILE_CALLS.with(|calls| calls.replace(0))
+}
+
+#[cfg(test)]
+fn take_route_quality_profile_calls() -> usize {
+    ROUTE_QUALITY_PROFILE_CALLS.with(|calls| calls.replace(0))
 }
 
 #[cfg(test)]
@@ -9635,6 +9661,16 @@ enum GlobalLaneDeltaFamily {
     Refined,
 }
 
+// Records only the eligibility outcome of a lane-delta attempt. Deliberately does NOT
+// increment an "eliminated sweep" counter: doing so in this same `Ok` arm would be
+// tautological with eligibility (it could never disagree) and would over-report when the
+// family is later discarded by the candidate budget gate. Elimination is instead proven
+// independently in tests by the `ROUTE_QUALITY_PROFILE_CALLS` counter: an eligible run scores
+// the compact candidate from the delta and therefore performs exactly one fewer
+// `route_quality_profile_for_plan` sweep than a topologically identical run that falls back to
+// the full scorer. The debug-parity block bypasses that counter (it calls
+// `compute_horizontal_crossing_profile_by_net` directly), so the counter reflects only the real
+// scoring sweeps.
 fn record_global_lane_delta_result(
     family: GlobalLaneDeltaFamily,
     result: &Result<RetainedHorizontalCrossingProfile, LaneDeltaFallbackReason>,
@@ -9646,15 +9682,12 @@ fn record_global_lane_delta_result(
         Ok(_) => match family {
             GlobalLaneDeltaFamily::Global => {
                 counts.lane_delta_global_eligible += 1;
-                counts.lane_delta_global_eliminated_sweeps += 1;
             }
             GlobalLaneDeltaFamily::PreservedRefined => {
                 counts.lane_delta_preserved_refined_eligible += 1;
-                counts.lane_delta_preserved_refined_eliminated_sweeps += 1;
             }
             GlobalLaneDeltaFamily::Refined => {
                 counts.lane_delta_refined_eligible += 1;
-                counts.lane_delta_refined_eliminated_sweeps += 1;
             }
         },
         Err(reason) => counts.lane_delta_fallbacks.record(reason),
@@ -12314,8 +12347,8 @@ mod tests {
         select_outer_side_repairs, selected_route_family_is_safe, shared_endpoints,
         shortest_crossing_path, sorted_unmerged_physical_route_segments, sparse_channel_route,
         sparse_crossing_paths, sparse_gap_x, sum_within_limit,
-        take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
-        vertical_horizontal_crossings,
+        take_horizontal_crossing_profile_calls, take_route_quality_profile_calls,
+        take_routing_reuse_counts, vertical_horizontal_crossings,
     };
 
     fn endpoint_access(
@@ -15456,33 +15489,73 @@ mod tests {
     }
 
     #[test]
-    fn global_lane_delta_eliminates_one_sweep_for_an_eligible_emitted_family() {
-        let (graph, geometry, ranks) =
-            global_gap_route_fixture_with_patterns([(0.0, 80.0), (20.0, 40.0), (60.0, 100.0)], 16);
+    fn global_lane_delta_eliminates_one_compact_full_score_sweep() {
+        // Two runs over identical topology (3 nets x 16 branches); only the endpoint y
+        // coordinates differ. The first pattern keeps endpoint tracks stable, so the lane-delta
+        // scorer accepts the global family and scores its compact candidate from the retained
+        // baseline profile. The second pattern moves endpoint tracks, so the delta reports
+        // `EndpointTracksChanged` and the family is emitted through the original full scorer.
+        //
+        // Elimination is proven independently of eligibility by counting real
+        // `route_quality_profile_for_plan` sweeps: the eligible run must perform exactly one
+        // fewer compact full-score sweep than the topologically identical fallback run. The
+        // debug-parity block bypasses this counter (it calls
+        // `compute_horizontal_crossing_profile_by_net` directly), so the counter reflects only
+        // the scoring sweeps the delta actually replaces.
         let options = LayoutOptions {
             port_stub: 1e-3,
             ..LayoutOptions::default()
         };
-        let indexed = validate_and_index(&graph, options).unwrap();
-        let plan = RoutingPlan::new(&indexed, &ranks);
+        let route_and_measure = |patterns: [(f64, f64); 3]| {
+            let (graph, geometry, ranks) = global_gap_route_fixture_with_patterns(patterns, 16);
+            let indexed = validate_and_index(&graph, options).unwrap();
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            take_routing_reuse_counts();
+            take_route_quality_profile_calls();
+            let routed = route_planned_candidates_with_sparse_global(
+                &plan, &geometry, options, false, true, false,
+            );
+            let counts = take_routing_reuse_counts();
+            let route_quality_profile_calls = take_route_quality_profile_calls();
+            let exactly_scored = routed
+                .alternatives
+                .iter()
+                .all(|(quality, routes)| *quality == route_quality(&indexed, routes));
+            (
+                routed.alternatives.len(),
+                counts,
+                route_quality_profile_calls,
+                exactly_scored,
+            )
+        };
 
-        take_routing_reuse_counts();
-        let routed = route_planned_candidates_with_sparse_global(
-            &plan, &geometry, options, false, true, false,
-        );
-        let counts = take_routing_reuse_counts();
+        let (eligible_families, eligible_counts, eligible_calls, eligible_exact) =
+            route_and_measure([(0.0, 80.0), (20.0, 40.0), (60.0, 100.0)]);
+        let (fallback_families, fallback_counts, fallback_calls, fallback_exact) =
+            route_and_measure([(0.0, 40.0), (40.0, 80.0), (80.0, 0.0)]);
 
-        assert_eq!(routed.alternatives.len(), 1);
-        assert_eq!(counts.lane_delta_global_eligible, 1);
-        assert_eq!(counts.lane_delta_global_eliminated_sweeps, 1);
+        assert_eq!(eligible_families, 1);
+        assert_eq!(fallback_families, 1);
+        assert!(eligible_exact);
+        assert!(fallback_exact);
+
+        assert_eq!(eligible_counts.lane_delta_global_eligible, 1);
         assert_eq!(
-            counts.lane_delta_fallbacks,
+            eligible_counts.lane_delta_fallbacks,
             super::LaneDeltaFallbackCounts::default()
         );
+        assert_eq!(fallback_counts.lane_delta_global_eligible, 0);
         assert_eq!(
-            routed.alternatives[0].0,
-            route_quality(&indexed, &routed.alternatives[0].1)
+            fallback_counts.lane_delta_fallbacks,
+            super::LaneDeltaFallbackCounts {
+                endpoint_tracks_changed: 1,
+                ..super::LaneDeltaFallbackCounts::default()
+            }
         );
+
+        // The eliminated sweep: one emitted family each, identical topology, and the only
+        // behavioral difference is delta-accept vs full-score fallback.
+        assert_eq!(fallback_calls, eligible_calls + 1);
     }
 
     #[test]
@@ -15503,7 +15576,6 @@ mod tests {
 
         assert_eq!(routed.alternatives.len(), 1);
         assert_eq!(counts.lane_delta_global_eligible, 0);
-        assert_eq!(counts.lane_delta_global_eliminated_sweeps, 0);
         assert_eq!(
             counts.lane_delta_fallbacks,
             super::LaneDeltaFallbackCounts {
@@ -15535,7 +15607,6 @@ mod tests {
 
         assert_eq!(routed.primary, stable.primary);
         assert_eq!(lane_delta_counts.lane_delta_global_eligible, 1);
-        assert_eq!(lane_delta_counts.lane_delta_global_eliminated_sweeps, 1);
         assert_eq!(
             lane_delta_counts.lane_delta_fallbacks,
             super::LaneDeltaFallbackCounts::default()
