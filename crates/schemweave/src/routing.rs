@@ -7341,7 +7341,11 @@ fn route_length_from_physical_segments(segments: &[PhysicalSegment]) -> f64 {
 #[allow(dead_code)]
 mod lane_pair_contribution {
     use super::{
-        BTreeMap, BTreeSet, Endpoint, HashSet, NetId, PhysicalSegment, UnmergedPhysicalSegment,
+        BTreeMap, BTreeSet, EdgeGeometry, EdgeId, Endpoint, EndpointTracks, GapTrackSpacing,
+        HashSet, MAX_GLOBAL_GAP_LANES, MAX_GLOBAL_GAP_PAIRS, MAX_LARGE_GLOBAL_GAP_ACCESS_WORK,
+        MAX_LARGE_GLOBAL_GAP_LANES, MAX_LARGE_GLOBAL_GAP_PAIRS,
+        MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS, NetId, OuterLane, PhysicalSegment, Rc,
+        RetainedHorizontalCrossingProfile, UnmergedPhysicalSegment,
         merge_sorted_physical_route_segments,
     };
 
@@ -7364,6 +7368,10 @@ mod lane_pair_contribution {
         pub(super) target: Endpoint,
         pub(super) shared_source: Option<usize>,
         pub(super) shared_target: Option<usize>,
+        /// Physical span on the segment's changing axis. For a horizontal arm this is its x-span;
+        /// the eligibility gate uses it to prove that the arm crosses every intervening lane.
+        pub(super) span_start: f64,
+        pub(super) span_end: f64,
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -7454,12 +7462,18 @@ mod lane_pair_contribution {
             shared_target: shared_ordinals
                 .get(&(segment.target.node, segment.target.port))
                 .copied(),
+            span_start: segment.start,
+            span_end: segment.end,
         }
     }
 
     /// Canonicalize once from the same sorted raw segment stream consumed by
     /// `physical_route_segments`, then tag each surviving segment as a vertical interval, a left
     /// arm, a right arm, or both arms for every declared gap track.
+    ///
+    /// Pair scoring has an additional precondition: every classified left/right arm must span all
+    /// intervening lane tracks. This builder records the physical span but deliberately does not
+    /// enforce that candidate-specific condition; `lane_delta_eligibility` rejects partial arms.
     pub(super) fn canonical_lane_gap_accesses_from_sorted_segments(
         sorted_segments: Vec<UnmergedPhysicalSegment>,
         gap_tracks: &[Vec<CanonicalLaneTrack>],
@@ -7567,6 +7581,10 @@ mod lane_pair_contribution {
     }
 
     /// Exact contribution for the ordered relation `first before second`.
+    ///
+    /// Precondition: every horizontal arm spans all intervening lane tracks in the classified
+    /// gap. This primitive tests only strict ordinate containment and retained shared endpoints;
+    /// callers that cannot prove full arm extent must use the physical sweep instead.
     pub(super) fn exact_ordered_lane_pair_contribution(
         first: &CanonicalLaneNetAccess,
         second: &CanonicalLaneNetAccess,
@@ -7672,6 +7690,1123 @@ mod lane_pair_contribution {
             }
         }
         Some(contributions)
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum LaneDeltaStorageKind {
+        SmallTriangular,
+        LargeHotRows,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum LaneDeltaWorkKind {
+        Inversions,
+        ContactVisits,
+        ProfileUpdates,
+    }
+
+    /// Release-mode reason that an exact lane delta must fall back to the physical sweep.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) enum LaneDeltaFallbackReason {
+        GapVectorLengthMismatch,
+        GapNetSetOrLaneCountMismatch { gap: usize },
+        LaneMapNotBijection { gap: usize, candidate: bool },
+        EndpointTracksChanged,
+        CrossingPathsChangedOrNotReused,
+        GapSpacingChanged,
+        OuterLanesPresent,
+        OuterOrChannelAssignmentChanged,
+        RouteTopologyChanged,
+        InvalidTrackCoordinates { gap: usize },
+        TrackCoordinatesChanged { gap: usize },
+        CanonicalContactSignatureChanged { gap: usize, net: NetId },
+        ArmExtentDoesNotSpanGap { gap: usize, net: NetId },
+        ProfileInvocationOrRouteIdentityMismatch,
+        PairStorageCapExceeded { storage: LaneDeltaStorageKind },
+        WorkBudgetExceeded { work: LaneDeltaWorkKind },
+        InvalidCandidateIndex,
+        MissingPairContribution { gap: usize, low: usize, high: usize },
+        ArithmeticOverflow,
+        ArithmeticUnderflow,
+        AllocationFailure,
+    }
+
+    /// Pointer identity tying a retained base profile and candidate to one routing-plan
+    /// invocation. It is intentionally not a reusable value fingerprint.
+    #[derive(Clone, Debug)]
+    pub(super) struct LaneDeltaInvocationIdentity(Rc<()>);
+
+    impl LaneDeltaInvocationIdentity {
+        pub(super) fn new() -> Self {
+            Self(Rc::new(()))
+        }
+
+        fn matches(&self, other: &Self) -> bool {
+            Rc::ptr_eq(&self.0, &other.0)
+        }
+    }
+
+    pub(super) struct LaneDeltaEligibilityInput<'a> {
+        pub(super) baseline_gap_lanes: &'a [BTreeMap<NetId, usize>],
+        pub(super) candidate_gap_lanes: &'a [BTreeMap<NetId, usize>],
+        pub(super) baseline_endpoint_tracks: &'a EndpointTracks,
+        pub(super) candidate_endpoint_tracks: &'a EndpointTracks,
+        pub(super) baseline_crossing_paths: &'a [Option<Vec<f64>>],
+        pub(super) candidate_crossing_paths: &'a [Option<Vec<f64>>],
+        pub(super) paths_reused: bool,
+        pub(super) baseline_spacing: GapTrackSpacing,
+        pub(super) candidate_spacing: GapTrackSpacing,
+        pub(super) baseline_outer_lanes: &'a BTreeMap<EdgeId, OuterLane>,
+        pub(super) candidate_outer_lanes: &'a BTreeMap<EdgeId, OuterLane>,
+        pub(super) outer_side_reassigned: bool,
+        pub(super) channel_indices_changed: bool,
+        pub(super) baseline_routes: &'a [EdgeGeometry],
+        pub(super) candidate_routes: &'a [EdgeGeometry],
+        /// Open x-bounds of each classified sparse gap.
+        pub(super) gap_bounds: &'a [(f64, f64)],
+        pub(super) baseline_gap_accesses: &'a [CanonicalLaneGapAccess],
+        pub(super) candidate_gap_accesses: &'a [CanonicalLaneGapAccess],
+        pub(super) base_profile: &'a RetainedHorizontalCrossingProfile,
+        pub(super) base_invocation: &'a LaneDeltaInvocationIdentity,
+        pub(super) candidate_invocation: &'a LaneDeltaInvocationIdentity,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    pub(super) struct LaneInversion {
+        gap: usize,
+        low: usize,
+        high: usize,
+    }
+
+    #[derive(Clone, Debug)]
+    pub(super) struct LaneDeltaEligibility<'a> {
+        baseline_gap_lanes: &'a [BTreeMap<NetId, usize>],
+        baseline_gap_accesses: &'a [CanonicalLaneGapAccess],
+        base_profile: &'a RetainedHorizontalCrossingProfile,
+        /// Per-gap dense ordinals ordered by `(baseline_lane, NetId)`.
+        baseline_orders: Vec<Vec<NetId>>,
+        inversions: Vec<LaneInversion>,
+    }
+
+    impl LaneDeltaEligibility<'_> {
+        #[cfg(test)]
+        pub(super) fn inversion_keys(&self) -> Vec<(usize, usize, usize)> {
+            self.inversions
+                .iter()
+                .map(|inversion| (inversion.gap, inversion.low, inversion.high))
+                .collect()
+        }
+    }
+
+    impl PartialEq for LaneDeltaEligibility<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.baseline_orders == other.baseline_orders && self.inversions == other.inversions
+        }
+    }
+
+    impl Eq for LaneDeltaEligibility<'_> {}
+
+    fn dense_lane_order(lanes: &BTreeMap<NetId, usize>) -> Option<Vec<NetId>> {
+        let mut order = Vec::new();
+        order.try_reserve_exact(lanes.len()).ok()?;
+        order.resize(lanes.len(), None);
+        for (&net, &lane) in lanes {
+            let slot = order.get_mut(lane)?;
+            if slot.replace(net).is_some() {
+                return None;
+            }
+        }
+        order.into_iter().collect()
+    }
+
+    fn gap_accesses_by_net(
+        gap: &CanonicalLaneGapAccess,
+    ) -> Option<BTreeMap<NetId, &CanonicalLaneNetAccess>> {
+        let mut by_net = BTreeMap::new();
+        for access in &gap.nets {
+            if by_net.insert(access.net, access).is_some() {
+                return None;
+            }
+        }
+        Some(by_net)
+    }
+
+    fn contact_signature_matches(
+        left: &CanonicalLaneContact,
+        right: &CanonicalLaneContact,
+    ) -> bool {
+        left.ordinate_or_low.to_bits() == right.ordinate_or_low.to_bits()
+            && left.high.to_bits() == right.high.to_bits()
+            && left.source == right.source
+            && left.target == right.target
+            && left.shared_source == right.shared_source
+            && left.shared_target == right.shared_target
+    }
+
+    fn contact_list_signature_matches(
+        left: &[CanonicalLaneContact],
+        right: &[CanonicalLaneContact],
+    ) -> bool {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(left, right)| contact_signature_matches(left, right))
+    }
+
+    fn access_signature_matches(
+        left: &CanonicalLaneNetAccess,
+        right: &CanonicalLaneNetAccess,
+    ) -> bool {
+        left.net == right.net
+            && contact_list_signature_matches(&left.vertical, &right.vertical)
+            && contact_list_signature_matches(&left.left, &right.left)
+            && contact_list_signature_matches(&left.right, &right.right)
+    }
+
+    fn canonical_access_shape_is_valid(access: &CanonicalLaneNetAccess) -> bool {
+        let vertical_is_valid = access.vertical.iter().all(|contact| {
+            contact.ordinate_or_low.is_finite()
+                && contact.high.is_finite()
+                && contact.ordinate_or_low < contact.high
+        }) && access.vertical.windows(2).all(|contacts| {
+            contacts[0]
+                .ordinate_or_low
+                .total_cmp(&contacts[1].ordinate_or_low)
+                .is_le()
+        });
+        let horizontal_is_valid = |contacts: &[CanonicalLaneContact]| {
+            contacts.iter().all(|contact| {
+                contact.ordinate_or_low.is_finite()
+                    && contact.high.to_bits() == contact.ordinate_or_low.to_bits()
+                    && contact.span_start.is_finite()
+                    && contact.span_end.is_finite()
+                    && contact.span_start < contact.span_end
+            }) && contacts.windows(2).all(|contacts| {
+                contacts[0]
+                    .ordinate_or_low
+                    .total_cmp(&contacts[1].ordinate_or_low)
+                    .is_le()
+            })
+        };
+        vertical_is_valid && horizontal_is_valid(&access.left) && horizontal_is_valid(&access.right)
+    }
+
+    fn ordered_track_coordinates(
+        lanes: &BTreeMap<NetId, usize>,
+        accesses: &CanonicalLaneGapAccess,
+        bounds: (f64, f64),
+    ) -> Option<Vec<f64>> {
+        if !bounds.0.is_finite() || !bounds.1.is_finite() || bounds.0 >= bounds.1 {
+            return None;
+        }
+        let order = dense_lane_order(lanes)?;
+        let by_net = gap_accesses_by_net(accesses)?;
+        if by_net.len() != order.len() || !by_net.keys().copied().eq(lanes.keys().copied()) {
+            return None;
+        }
+        let mut coordinates = Vec::new();
+        coordinates.try_reserve_exact(order.len()).ok()?;
+        for net in order {
+            let track = by_net.get(&net)?.track;
+            if !track.is_finite() || !(bounds.0 < track && track < bounds.1) {
+                return None;
+            }
+            if coordinates
+                .last()
+                .is_some_and(|previous| *previous >= track)
+            {
+                return None;
+            }
+            coordinates.push(track);
+        }
+        Some(coordinates)
+    }
+
+    fn arms_span_gap(
+        gap: usize,
+        lanes: &BTreeMap<NetId, usize>,
+        accesses: &CanonicalLaneGapAccess,
+    ) -> Result<(), LaneDeltaFallbackReason> {
+        let order =
+            dense_lane_order(lanes).ok_or(LaneDeltaFallbackReason::LaneMapNotBijection {
+                gap,
+                candidate: false,
+            })?;
+        if order.is_empty() {
+            return Ok(());
+        }
+        let by_net = gap_accesses_by_net(accesses)
+            .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?;
+        let minimum_track = by_net
+            .get(&order[0])
+            .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?
+            .track;
+        let maximum_track = by_net
+            .get(order.last().expect("nonempty order"))
+            .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?
+            .track;
+        for net in order {
+            let access = by_net
+                .get(&net)
+                .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?;
+            let partial_left = access.left.iter().any(|arm| {
+                !arm.span_start.is_finite()
+                    || !arm.span_end.is_finite()
+                    || arm.span_start >= minimum_track
+                    || arm.span_end < access.track
+            });
+            let partial_right = access.right.iter().any(|arm| {
+                !arm.span_start.is_finite()
+                    || !arm.span_end.is_finite()
+                    || arm.span_start > access.track
+                    || arm.span_end <= maximum_track
+            });
+            if partial_left || partial_right {
+                return Err(LaneDeltaFallbackReason::ArmExtentDoesNotSpanGap { gap, net });
+            }
+        }
+        Ok(())
+    }
+
+    fn route_topology(routes: &[EdgeGeometry]) -> Option<BTreeMap<EdgeId, (usize, Vec<u8>)>> {
+        let mut topology = BTreeMap::new();
+        for route in routes {
+            let mut segments = Vec::new();
+            let segment_count = if route.points.is_empty() {
+                0
+            } else {
+                route.points.len() - 1
+            };
+            segments.try_reserve_exact(segment_count).ok()?;
+            for points in route.points.windows(2) {
+                if !points[0].x.is_finite()
+                    || !points[0].y.is_finite()
+                    || !points[1].x.is_finite()
+                    || !points[1].y.is_finite()
+                {
+                    return None;
+                }
+                let horizontal = points[0].y == points[1].y;
+                let vertical = points[0].x == points[1].x;
+                let kind = match (horizontal, vertical) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => return None,
+                };
+                segments.push(kind);
+            }
+            if topology
+                .insert(route.id, (route.points.len(), segments))
+                .is_some()
+            {
+                return None;
+            }
+        }
+        Some(topology)
+    }
+
+    fn append_gap_inversions(
+        gap: usize,
+        baseline_order: &[NetId],
+        candidate_order: &[NetId],
+        inversions: &mut Vec<LaneInversion>,
+    ) -> Result<(), LaneDeltaFallbackReason> {
+        let baseline_ordinals = baseline_order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, net)| (net, ordinal))
+            .collect::<BTreeMap<_, _>>();
+        let mut seen = BTreeSet::new();
+        for net in candidate_order {
+            let ordinal = *baseline_ordinals
+                .get(net)
+                .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?;
+            if let Some(start) = ordinal.checked_add(1) {
+                for &greater in seen.range(start..) {
+                    if inversions.len() >= MAX_LARGE_GLOBAL_GAP_PAIRS {
+                        return Err(LaneDeltaFallbackReason::WorkBudgetExceeded {
+                            work: LaneDeltaWorkKind::Inversions,
+                        });
+                    }
+                    inversions
+                        .try_reserve(1)
+                        .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+                    inversions.push(LaneInversion {
+                        gap,
+                        low: ordinal,
+                        high: greater,
+                    });
+                }
+            }
+            if !seen.insert(ordinal) {
+                return Err(LaneDeltaFallbackReason::LaneMapNotBijection {
+                    gap,
+                    candidate: true,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Prove all twelve release-mode eligibility conditions before exact pair math is used.
+    pub(super) fn lane_delta_eligibility<'a>(
+        input: &LaneDeltaEligibilityInput<'a>,
+    ) -> Result<LaneDeltaEligibility<'a>, LaneDeltaFallbackReason> {
+        let gap_count = input.baseline_gap_lanes.len();
+        if input.candidate_gap_lanes.len() != gap_count
+            || input.baseline_gap_accesses.len() != gap_count
+            || input.candidate_gap_accesses.len() != gap_count
+            || input.gap_bounds.len() != gap_count
+        {
+            return Err(LaneDeltaFallbackReason::GapVectorLengthMismatch);
+        }
+
+        let mut baseline_orders = Vec::new();
+        baseline_orders
+            .try_reserve_exact(gap_count)
+            .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+        let mut candidate_orders = Vec::new();
+        candidate_orders
+            .try_reserve_exact(gap_count)
+            .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+        for gap in 0..gap_count {
+            let baseline = &input.baseline_gap_lanes[gap];
+            let candidate = &input.candidate_gap_lanes[gap];
+            if baseline.len() != candidate.len()
+                || !baseline.keys().copied().eq(candidate.keys().copied())
+            {
+                return Err(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap });
+            }
+            baseline_orders.push(dense_lane_order(baseline).ok_or(
+                LaneDeltaFallbackReason::LaneMapNotBijection {
+                    gap,
+                    candidate: false,
+                },
+            )?);
+            candidate_orders.push(dense_lane_order(candidate).ok_or(
+                LaneDeltaFallbackReason::LaneMapNotBijection {
+                    gap,
+                    candidate: true,
+                },
+            )?);
+        }
+
+        if input.baseline_endpoint_tracks != input.candidate_endpoint_tracks {
+            return Err(LaneDeltaFallbackReason::EndpointTracksChanged);
+        }
+        if !input.paths_reused || input.baseline_crossing_paths != input.candidate_crossing_paths {
+            return Err(LaneDeltaFallbackReason::CrossingPathsChangedOrNotReused);
+        }
+        if input.baseline_spacing != input.candidate_spacing {
+            return Err(LaneDeltaFallbackReason::GapSpacingChanged);
+        }
+        if !input.baseline_outer_lanes.is_empty() || !input.candidate_outer_lanes.is_empty() {
+            return Err(LaneDeltaFallbackReason::OuterLanesPresent);
+        }
+        if input.outer_side_reassigned || input.channel_indices_changed {
+            return Err(LaneDeltaFallbackReason::OuterOrChannelAssignmentChanged);
+        }
+        let baseline_topology = route_topology(input.baseline_routes)
+            .ok_or(LaneDeltaFallbackReason::RouteTopologyChanged)?;
+        let candidate_topology = route_topology(input.candidate_routes)
+            .ok_or(LaneDeltaFallbackReason::RouteTopologyChanged)?;
+        if baseline_topology != candidate_topology {
+            return Err(LaneDeltaFallbackReason::RouteTopologyChanged);
+        }
+
+        for (gap, baseline_order) in baseline_orders.iter().enumerate() {
+            let baseline_coordinates = ordered_track_coordinates(
+                &input.baseline_gap_lanes[gap],
+                &input.baseline_gap_accesses[gap],
+                input.gap_bounds[gap],
+            )
+            .ok_or(LaneDeltaFallbackReason::InvalidTrackCoordinates { gap })?;
+            let candidate_coordinates = ordered_track_coordinates(
+                &input.candidate_gap_lanes[gap],
+                &input.candidate_gap_accesses[gap],
+                input.gap_bounds[gap],
+            )
+            .ok_or(LaneDeltaFallbackReason::InvalidTrackCoordinates { gap })?;
+            if !baseline_coordinates
+                .iter()
+                .zip(&candidate_coordinates)
+                .all(|(baseline, candidate)| baseline.to_bits() == candidate.to_bits())
+            {
+                return Err(LaneDeltaFallbackReason::TrackCoordinatesChanged { gap });
+            }
+
+            let baseline_by_net = gap_accesses_by_net(&input.baseline_gap_accesses[gap])
+                .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?;
+            let candidate_by_net = gap_accesses_by_net(&input.candidate_gap_accesses[gap])
+                .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?;
+            for &net in baseline_order {
+                let baseline = baseline_by_net
+                    .get(&net)
+                    .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?;
+                let candidate = candidate_by_net
+                    .get(&net)
+                    .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap })?;
+                if !canonical_access_shape_is_valid(baseline)
+                    || !canonical_access_shape_is_valid(candidate)
+                    || !access_signature_matches(baseline, candidate)
+                {
+                    return Err(LaneDeltaFallbackReason::CanonicalContactSignatureChanged {
+                        gap,
+                        net,
+                    });
+                }
+            }
+            arms_span_gap(
+                gap,
+                &input.baseline_gap_lanes[gap],
+                &input.baseline_gap_accesses[gap],
+            )?;
+            arms_span_gap(
+                gap,
+                &input.candidate_gap_lanes[gap],
+                &input.candidate_gap_accesses[gap],
+            )?;
+        }
+
+        let attributed_total = input
+            .base_profile
+            .crossing_counts
+            .values()
+            .try_fold(0usize, |total, &count| total.checked_add(count))
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        if !input.base_invocation.matches(input.candidate_invocation)
+            || !input.base_profile.matches_routes(input.baseline_routes)
+            || input.base_profile.quality.crossings != attributed_total
+        {
+            return Err(LaneDeltaFallbackReason::ProfileInvocationOrRouteIdentityMismatch);
+        }
+
+        let mut inversions = Vec::new();
+        for gap in 0..gap_count {
+            append_gap_inversions(
+                gap,
+                &baseline_orders[gap],
+                &candidate_orders[gap],
+                &mut inversions,
+            )?;
+        }
+        inversions.sort_unstable();
+        Ok(LaneDeltaEligibility {
+            baseline_gap_lanes: input.baseline_gap_lanes,
+            baseline_gap_accesses: input.baseline_gap_accesses,
+            base_profile: input.base_profile,
+            baseline_orders,
+            inversions,
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LanePairContribution {
+        first_before_second: OrderedLanePairContribution,
+        second_before_first: OrderedLanePairContribution,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SmallTriangularPairStorage {
+        width: usize,
+        pairs: Vec<LanePairContribution>,
+    }
+
+    impl SmallTriangularPairStorage {
+        fn index(&self, low: usize, high: usize) -> Option<usize> {
+            if low >= high || high >= self.width {
+                return None;
+            }
+            let row_start = low
+                .checked_mul(self.width)?
+                .checked_sub(low.checked_mul(low.checked_add(1)?)? / 2)?;
+            row_start.checked_add(high.checked_sub(low)?.checked_sub(1)?)
+        }
+
+        fn get(&self, low: usize, high: usize) -> Option<LanePairContribution> {
+            self.pairs.get(self.index(low, high)?).copied()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct LargePairEntry {
+        high: usize,
+        contribution: LanePairContribution,
+    }
+
+    #[derive(Clone, Debug)]
+    struct LargeHotRow {
+        low: usize,
+        entries: Vec<LargePairEntry>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct LargeHotRowPairStorage {
+        rows: Vec<LargeHotRow>,
+    }
+
+    impl LargeHotRowPairStorage {
+        fn get(&self, low: usize, high: usize) -> Option<LanePairContribution> {
+            let row = self
+                .rows
+                .binary_search_by_key(&low, |row| row.low)
+                .ok()
+                .and_then(|index| self.rows.get(index))?;
+            let entry = row
+                .entries
+                .binary_search_by_key(&high, |entry| entry.high)
+                .ok()
+                .and_then(|index| row.entries.get(index))?;
+            Some(entry.contribution)
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum LaneDeltaPairStorage {
+        Small(SmallTriangularPairStorage),
+        Large(LargeHotRowPairStorage),
+    }
+
+    impl LaneDeltaPairStorage {
+        fn kind(&self) -> LaneDeltaStorageKind {
+            match self {
+                Self::Small(_) => LaneDeltaStorageKind::SmallTriangular,
+                Self::Large(_) => LaneDeltaStorageKind::LargeHotRows,
+            }
+        }
+
+        fn get(&self, low: usize, high: usize) -> Option<LanePairContribution> {
+            match self {
+                Self::Small(storage) => storage.get(low, high),
+                Self::Large(storage) => storage.get(low, high),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub(super) struct LaneDeltaWorkLedger {
+        /// Sum of actual inverted unordered pairs across candidates, including repeated keys.
+        pub(super) inversion_gap_work: usize,
+        /// Conservative Cartesian upper bound on interval/arm visits for stored pair queries.
+        pub(super) contact_visits: usize,
+        /// Two horizontal-net attribution entries per inversion.
+        pub(super) profile_updates: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct LaneDeltaLimits {
+        pub(super) max_small_pairs: usize,
+        /// Each sorted-union entry stores both directed orderings (four `usize` components).
+        pub(super) max_large_pairs: usize,
+        pub(super) max_inversion_gap_work: usize,
+        pub(super) max_contact_visits: usize,
+        pub(super) max_profile_updates: usize,
+    }
+
+    impl Default for LaneDeltaLimits {
+        fn default() -> Self {
+            Self {
+                max_small_pairs: MAX_GLOBAL_GAP_PAIRS,
+                max_large_pairs: MAX_REFINED_LARGE_GLOBAL_GAP_HOT_NETS * MAX_LARGE_GLOBAL_GAP_LANES,
+                max_inversion_gap_work: MAX_LARGE_GLOBAL_GAP_PAIRS,
+                max_contact_visits: MAX_LARGE_GLOBAL_GAP_ACCESS_WORK,
+                max_profile_updates: MAX_LARGE_GLOBAL_GAP_PAIRS * 2,
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) struct LaneDeltaScore {
+        pub(super) total: usize,
+        pub(super) horizontal_by_net: BTreeMap<NetId, usize>,
+        pub(super) work: LaneDeltaWorkLedger,
+    }
+
+    #[derive(Clone, Debug)]
+    pub(super) struct LaneDeltaEngine {
+        baseline_orders: Vec<Vec<NetId>>,
+        pair_storage: Vec<LaneDeltaPairStorage>,
+        candidates: Vec<Vec<LaneInversion>>,
+        base_total: usize,
+        base_horizontal_by_net: BTreeMap<NetId, usize>,
+        work: LaneDeltaWorkLedger,
+    }
+
+    fn unordered_pair_count(width: usize) -> Option<usize> {
+        if width < 2 {
+            return Some(0);
+        }
+        width.checked_mul(width.checked_sub(1)?)?.checked_div(2)
+    }
+
+    fn directed_contact_work(
+        first: &CanonicalLaneNetAccess,
+        second: &CanonicalLaneNetAccess,
+    ) -> Option<usize> {
+        fn visits(vertical: usize, horizontal: usize) -> Option<usize> {
+            vertical.checked_mul(horizontal.checked_add(1)?)
+        }
+        visits(second.vertical.len(), first.right.len())?
+            .checked_add(visits(first.vertical.len(), second.left.len())?)
+    }
+
+    fn build_pair_contribution(
+        first: &CanonicalLaneNetAccess,
+        second: &CanonicalLaneNetAccess,
+        ledger: &mut LaneDeltaWorkLedger,
+        limits: LaneDeltaLimits,
+    ) -> Result<LanePairContribution, LaneDeltaFallbackReason> {
+        let contact_visits = directed_contact_work(first, second)
+            .and_then(|work| work.checked_add(directed_contact_work(second, first)?))
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        ledger.contact_visits = ledger
+            .contact_visits
+            .checked_add(contact_visits)
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        if ledger.contact_visits > limits.max_contact_visits {
+            return Err(LaneDeltaFallbackReason::WorkBudgetExceeded {
+                work: LaneDeltaWorkKind::ContactVisits,
+            });
+        }
+        let first_before_second = exact_ordered_lane_pair_contribution(first, second)
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        let second_before_first = exact_ordered_lane_pair_contribution(second, first)
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        first_before_second
+            .checked_total()
+            .and_then(|_| second_before_first.checked_total())
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        Ok(LanePairContribution {
+            first_before_second,
+            second_before_first,
+        })
+    }
+
+    fn ordered_accesses<'a>(
+        order: &[NetId],
+        gap: &'a CanonicalLaneGapAccess,
+        gap_index: usize,
+    ) -> Result<Vec<&'a CanonicalLaneNetAccess>, LaneDeltaFallbackReason> {
+        let by_net = gap_accesses_by_net(gap)
+            .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap: gap_index })?;
+        if by_net.len() != order.len() || order.iter().any(|net| !by_net.contains_key(net)) {
+            return Err(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap: gap_index });
+        }
+        let mut accesses = Vec::new();
+        accesses
+            .try_reserve_exact(order.len())
+            .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+        for net in order {
+            let access = *by_net
+                .get(net)
+                .ok_or(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap: gap_index })?;
+            if !canonical_access_shape_is_valid(access) {
+                return Err(LaneDeltaFallbackReason::CanonicalContactSignatureChanged {
+                    gap: gap_index,
+                    net: *net,
+                });
+            }
+            accesses.push(access);
+        }
+        Ok(accesses)
+    }
+
+    fn build_small_storage(
+        accesses: &[&CanonicalLaneNetAccess],
+        ledger: &mut LaneDeltaWorkLedger,
+        limits: LaneDeltaLimits,
+    ) -> Result<LaneDeltaPairStorage, LaneDeltaFallbackReason> {
+        let pair_count = unordered_pair_count(accesses.len())
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        let mut pairs = Vec::new();
+        pairs
+            .try_reserve_exact(pair_count)
+            .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+        for low in 0..accesses.len() {
+            for high in low + 1..accesses.len() {
+                pairs.push(build_pair_contribution(
+                    accesses[low],
+                    accesses[high],
+                    ledger,
+                    limits,
+                )?);
+            }
+        }
+        Ok(LaneDeltaPairStorage::Small(SmallTriangularPairStorage {
+            width: accesses.len(),
+            pairs,
+        }))
+    }
+
+    fn build_large_storage(
+        gap: usize,
+        accesses: &[&CanonicalLaneNetAccess],
+        union: &BTreeSet<LaneInversion>,
+        ledger: &mut LaneDeltaWorkLedger,
+        limits: LaneDeltaLimits,
+    ) -> Result<LaneDeltaPairStorage, LaneDeltaFallbackReason> {
+        let mut rows = Vec::<LargeHotRow>::new();
+        for &key in union.range(
+            LaneInversion {
+                gap,
+                low: 0,
+                high: 0,
+            }..=LaneInversion {
+                gap,
+                low: usize::MAX,
+                high: usize::MAX,
+            },
+        ) {
+            let first =
+                accesses
+                    .get(key.low)
+                    .ok_or(LaneDeltaFallbackReason::MissingPairContribution {
+                        gap,
+                        low: key.low,
+                        high: key.high,
+                    })?;
+            let second =
+                accesses
+                    .get(key.high)
+                    .ok_or(LaneDeltaFallbackReason::MissingPairContribution {
+                        gap,
+                        low: key.low,
+                        high: key.high,
+                    })?;
+            let contribution = build_pair_contribution(first, second, ledger, limits)?;
+            if rows.last().is_none_or(|row| row.low != key.low) {
+                rows.try_reserve(1)
+                    .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+                rows.push(LargeHotRow {
+                    low: key.low,
+                    entries: Vec::new(),
+                });
+            }
+            let row = rows.last_mut().expect("row was just inserted");
+            row.entries
+                .try_reserve(1)
+                .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+            row.entries.push(LargePairEntry {
+                high: key.high,
+                contribution,
+            });
+        }
+        Ok(LaneDeltaPairStorage::Large(LargeHotRowPairStorage { rows }))
+    }
+
+    fn checked_profile_subtract(
+        profile: &mut BTreeMap<NetId, usize>,
+        net: NetId,
+        value: usize,
+    ) -> Result<(), LaneDeltaFallbackReason> {
+        if value == 0 {
+            return Ok(());
+        }
+        let updated = profile
+            .get(&net)
+            .copied()
+            .unwrap_or(0)
+            .checked_sub(value)
+            .ok_or(LaneDeltaFallbackReason::ArithmeticUnderflow)?;
+        if updated == 0 {
+            profile.remove(&net);
+        } else {
+            profile.insert(net, updated);
+        }
+        Ok(())
+    }
+
+    fn checked_profile_add(
+        profile: &mut BTreeMap<NetId, usize>,
+        net: NetId,
+        value: usize,
+    ) -> Result<(), LaneDeltaFallbackReason> {
+        if value == 0 {
+            return Ok(());
+        }
+        let updated = profile
+            .get(&net)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(value)
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        profile.insert(net, updated);
+        Ok(())
+    }
+
+    fn apply_pair_delta(
+        total: &mut usize,
+        horizontal: &mut BTreeMap<NetId, usize>,
+        low_net: NetId,
+        high_net: NetId,
+        pair: LanePairContribution,
+    ) -> Result<(), LaneDeltaFallbackReason> {
+        *total = total
+            .checked_sub(
+                pair.first_before_second
+                    .checked_total()
+                    .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?,
+            )
+            .ok_or(LaneDeltaFallbackReason::ArithmeticUnderflow)?;
+        checked_profile_subtract(
+            horizontal,
+            low_net,
+            pair.first_before_second.horizontal_first,
+        )?;
+        checked_profile_subtract(
+            horizontal,
+            high_net,
+            pair.first_before_second.horizontal_second,
+        )?;
+        *total = total
+            .checked_add(
+                pair.second_before_first
+                    .checked_total()
+                    .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?,
+            )
+            .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+        checked_profile_add(
+            horizontal,
+            high_net,
+            pair.second_before_first.horizontal_first,
+        )?;
+        checked_profile_add(
+            horizontal,
+            low_net,
+            pair.second_before_first.horizontal_second,
+        )?;
+        Ok(())
+    }
+
+    impl LaneDeltaEngine {
+        pub(super) fn build(
+            baseline_gap_lanes: &[BTreeMap<NetId, usize>],
+            baseline_gap_accesses: &[CanonicalLaneGapAccess],
+            candidates: &[LaneDeltaEligibility<'_>],
+            limits: LaneDeltaLimits,
+        ) -> Result<Self, LaneDeltaFallbackReason> {
+            if baseline_gap_lanes.len() != baseline_gap_accesses.len() {
+                return Err(LaneDeltaFallbackReason::GapVectorLengthMismatch);
+            }
+            let mut baseline_orders = Vec::new();
+            baseline_orders
+                .try_reserve_exact(baseline_gap_lanes.len())
+                .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+            for (gap, lanes) in baseline_gap_lanes.iter().enumerate() {
+                baseline_orders.push(dense_lane_order(lanes).ok_or(
+                    LaneDeltaFallbackReason::LaneMapNotBijection {
+                        gap,
+                        candidate: false,
+                    },
+                )?);
+            }
+            let first_candidate = candidates
+                .first()
+                .ok_or(LaneDeltaFallbackReason::InvalidCandidateIndex)?;
+            for candidate in candidates {
+                if !std::ptr::eq(candidate.baseline_gap_lanes, baseline_gap_lanes)
+                    || !std::ptr::eq(candidate.baseline_gap_accesses, baseline_gap_accesses)
+                    || !std::ptr::eq(candidate.base_profile, first_candidate.base_profile)
+                    || candidate.baseline_orders != baseline_orders
+                {
+                    return Err(LaneDeltaFallbackReason::ProfileInvocationOrRouteIdentityMismatch);
+                }
+            }
+
+            let mut work = LaneDeltaWorkLedger::default();
+            let mut candidate_inversions = Vec::new();
+            candidate_inversions
+                .try_reserve_exact(candidates.len())
+                .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+            let mut union = BTreeSet::new();
+            for candidate in candidates {
+                work.inversion_gap_work = work
+                    .inversion_gap_work
+                    .checked_add(candidate.inversions.len())
+                    .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+                if work.inversion_gap_work > limits.max_inversion_gap_work {
+                    return Err(LaneDeltaFallbackReason::WorkBudgetExceeded {
+                        work: LaneDeltaWorkKind::Inversions,
+                    });
+                }
+                for &inversion in &candidate.inversions {
+                    if inversion.low >= inversion.high
+                        || inversion.gap >= baseline_orders.len()
+                        || inversion.high >= baseline_orders[inversion.gap].len()
+                    {
+                        return Err(LaneDeltaFallbackReason::MissingPairContribution {
+                            gap: inversion.gap,
+                            low: inversion.low,
+                            high: inversion.high,
+                        });
+                    }
+                    union.insert(inversion);
+                }
+                let mut inversions = Vec::new();
+                inversions
+                    .try_reserve_exact(candidate.inversions.len())
+                    .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+                inversions.extend_from_slice(&candidate.inversions);
+                candidate_inversions.push(inversions);
+            }
+            work.profile_updates = work
+                .inversion_gap_work
+                .checked_mul(2)
+                .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+            if work.profile_updates > limits.max_profile_updates {
+                return Err(LaneDeltaFallbackReason::WorkBudgetExceeded {
+                    work: LaneDeltaWorkKind::ProfileUpdates,
+                });
+            }
+
+            let mut small_pairs = 0usize;
+            for order in &baseline_orders {
+                if order.len() <= MAX_GLOBAL_GAP_LANES {
+                    small_pairs = small_pairs
+                        .checked_add(
+                            unordered_pair_count(order.len())
+                                .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?,
+                        )
+                        .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+                }
+            }
+            if small_pairs > limits.max_small_pairs {
+                return Err(LaneDeltaFallbackReason::PairStorageCapExceeded {
+                    storage: LaneDeltaStorageKind::SmallTriangular,
+                });
+            }
+            let large_union_pairs = union
+                .iter()
+                .filter(|key| baseline_orders[key.gap].len() > MAX_GLOBAL_GAP_LANES)
+                .count();
+            if large_union_pairs > limits.max_large_pairs {
+                return Err(LaneDeltaFallbackReason::PairStorageCapExceeded {
+                    storage: LaneDeltaStorageKind::LargeHotRows,
+                });
+            }
+
+            let mut pair_storage = Vec::new();
+            pair_storage
+                .try_reserve_exact(baseline_orders.len())
+                .map_err(|_| LaneDeltaFallbackReason::AllocationFailure)?;
+            for (gap, order) in baseline_orders.iter().enumerate() {
+                let accesses = ordered_accesses(order, &baseline_gap_accesses[gap], gap)?;
+                let storage = if order.len() <= MAX_GLOBAL_GAP_LANES {
+                    build_small_storage(&accesses, &mut work, limits)?
+                } else {
+                    build_large_storage(gap, &accesses, &union, &mut work, limits)?
+                };
+                pair_storage.push(storage);
+            }
+            Ok(Self {
+                baseline_orders,
+                pair_storage,
+                candidates: candidate_inversions,
+                base_total: first_candidate.base_profile.quality.crossings,
+                base_horizontal_by_net: (*first_candidate.base_profile.crossing_counts).clone(),
+                work,
+            })
+        }
+
+        pub(super) fn storage_kinds(&self) -> Vec<LaneDeltaStorageKind> {
+            self.pair_storage
+                .iter()
+                .map(LaneDeltaPairStorage::kind)
+                .collect()
+        }
+
+        pub(super) fn apply(
+            &self,
+            candidate: usize,
+        ) -> Result<LaneDeltaScore, LaneDeltaFallbackReason> {
+            let inversions = self
+                .candidates
+                .get(candidate)
+                .ok_or(LaneDeltaFallbackReason::InvalidCandidateIndex)?;
+            let mut total = self.base_total;
+            let mut horizontal_by_net = self.base_horizontal_by_net.clone();
+            for inversion in inversions {
+                let pair = self.pair_storage[inversion.gap]
+                    .get(inversion.low, inversion.high)
+                    .ok_or(LaneDeltaFallbackReason::MissingPairContribution {
+                        gap: inversion.gap,
+                        low: inversion.low,
+                        high: inversion.high,
+                    })?;
+                apply_pair_delta(
+                    &mut total,
+                    &mut horizontal_by_net,
+                    self.baseline_orders[inversion.gap][inversion.low],
+                    self.baseline_orders[inversion.gap][inversion.high],
+                    pair,
+                )?;
+            }
+            Ok(LaneDeltaScore {
+                total,
+                horizontal_by_net,
+                work: self.work,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn lane_delta_btree_reference(
+        baseline_gap_accesses: &[CanonicalLaneGapAccess],
+        eligibility: &LaneDeltaEligibility<'_>,
+    ) -> Result<LaneDeltaScore, LaneDeltaFallbackReason> {
+        if !std::ptr::eq(baseline_gap_accesses, eligibility.baseline_gap_accesses)
+            || baseline_gap_accesses.len() != eligibility.baseline_orders.len()
+        {
+            return Err(LaneDeltaFallbackReason::GapVectorLengthMismatch);
+        }
+        let mut pairs = BTreeMap::new();
+        for inversion in &eligibility.inversions {
+            let accesses = ordered_accesses(
+                &eligibility.baseline_orders[inversion.gap],
+                &baseline_gap_accesses[inversion.gap],
+                inversion.gap,
+            )?;
+            let first = accesses[inversion.low];
+            let second = accesses[inversion.high];
+            let first_before_second = exhaustive_ordered_lane_pair_contribution(first, second)
+                .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+            let second_before_first = exhaustive_ordered_lane_pair_contribution(second, first)
+                .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?;
+            pairs.insert(
+                *inversion,
+                LanePairContribution {
+                    first_before_second,
+                    second_before_first,
+                },
+            );
+        }
+        let mut total = eligibility.base_profile.quality.crossings;
+        let mut horizontal_by_net = (*eligibility.base_profile.crossing_counts).clone();
+        for inversion in &eligibility.inversions {
+            apply_pair_delta(
+                &mut total,
+                &mut horizontal_by_net,
+                eligibility.baseline_orders[inversion.gap][inversion.low],
+                eligibility.baseline_orders[inversion.gap][inversion.high],
+                pairs[inversion],
+            )?;
+        }
+        Ok(LaneDeltaScore {
+            total,
+            horizontal_by_net,
+            work: LaneDeltaWorkLedger {
+                inversion_gap_work: eligibility.inversions.len(),
+                contact_visits: 0,
+                profile_updates: eligibility
+                    .inversions
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(LaneDeltaFallbackReason::ArithmeticOverflow)?,
+            },
+        })
     }
 }
 
@@ -10654,10 +11789,13 @@ mod tests {
         horizontal_crossing_counts_by_net, lane_indices,
         lane_pair_contribution::{
             CanonicalLaneContact, CanonicalLaneGapAccess, CanonicalLaneNetAccess,
-            CanonicalLaneTrack, OrderedLanePairContribution,
+            CanonicalLaneTrack, LaneDeltaEligibilityInput, LaneDeltaEngine,
+            LaneDeltaFallbackReason, LaneDeltaInvocationIdentity, LaneDeltaLimits,
+            LaneDeltaStorageKind, LaneDeltaWorkKind, OrderedLanePairContribution,
             canonical_lane_gap_accesses_from_sorted_segments,
             dense_ordered_lane_pair_contributions, exact_ordered_lane_pair_contribution,
-            exhaustive_ordered_lane_pair_contributions,
+            exhaustive_ordered_lane_pair_contributions, lane_delta_btree_reference,
+            lane_delta_eligibility,
         },
         large_gap_hot_access_work, large_gap_hot_access_work_from_counts,
         large_gap_hot_insertion_order_btree_reference, large_gap_hot_insertion_order_with_rounds,
@@ -18409,6 +19547,8 @@ mod tests {
             },
             shared_source,
             shared_target,
+            span_start: f64::NEG_INFINITY,
+            span_end: f64::INFINITY,
         }
     }
 
@@ -18425,6 +19565,189 @@ mod tests {
             vertical,
             left,
             right,
+        }
+    }
+
+    fn spanning_lane_contact(
+        ordinate_or_low: f64,
+        high: f64,
+        source: u32,
+        target: u32,
+        span_start: f64,
+        span_end: f64,
+    ) -> CanonicalLaneContact {
+        CanonicalLaneContact {
+            ordinate_or_low,
+            high,
+            source: Endpoint {
+                node: source,
+                port: 0,
+            },
+            target: Endpoint {
+                node: target,
+                port: 0,
+            },
+            shared_source: None,
+            shared_target: None,
+            span_start,
+            span_end,
+        }
+    }
+
+    fn asymmetric_lane_pair_gap(first_track: f64, second_track: f64) -> CanonicalLaneGapAccess {
+        CanonicalLaneGapAccess {
+            nets: vec![
+                canonical_lane_access(
+                    1,
+                    first_track,
+                    vec![spanning_lane_contact(0.0, 10.0, 1, 2, 0.0, 10.0)],
+                    vec![spanning_lane_contact(2.0, 2.0, 3, 4, 0.0, 30.0)],
+                    vec![spanning_lane_contact(5.0, 5.0, 5, 6, 0.0, 30.0)],
+                ),
+                canonical_lane_access(
+                    2,
+                    second_track,
+                    vec![spanning_lane_contact(0.0, 4.0, 7, 8, 0.0, 4.0)],
+                    vec![spanning_lane_contact(5.0, 5.0, 9, 10, 0.0, 30.0)],
+                    vec![spanning_lane_contact(5.0, 5.0, 11, 12, 0.0, 30.0)],
+                ),
+            ],
+        }
+    }
+
+    struct LaneDeltaEligibilityFixture {
+        baseline_gap_lanes: Vec<BTreeMap<u32, usize>>,
+        candidate_gap_lanes: Vec<BTreeMap<u32, usize>>,
+        baseline_endpoint_tracks: super::EndpointTracks,
+        candidate_endpoint_tracks: super::EndpointTracks,
+        baseline_crossing_paths: Vec<Option<Vec<f64>>>,
+        candidate_crossing_paths: Vec<Option<Vec<f64>>>,
+        paths_reused: bool,
+        baseline_spacing: GapTrackSpacing,
+        candidate_spacing: GapTrackSpacing,
+        baseline_outer_lanes: BTreeMap<u32, OuterLane>,
+        candidate_outer_lanes: BTreeMap<u32, OuterLane>,
+        outer_side_reassigned: bool,
+        channel_indices_changed: bool,
+        baseline_routes: Vec<EdgeGeometry>,
+        candidate_routes: Vec<EdgeGeometry>,
+        gap_bounds: Vec<(f64, f64)>,
+        baseline_gap_accesses: Vec<CanonicalLaneGapAccess>,
+        candidate_gap_accesses: Vec<CanonicalLaneGapAccess>,
+        base_profile: super::RetainedHorizontalCrossingProfile,
+        base_invocation: LaneDeltaInvocationIdentity,
+        candidate_invocation: LaneDeltaInvocationIdentity,
+    }
+
+    fn test_retained_lane_profile(
+        routes: &[EdgeGeometry],
+        crossings: usize,
+        crossing_counts: BTreeMap<u32, usize>,
+    ) -> super::RetainedHorizontalCrossingProfile {
+        super::RetainedHorizontalCrossingProfile::new(
+            routes,
+            Vec::new(),
+            crossing_counts,
+            RouteQuality {
+                crossings,
+                bends: 0,
+                route_length: 0.0,
+            },
+        )
+    }
+
+    impl LaneDeltaEligibilityFixture {
+        fn from_lane_maps(
+            baseline_gap_lanes: Vec<BTreeMap<u32, usize>>,
+            candidate_gap_lanes: Vec<BTreeMap<u32, usize>>,
+        ) -> Self {
+            fn accesses(lanes: &BTreeMap<u32, usize>) -> CanonicalLaneGapAccess {
+                CanonicalLaneGapAccess {
+                    nets: lanes
+                        .iter()
+                        .map(|(&net, &lane)| {
+                            canonical_lane_access(
+                                net,
+                                10.0 + lane as f64 * 10.0,
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        })
+                        .collect(),
+                }
+            }
+
+            let baseline_gap_accesses = baseline_gap_lanes.iter().map(accesses).collect::<Vec<_>>();
+            let candidate_gap_accesses =
+                candidate_gap_lanes.iter().map(accesses).collect::<Vec<_>>();
+            let gap_bounds = baseline_gap_lanes
+                .iter()
+                .map(|lanes| (0.0, 20.0 + lanes.len() as f64 * 10.0))
+                .collect();
+            let baseline_routes = vec![
+                EdgeGeometry {
+                    id: 9,
+                    points: vec![Point { x: 0.0, y: 0.0 }, Point { x: 1.0, y: 0.0 }],
+                },
+                EdgeGeometry {
+                    id: 3,
+                    points: vec![Point { x: 2.0, y: 1.0 }, Point { x: 2.0, y: 2.0 }],
+                },
+            ];
+            let candidate_routes = baseline_routes.clone();
+            let base_profile = test_retained_lane_profile(&baseline_routes, 0, BTreeMap::new());
+            let base_invocation = LaneDeltaInvocationIdentity::new();
+            let candidate_invocation = base_invocation.clone();
+            Self {
+                baseline_gap_lanes,
+                candidate_gap_lanes,
+                baseline_endpoint_tracks: BTreeMap::new(),
+                candidate_endpoint_tracks: BTreeMap::new(),
+                baseline_crossing_paths: vec![Some(vec![1.0, 2.0])],
+                candidate_crossing_paths: vec![Some(vec![1.0, 2.0])],
+                paths_reused: true,
+                baseline_spacing: GapTrackSpacing::Compact,
+                candidate_spacing: GapTrackSpacing::Compact,
+                baseline_outer_lanes: BTreeMap::new(),
+                candidate_outer_lanes: BTreeMap::new(),
+                outer_side_reassigned: false,
+                channel_indices_changed: false,
+                baseline_routes,
+                candidate_routes,
+                gap_bounds,
+                baseline_gap_accesses,
+                candidate_gap_accesses,
+                base_profile,
+                base_invocation,
+                candidate_invocation,
+            }
+        }
+
+        fn input(&self) -> LaneDeltaEligibilityInput<'_> {
+            LaneDeltaEligibilityInput {
+                baseline_gap_lanes: &self.baseline_gap_lanes,
+                candidate_gap_lanes: &self.candidate_gap_lanes,
+                baseline_endpoint_tracks: &self.baseline_endpoint_tracks,
+                candidate_endpoint_tracks: &self.candidate_endpoint_tracks,
+                baseline_crossing_paths: &self.baseline_crossing_paths,
+                candidate_crossing_paths: &self.candidate_crossing_paths,
+                paths_reused: self.paths_reused,
+                baseline_spacing: self.baseline_spacing,
+                candidate_spacing: self.candidate_spacing,
+                baseline_outer_lanes: &self.baseline_outer_lanes,
+                candidate_outer_lanes: &self.candidate_outer_lanes,
+                outer_side_reassigned: self.outer_side_reassigned,
+                channel_indices_changed: self.channel_indices_changed,
+                baseline_routes: &self.baseline_routes,
+                candidate_routes: &self.candidate_routes,
+                gap_bounds: &self.gap_bounds,
+                baseline_gap_accesses: &self.baseline_gap_accesses,
+                candidate_gap_accesses: &self.candidate_gap_accesses,
+                base_profile: &self.base_profile,
+                base_invocation: &self.base_invocation,
+                candidate_invocation: &self.candidate_invocation,
+            }
         }
     }
 
@@ -18845,8 +20168,11 @@ mod tests {
     #[test]
     fn canonical_lane_pair_totals_and_components_match_generated_physical_sweeps() {
         let mut state = 0xc0ff_ee12_3456_789au64;
+        let mut saw_shared_endpoint = false;
+        let mut saw_excluded_contact = false;
         for _ in 0..128 {
             let (segments, gaps, shared) = canonical_lane_state_for_generated_corpus(&mut state);
+            saw_shared_endpoint |= !shared.is_empty();
             let gap = &gaps[0];
             let dense =
                 dense_ordered_lane_pair_contributions(gap).expect("generated counts fit usize");
@@ -18854,6 +20180,30 @@ mod tests {
             let mut expected_horizontal = BTreeMap::<u32, usize>::new();
             for first in 0..gap.nets.len() {
                 for second in first + 1..gap.nets.len() {
+                    let excluded =
+                        |vertical: &CanonicalLaneContact, horizontal: &CanonicalLaneContact| {
+                            vertical.ordinate_or_low < horizontal.ordinate_or_low
+                                && horizontal.ordinate_or_low < vertical.high
+                                && [vertical.shared_source, vertical.shared_target]
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|endpoint| {
+                                        horizontal.shared_source == Some(endpoint)
+                                            || horizontal.shared_target == Some(endpoint)
+                                    })
+                        };
+                    saw_excluded_contact |=
+                        gap.nets[first].vertical.iter().any(|vertical| {
+                            gap.nets[second]
+                                .left
+                                .iter()
+                                .any(|horizontal| excluded(vertical, horizontal))
+                        }) || gap.nets[second].vertical.iter().any(|vertical| {
+                            gap.nets[first]
+                                .right
+                                .iter()
+                                .any(|horizontal| excluded(vertical, horizontal))
+                        });
                     let contribution = dense
                         .get(first, second)
                         .expect("ordered distinct pair is populated");
@@ -18885,6 +20235,764 @@ mod tests {
                 expected_total
             );
             assert_eq!(actual_horizontal, expected_horizontal);
+        }
+        assert!(
+            saw_shared_endpoint,
+            "the sweep-parity corpus must retain shared-endpoint coverage"
+        );
+        assert!(
+            saw_excluded_contact,
+            "the sweep-parity corpus must exercise at least one excluded shared contact"
+        );
+    }
+
+    #[test]
+    fn lane_delta_eligibility_rejects_partial_arm_extent_before_pair_math() {
+        let endpoint = |node| Endpoint { node, port: 0 };
+        let partial = CanonicalLaneGapAccess {
+            nets: vec![
+                canonical_lane_access(
+                    1,
+                    10.0,
+                    vec![canonical_lane_contact(0.0, 10.0, 1, 2, None, None)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                canonical_lane_access(2, 20.0, Vec::new(), Vec::new(), Vec::new()),
+                canonical_lane_access(
+                    3,
+                    30.0,
+                    Vec::new(),
+                    vec![CanonicalLaneContact {
+                        ordinate_or_low: 5.0,
+                        high: 5.0,
+                        source: endpoint(3),
+                        target: endpoint(4),
+                        shared_source: None,
+                        shared_target: None,
+                        span_start: 15.0,
+                        span_end: 30.0,
+                    }],
+                    Vec::new(),
+                ),
+            ],
+        };
+        assert_eq!(
+            exact_ordered_lane_pair_contribution(&partial.nets[0], &partial.nets[2])
+                .expect("the primitive only tests ordinate containment")
+                .checked_total(),
+            Some(1),
+            "the primitive alone miscounts the x=10 vertical because the arm starts at x=15"
+        );
+
+        let baseline_lanes = vec![BTreeMap::from([(1, 0), (2, 1), (3, 2)])];
+        let candidate_lanes = baseline_lanes.clone();
+        let routes = vec![EdgeGeometry {
+            id: 1,
+            points: vec![Point { x: 0.0, y: 0.0 }, Point { x: 1.0, y: 0.0 }],
+        }];
+        let base_profile = test_retained_lane_profile(&routes, 0, BTreeMap::new());
+        let invocation = LaneDeltaInvocationIdentity::new();
+        let endpoint_tracks = BTreeMap::new();
+        let crossing_paths = vec![None];
+        let outer_lanes = BTreeMap::new();
+        let bounds = vec![(0.0, 40.0)];
+        let result = lane_delta_eligibility(&LaneDeltaEligibilityInput {
+            baseline_gap_lanes: &baseline_lanes,
+            candidate_gap_lanes: &candidate_lanes,
+            baseline_endpoint_tracks: &endpoint_tracks,
+            candidate_endpoint_tracks: &endpoint_tracks,
+            baseline_crossing_paths: &crossing_paths,
+            candidate_crossing_paths: &crossing_paths,
+            paths_reused: true,
+            baseline_spacing: GapTrackSpacing::Compact,
+            candidate_spacing: GapTrackSpacing::Compact,
+            baseline_outer_lanes: &outer_lanes,
+            candidate_outer_lanes: &outer_lanes,
+            outer_side_reassigned: false,
+            channel_indices_changed: false,
+            baseline_routes: &routes,
+            candidate_routes: &routes,
+            gap_bounds: &bounds,
+            baseline_gap_accesses: std::slice::from_ref(&partial),
+            candidate_gap_accesses: std::slice::from_ref(&partial),
+            base_profile: &base_profile,
+            base_invocation: &invocation,
+            candidate_invocation: &invocation,
+        });
+        assert_eq!(
+            result,
+            Err(LaneDeltaFallbackReason::ArmExtentDoesNotSpanGap { gap: 0, net: 3 })
+        );
+    }
+
+    #[test]
+    fn lane_delta_extracts_identity_adjacent_reverse_and_sparse_multigap_inversions() {
+        let inversions = |baseline, candidate| {
+            let fixture = LaneDeltaEligibilityFixture::from_lane_maps(baseline, candidate);
+            lane_delta_eligibility(&fixture.input())
+                .expect("pure lane permutation is eligible")
+                .inversion_keys()
+        };
+        let four = BTreeMap::from([(40, 0), (10, 1), (30, 2), (20, 3)]);
+        assert!(inversions(vec![four.clone()], vec![four.clone()]).is_empty());
+
+        let adjacent = BTreeMap::from([(40, 0), (10, 2), (30, 1), (20, 3)]);
+        assert_eq!(
+            inversions(vec![four.clone()], vec![adjacent]),
+            vec![(0, 1, 2)]
+        );
+
+        let reverse = BTreeMap::from([(40, 3), (10, 2), (30, 1), (20, 0)]);
+        assert_eq!(
+            inversions(vec![four.clone()], vec![reverse]),
+            vec![
+                (0, 0, 1),
+                (0, 0, 2),
+                (0, 0, 3),
+                (0, 1, 2),
+                (0, 1, 3),
+                (0, 2, 3),
+            ]
+        );
+
+        let second = BTreeMap::from([(7, 0), (8, 1), (9, 2)]);
+        let second_sparse = BTreeMap::from([(7, 2), (8, 0), (9, 1)]);
+        assert_eq!(
+            inversions(vec![four.clone(), second], vec![four, second_sparse]),
+            vec![(1, 0, 1), (1, 0, 2)]
+        );
+
+        let baseline = vec![
+            BTreeMap::from([(40, 0), (10, 1), (30, 2), (20, 3)]),
+            BTreeMap::from([(7, 0), (8, 1), (9, 2)]),
+        ];
+        let candidate = vec![
+            baseline[0].clone(),
+            BTreeMap::from([(7, 2), (8, 0), (9, 1)]),
+        ];
+        let fixture = LaneDeltaEligibilityFixture::from_lane_maps(baseline, candidate);
+        let eligibility = lane_delta_eligibility(&fixture.input()).expect("sparse multi-gap state");
+        let engine = LaneDeltaEngine::build(
+            &fixture.baseline_gap_lanes,
+            &fixture.baseline_gap_accesses,
+            std::slice::from_ref(&eligibility),
+            LaneDeltaLimits::default(),
+        )
+        .expect("multi-gap triangular state");
+        let score = engine.apply(0).expect("multi-gap delta");
+        assert_eq!(score.total, 0);
+        assert!(score.horizontal_by_net.is_empty());
+        assert_eq!(score.work.inversion_gap_work, 2);
+    }
+
+    #[test]
+    fn lane_delta_gate_reports_each_structural_fallback_condition() {
+        let baseline = vec![BTreeMap::from([(1, 0), (2, 1)])];
+        let candidate = vec![BTreeMap::from([(1, 1), (2, 0)])];
+        let fixture =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        assert!(lane_delta_eligibility(&fixture.input()).is_ok());
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_gap_lanes.clear();
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::GapVectorLengthMismatch)
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_gap_lanes[0].remove(&2);
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::GapNetSetOrLaneCountMismatch { gap: 0 })
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_gap_lanes[0].insert(1, 0);
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::LaneMapNotBijection {
+                gap: 0,
+                candidate: true,
+            })
+        );
+
+        let malformed_baseline = vec![BTreeMap::from([(1, 0), (2, 0)])];
+        let malformed_candidate = malformed_baseline.clone();
+        let changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(malformed_baseline, malformed_candidate);
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::LaneMapNotBijection {
+                gap: 0,
+                candidate: false,
+            })
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_endpoint_tracks.insert(
+            (1, 2, 3),
+            super::EndpointTrack {
+                lane: 0,
+                lane_count: 1,
+                approximate_offset: None,
+            },
+        );
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::EndpointTracksChanged)
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.paths_reused = false;
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::CrossingPathsChangedOrNotReused)
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_spacing = GapTrackSpacing::Adaptive;
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::GapSpacingChanged)
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_outer_lanes.insert(
+            1,
+            OuterLane {
+                side: OuterSide::Top,
+                side_index: 0,
+                channel_index: 0,
+                channel_count: 1,
+            },
+        );
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::OuterLanesPresent)
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.channel_indices_changed = true;
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::OuterOrChannelAssignmentChanged)
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_routes[0]
+            .points
+            .push(Point { x: 1.0, y: 1.0 });
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::RouteTopologyChanged)
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_gap_accesses[0].nets[0].track = f64::NAN;
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::InvalidTrackCoordinates { gap: 0 })
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        for access in &mut changed.candidate_gap_accesses[0].nets {
+            access.track += 1.0;
+        }
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::TrackCoordinatesChanged { gap: 0 })
+        );
+
+        let mut changed =
+            LaneDeltaEligibilityFixture::from_lane_maps(baseline.clone(), candidate.clone());
+        changed.candidate_gap_accesses[0].nets[0]
+            .vertical
+            .push(spanning_lane_contact(0.0, 1.0, 1, 2, 0.0, 1.0));
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::CanonicalContactSignatureChanged { gap: 0, net: 1 })
+        );
+
+        let mut changed = LaneDeltaEligibilityFixture::from_lane_maps(baseline, candidate);
+        changed.candidate_invocation = LaneDeltaInvocationIdentity::new();
+        assert_eq!(
+            lane_delta_eligibility(&changed.input()),
+            Err(LaneDeltaFallbackReason::ProfileInvocationOrRouteIdentityMismatch)
+        );
+    }
+
+    fn asymmetric_lane_delta_fixture() -> LaneDeltaEligibilityFixture {
+        let baseline = vec![BTreeMap::from([(1, 0), (2, 1)])];
+        let candidate = vec![BTreeMap::from([(1, 1), (2, 0)])];
+        let mut fixture = LaneDeltaEligibilityFixture::from_lane_maps(baseline, candidate);
+        fixture.baseline_gap_accesses = vec![asymmetric_lane_pair_gap(10.0, 20.0)];
+        fixture.candidate_gap_accesses = vec![asymmetric_lane_pair_gap(20.0, 10.0)];
+        fixture.gap_bounds = vec![(0.0, 30.0)];
+        fixture.base_profile =
+            test_retained_lane_profile(&fixture.baseline_routes, 1, BTreeMap::from([(2, 1)]));
+        fixture
+    }
+
+    #[test]
+    fn lane_delta_engine_updates_checked_total_and_both_horizontal_components() {
+        let fixture = asymmetric_lane_delta_fixture();
+        let eligibility =
+            lane_delta_eligibility(&fixture.input()).expect("full-span swap is eligible");
+        let engine = LaneDeltaEngine::build(
+            &fixture.baseline_gap_lanes,
+            &fixture.baseline_gap_accesses,
+            std::slice::from_ref(&eligibility),
+            LaneDeltaLimits::default(),
+        )
+        .expect("bounded pair state");
+        assert_eq!(
+            engine.storage_kinds(),
+            vec![LaneDeltaStorageKind::SmallTriangular]
+        );
+        let score = engine.apply(0).expect("checked adjacent-swap delta");
+        assert_eq!(score.total, 2);
+        assert_eq!(score.horizontal_by_net, BTreeMap::from([(1, 1), (2, 1)]));
+        assert_eq!(score.work.inversion_gap_work, 1);
+        assert_eq!(score.work.profile_updates, 2);
+        assert_eq!(score.work.contact_visits, 8);
+
+        let reference = lane_delta_btree_reference(&fixture.baseline_gap_accesses, &eligibility)
+            .expect("exhaustive reference");
+        assert_eq!(score.total, reference.total);
+        assert_eq!(score.horizontal_by_net, reference.horizontal_by_net);
+    }
+
+    #[test]
+    fn lane_delta_storage_and_work_caps_accept_exact_boundary_and_reject_cap_plus_one() {
+        assert_eq!(LaneDeltaLimits::default().max_small_pairs, 32_768);
+        assert_eq!(LaneDeltaLimits::default().max_large_pairs, 180_480);
+        let fixture = asymmetric_lane_delta_fixture();
+        let eligibility =
+            lane_delta_eligibility(&fixture.input()).expect("full-span swap is eligible");
+        let exact = LaneDeltaLimits {
+            max_small_pairs: 1,
+            max_large_pairs: 0,
+            max_inversion_gap_work: 1,
+            max_contact_visits: 8,
+            max_profile_updates: 2,
+        };
+        assert!(
+            LaneDeltaEngine::build(
+                &fixture.baseline_gap_lanes,
+                &fixture.baseline_gap_accesses,
+                std::slice::from_ref(&eligibility),
+                exact,
+            )
+            .is_ok()
+        );
+
+        let mut below = exact;
+        below.max_small_pairs = 0;
+        assert!(matches!(
+            LaneDeltaEngine::build(
+                &fixture.baseline_gap_lanes,
+                &fixture.baseline_gap_accesses,
+                std::slice::from_ref(&eligibility),
+                below,
+            ),
+            Err(LaneDeltaFallbackReason::PairStorageCapExceeded {
+                storage: LaneDeltaStorageKind::SmallTriangular
+            })
+        ));
+        let mut below = exact;
+        below.max_inversion_gap_work = 0;
+        assert_eq!(
+            LaneDeltaEngine::build(
+                &fixture.baseline_gap_lanes,
+                &fixture.baseline_gap_accesses,
+                std::slice::from_ref(&eligibility),
+                below,
+            )
+            .unwrap_err(),
+            LaneDeltaFallbackReason::WorkBudgetExceeded {
+                work: LaneDeltaWorkKind::Inversions,
+            }
+        );
+        let mut below = exact;
+        below.max_contact_visits = 7;
+        assert_eq!(
+            LaneDeltaEngine::build(
+                &fixture.baseline_gap_lanes,
+                &fixture.baseline_gap_accesses,
+                std::slice::from_ref(&eligibility),
+                below,
+            )
+            .unwrap_err(),
+            LaneDeltaFallbackReason::WorkBudgetExceeded {
+                work: LaneDeltaWorkKind::ContactVisits,
+            }
+        );
+        let mut below = exact;
+        below.max_profile_updates = 1;
+        assert_eq!(
+            LaneDeltaEngine::build(
+                &fixture.baseline_gap_lanes,
+                &fixture.baseline_gap_accesses,
+                std::slice::from_ref(&eligibility),
+                below,
+            )
+            .unwrap_err(),
+            LaneDeltaFallbackReason::WorkBudgetExceeded {
+                work: LaneDeltaWorkKind::ProfileUpdates,
+            }
+        );
+
+        let baseline = vec![(0..33u32).map(|net| (net, net as usize)).collect()];
+        let candidate = vec![
+            (0..33u32)
+                .map(|net| {
+                    let lane = match net {
+                        0 => 1,
+                        1 => 0,
+                        _ => net as usize,
+                    };
+                    (net, lane)
+                })
+                .collect(),
+        ];
+        let large = LaneDeltaEligibilityFixture::from_lane_maps(baseline, candidate);
+        let eligibility =
+            lane_delta_eligibility(&large.input()).expect("large adjacent swap is eligible");
+        let exact_large = LaneDeltaLimits {
+            max_small_pairs: 0,
+            max_large_pairs: 1,
+            max_inversion_gap_work: 1,
+            max_contact_visits: 0,
+            max_profile_updates: 2,
+        };
+        let engine = LaneDeltaEngine::build(
+            &large.baseline_gap_lanes,
+            &large.baseline_gap_accesses,
+            std::slice::from_ref(&eligibility),
+            exact_large,
+        )
+        .expect("one unordered key stores both directed contributions");
+        assert_eq!(
+            engine.storage_kinds(),
+            vec![LaneDeltaStorageKind::LargeHotRows]
+        );
+        let duplicate_candidates = [eligibility.clone(), eligibility.clone()];
+        let duplicate_union_limits = LaneDeltaLimits {
+            max_inversion_gap_work: 2,
+            max_profile_updates: 4,
+            ..exact_large
+        };
+        let duplicate_union = LaneDeltaEngine::build(
+            &large.baseline_gap_lanes,
+            &large.baseline_gap_accesses,
+            &duplicate_candidates,
+            duplicate_union_limits,
+        )
+        .expect("repeated candidate keys occupy one sorted-union pair entry");
+        assert_eq!(
+            duplicate_union.apply(1).expect("second candidate").work,
+            super::lane_pair_contribution::LaneDeltaWorkLedger {
+                inversion_gap_work: 2,
+                contact_visits: 0,
+                profile_updates: 4,
+            }
+        );
+        let mut below = exact_large;
+        below.max_large_pairs = 0;
+        assert_eq!(
+            LaneDeltaEngine::build(
+                &large.baseline_gap_lanes,
+                &large.baseline_gap_accesses,
+                std::slice::from_ref(&eligibility),
+                below,
+            )
+            .unwrap_err(),
+            LaneDeltaFallbackReason::PairStorageCapExceeded {
+                storage: LaneDeltaStorageKind::LargeHotRows,
+            }
+        );
+    }
+
+    #[test]
+    fn lane_delta_checked_arithmetic_falls_back_on_underflow_and_overflow() {
+        let mut fixture = asymmetric_lane_delta_fixture();
+        fixture.base_profile =
+            test_retained_lane_profile(&fixture.baseline_routes, 0, BTreeMap::new());
+        let eligibility =
+            lane_delta_eligibility(&fixture.input()).expect("full-span swap is eligible");
+        let underflow = LaneDeltaEngine::build(
+            &fixture.baseline_gap_lanes,
+            &fixture.baseline_gap_accesses,
+            std::slice::from_ref(&eligibility),
+            LaneDeltaLimits::default(),
+        )
+        .expect("pair state");
+        assert_eq!(
+            underflow.apply(0),
+            Err(LaneDeltaFallbackReason::ArithmeticUnderflow)
+        );
+
+        let mut fixture = asymmetric_lane_delta_fixture();
+        fixture.base_profile = test_retained_lane_profile(
+            &fixture.baseline_routes,
+            usize::MAX,
+            BTreeMap::from([(2, usize::MAX)]),
+        );
+        let eligibility =
+            lane_delta_eligibility(&fixture.input()).expect("full-span swap is eligible");
+        let overflow = LaneDeltaEngine::build(
+            &fixture.baseline_gap_lanes,
+            &fixture.baseline_gap_accesses,
+            std::slice::from_ref(&eligibility),
+            LaneDeltaLimits::default(),
+        )
+        .expect("pair state");
+        assert_eq!(
+            overflow.apply(0),
+            Err(LaneDeltaFallbackReason::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn lane_delta_state_and_result_ignore_candidate_and_edge_input_order() {
+        let baseline = asymmetric_lane_delta_fixture();
+        let baseline_eligibility =
+            lane_delta_eligibility(&baseline.input()).expect("baseline input is eligible");
+        let baseline_engine = LaneDeltaEngine::build(
+            &baseline.baseline_gap_lanes,
+            &baseline.baseline_gap_accesses,
+            std::slice::from_ref(&baseline_eligibility),
+            LaneDeltaLimits::default(),
+        )
+        .expect("baseline engine");
+
+        let mut permuted = asymmetric_lane_delta_fixture();
+        permuted.baseline_gap_accesses[0].nets.reverse();
+        permuted.candidate_gap_accesses[0].nets.reverse();
+        permuted.baseline_routes.reverse();
+        permuted.candidate_routes.reverse();
+        permuted.base_profile =
+            test_retained_lane_profile(&permuted.baseline_routes, 1, BTreeMap::from([(2, 1)]));
+        let permuted_eligibility =
+            lane_delta_eligibility(&permuted.input()).expect("permuted input is eligible");
+        assert_eq!(
+            permuted_eligibility.inversion_keys(),
+            baseline_eligibility.inversion_keys()
+        );
+        let permuted_engine = LaneDeltaEngine::build(
+            &permuted.baseline_gap_lanes,
+            &permuted.baseline_gap_accesses,
+            std::slice::from_ref(&permuted_eligibility),
+            LaneDeltaLimits::default(),
+        )
+        .expect("permuted engine");
+        assert_eq!(
+            permuted_engine.storage_kinds(),
+            baseline_engine.storage_kinds()
+        );
+        assert_eq!(
+            permuted_engine.apply(0).expect("permuted score"),
+            baseline_engine.apply(0).expect("baseline score")
+        );
+    }
+
+    #[test]
+    fn randomized_lane_delta_matches_full_sweep_and_btree_reference() {
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *state
+        }
+
+        fn routes_for_lanes(
+            lanes: &BTreeMap<u32, usize>,
+            left_y: &[f64],
+            right_y: &[f64],
+        ) -> Vec<EdgeGeometry> {
+            lanes
+                .keys()
+                .copied()
+                .map(|net| {
+                    let track = 10.0 + lanes[&net] as f64 * 10.0;
+                    EdgeGeometry {
+                        id: net,
+                        points: vec![
+                            Point {
+                                x: 0.0,
+                                y: left_y[net as usize],
+                            },
+                            Point {
+                                x: track,
+                                y: left_y[net as usize],
+                            },
+                            Point {
+                                x: track,
+                                y: right_y[net as usize],
+                            },
+                            Point {
+                                x: 100.0,
+                                y: right_y[net as usize],
+                            },
+                        ],
+                    }
+                })
+                .collect()
+        }
+
+        let mut state = 0xd311_a5c0_5eed_1234u64;
+        for iteration in 0..96 {
+            let count = 2 + (next(&mut state) % 7) as usize;
+            let edges = (0..count as u32)
+                .map(|net| Edge {
+                    id: net,
+                    source: Endpoint {
+                        node: 500 + net % 2,
+                        port: 0,
+                    },
+                    target: Endpoint {
+                        node: 1_000 + net,
+                        port: 0,
+                    },
+                    net,
+                    participates_in_ranking: true,
+                })
+                .collect::<Vec<_>>();
+            let baseline_lanes = (0..count as u32)
+                .map(|net| (net, net as usize))
+                .collect::<BTreeMap<_, _>>();
+            let mut candidate_order = (0..count as u32).collect::<Vec<_>>();
+            if iteration == 1 {
+                candidate_order.reverse();
+            } else if iteration > 1 {
+                for index in (1..candidate_order.len()).rev() {
+                    let swap = (next(&mut state) as usize) % (index + 1);
+                    candidate_order.swap(index, swap);
+                }
+            }
+            let candidate_lanes = candidate_order
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(lane, net)| (net, lane))
+                .collect::<BTreeMap<_, _>>();
+            let left_y = (0..count)
+                .map(|_| (next(&mut state) % 17) as f64)
+                .collect::<Vec<_>>();
+            let right_y = (0..count)
+                .map(|_| (next(&mut state) % 17) as f64)
+                .collect::<Vec<_>>();
+            let baseline_routes = routes_for_lanes(&baseline_lanes, &left_y, &right_y);
+            let candidate_routes = routes_for_lanes(&candidate_lanes, &left_y, &right_y);
+            let shared = shared_endpoints(edges.iter());
+            let baseline_tracks = vec![
+                baseline_lanes
+                    .iter()
+                    .map(|(&net, &lane)| CanonicalLaneTrack {
+                        net,
+                        lane,
+                        fixed: 10.0 + lane as f64 * 10.0,
+                    })
+                    .rev()
+                    .collect::<Vec<_>>(),
+            ];
+            let candidate_tracks = vec![
+                candidate_lanes
+                    .iter()
+                    .map(|(&net, &lane)| CanonicalLaneTrack {
+                        net,
+                        lane,
+                        fixed: 10.0 + lane as f64 * 10.0,
+                    })
+                    .collect::<Vec<_>>(),
+            ];
+            let (baseline_segments, baseline_accesses) =
+                canonical_lane_gap_accesses_from_sorted_segments(
+                    sorted_unmerged_physical_route_segments(edges.iter(), &baseline_routes, None),
+                    &baseline_tracks,
+                    &shared,
+                )
+                .expect("baseline canonical state");
+            let (candidate_segments, candidate_accesses) =
+                canonical_lane_gap_accesses_from_sorted_segments(
+                    sorted_unmerged_physical_route_segments(edges.iter(), &candidate_routes, None),
+                    &candidate_tracks,
+                    &shared,
+                )
+                .expect("candidate canonical state");
+            let mut base_horizontal = BTreeMap::new();
+            let base_total = physical_crossing_sweep(
+                &shared,
+                &baseline_segments,
+                true,
+                Some(&mut base_horizontal),
+            );
+            let mut expected_horizontal = BTreeMap::new();
+            let expected_total = physical_crossing_sweep(
+                &shared,
+                &candidate_segments,
+                true,
+                Some(&mut expected_horizontal),
+            );
+
+            let base_profile =
+                test_retained_lane_profile(&baseline_routes, base_total, base_horizontal);
+            let invocation = LaneDeltaInvocationIdentity::new();
+            let endpoint_tracks = BTreeMap::new();
+            let crossing_paths = vec![None];
+            let outer_lanes = BTreeMap::new();
+            let eligibility = lane_delta_eligibility(&LaneDeltaEligibilityInput {
+                baseline_gap_lanes: std::slice::from_ref(&baseline_lanes),
+                candidate_gap_lanes: std::slice::from_ref(&candidate_lanes),
+                baseline_endpoint_tracks: &endpoint_tracks,
+                candidate_endpoint_tracks: &endpoint_tracks,
+                baseline_crossing_paths: &crossing_paths,
+                candidate_crossing_paths: &crossing_paths,
+                paths_reused: true,
+                baseline_spacing: GapTrackSpacing::Compact,
+                candidate_spacing: GapTrackSpacing::Compact,
+                baseline_outer_lanes: &outer_lanes,
+                candidate_outer_lanes: &outer_lanes,
+                outer_side_reassigned: false,
+                channel_indices_changed: false,
+                baseline_routes: &baseline_routes,
+                candidate_routes: &candidate_routes,
+                gap_bounds: &[(0.0, 100.0)],
+                baseline_gap_accesses: &baseline_accesses,
+                candidate_gap_accesses: &candidate_accesses,
+                base_profile: &base_profile,
+                base_invocation: &invocation,
+                candidate_invocation: &invocation,
+            })
+            .expect("generated pure permutation is eligible");
+            let engine = LaneDeltaEngine::build(
+                std::slice::from_ref(&baseline_lanes),
+                &baseline_accesses,
+                std::slice::from_ref(&eligibility),
+                LaneDeltaLimits::default(),
+            )
+            .expect("generated bounded state");
+            let actual = engine.apply(0).expect("generated checked delta");
+            assert_eq!(actual.total, expected_total);
+            assert_eq!(actual.horizontal_by_net, expected_horizontal);
+
+            let reference = lane_delta_btree_reference(&baseline_accesses, &eligibility)
+                .expect("generated exhaustive reference");
+            assert_eq!(actual.total, reference.total);
+            assert_eq!(actual.horizontal_by_net, reference.horizontal_by_net);
         }
     }
 
