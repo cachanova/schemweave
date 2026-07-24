@@ -540,25 +540,30 @@ fn common_horizontal_collector_x(
         BoundaryBundleRole::Output => left.total_cmp(right),
     });
     candidates.dedup_by(|left, right| left.to_bits() == right.to_bits());
-    candidates.into_iter().find(|&candidate| {
-        bundle.members.iter().all(|member| {
-            let Some(route) = context
-                .route_index
-                .get(&member.edge)
-                .and_then(|index| routes.get(*index))
-            else {
-                return false;
-            };
-            route.points.windows(2).any(|pair| {
-                let Some(next) = remaining.checked_sub(1) else {
-                    return false;
-                };
-                *remaining = next;
-                shared_trunk_horizontal_range(pair[0], pair[1], bundle.role, context.pitch)
+    for candidate in candidates {
+        let mut common = true;
+        for member in &bundle.members {
+            let route = routes.get(*context.route_index.get(&member.edge)?)?;
+            let mut found = false;
+            for pair in route.points.windows(2) {
+                *remaining = remaining.checked_sub(1)?;
+                if shared_trunk_horizontal_range(pair[0], pair[1], bundle.role, context.pitch)
                     .is_some_and(|(low, high)| candidate >= low && candidate <= high)
-            })
-        })
-    })
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                common = false;
+                break;
+            }
+        }
+        if common {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn build_geometry(
