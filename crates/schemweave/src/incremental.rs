@@ -7,10 +7,10 @@ use thiserror::Error;
 use crate::{
     BoundaryBundleConstraint, BoundaryBundleGeometry, BoundaryBundleId,
     BoundaryBundleMemberConstraint, BoundaryBundleMemberGeometry, BoundaryBundleRole,
-    ConstrainedLayoutError, Edge, EdgeGeometry, EdgeId, Endpoint, Graph, Layout, LayoutConstraints,
-    LayoutError, LayoutOptions, NetId, Node, NodeGeometry, NodeId, Point, Port, PortSide,
-    QualityEffort, boundary_bundles, layout_with_quality_effort_and_constraints, routing,
-    validation,
+    BoundaryBundleSegment, ConstrainedLayoutError, Edge, EdgeGeometry, EdgeId, Endpoint, Graph,
+    Layout, LayoutConstraints, LayoutError, LayoutOptions, NetId, Node, NodeGeometry, NodeId,
+    Point, Port, PortSide, QualityEffort, boundary_bundles,
+    layout_with_quality_effort_and_constraints, routing, validation,
 };
 
 const MAX_EXPANSION_MEMBERS: usize = 4_096;
@@ -21,6 +21,7 @@ const FAST_CANDIDATE_WORK: usize = 10_000_000;
 const QUALITY_CANDIDATE_WORK: usize = 30_000_000;
 const MAX_CANDIDATE_WORK: usize = 120_000_000;
 const SAFETY_CANDIDATES: usize = 2;
+const LOCAL_REFLOW_CANDIDATES: usize = 2;
 const EXPANSION_COMPONENT_GAP: f64 = 18.0;
 const EXPANSION_STACK_HEIGHT_FACTOR: f64 = 1.5;
 
@@ -229,14 +230,17 @@ impl CandidateScore {
     }
 }
 
-/// Expand one quotient node without moving retained nodes or retained routes.
+/// Expand one quotient node while preserving distant retained geometry.
 ///
 /// The compact and expanded graphs must use stable identifiers. Every node and
-/// edge unrelated to the anchor must be byte-for-byte equivalent. Boundary
+/// edge unrelated to the anchor must remain semantically equivalent. Boundary
 /// member edges reuse explicitly mapped compact trunks, while member placement
-/// and internal routing use the canonical SchemWeave engine. A result is
-/// returned only when every hard geometry and left-to-right invariant survives;
-/// callers must perform a full layout after `NeedsFullRelayout`.
+/// and internal routing use the canonical SchemWeave engine. Wider groups open
+/// a horizontal corridor. Taller groups may move the connected obstructing
+/// vertical slab and deform only routes crossing that slab; the non-reflow
+/// candidate remains available as a fallback. A result is returned
+/// only when every hard geometry and left-to-right invariant survives; callers
+/// must perform a full layout after `NeedsFullRelayout`.
 pub fn expand_group_in_place(
     compact_graph: &Graph,
     compact_layout: &Layout,
@@ -382,16 +386,24 @@ pub fn expand_group_in_place_with_reference_height(
     }
     let corridor_layout =
         insert_horizontal_expansion_corridor(compact_layout, expansion.anchor, member_layout.width);
-    let working_layout = corridor_layout.as_ref().unwrap_or(compact_layout);
+    let horizontal_layout = corridor_layout.as_ref().unwrap_or(compact_layout);
+    let vertical_layout = insert_local_vertical_expansion_corridor(
+        compact_graph,
+        horizontal_layout,
+        expansion.anchor,
+        member_layout.width,
+        member_layout.height,
+        options.layout,
+    );
     let contract = validate_contract(
         compact_graph,
-        working_layout,
+        horizontal_layout,
         expanded_graph,
         expansion,
         options.layout,
     )?;
     let boundary_bundles = remap_boundary_bundles(
-        working_layout,
+        horizontal_layout,
         expanded_graph,
         &expanded_indexed,
         &contract,
@@ -405,32 +417,93 @@ pub fn expand_group_in_place_with_reference_height(
                 ^ contract.members.contains(&edge.target.node)
         })
         .count();
-    let projected_segments = projected_segment_count(expanded_graph, &contract, &member_layout);
-    if projected_segments > MAX_LAYOUT_SEGMENTS {
+    let baseline_projected_segments =
+        projected_segment_count(expanded_graph, &contract, &member_layout);
+    if baseline_projected_segments > MAX_LAYOUT_SEGMENTS {
         return Err(GroupExpansionError::PreservedGeometryTooLarge {
-            actual: projected_segments,
+            actual: baseline_projected_segments,
             maximum: MAX_LAYOUT_SEGMENTS,
         });
     }
-    let mut positions = candidate_positions(
-        working_layout,
+    let mut projected_segments = baseline_projected_segments;
+    let vertical_contract = vertical_layout.as_ref().and_then(|vertical_layout| {
+        validate_contract(
+            compact_graph,
+            vertical_layout,
+            expanded_graph,
+            expansion,
+            options.layout,
+        )
+        .ok()
+    });
+    let vertical_bundles = vertical_layout
+        .as_ref()
+        .zip(vertical_contract.as_ref())
+        .and_then(|(vertical_layout, vertical_contract)| {
+            remap_boundary_bundles(
+                vertical_layout,
+                expanded_graph,
+                &expanded_indexed,
+                vertical_contract,
+                options.layout,
+            )
+            .ok()
+        });
+    let mut vertical_layout_is_usable = vertical_contract
+        .as_ref()
+        .zip(vertical_bundles.as_ref())
+        .is_some_and(|(vertical_contract, _)| {
+            let vertical_segments =
+                projected_segment_count(expanded_graph, vertical_contract, &member_layout);
+            if vertical_segments <= MAX_LAYOUT_SEGMENTS {
+                projected_segments = projected_segments.max(vertical_segments);
+                true
+            } else {
+                false
+            }
+        });
+    let mut reserved_candidates = if vertical_layout_is_usable {
+        LOCAL_REFLOW_CANDIDATES
+    } else {
+        0
+    };
+    let expansion_work = |projected_segments| ExpansionWork {
+        nodes: expanded_graph.nodes.len(),
+        edges: expanded_graph.edges.len(),
+        boundary_edges,
+        projected_segments,
+        boundary_bundles: expanded_indexed.boundary_bundles.len(),
+        boundary_bundle_members: expanded_indexed
+            .boundary_bundles
+            .iter()
+            .map(|bundle| bundle.members.len())
+            .sum(),
+    };
+    let mut positions = match candidate_positions(
+        horizontal_layout,
         contract.anchor_geometry,
         &member_layout,
-        ExpansionWork {
-            nodes: expanded_graph.nodes.len(),
-            edges: expanded_graph.edges.len(),
-            boundary_edges,
-            projected_segments,
-            boundary_bundles: expanded_indexed.boundary_bundles.len(),
-            boundary_bundle_members: expanded_indexed
-                .boundary_bundles
-                .iter()
-                .map(|bundle| bundle.members.len())
-                .sum(),
-        },
+        expansion_work(projected_segments),
         options.layout,
         options.quality_effort,
-    )?;
+        reserved_candidates,
+    ) {
+        Ok(positions) => positions,
+        Err(_) if vertical_layout_is_usable => {
+            vertical_layout_is_usable = false;
+            reserved_candidates = 0;
+            candidate_positions(
+                horizontal_layout,
+                contract.anchor_geometry,
+                &member_layout,
+                expansion_work(baseline_projected_segments),
+                options.layout,
+                options.quality_effort,
+                0,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
     prioritize_constraint_positions(
         &mut positions,
         constraint_x_candidates(
@@ -441,11 +514,66 @@ pub fn expand_group_in_place_with_reference_height(
         ),
     );
 
-    let anchor_center = center(contract.anchor_geometry);
+    let anchor_origin = Point {
+        x: contract.anchor_geometry.x,
+        y: contract.anchor_geometry.y,
+    };
     let mut best: Option<(CandidateScore, Layout)> = None;
     let hard_budget_maximum = candidate_work_budget(options.quality_effort);
     let mut hard_budget = WorkBudget::new(hard_budget_maximum);
-    let mut candidate_attempts_remaining = positions.len();
+    let mut candidate_attempts_remaining = positions.len() + reserved_candidates;
+
+    if vertical_layout_is_usable {
+        let vertical_layout = vertical_layout
+            .as_ref()
+            .expect("usable vertical layout was constructed");
+        let vertical_contract = vertical_contract
+            .as_ref()
+            .expect("usable vertical layout has a validated contract");
+        let vertical_bundles = vertical_bundles
+            .as_ref()
+            .expect("usable vertical layout has remapped boundary bundles");
+        let frame = Rect {
+            left: anchor_origin.x,
+            top: anchor_origin.y,
+            right: anchor_origin.x + member_layout.width,
+            bottom: anchor_origin.y + member_layout.height,
+        };
+        if retained_node_overlap_area(vertical_layout, expansion.anchor, frame, 0.0) == 0.0 {
+            for prefer_direct_boundary_routes in [true, false] {
+                if candidate_attempts_remaining == 0 {
+                    break;
+                }
+                candidate_attempts_remaining -= 1;
+                if let Some(candidate) = evaluate_expansion_candidate(
+                    vertical_layout,
+                    expanded_graph,
+                    &expanded_indexed,
+                    vertical_contract,
+                    &member_layout,
+                    vertical_bundles,
+                    anchor_origin.x,
+                    anchor_origin.y,
+                    options,
+                    prefer_direct_boundary_routes,
+                    anchor_origin,
+                    &mut hard_budget,
+                    hard_budget_maximum,
+                )? {
+                    if best
+                        .as_ref()
+                        .is_none_or(|(current, _)| candidate.0.cmp(*current).is_lt())
+                    {
+                        best = Some(candidate);
+                    }
+                    if prefer_direct_boundary_routes {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     for (x, y) in positions {
         let frame = Rect {
             left: x,
@@ -453,7 +581,7 @@ pub fn expand_group_in_place_with_reference_height(
             right: x + member_layout.width,
             bottom: y + member_layout.height,
         };
-        if retained_node_overlap_area(working_layout, expansion.anchor, frame, 0.0) > 0.0 {
+        if retained_node_overlap_area(horizontal_layout, expansion.anchor, frame, 0.0) > 0.0 {
             continue;
         }
         for prefer_direct_boundary_routes in [true, false] {
@@ -461,102 +589,29 @@ pub fn expand_group_in_place_with_reference_height(
                 break;
             }
             candidate_attempts_remaining -= 1;
-            let candidate = match compose_candidate(
-                working_layout,
+            let Some(candidate) = evaluate_expansion_candidate(
+                horizontal_layout,
                 expanded_graph,
+                &expanded_indexed,
                 &contract,
                 &member_layout,
                 &boundary_bundles,
                 x,
                 y,
-                options.layout,
+                options,
                 prefer_direct_boundary_routes,
-            ) {
-                Ok(candidate) => candidate,
-                Err(GroupExpansionError::NoSafeBoundaryBridge(_)) => continue,
-                Err(error) => return Err(error),
-            };
-            hard_budget
-                .take(expanded_graph.edges.len())
-                .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
-                    required,
-                    maximum: hard_budget_maximum,
-                })?;
-            let geometry_is_clean =
-                hard_geometry_is_clean_bounded(expanded_graph, &candidate, &mut hard_budget)
-                    .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
-                        required,
-                        maximum: hard_budget_maximum,
-                    })?;
-            charge_expansion_work(
+                anchor_origin,
                 &mut hard_budget,
-                clearance_work_upper_bound(&candidate, options.layout),
                 hard_budget_maximum,
-            )?;
-            let mut clearance_work_exhausted = false;
-            let clearance_is_clean = crate::candidate_satisfies_edge_node_clearance_bounded(
-                &expanded_indexed,
-                &candidate,
-                options.layout,
-                crate::MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
-                &mut clearance_work_exhausted,
-            );
-            charge_expansion_work(
-                &mut hard_budget,
-                parallel_spacing_work_upper_bound(&candidate, options.layout),
-                hard_budget_maximum,
-            )?;
-            let parallel_spacing_is_clean = if options.layout.minimum_parallel_wire_spacing > 0.0 {
-                matches!(
-                    routing::route_family_satisfies_parallel_spacing_bounded(
-                        &expanded_indexed,
-                        &candidate.edges,
-                        options.layout.minimum_parallel_wire_spacing,
-                        crate::outward_obstacle_clearance_stub(options.layout),
-                        crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
-                        crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
-                    ),
-                    Ok(true)
-                )
-            } else {
-                true
-            };
-            charge_expansion_work(
-                &mut hard_budget,
-                boundary_bundle_work_upper_bound(&expanded_indexed, &candidate),
-                hard_budget_maximum,
-            )?;
-            let boundary_bundle_geometry_is_clean =
-                boundary_bundles::verify_geometry(&expanded_indexed, &candidate, options.layout)
-                    .is_ok();
-            if ranking_direction_violations(expanded_graph, &candidate) != 0
-                || !constraints_are_satisfied(&candidate, &options.constraints)
-                || !geometry_is_clean
-                || !clearance_is_clean
-                || clearance_work_exhausted
-                || !parallel_spacing_is_clean
-                || !boundary_bundle_geometry_is_clean
-            {
+            )?
+            else {
                 continue;
-            }
-            let score = CandidateScore {
-                quality: routing::route_quality(&expanded_indexed, &candidate.edges),
-                displacement: squared_distance(
-                    Point {
-                        x: x + member_layout.width / 2.0,
-                        y: y + member_layout.height / 2.0,
-                    },
-                    anchor_center,
-                ),
-                area: candidate.width * candidate.height,
-                x,
-                y,
             };
             if best
                 .as_ref()
-                .is_none_or(|(current, _)| score.cmp(*current).is_lt())
+                .is_none_or(|(current, _)| candidate.0.cmp(*current).is_lt())
             {
-                best = Some((score, candidate));
+                best = Some(candidate);
             }
             if prefer_direct_boundary_routes {
                 break;
@@ -568,6 +623,108 @@ pub fn expand_group_in_place_with_reference_height(
     }
     best.map(|(_, layout)| layout)
         .ok_or(GroupExpansionError::NeedsFullRelayout)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_expansion_candidate(
+    working_layout: &Layout,
+    expanded_graph: &Graph,
+    expanded_indexed: &validation::IndexedGraph<'_>,
+    contract: &ExpansionContract<'_>,
+    member_layout: &Layout,
+    remapped_bundles: &RemappedBoundaryBundles,
+    x: f64,
+    y: f64,
+    options: &GroupExpansionOptions,
+    prefer_direct_boundary_routes: bool,
+    anchor_origin: Point,
+    hard_budget: &mut WorkBudget,
+    hard_budget_maximum: usize,
+) -> Result<Option<(CandidateScore, Layout)>, GroupExpansionError> {
+    let candidate = match compose_candidate(
+        working_layout,
+        expanded_graph,
+        contract,
+        member_layout,
+        remapped_bundles,
+        x,
+        y,
+        options.layout,
+        prefer_direct_boundary_routes,
+    ) {
+        Ok(candidate) => candidate,
+        Err(GroupExpansionError::NoSafeBoundaryBridge(_)) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    hard_budget
+        .take(expanded_graph.edges.len())
+        .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
+            required,
+            maximum: hard_budget_maximum,
+        })?;
+    let geometry_is_clean = hard_geometry_is_clean_bounded(expanded_graph, &candidate, hard_budget)
+        .map_err(|required| GroupExpansionError::ExpansionWorkLimitExceeded {
+            required,
+            maximum: hard_budget_maximum,
+        })?;
+    charge_expansion_work(
+        hard_budget,
+        clearance_work_upper_bound(&candidate, options.layout),
+        hard_budget_maximum,
+    )?;
+    let mut clearance_work_exhausted = false;
+    let clearance_is_clean = crate::candidate_satisfies_edge_node_clearance_bounded(
+        expanded_indexed,
+        &candidate,
+        options.layout,
+        crate::MAX_LAYOUT_CLEARANCE_PAIR_VISITS,
+        &mut clearance_work_exhausted,
+    );
+    charge_expansion_work(
+        hard_budget,
+        parallel_spacing_work_upper_bound(&candidate, options.layout),
+        hard_budget_maximum,
+    )?;
+    let parallel_spacing_is_clean = if options.layout.minimum_parallel_wire_spacing > 0.0 {
+        matches!(
+            routing::route_family_satisfies_parallel_spacing_bounded(
+                expanded_indexed,
+                &candidate.edges,
+                options.layout.minimum_parallel_wire_spacing,
+                crate::outward_obstacle_clearance_stub(options.layout),
+                crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS,
+                crate::MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS,
+            ),
+            Ok(true)
+        )
+    } else {
+        true
+    };
+    charge_expansion_work(
+        hard_budget,
+        boundary_bundle_work_upper_bound(expanded_indexed, &candidate),
+        hard_budget_maximum,
+    )?;
+    let boundary_bundle_geometry_is_clean =
+        boundary_bundles::verify_geometry(expanded_indexed, &candidate, options.layout).is_ok();
+    if ranking_direction_violations(expanded_graph, &candidate) != 0
+        || !constraints_are_satisfied(&candidate, &options.constraints)
+        || !geometry_is_clean
+        || !clearance_is_clean
+        || clearance_work_exhausted
+        || !parallel_spacing_is_clean
+        || !boundary_bundle_geometry_is_clean
+    {
+        return Ok(None);
+    }
+    let score = CandidateScore {
+        quality: routing::route_quality(expanded_indexed, &candidate.edges),
+        displacement: squared_distance(Point { x, y }, anchor_origin),
+        area: candidate.width * candidate.height,
+        x,
+        y,
+    };
+    Ok(Some((score, candidate)))
 }
 
 fn charge_expansion_work(
@@ -1480,6 +1637,267 @@ fn insert_horizontal_expansion_corridor(
     Some(expanded)
 }
 
+fn insert_local_vertical_expansion_corridor(
+    compact_graph: &Graph,
+    compact_layout: &Layout,
+    anchor: NodeId,
+    member_width: f64,
+    member_height: f64,
+    options: LayoutOptions,
+) -> Option<Layout> {
+    let anchor_geometry = compact_layout.nodes.iter().find(|node| node.id == anchor)?;
+    if member_height <= anchor_geometry.height + HARD_GATE_EPSILON {
+        return None;
+    }
+
+    let cut = anchor_geometry.y + anchor_geometry.height;
+    let margin = options.node_gap / 2.0;
+    let frame = Rect {
+        left: anchor_geometry.x,
+        top: anchor_geometry.y,
+        right: anchor_geometry.x + member_width,
+        bottom: anchor_geometry.y + member_height,
+    };
+    let blocker_top = compact_layout
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.id != anchor
+                && node.y + HARD_GATE_EPSILON >= cut
+                && Rect::from_node(node).overlap_area(frame.expanded(margin)) > HARD_GATE_EPSILON
+        })
+        .map(|node| node.y)
+        .min_by(f64::total_cmp)?;
+    let delta = frame.bottom + margin - blocker_top;
+    if delta <= HARD_GATE_EPSILON {
+        return None;
+    }
+
+    // Merge x intervals once to find the connected slab containing the
+    // expanded frame. This keeps nodes atomic without an all-pairs closure.
+    let seed_left = (frame.left - margin).max(0.0);
+    let seed_right = frame.right + margin;
+    let mut intervals = compact_layout
+        .nodes
+        .iter()
+        .filter(|node| node.id != anchor && node.y + HARD_GATE_EPSILON >= cut)
+        .map(|node| {
+            (
+                (node.x - margin).max(0.0),
+                node.x + node.width + margin,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    intervals.push((seed_left, seed_right, true));
+    intervals.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then(left.1.total_cmp(&right.1))
+            .then(left.2.cmp(&right.2))
+    });
+    let mut components = Vec::<(f64, f64, bool)>::new();
+    for (left, right, contains_seed) in intervals {
+        if let Some(component) = components.last_mut()
+            && left <= component.1 + HARD_GATE_EPSILON
+        {
+            component.1 = component.1.max(right);
+            component.2 |= contains_seed;
+        } else {
+            components.push((left, right, contains_seed));
+        }
+    }
+    let (left, right, _) = components
+        .into_iter()
+        .find(|component| component.2)
+        .expect("the frame seed belongs to one merged interval");
+    let slab = Rect {
+        left,
+        top: cut,
+        right,
+        bottom: f64::INFINITY,
+    };
+    if compact_layout.nodes.iter().any(|node| {
+        node.id != anchor
+            && node.x < slab.right - HARD_GATE_EPSILON
+            && node.x + node.width > slab.left + HARD_GATE_EPSILON
+            && node.y < cut - HARD_GATE_EPSILON
+            && node.y + node.height > cut + HARD_GATE_EPSILON
+    }) {
+        return None;
+    }
+
+    let mut expanded = compact_layout.clone();
+    let anchor_edges = compact_graph
+        .edges
+        .iter()
+        .filter(|edge| edge.source.node == anchor || edge.target.node == anchor)
+        .map(|edge| edge.id)
+        .collect::<BTreeSet<_>>();
+    let protected_bundle_edges = compact_layout
+        .boundary_bundles
+        .iter()
+        .flat_map(|bundle| bundle.members.iter().map(|member| member.edge))
+        .filter(|edge| !anchor_edges.contains(edge))
+        .collect::<BTreeSet<_>>();
+    let mut moved = false;
+    for node in &mut expanded.nodes {
+        if node.id != anchor
+            && node.y + HARD_GATE_EPSILON >= cut
+            && node.x >= slab.left - HARD_GATE_EPSILON
+            && node.x + node.width <= slab.right + HARD_GATE_EPSILON
+        {
+            node.y += delta;
+            moved = true;
+        }
+    }
+    if !moved {
+        return None;
+    }
+    for route in &mut expanded.edges {
+        let warped = warp_vertical_slab_route(&route.points, slab.left, slab.right, cut, delta);
+        if protected_bundle_edges.contains(&route.id) && warped != route.points {
+            return None;
+        }
+        route.points = warped;
+    }
+    if route_segment_count(&expanded) > MAX_LAYOUT_SEGMENTS {
+        return None;
+    }
+    for bundle in &mut expanded.boundary_bundles {
+        bundle.collector =
+            warp_vertical_slab_segment(bundle.collector, slab.left, slab.right, cut, delta)?;
+        bundle.spine = warp_vertical_slab_segment(bundle.spine, slab.left, slab.right, cut, delta)?;
+        for member in &mut bundle.members {
+            member.tap = warp_vertical_slab_point(member.tap, slab.left, slab.right, cut, delta);
+        }
+    }
+    expanded.height = layout_bottom(&expanded).max(compact_layout.height);
+    Some(expanded)
+}
+
+fn warp_vertical_slab_point(point: Point, left: f64, right: f64, cut: f64, delta: f64) -> Point {
+    if point.x > left + HARD_GATE_EPSILON
+        && point.x < right - HARD_GATE_EPSILON
+        && point.y + HARD_GATE_EPSILON >= cut
+    {
+        Point {
+            y: point.y + delta,
+            ..point
+        }
+    } else {
+        point
+    }
+}
+
+fn warp_vertical_slab_route(
+    points: &[Point],
+    left: f64,
+    right: f64,
+    cut: f64,
+    delta: f64,
+) -> Vec<Point> {
+    let Some(&first) = points.first() else {
+        return Vec::new();
+    };
+    let mut warped = vec![warp_vertical_slab_point(first, left, right, cut, delta)];
+    for segment in points.windows(2) {
+        let start = segment[0];
+        let end = segment[1];
+        if start.x == end.x || start.y < cut - HARD_GATE_EPSILON {
+            warped.push(warp_vertical_slab_point(end, left, right, cut, delta));
+            continue;
+        }
+        debug_assert_eq!(start.y, end.y);
+        let (minimum, maximum) = if start.x <= end.x {
+            (start.x, end.x)
+        } else {
+            (end.x, start.x)
+        };
+        let mut breaks = [left, right]
+            .into_iter()
+            .filter(|x| *x > minimum + HARD_GATE_EPSILON && *x < maximum - HARD_GATE_EPSILON)
+            .collect::<Vec<_>>();
+        breaks.sort_by(f64::total_cmp);
+        if start.x > end.x {
+            breaks.reverse();
+        }
+        breaks.push(end.x);
+        let mut current_x = start.x;
+        for next_x in breaks {
+            let midpoint = (current_x + next_x) / 2.0;
+            let interval_y =
+                if midpoint > left + HARD_GATE_EPSILON && midpoint < right - HARD_GATE_EPSILON {
+                    start.y + delta
+                } else {
+                    start.y
+                };
+            let current = *warped.last().expect("warped route has a start");
+            if current.y != interval_y {
+                warped.push(Point {
+                    x: current_x,
+                    y: interval_y,
+                });
+            }
+            warped.push(Point {
+                x: next_x,
+                y: interval_y,
+            });
+            current_x = next_x;
+        }
+        let transformed_end = warp_vertical_slab_point(end, left, right, cut, delta);
+        if warped.last().copied() != Some(transformed_end) {
+            warped.push(transformed_end);
+        }
+    }
+    simplify_orthogonal(warped)
+}
+
+fn warp_vertical_slab_segment(
+    segment: BoundaryBundleSegment,
+    left: f64,
+    right: f64,
+    cut: f64,
+    delta: f64,
+) -> Option<BoundaryBundleSegment> {
+    let points = warp_vertical_slab_route(&[segment.start, segment.end], left, right, cut, delta);
+    match points.as_slice() {
+        [point] => Some(BoundaryBundleSegment {
+            start: *point,
+            end: *point,
+        }),
+        [start, end] => Some(BoundaryBundleSegment {
+            start: *start,
+            end: *end,
+        }),
+        _ => None,
+    }
+}
+
+fn layout_bottom(layout: &Layout) -> f64 {
+    layout
+        .nodes
+        .iter()
+        .map(|node| node.y + node.height)
+        .chain(
+            layout
+                .edges
+                .iter()
+                .flat_map(|edge| edge.points.iter().map(|point| point.y)),
+        )
+        .chain(layout.boundary_bundles.iter().flat_map(|bundle| {
+            [
+                bundle.collector.start.y,
+                bundle.collector.end.y,
+                bundle.spine.start.y,
+                bundle.spine.end.y,
+            ]
+            .into_iter()
+            .chain(bundle.members.iter().map(|member| member.tap.y))
+        }))
+        .fold(0.0, f64::max)
+}
+
 fn arrange_member_components(
     graph: &Graph,
     layout: &Layout,
@@ -2367,6 +2785,7 @@ fn candidate_positions(
     work: ExpansionWork,
     options: LayoutOptions,
     effort: QualityEffort,
+    reserved_candidates: usize,
 ) -> Result<Vec<(f64, f64)>, GroupExpansionError> {
     let radius: i32 = match effort {
         QualityEffort::Fast => 0,
@@ -2413,14 +2832,15 @@ fn candidate_positions(
         .saturating_add(projected_parallel_work)
         .saturating_add(projected_bundle_work)
         .max(1);
-    let minimum_work = work_per_candidate.saturating_mul(SAFETY_CANDIDATES + 1);
+    let reserved_candidates = reserved_candidates.saturating_add(SAFETY_CANDIDATES);
+    let minimum_work = work_per_candidate.saturating_mul(reserved_candidates.saturating_add(1));
     if minimum_work > budget {
         return Err(GroupExpansionError::ExpansionWorkLimitExceeded {
             required: minimum_work,
             maximum: budget,
         });
     }
-    let candidate_limit = (budget / work_per_candidate).saturating_sub(SAFETY_CANDIDATES);
+    let candidate_limit = (budget / work_per_candidate).saturating_sub(reserved_candidates);
     let mut offsets = Vec::new();
     for distance in 0..=radius * 2 {
         for dx in -radius..=radius {
@@ -2462,7 +2882,13 @@ fn candidate_positions(
     ));
     let mut seen = BTreeSet::new();
     positions.retain(|&(x, y)| seen.insert((x.to_bits(), y.to_bits())));
-    debug_assert!(positions.len().saturating_mul(work_per_candidate) <= budget);
+    debug_assert!(
+        positions
+            .len()
+            .saturating_add(reserved_candidates.saturating_sub(SAFETY_CANDIDATES))
+            .saturating_mul(work_per_candidate)
+            <= budget
+    );
     Ok(positions)
 }
 
@@ -3539,13 +3965,6 @@ fn correct_direction(endpoint: Point, adjacent: Point, side: PortSide) -> bool {
     }
 }
 
-fn center(node: &NodeGeometry) -> Point {
-    Point {
-        x: node.x + node.width / 2.0,
-        y: node.y + node.height / 2.0,
-    }
-}
-
 fn squared_distance(left: Point, right: Point) -> f64 {
     (left.x - right.x).powi(2) + (left.y - right.y).powi(2)
 }
@@ -4039,6 +4458,136 @@ mod tests {
         assert!(result.width > compact_layout.width);
         assert!(super::hard_geometry_is_clean(&expanded, &result));
         assert_eq!(super::ranking_direction_violations(&expanded, &result), 0);
+    }
+
+    #[test]
+    fn taller_expansion_reflows_only_the_obstructing_local_row() {
+        let compact = Graph {
+            nodes: vec![node(1), node(2), node(10), node(20), node(30), node(40)],
+            edges: vec![
+                edge(1, 1, 10, 100),
+                edge(2, 10, 20, 200),
+                edge(3, 2, 30, 300),
+                edge(4, 30, 40, 400),
+            ],
+        };
+        let expanded = Graph {
+            nodes: vec![
+                node(1),
+                node(2),
+                node(11),
+                node(12),
+                node(13),
+                node(14),
+                node(20),
+                node(30),
+                node(40),
+            ],
+            edges: vec![
+                edge(11, 1, 11, 100),
+                edge(12, 11, 20, 200),
+                edge(3, 2, 30, 300),
+                edge(4, 30, 40, 400),
+            ],
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_nodes = compact_layout
+            .nodes
+            .iter()
+            .map(|node| (node.id, node.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let result = expand_group_in_place(
+            &compact,
+            &compact_layout,
+            &expanded,
+            &GroupExpansion {
+                anchor: 10,
+                members: vec![11, 12, 13, 14],
+                boundary_trunks: vec![
+                    BoundaryTrunk {
+                        expanded_edge: 11,
+                        compact_edge: 1,
+                    },
+                    BoundaryTrunk {
+                        expanded_edge: 12,
+                        compact_edge: 2,
+                    },
+                ],
+            },
+            &GroupExpansionOptions {
+                quality_effort: QualityEffort::Max,
+                ..GroupExpansionOptions::default()
+            },
+        )
+        .unwrap();
+        let result_nodes = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<BTreeMap<_, _>>();
+        let member_left = [11, 12, 13, 14]
+            .into_iter()
+            .map(|id| result_nodes[&id].x)
+            .fold(f64::INFINITY, f64::min);
+        let member_top = [11, 12, 13, 14]
+            .into_iter()
+            .map(|id| result_nodes[&id].y)
+            .fold(f64::INFINITY, f64::min);
+
+        assert_eq!(member_left, compact_nodes[&10].x);
+        assert_eq!(member_top, compact_nodes[&10].y);
+        assert!(result_nodes[&30].y > compact_nodes[&30].y);
+        for retained in [1, 2] {
+            assert_eq!(result_nodes[&retained], &compact_nodes[&retained]);
+        }
+        for retained in [20, 40] {
+            assert_eq!(result_nodes[&retained].y, compact_nodes[&retained].y);
+            assert!(result_nodes[&retained].x > compact_nodes[&retained].x);
+        }
+        assert_ne!(
+            result.edges.iter().find(|edge| edge.id == 3),
+            compact_layout.edges.iter().find(|edge| edge.id == 3),
+        );
+        assert_ne!(
+            result.edges.iter().find(|edge| edge.id == 4),
+            compact_layout.edges.iter().find(|edge| edge.id == 4),
+        );
+        assert!(super::hard_geometry_is_clean(&expanded, &result));
+        assert_eq!(super::ranking_direction_violations(&expanded, &result), 0);
+
+        let mut permuted_compact = compact;
+        permuted_compact.nodes.reverse();
+        permuted_compact.edges.reverse();
+        let mut permuted_expanded = expanded;
+        permuted_expanded.nodes.reverse();
+        permuted_expanded.edges.reverse();
+        assert_eq!(
+            expand_group_in_place(
+                &permuted_compact,
+                &compact_layout,
+                &permuted_expanded,
+                &GroupExpansion {
+                    anchor: 10,
+                    members: vec![14, 13, 12, 11],
+                    boundary_trunks: vec![
+                        BoundaryTrunk {
+                            expanded_edge: 12,
+                            compact_edge: 2,
+                        },
+                        BoundaryTrunk {
+                            expanded_edge: 11,
+                            compact_edge: 1,
+                        },
+                    ],
+                },
+                &GroupExpansionOptions {
+                    quality_effort: QualityEffort::Max,
+                    ..GroupExpansionOptions::default()
+                },
+            )
+            .unwrap(),
+            result,
+        );
     }
 
     #[test]
@@ -5639,6 +6188,7 @@ mod tests {
                 small,
                 options,
                 QualityEffort::Fast,
+                0,
             )
             .unwrap()
             .len(),
@@ -5652,6 +6202,7 @@ mod tests {
                 small,
                 options,
                 QualityEffort::Quality,
+                0,
             )
             .unwrap()
             .len(),
@@ -5665,6 +6216,7 @@ mod tests {
                 small,
                 options,
                 QualityEffort::Max,
+                0,
             )
             .unwrap()
             .len(),
@@ -5686,6 +6238,7 @@ mod tests {
                 maximum,
                 options,
                 QualityEffort::Max,
+                0,
             )
             .unwrap()
             .len(),
@@ -5707,6 +6260,7 @@ mod tests {
                 over_budget,
                 options,
                 QualityEffort::Max,
+                0,
             ),
             Err(GroupExpansionError::ExpansionWorkLimitExceeded {
                 required: 123_222_294,
@@ -5733,6 +6287,7 @@ mod tests {
                     ..options
                 },
                 QualityEffort::Max,
+                0,
             ),
             Err(GroupExpansionError::ExpansionWorkLimitExceeded {
                 required: 384_108_060,
