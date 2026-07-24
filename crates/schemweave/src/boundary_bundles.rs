@@ -809,7 +809,9 @@ fn segments_have_disallowed_contact(
             })
     };
     contact.is_some_and(|point| {
-        permitted_tap != Some(point) || (route_start != point && route_end != point)
+        !permitted_tap.is_some_and(|tap| preserved_point_matches(tap, point))
+            || (!preserved_point_matches(route_start, point)
+                && !preserved_point_matches(route_end, point))
     })
 }
 
@@ -963,6 +965,26 @@ mod tests {
             Point { x: 10.0, y: 0.0 },
             Point { x: 15.0, y: 0.0 },
             Some(Point { x: 10.0, y: 0.0 }),
+        ));
+    }
+
+    #[test]
+    fn permitted_tap_contact_accepts_preserved_geometry_epsilon() {
+        let bus = BoundaryBundleSegment {
+            start: Point { x: 10.0, y: 0.0 },
+            end: Point { x: 10.0, y: 20.0 },
+        };
+        assert!(!segments_have_disallowed_contact(
+            bus,
+            Point {
+                x: 0.0,
+                y: 7.000_000_000_000_004,
+            },
+            Point {
+                x: 10.0,
+                y: 7.000_000_000_000_004,
+            },
+            Some(Point { x: 10.0, y: 7.0 }),
         ));
     }
 
