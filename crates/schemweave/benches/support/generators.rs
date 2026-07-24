@@ -332,6 +332,107 @@ pub fn boundary_fanin_expansion_pair(members: u32) -> (Graph, Graph, GroupExpans
     shared_boundary_expansion_pair(members, false)
 }
 
+fn grouped_shared_boundary_expansion_pair(
+    groups: u32,
+    members: u32,
+    incoming: bool,
+) -> (Graph, Graph, GroupExpansion) {
+    assert!(groups >= 2);
+    assert!(members >= 2);
+    let anchor = if incoming {
+        block(1, groups, 0)
+    } else {
+        block(1, 0, groups)
+    };
+    let retained_nodes = (0..groups)
+        .map(|group| {
+            if incoming {
+                block(10 + group, 0, 1)
+            } else {
+                block(10 + group, 1, 0)
+            }
+        })
+        .collect::<Vec<_>>();
+    let compact_edges = (0..groups)
+        .map(|group| {
+            let id = 1 + group;
+            if incoming {
+                edge(id, (10 + group, 0), (1, group), 100 + group)
+            } else {
+                edge(id, (1, group), (10 + group, 0), 100 + group)
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut compact_nodes = retained_nodes.clone();
+    compact_nodes.push(anchor);
+    let compact = Graph {
+        nodes: compact_nodes,
+        edges: compact_edges,
+    };
+    let member_ids = (0..members).map(|index| 200 + index).collect::<Vec<_>>();
+    let member_nodes = member_ids
+        .iter()
+        .map(|&id| {
+            if incoming {
+                block(id, groups, 0)
+            } else {
+                block(id, 0, groups)
+            }
+        })
+        .collect::<Vec<_>>();
+    let expanded_edges = (0..groups)
+        .flat_map(|group| {
+            member_ids.iter().enumerate().map(move |(index, &member)| {
+                let id = 1_000 + group * members + index as u32;
+                if incoming {
+                    edge(id, (10 + group, 0), (member, group), 100 + group)
+                } else {
+                    edge(id, (member, group), (10 + group, 0), 100 + group)
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut expanded_nodes = retained_nodes;
+    expanded_nodes.extend(member_nodes);
+    let expansion = GroupExpansion {
+        anchor: 1,
+        members: member_ids,
+        boundary_trunks: expanded_edges
+            .iter()
+            .map(|edge| BoundaryTrunk {
+                expanded_edge: edge.id,
+                compact_edge: 1 + (edge.net - 100),
+            })
+            .collect(),
+    };
+    (
+        compact,
+        Graph {
+            nodes: expanded_nodes,
+            edges: expanded_edges,
+        },
+        expansion,
+    )
+}
+
+/// Several retained drivers, each feeding every expanded member through an
+/// independent shared input boundary trunk.
+pub fn grouped_boundary_fanout_expansion_pair(
+    groups: u32,
+    members: u32,
+) -> (Graph, Graph, GroupExpansion) {
+    grouped_shared_boundary_expansion_pair(groups, members, true)
+}
+
+/// Several retained consumers, each receiving every expanded member through
+/// an independent shared output boundary trunk.
+pub fn grouped_boundary_fanin_expansion_pair(
+    groups: u32,
+    members: u32,
+) -> (Graph, Graph, GroupExpansion) {
+    grouped_shared_boundary_expansion_pair(groups, members, false)
+}
+
 /// A wider expansion followed by one retained peer chain. The peer lies
 /// entirely to the right of the compact anchor, so opening the horizontal
 /// corridor must translate every peer node and internal route rigidly.

@@ -3878,6 +3878,9 @@ fn compose_candidate(
         .collect::<Vec<_>>();
     let (mut shared_groups, shared_group_by_edge) =
         shared_boundary_groups(incoming_groups, outgoing_groups);
+    let shared_member_corridors = (!shared_groups.is_empty()).then(|| {
+        MemberCorridorPlan::new(contract.members.iter().map(|member| node_geometry[member]))
+    });
     let bridge_pitch = options
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
@@ -3978,6 +3981,9 @@ fn compose_candidate(
                             contract,
                             &node_geometry,
                             options,
+                            shared_member_corridors
+                                .as_ref()
+                                .expect("shared groups have a member corridor plan"),
                             if group.role == BoundaryBundleRole::Input {
                                 &incoming_lane_by_column_net
                             } else {
@@ -4098,20 +4104,14 @@ fn shared_boundary_group_geometry(
     contract: &ExpansionContract<'_>,
     node_geometry: &BTreeMap<NodeId, &NodeGeometry>,
     options: LayoutOptions,
+    member_corridors: &MemberCorridorPlan,
     approach_lane_by_column_net: &BTreeMap<(FloatKey, NetId), f64>,
 ) -> Result<SharedBoundaryGeometry, GroupExpansionError> {
     let clearance = crate::outward_obstacle_clearance_stub(options);
-    let member_nodes = contract
-        .members
-        .iter()
-        .map(|member| node_geometry[member])
-        .collect::<Vec<_>>();
     let pitch = options
         .route_lane_gap
         .max(options.minimum_parallel_wire_spacing);
-    let Some(trunk_y) =
-        central_member_corridor_y(&member_nodes, clearance, pitch, group.lane, group.lanes)
-    else {
+    let Some(trunk_y) = member_corridors.lane_y(clearance, pitch, group.lane, group.lanes) else {
         return Err(GroupExpansionError::NoSafeBoundaryBridge(failing_edge));
     };
     let junction_x = match group.role {
@@ -4256,48 +4256,57 @@ fn shared_boundary_trunk_route(
         .ok_or(GroupExpansionError::NoSafeBoundaryBridge(edge.id))
 }
 
-fn central_member_corridor_y(
-    nodes: &[&NodeGeometry],
-    clearance: f64,
-    pitch: f64,
-    lane: usize,
-    lanes: usize,
-) -> Option<f64> {
-    let mut bands = nodes
-        .iter()
-        .map(|node| (node.y, node.y + node.height))
-        .collect::<Vec<_>>();
-    bands.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
-    let mut merged = Vec::<(f64, f64)>::new();
-    for band in bands {
-        if let Some(last) = merged.last_mut()
-            && band.0 <= last.1 + HARD_GATE_EPSILON
-        {
-            last.1 = last.1.max(band.1);
-        } else {
-            merged.push(band);
+#[derive(Debug)]
+struct MemberCorridorPlan {
+    merged_bands: Vec<(f64, f64)>,
+    frame_center: Option<f64>,
+}
+
+impl MemberCorridorPlan {
+    fn new<'a>(nodes: impl Iterator<Item = &'a NodeGeometry>) -> Self {
+        let mut bands = nodes
+            .map(|node| (node.y, node.y + node.height))
+            .collect::<Vec<_>>();
+        bands.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.total_cmp(&right.1)));
+        let mut merged_bands = Vec::<(f64, f64)>::new();
+        for band in bands {
+            if let Some(last) = merged_bands.last_mut()
+                && band.0 <= last.1 + HARD_GATE_EPSILON
+            {
+                last.1 = last.1.max(band.1);
+            } else {
+                merged_bands.push(band);
+            }
+        }
+        let frame_center = merged_bands
+            .first()
+            .zip(merged_bands.last())
+            .map(|(first, last)| (first.0 + last.1) / 2.0);
+        Self {
+            merged_bands,
+            frame_center,
         }
     }
-    let frame_center = merged
-        .first()
-        .zip(merged.last())
-        .map(|(first, last)| (first.0 + last.1) / 2.0)?;
-    merged
-        .windows(2)
-        .filter_map(|bands| {
-            let gap = bands[1].0 - bands[0].1;
-            let required = clearance * 2.0 + pitch * lanes.saturating_sub(1) as f64;
-            (gap + HARD_GATE_EPSILON >= required).then_some(
-                (bands[0].1 + bands[1].0) / 2.0
-                    + (lane as f64 - lanes.saturating_sub(1) as f64 / 2.0) * pitch,
-            )
-        })
-        .min_by(|left, right| {
-            (left - frame_center)
-                .abs()
-                .total_cmp(&(right - frame_center).abs())
-                .then(left.total_cmp(right))
-        })
+
+    fn lane_y(&self, clearance: f64, pitch: f64, lane: usize, lanes: usize) -> Option<f64> {
+        let frame_center = self.frame_center?;
+        self.merged_bands
+            .windows(2)
+            .filter_map(|bands| {
+                let gap = bands[1].0 - bands[0].1;
+                let required = clearance * 2.0 + pitch * lanes.saturating_sub(1) as f64;
+                (gap + HARD_GATE_EPSILON >= required).then_some(
+                    (bands[0].1 + bands[1].0) / 2.0
+                        + (lane as f64 - lanes.saturating_sub(1) as f64 / 2.0) * pitch,
+                )
+            })
+            .min_by(|left, right| {
+                (left - frame_center)
+                    .abs()
+                    .total_cmp(&(right - frame_center).abs())
+                    .then(left.total_cmp(right))
+            })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5704,6 +5713,74 @@ mod tests {
         .unwrap();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn shared_boundary_group_without_a_member_corridor_fails_deterministically() {
+        let compact = Graph {
+            nodes: vec![node(1), node(10)],
+            edges: vec![edge(1, 1, 10, 100)],
+        };
+        let mut second_member = node(3);
+        second_member.ports[0].offset = 15.0;
+        second_member.ports.push(Port {
+            id: 2,
+            side: PortSide::West,
+            offset: 35.0,
+        });
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), second_member],
+            edges: vec![
+                edge(11, 1, 2, 100),
+                edge(12, 1, 3, 100),
+                Edge {
+                    id: 13,
+                    source: Endpoint { node: 2, port: 1 },
+                    target: Endpoint { node: 3, port: 2 },
+                    net: 200,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: vec![2, 3],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 11,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 12,
+                    compact_edge: 1,
+                },
+            ],
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let run = |expanded: &Graph, expansion: &GroupExpansion| {
+            expand_group_in_place(
+                &compact,
+                &compact_layout,
+                expanded,
+                expansion,
+                &GroupExpansionOptions::default(),
+            )
+        };
+        assert_eq!(
+            run(&expanded, &expansion),
+            Err(GroupExpansionError::NeedsFullRelayout)
+        );
+
+        let mut expanded_permuted = expanded;
+        expanded_permuted.nodes.reverse();
+        expanded_permuted.edges.reverse();
+        let mut expansion_permuted = expansion;
+        expansion_permuted.members.reverse();
+        expansion_permuted.boundary_trunks.reverse();
+        assert_eq!(
+            run(&expanded_permuted, &expansion_permuted),
+            Err(GroupExpansionError::NeedsFullRelayout)
+        );
     }
 
     #[test]
