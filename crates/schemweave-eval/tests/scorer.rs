@@ -2479,6 +2479,139 @@ fn shared_same_net_corners_count_once() {
 }
 
 #[test]
+fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministically() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/synth_priority_encoder_case.json")).unwrap();
+    let graph: Graph = serde_json::from_value(fixture["graph"].clone()).unwrap();
+    let constraints: LayoutConstraints =
+        serde_json::from_value(fixture["constraints"].clone()).unwrap();
+    assert_eq!(graph.nodes.len(), 152);
+    assert_eq!(graph.edges.len(), 324);
+    assert_eq!(
+        constraints
+            .boundary_bundles
+            .iter()
+            .map(|bundle| bundle.width)
+            .collect::<Vec<_>>(),
+        vec![32, 5, 32]
+    );
+
+    let options = LayoutOptions::default();
+    let actual = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Quality,
+        &constraints,
+    )
+    .unwrap();
+    let repeated = layout_with_quality_effort_and_constraints(
+        &graph,
+        options,
+        QualityEffort::Quality,
+        &constraints,
+    )
+    .unwrap();
+    assert_eq!(actual, repeated);
+    let minimum_interior_depth = options.port_stub + options.route_lane_gap;
+    for role in [BoundaryBundleRole::Input, BoundaryBundleRole::Output] {
+        assert!(
+            actual.boundary_bundles.iter().any(|bundle| {
+                bundle.role == role
+                    && (bundle.spine.end.x - bundle.spine.start.x).abs() > minimum_interior_depth
+            }),
+            "missing interior {role:?} trunk"
+        );
+    }
+
+    let report = score(
+        &graph,
+        &actual,
+        ScoreOptions {
+            edge_node_clearance_threshold: 0.0,
+            ..ScoreOptions::default()
+        },
+    );
+    assert_eq!(report.semantic_violations, 0, "{report:#?}");
+    assert_eq!(report.node_overlaps, 0, "{report:#?}");
+    assert_eq!(report.node_intersections, 0, "{report:#?}");
+    assert_eq!(report.unrelated_overlaps, 0, "{report:#?}");
+    assert_eq!(report.unrelated_contacts, 0, "{report:#?}");
+    assert_eq!(report.ranking_direction_violations, 0, "{report:#?}");
+    assert!(report.crossings <= 1_579, "{report:#?}");
+    assert!(report.bends <= 1_351, "{report:#?}");
+    assert!(report.route_length <= 151_807.0, "{report:#?}");
+    assert!(report.area <= 3_622_241.0, "{report:#?}");
+    assert!(
+        actual
+            .edges
+            .iter()
+            .map(|route| route.points.len())
+            .sum::<usize>()
+            <= 2_152
+    );
+
+    let highest = layout_with_config(
+        &graph,
+        &LayoutConfig {
+            constraints: constraints.clone(),
+            ..LayoutConfig::highest_quality()
+        },
+    )
+    .unwrap();
+    for role in [BoundaryBundleRole::Input, BoundaryBundleRole::Output] {
+        assert!(
+            highest.boundary_bundles.iter().any(|bundle| {
+                bundle.role == role
+                    && (bundle.spine.end.x - bundle.spine.start.x).abs() > minimum_interior_depth
+            }),
+            "highest-quality layout is missing interior {role:?} trunk"
+        );
+    }
+    let highest_report = score(
+        &graph,
+        &highest,
+        ScoreOptions {
+            edge_node_clearance_threshold: LayoutConfig::highest_quality()
+                .layout
+                .edge_node_clearance,
+            ..ScoreOptions::default()
+        },
+    );
+    assert_eq!(
+        highest_report.edge_node_clearance_violations, 0,
+        "{highest_report:#?}"
+    );
+    assert_eq!(highest_report.unrelated_contacts, 0, "{highest_report:#?}");
+
+    let mut permuted_graph = graph.clone();
+    permuted_graph.nodes.reverse();
+    permuted_graph.edges.reverse();
+    for node in &mut permuted_graph.nodes {
+        node.ports.reverse();
+    }
+    let mut permuted_constraints = constraints;
+    permuted_constraints.inputs.reverse();
+    permuted_constraints.outputs.reverse();
+    permuted_constraints.boundary_bundles.reverse();
+    for bundle in &mut permuted_constraints.boundary_bundles {
+        bundle.members.reverse();
+        for member in &mut bundle.members {
+            member.slots.reverse();
+        }
+    }
+    assert_eq!(
+        actual,
+        layout_with_quality_effort_and_constraints(
+            &permuted_graph,
+            options,
+            QualityEffort::Quality,
+            &permuted_constraints,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn boundary_bundle_geometry_and_tap_endpoints_participate_in_scoring() {
     let graph = Graph {
         nodes: vec![

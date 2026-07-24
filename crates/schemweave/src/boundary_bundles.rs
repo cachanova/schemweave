@@ -10,6 +10,7 @@ use crate::{
 
 pub(crate) const MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS: usize = 20_000_000;
 const MAX_INTERIOR_COLLECTOR_BUNDLES: usize = 32;
+const MAX_INTERIOR_HORIZONTAL_TAP_VISITS: usize = 2_000_000;
 const BUNDLE_CLEARANCE_NET_BASE: u32 = 0x8000_0000;
 const PRESERVED_GEOMETRY_EPSILON: f64 = 1e-7;
 
@@ -22,6 +23,15 @@ struct BundleGeometryContext<'layout, 'graph> {
     output_fallback_corridors: &'layout HashMap<u32, f64>,
     pitch: f64,
     rail_depth: f64,
+    member_endpoint_reserve: f64,
+}
+
+#[derive(Clone, Copy)]
+struct InteriorCollectorRange {
+    role: BoundaryBundleRole,
+    minimum_x: f64,
+    desired_x: f64,
+    maximum_x: f64,
 }
 
 pub(crate) fn preserved_point_matches(left: Point, right: Point) -> bool {
@@ -92,8 +102,17 @@ fn segment_length(segment: BoundaryBundleSegment) -> f64 {
 
 pub(crate) fn apply_and_normalize(
     graph: &IndexedGraph<'_>,
+    layout: Layout,
+    options: LayoutOptions,
+) -> Result<Layout, LayoutError> {
+    apply_and_normalize_preserving(graph, layout, options, &BTreeSet::new())
+}
+
+pub(crate) fn apply_and_normalize_preserving(
+    graph: &IndexedGraph<'_>,
     mut layout: Layout,
     options: LayoutOptions,
+    preserved_bundle_ids: &BTreeSet<u32>,
 ) -> Result<Layout, LayoutError> {
     if graph.boundary_bundles.is_empty() {
         return Ok(layout);
@@ -102,10 +121,15 @@ pub(crate) fn apply_and_normalize(
         normalize_layout(&mut layout);
         return Ok(layout);
     }
-    let interior_allowed = options.edge_node_clearance == 0.0
-        && options.minimum_parallel_wire_spacing == 0.0
+    let interior_allowed = options.minimum_parallel_wire_spacing == 0.0
         && graph.boundary_bundles.len() <= MAX_INTERIOR_COLLECTOR_BUNDLES;
-    apply_bundle_geometry(graph, layout, options, interior_allowed)
+    apply_bundle_geometry(
+        graph,
+        layout,
+        options,
+        interior_allowed,
+        preserved_bundle_ids,
+    )
 }
 
 fn apply_bundle_geometry(
@@ -113,6 +137,7 @@ fn apply_bundle_geometry(
     mut layout: Layout,
     options: LayoutOptions,
     allow_interior_collectors: bool,
+    preserved_bundle_ids: &BTreeSet<u32>,
 ) -> Result<Layout, LayoutError> {
     let node_geometry = layout
         .nodes
@@ -148,15 +173,49 @@ fn apply_bundle_geometry(
         output_fallback_corridors: &output_fallback_corridors,
         pitch,
         rail_depth,
+        member_endpoint_reserve: crate::outward_obstacle_clearance_stub(options),
     };
-    layout.boundary_bundles.clear();
-    for (bundle_index, (bundle, corridor_offset)) in graph
+    let interior_collectors = if allow_interior_collectors {
+        plan_interior_collectors(&geometry_context, &layout.edges)
+    } else {
+        vec![None; graph.boundary_bundles.len()]
+    };
+    let mut processing_order = (0..graph.boundary_bundles.len()).collect::<Vec<_>>();
+    processing_order.sort_unstable_by_key(|&bundle| {
+        let bundle = &graph.boundary_bundles[bundle];
+        (
+            match bundle.role {
+                BoundaryBundleRole::Input => 0_u8,
+                BoundaryBundleRole::Output => 1_u8,
+            },
+            bundle.endpoint.node,
+            bundle.endpoint.port,
+            bundle.id,
+        )
+    });
+    let mut partial_remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
+    let mut preserved_geometry = layout
         .boundary_bundles
         .iter()
-        .zip(corridor_offsets)
-        .enumerate()
-    {
-        let preserved = allow_interior_collectors.then(|| {
+        .filter(|bundle| preserved_bundle_ids.contains(&bundle.id))
+        .map(|bundle| (bundle.id, bundle.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if preserved_geometry.len() != preserved_bundle_ids.len() {
+        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+    }
+    layout.boundary_bundles.clear();
+    for bundle_index in processing_order {
+        let bundle = &graph.boundary_bundles[bundle_index];
+        if preserved_bundle_ids.contains(&bundle.id) {
+            let geometry = preserved_geometry
+                .remove(&bundle.id)
+                .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
+            layout.boundary_bundles.push(geometry);
+            continue;
+        }
+        let corridor_offset = corridor_offsets[bundle_index];
+        let planned_collector = interior_collectors[bundle_index];
+        let preserved = planned_collector.map(|_| {
             bundle
                 .members
                 .iter()
@@ -166,12 +225,8 @@ fn apply_bundle_geometry(
                 })
                 .collect::<Vec<_>>()
         });
-        let mut geometry = build_geometry(
-            &geometry_context,
-            bundle,
-            &layout.edges,
-            allow_interior_collectors,
-        );
+        let mut geometry =
+            build_geometry(&geometry_context, bundle, &layout.edges, planned_collector);
         rewrite_member_routes(
             bundle,
             &geometry,
@@ -182,30 +237,42 @@ fn apply_bundle_geometry(
             corridor_offset,
         )?;
         layout.boundary_bundles.push(geometry);
-        if allow_interior_collectors
-            && partial_geometry_is_clean(graph, &layout, options, bundle_index).is_err()
-        {
-            layout.boundary_bundles.pop();
-            let Some(preserved) = preserved else {
-                return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
-            };
-            for (index, points) in preserved {
-                layout.edges[index].points = points;
+        if planned_collector.is_some() {
+            match partial_geometry_is_clean(
+                graph,
+                &layout,
+                options,
+                bundle_index,
+                &mut partial_remaining,
+            ) {
+                Ok(()) => {}
+                Err(LayoutError::BoundaryBundleGeometryUnsatisfied) => {
+                    layout.boundary_bundles.pop();
+                    let Some(preserved) = preserved else {
+                        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+                    };
+                    for (index, points) in preserved {
+                        layout.edges[index].points = points;
+                    }
+                    geometry = build_geometry(&geometry_context, bundle, &layout.edges, None);
+                    rewrite_member_routes(
+                        bundle,
+                        &geometry,
+                        &route_index,
+                        &mut layout.edges,
+                        pitch,
+                        rail_depth,
+                        corridor_offset,
+                    )?;
+                    layout.boundary_bundles.push(geometry);
+                }
+                Err(error) => return Err(error),
             }
-            geometry = build_geometry(&geometry_context, bundle, &layout.edges, false);
-            rewrite_member_routes(
-                bundle,
-                &geometry,
-                &route_index,
-                &mut layout.edges,
-                pitch,
-                rail_depth,
-                corridor_offset,
-            )?;
-            layout.boundary_bundles.push(geometry);
-            partial_geometry_is_clean(graph, &layout, options, bundle_index)?;
         }
     }
+    layout
+        .boundary_bundles
+        .sort_unstable_by_key(|bundle| bundle.id);
     normalize_layout(&mut layout);
     verify_geometry(graph, &layout, options)?;
     Ok(layout)
@@ -246,11 +313,259 @@ fn fallback_corridors_by_edge(
     (inputs, outputs)
 }
 
+fn plan_interior_collectors(
+    context: &BundleGeometryContext<'_, '_>,
+    routes: &[EdgeGeometry],
+) -> Vec<Option<f64>> {
+    let mut horizontal_tap_visits = MAX_INTERIOR_HORIZONTAL_TAP_VISITS;
+    let ranges = context
+        .graph
+        .boundary_bundles
+        .iter()
+        .map(|bundle| interior_collector_range(context, bundle, routes, &mut horizontal_tap_visits))
+        .collect::<Vec<_>>();
+    let mut input_by_edge = HashMap::new();
+    let mut output_by_edge = HashMap::new();
+    for (bundle_index, bundle) in context.graph.boundary_bundles.iter().enumerate() {
+        if ranges[bundle_index].is_none() {
+            continue;
+        }
+        for member in &bundle.members {
+            match bundle.role {
+                BoundaryBundleRole::Input => {
+                    input_by_edge.insert(member.edge, bundle_index);
+                }
+                BoundaryBundleRole::Output => {
+                    output_by_edge.insert(member.edge, bundle_index);
+                }
+            }
+        }
+    }
+    let mut adjacent = vec![Vec::new(); ranges.len()];
+    for (edge, &input) in &input_by_edge {
+        let Some(&output) = output_by_edge.get(edge) else {
+            continue;
+        };
+        adjacent[input].push(output);
+        adjacent[output].push(input);
+    }
+    for neighbors in &mut adjacent {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+    }
+
+    let mut planned = ranges
+        .iter()
+        .map(|range| range.map(|range| range.desired_x))
+        .collect::<Vec<_>>();
+    let mut visited = vec![false; ranges.len()];
+    for start in 0..ranges.len() {
+        if visited[start] || ranges[start].is_none() {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut pending = vec![start];
+        visited[start] = true;
+        while let Some(bundle) = pending.pop() {
+            component.push(bundle);
+            for &neighbor in &adjacent[bundle] {
+                if !visited[neighbor] {
+                    visited[neighbor] = true;
+                    pending.push(neighbor);
+                }
+            }
+        }
+        let inputs = component
+            .iter()
+            .filter_map(|&bundle| {
+                let range = ranges[bundle]?;
+                (range.role == BoundaryBundleRole::Input).then_some(range)
+            })
+            .collect::<Vec<_>>();
+        let outputs = component
+            .iter()
+            .filter_map(|&bundle| {
+                let range = ranges[bundle]?;
+                (range.role == BoundaryBundleRole::Output).then_some(range)
+            })
+            .collect::<Vec<_>>();
+        if inputs.is_empty() || outputs.is_empty() {
+            continue;
+        }
+        let feasible_low = inputs
+            .iter()
+            .map(|range| range.minimum_x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let feasible_high = outputs
+            .iter()
+            .map(|range| range.maximum_x)
+            .fold(f64::INFINITY, f64::min);
+        if feasible_low + context.pitch > feasible_high {
+            for bundle in component {
+                planned[bundle] = None;
+            }
+            continue;
+        }
+        let deepest_input = inputs
+            .iter()
+            .map(|range| range.desired_x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let earliest_output = outputs
+            .iter()
+            .map(|range| range.desired_x)
+            .fold(f64::INFINITY, f64::min);
+        if deepest_input + context.pitch <= earliest_output {
+            continue;
+        }
+        let earliest_separated_output = earliest_output - context.pitch;
+        let input_split = (earliest_separated_output
+            + (deepest_input - earliest_separated_output) / 2.0)
+            .clamp(feasible_low, feasible_high - context.pitch);
+        let output_split = input_split + context.pitch;
+        for bundle in component {
+            let Some(range) = ranges[bundle] else {
+                continue;
+            };
+            planned[bundle] = Some(match range.role {
+                BoundaryBundleRole::Input => range.desired_x.min(input_split).max(range.minimum_x),
+                BoundaryBundleRole::Output => {
+                    range.desired_x.max(output_split).min(range.maximum_x)
+                }
+            });
+        }
+    }
+    planned
+}
+
+fn interior_collector_range(
+    context: &BundleGeometryContext<'_, '_>,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    horizontal_tap_visits: &mut usize,
+) -> Option<InteriorCollectorRange> {
+    if bundle.width <= 1 {
+        return None;
+    }
+    let node = &context.nodes[context.node_geometry[&bundle.endpoint.node]];
+    let indexed_node = context.graph.node_index[&bundle.endpoint.node];
+    let endpoint = port_point(
+        node,
+        context.graph.ports[indexed_node][&bundle.endpoint.port],
+    );
+    let mut desired_x = match bundle.role {
+        BoundaryBundleRole::Input => f64::INFINITY,
+        BoundaryBundleRole::Output => f64::NEG_INFINITY,
+    };
+    for member in &bundle.members {
+        let route = routes.get(*context.route_index.get(&member.edge)?)?;
+        let mut member_x = match bundle.role {
+            BoundaryBundleRole::Input => route.points.last()?.x - context.member_endpoint_reserve,
+            BoundaryBundleRole::Output => route.points.first()?.x + context.member_endpoint_reserve,
+        };
+        member_x = match bundle.role {
+            BoundaryBundleRole::Input => context
+                .output_fallback_corridors
+                .get(&member.edge)
+                .map_or(member_x, |corridor| member_x.min(*corridor)),
+            BoundaryBundleRole::Output => context
+                .input_fallback_corridors
+                .get(&member.edge)
+                .map_or(member_x, |corridor| member_x.max(*corridor)),
+        };
+        desired_x = match bundle.role {
+            BoundaryBundleRole::Input => desired_x.min(member_x),
+            BoundaryBundleRole::Output => desired_x.max(member_x),
+        };
+    }
+    let (minimum_x, maximum_x) = match bundle.role {
+        BoundaryBundleRole::Input => (endpoint.x + context.rail_depth + context.pitch, desired_x),
+        BoundaryBundleRole::Output => (desired_x, endpoint.x - context.rail_depth - context.pitch),
+    };
+    if !minimum_x.is_finite()
+        || !desired_x.is_finite()
+        || !maximum_x.is_finite()
+        || minimum_x > maximum_x
+    {
+        return None;
+    }
+    let desired_x = common_horizontal_collector_x(
+        context,
+        bundle,
+        routes,
+        minimum_x,
+        desired_x,
+        maximum_x,
+        horizontal_tap_visits,
+    )?;
+    Some(InteriorCollectorRange {
+        role: bundle.role,
+        minimum_x,
+        desired_x,
+        maximum_x,
+    })
+}
+
+fn common_horizontal_collector_x(
+    context: &BundleGeometryContext<'_, '_>,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    minimum_x: f64,
+    desired_x: f64,
+    maximum_x: f64,
+    remaining: &mut usize,
+) -> Option<f64> {
+    let mut candidates = vec![desired_x];
+    for member in &bundle.members {
+        let route = routes.get(*context.route_index.get(&member.edge)?)?;
+        for pair in route.points.windows(2) {
+            *remaining = remaining.checked_sub(1)?;
+            let Some((segment_low, segment_high)) =
+                shared_trunk_horizontal_range(pair[0], pair[1], bundle.role, context.pitch)
+            else {
+                continue;
+            };
+            let low = segment_low.max(minimum_x);
+            let high = segment_high.min(maximum_x);
+            if low > high {
+                continue;
+            }
+            candidates.push(match bundle.role {
+                BoundaryBundleRole::Input => high.min(desired_x),
+                BoundaryBundleRole::Output => low.max(desired_x),
+            });
+        }
+    }
+    candidates.sort_by(|left, right| match bundle.role {
+        BoundaryBundleRole::Input => right.total_cmp(left),
+        BoundaryBundleRole::Output => left.total_cmp(right),
+    });
+    candidates.dedup_by(|left, right| left.to_bits() == right.to_bits());
+    candidates.into_iter().find(|&candidate| {
+        bundle.members.iter().all(|member| {
+            let Some(route) = context
+                .route_index
+                .get(&member.edge)
+                .and_then(|index| routes.get(*index))
+            else {
+                return false;
+            };
+            route.points.windows(2).any(|pair| {
+                let Some(next) = remaining.checked_sub(1) else {
+                    return false;
+                };
+                *remaining = next;
+                shared_trunk_horizontal_range(pair[0], pair[1], bundle.role, context.pitch)
+                    .is_some_and(|(low, high)| candidate >= low && candidate <= high)
+            })
+        })
+    })
+}
+
 fn build_geometry(
     context: &BundleGeometryContext<'_, '_>,
     bundle: &IndexedBoundaryBundle,
     routes: &[EdgeGeometry],
-    allow_interior_collector: bool,
+    interior_collector_x: Option<f64>,
 ) -> BoundaryBundleGeometry {
     let node = &context.nodes[context.node_geometry[&bundle.endpoint.node]];
     let indexed_node = context.graph.node_index[&bundle.endpoint.node];
@@ -260,9 +575,9 @@ fn build_geometry(
         BoundaryBundleRole::Input => 1.0,
         BoundaryBundleRole::Output => -1.0,
     };
-    if allow_interior_collector
-        && bundle.width > 1
-        && let Some(geometry) = build_interior_geometry(context, bundle, endpoint, routes)
+    if let Some(collector_x) = interior_collector_x
+        && let Some(geometry) =
+            build_interior_geometry(context, bundle, endpoint, routes, collector_x)
     {
         return geometry;
     }
@@ -321,57 +636,26 @@ fn build_interior_geometry(
     bundle: &IndexedBoundaryBundle,
     endpoint: Point,
     routes: &[EdgeGeometry],
+    collector_x: f64,
 ) -> Option<BoundaryBundleGeometry> {
-    let mut terminal_x = match bundle.role {
-        BoundaryBundleRole::Input => f64::INFINITY,
-        BoundaryBundleRole::Output => f64::NEG_INFINITY,
-    };
-    for member in &bundle.members {
-        let route = routes.get(*context.route_index.get(&member.edge)?)?;
-        let mut member_terminal_x = match bundle.role {
-            BoundaryBundleRole::Input => route.points.last()?.x - context.rail_depth,
-            BoundaryBundleRole::Output => route.points.first()?.x + context.rail_depth,
-        };
-        member_terminal_x = match bundle.role {
-            BoundaryBundleRole::Input => context
-                .output_fallback_corridors
-                .get(&member.edge)
-                .map_or(member_terminal_x, |corridor| {
-                    member_terminal_x.min(*corridor)
-                }),
-            BoundaryBundleRole::Output => context
-                .input_fallback_corridors
-                .get(&member.edge)
-                .map_or(member_terminal_x, |corridor| {
-                    member_terminal_x.max(*corridor)
-                }),
-        };
-        terminal_x = match bundle.role {
-            BoundaryBundleRole::Input => terminal_x.min(member_terminal_x),
-            BoundaryBundleRole::Output => terminal_x.max(member_terminal_x),
-        };
-    }
-    let direction = match bundle.role {
-        BoundaryBundleRole::Input => 1.0,
-        BoundaryBundleRole::Output => -1.0,
-    };
-    let minimum_x = endpoint.x + direction * (context.rail_depth + context.pitch);
-    if !terminal_x.is_finite() || direction * (terminal_x - minimum_x) < 0.0 {
-        return None;
-    }
-    let collector_x = terminal_x;
     let mut members = Vec::with_capacity(bundle.members.len());
     let mut collector_low = endpoint.y;
     let mut collector_high = endpoint.y;
     for member in &bundle.members {
         let route = routes.get(*context.route_index.get(&member.edge)?)?;
         let (_, tap) = match bundle.role {
-            BoundaryBundleRole::Input => {
-                first_vertical_line_intersection(&route.points, collector_x)
-            }
-            BoundaryBundleRole::Output => {
-                last_vertical_line_intersection(&route.points, collector_x)
-            }
+            BoundaryBundleRole::Input => first_shared_trunk_intersection(
+                &route.points,
+                collector_x,
+                bundle.role,
+                context.pitch,
+            ),
+            BoundaryBundleRole::Output => last_shared_trunk_intersection(
+                &route.points,
+                collector_x,
+                bundle.role,
+                context.pitch,
+            ),
         }?;
         collector_low = collector_low.min(tap.y);
         collector_high = collector_high.max(tap.y);
@@ -431,9 +715,11 @@ fn rewrite_member_routes(
         }
         route.points = if interior_collector {
             match bundle.role {
-                BoundaryBundleRole::Input => rewrite_input_shared_trunk(&route.points, member.tap),
+                BoundaryBundleRole::Input => {
+                    rewrite_input_shared_trunk(&route.points, member.tap, pitch)
+                }
                 BoundaryBundleRole::Output => {
-                    rewrite_output_shared_trunk(&route.points, member.tap)
+                    rewrite_output_shared_trunk(&route.points, member.tap, pitch)
                 }
             }
         } else {
@@ -455,8 +741,13 @@ fn rewrite_member_routes(
     Ok(())
 }
 
-fn rewrite_input_shared_trunk(points: &[Point], tap: Point) -> Option<Vec<Point>> {
-    let (segment, intersection) = first_vertical_line_intersection(points, tap.x)?;
+fn rewrite_input_shared_trunk(
+    points: &[Point],
+    tap: Point,
+    minimum_length: f64,
+) -> Option<Vec<Point>> {
+    let (segment, intersection) =
+        first_shared_trunk_intersection(points, tap.x, BoundaryBundleRole::Input, minimum_length)?;
     if !preserved_point_matches(intersection, tap) {
         return None;
     }
@@ -468,8 +759,13 @@ fn rewrite_input_shared_trunk(points: &[Point], tap: Point) -> Option<Vec<Point>
     Some(rewritten)
 }
 
-fn rewrite_output_shared_trunk(points: &[Point], tap: Point) -> Option<Vec<Point>> {
-    let (segment, intersection) = last_vertical_line_intersection(points, tap.x)?;
+fn rewrite_output_shared_trunk(
+    points: &[Point],
+    tap: Point,
+    minimum_length: f64,
+) -> Option<Vec<Point>> {
+    let (segment, intersection) =
+        last_shared_trunk_intersection(points, tap.x, BoundaryBundleRole::Output, minimum_length)?;
     if !preserved_point_matches(intersection, tap) {
         return None;
     }
@@ -534,6 +830,62 @@ fn last_vertical_line_intersection(points: &[Point], x: f64) -> Option<(usize, P
             segment_vertical_line_intersection(pair[0], pair[1], x, true)
                 .map(|point| (segment, point))
         })
+}
+
+fn first_shared_trunk_intersection(
+    points: &[Point],
+    x: f64,
+    role: BoundaryBundleRole,
+    minimum_length: f64,
+) -> Option<(usize, Point)> {
+    points.windows(2).enumerate().find_map(|(segment, pair)| {
+        shared_trunk_horizontal_intersection(pair[0], pair[1], x, role, minimum_length)
+            .map(|point| (segment, point))
+    })
+}
+
+fn last_shared_trunk_intersection(
+    points: &[Point],
+    x: f64,
+    role: BoundaryBundleRole,
+    minimum_length: f64,
+) -> Option<(usize, Point)> {
+    points
+        .windows(2)
+        .enumerate()
+        .rev()
+        .find_map(|(segment, pair)| {
+            shared_trunk_horizontal_intersection(pair[0], pair[1], x, role, minimum_length)
+                .map(|point| (segment, point))
+        })
+}
+
+fn shared_trunk_horizontal_intersection(
+    start: Point,
+    end: Point,
+    x: f64,
+    role: BoundaryBundleRole,
+    minimum_length: f64,
+) -> Option<Point> {
+    shared_trunk_horizontal_range(start, end, role, minimum_length)
+        .is_some_and(|(low, high)| x >= low && x <= high)
+        .then_some(Point { x, y: start.y })
+}
+
+fn shared_trunk_horizontal_range(
+    start: Point,
+    end: Point,
+    role: BoundaryBundleRole,
+    minimum_length: f64,
+) -> Option<(f64, f64)> {
+    if start.y != end.y || start.x >= end.x {
+        return None;
+    }
+    let (low, high) = match role {
+        BoundaryBundleRole::Input => (start.x, end.x - minimum_length),
+        BoundaryBundleRole::Output => (start.x + minimum_length, end.x),
+    };
+    (low <= high).then_some((low, high))
 }
 
 fn segment_vertical_line_intersection(
@@ -648,10 +1000,70 @@ fn partial_geometry_is_clean(
     layout: &Layout,
     options: LayoutOptions,
     bundle: usize,
+    remaining: &mut usize,
 ) -> Result<(), LayoutError> {
-    verify_bundle_node_clearance(layout, options)?;
-    verify_one_bundle_route_node_interiors(graph, layout, bundle)?;
-    verify_bundle_route_contacts(graph, layout, options.minimum_parallel_wire_spacing)
+    let layout_bundle = layout
+        .boundary_bundles
+        .len()
+        .checked_sub(1)
+        .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
+    verify_one_bundle_node_clearance(layout, options, layout_bundle, remaining)?;
+    verify_one_bundle_route_node_interiors(graph, layout, bundle, remaining)?;
+    verify_new_bundle_route_contacts(
+        layout,
+        layout_bundle,
+        graph.boundary_bundles[bundle]
+            .members
+            .iter()
+            .map(|member| member.edge)
+            .collect(),
+        options.minimum_parallel_wire_spacing,
+        remaining,
+    )?;
+    verify_rewritten_route_contacts(graph, layout, options, remaining)
+}
+
+fn verify_one_bundle_node_clearance(
+    layout: &Layout,
+    options: LayoutOptions,
+    bundle: usize,
+    remaining: &mut usize,
+) -> Result<(), LayoutError> {
+    let geometry = layout
+        .boundary_bundles
+        .get(bundle)
+        .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
+    let net = BUNDLE_CLEARANCE_NET_BASE.wrapping_add(bundle as u32);
+    let mut segments = Vec::with_capacity(2);
+    push_clearance_segment(&mut segments, net, geometry.collector)?;
+    push_clearance_segment(&mut segments, net, geometry.spine)?;
+    let maximum = segments.len().saturating_mul(layout.nodes.len()).max(1);
+    *remaining = remaining.checked_sub(maximum).ok_or(
+        LayoutError::BoundaryBundleGeometryWorkLimitExceeded {
+            maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
+        },
+    )?;
+    let threshold = options.edge_node_clearance.max(f64::EPSILON);
+    match measure_edge_node_clearance_bounded(
+        &segments,
+        &layout.nodes,
+        &[NetNodeRelation {
+            net,
+            node: geometry.endpoint.node,
+        }],
+        threshold,
+        maximum,
+    ) {
+        Ok(clearance) if clearance.violations == 0 => Ok(()),
+        Ok(_) | Err(EdgeNodeClearanceError::InvalidInput) => {
+            Err(LayoutError::BoundaryBundleGeometryUnsatisfied)
+        }
+        Err(EdgeNodeClearanceError::WorkLimitExceeded) => {
+            Err(LayoutError::BoundaryBundleGeometryWorkLimitExceeded {
+                maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
+            })
+        }
+    }
 }
 
 fn verify_bundle_node_clearance(
@@ -854,13 +1266,15 @@ fn verify_rewritten_route_node_interiors(
         .iter()
         .flat_map(|bundle| bundle.members.iter().map(|member| member.edge))
         .collect::<std::collections::BTreeSet<_>>();
-    verify_member_route_node_interiors(graph, layout, &member_edges)
+    let mut remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
+    verify_member_route_node_interiors(graph, layout, &member_edges, &mut remaining)
 }
 
 fn verify_one_bundle_route_node_interiors(
     graph: &IndexedGraph<'_>,
     layout: &Layout,
     bundle: usize,
+    remaining: &mut usize,
 ) -> Result<(), LayoutError> {
     let member_edges = graph
         .boundary_bundles
@@ -870,20 +1284,20 @@ fn verify_one_bundle_route_node_interiors(
         .iter()
         .map(|member| member.edge)
         .collect::<BTreeSet<_>>();
-    verify_member_route_node_interiors(graph, layout, &member_edges)
+    verify_member_route_node_interiors(graph, layout, &member_edges, remaining)
 }
 
 fn verify_member_route_node_interiors(
     graph: &IndexedGraph<'_>,
     layout: &Layout,
     member_edges: &BTreeSet<u32>,
+    remaining: &mut usize,
 ) -> Result<(), LayoutError> {
     let graph_edges = graph
         .edges
         .iter()
         .map(|edge| (edge.id, *edge))
         .collect::<HashMap<_, _>>();
-    let mut remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
     for route in layout
         .edges
         .iter()
@@ -903,7 +1317,7 @@ fn verify_member_route_node_interiors(
                 .iter()
                 .filter(|node| node.id != edge.source.node && node.id != edge.target.node)
             {
-                remaining = remaining.checked_sub(1).ok_or(
+                *remaining = remaining.checked_sub(1).ok_or(
                     LayoutError::BoundaryBundleGeometryWorkLimitExceeded {
                         maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
                     },
@@ -956,6 +1370,146 @@ fn push_clearance_segment(
         Ok(())
     } else {
         Err(LayoutError::BoundaryBundleGeometryUnsatisfied)
+    }
+}
+
+fn verify_new_bundle_route_contacts(
+    layout: &Layout,
+    new_bundle: usize,
+    changed_routes: BTreeSet<u32>,
+    minimum_spacing: f64,
+    remaining: &mut usize,
+) -> Result<(), LayoutError> {
+    let geometry = layout
+        .boundary_bundles
+        .get(new_bundle)
+        .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
+    let permitted_taps = geometry
+        .members
+        .iter()
+        .map(|member| (member.edge, member.tap))
+        .collect::<HashMap<_, _>>();
+    for segment in [geometry.collector, geometry.spine] {
+        for route in &layout.edges {
+            let permitted_tap = permitted_taps.get(&route.id).copied();
+            for pair in route.points.windows(2) {
+                consume_geometry_visit(remaining)?;
+                if segments_have_disallowed_contact(segment, pair[0], pair[1], permitted_tap)
+                    || parallel_segments_are_too_close(
+                        segment,
+                        BoundaryBundleSegment {
+                            start: pair[0],
+                            end: pair[1],
+                        },
+                        minimum_spacing,
+                    )
+                {
+                    return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+                }
+            }
+        }
+    }
+    for prior in &layout.boundary_bundles[..new_bundle] {
+        let prior_taps = prior
+            .members
+            .iter()
+            .map(|member| (member.edge, member.tap))
+            .collect::<HashMap<_, _>>();
+        for segment in [prior.collector, prior.spine] {
+            for route in layout
+                .edges
+                .iter()
+                .filter(|route| changed_routes.contains(&route.id))
+            {
+                let permitted_tap = prior_taps.get(&route.id).copied();
+                for pair in route.points.windows(2) {
+                    consume_geometry_visit(remaining)?;
+                    if segments_have_disallowed_contact(segment, pair[0], pair[1], permitted_tap)
+                        || parallel_segments_are_too_close(
+                            segment,
+                            BoundaryBundleSegment {
+                                start: pair[0],
+                                end: pair[1],
+                            },
+                            minimum_spacing,
+                        )
+                    {
+                        return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+                    }
+                }
+            }
+        }
+        for new_segment in [geometry.collector, geometry.spine] {
+            for prior_segment in [prior.collector, prior.spine] {
+                consume_geometry_visit(remaining)?;
+                if segments_have_disallowed_contact(
+                    new_segment,
+                    prior_segment.start,
+                    prior_segment.end,
+                    None,
+                ) || parallel_segments_are_too_close(new_segment, prior_segment, minimum_spacing)
+                {
+                    return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn consume_geometry_visit(remaining: &mut usize) -> Result<(), LayoutError> {
+    *remaining =
+        remaining
+            .checked_sub(1)
+            .ok_or(LayoutError::BoundaryBundleGeometryWorkLimitExceeded {
+                maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
+            })?;
+    Ok(())
+}
+
+fn verify_rewritten_route_contacts(
+    graph: &IndexedGraph<'_>,
+    layout: &Layout,
+    options: LayoutOptions,
+    remaining: &mut usize,
+) -> Result<(), LayoutError> {
+    if options.edge_node_clearance <= 0.0 {
+        return Ok(());
+    }
+    let segments = layout
+        .edges
+        .iter()
+        .map(|route| route.points.len().saturating_sub(1))
+        .sum::<usize>();
+    if segments > crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS {
+        return Err(LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
+            maximum: crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+        });
+    }
+    let maximum = segments.saturating_mul(segments).max(1);
+    *remaining = remaining.checked_sub(maximum).ok_or(
+        LayoutError::UnrelatedRouteContactWorkLimitExceeded {
+            maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
+        },
+    )?;
+    match crate::routing::route_family_has_unrelated_contact_bounded(
+        graph,
+        &layout.edges,
+        crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+        maximum,
+    ) {
+        Ok(false) => Ok(()),
+        Ok(true) | Err(crate::routing::RouteContactError::InvalidInput) => {
+            Err(LayoutError::BoundaryBundleGeometryUnsatisfied)
+        }
+        Err(crate::routing::RouteContactError::WorkLimitExceeded) => {
+            Err(LayoutError::UnrelatedRouteContactWorkLimitExceeded { maximum })
+        }
+        Err(crate::routing::RouteContactError::SegmentLimitExceeded) => {
+            Err(LayoutError::UnrelatedRouteContactSegmentLimitExceeded {
+                maximum: crate::MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
+            })
+        }
     }
 }
 
@@ -1493,14 +2047,14 @@ mod tests {
             bundle.spine,
             BoundaryBundleSegment {
                 start: Point { x: 80.0, y: 25.0 },
-                end: Point { x: 286.0, y: 25.0 },
+                end: Point { x: 290.0, y: 25.0 },
             }
         );
         assert_eq!(
             bundle.collector,
             BoundaryBundleSegment {
-                start: Point { x: 286.0, y: 25.0 },
-                end: Point { x: 286.0, y: 125.0 },
+                start: Point { x: 290.0, y: 25.0 },
+                end: Point { x: 290.0, y: 125.0 },
             }
         );
         assert_eq!(
@@ -1508,11 +2062,11 @@ mod tests {
             vec![
                 EdgeGeometry {
                     id: 10,
-                    points: vec![Point { x: 286.0, y: 25.0 }, Point { x: 300.0, y: 25.0 }],
+                    points: vec![Point { x: 290.0, y: 25.0 }, Point { x: 300.0, y: 25.0 }],
                 },
                 EdgeGeometry {
                     id: 11,
-                    points: vec![Point { x: 286.0, y: 125.0 }, Point { x: 300.0, y: 125.0 }],
+                    points: vec![Point { x: 290.0, y: 125.0 }, Point { x: 300.0, y: 125.0 }],
                 },
             ]
         );
@@ -1532,12 +2086,116 @@ mod tests {
     }
 
     #[test]
+    fn interior_collector_falls_back_from_an_unrelated_route_contact() {
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::West),
+                node(4, PortSide::East),
+                node(5, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 12,
+                    source: Endpoint { node: 4, port: 0 },
+                    target: Endpoint { node: 5, port: 0 },
+                    net: 12,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1, 4],
+            outputs: vec![2, 3, 5],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 1, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            }],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let unrelated = EdgeGeometry {
+            id: 12,
+            points: vec![
+                Point { x: 80.0, y: 225.0 },
+                Point { x: 250.0, y: 225.0 },
+                Point { x: 250.0, y: 75.0 },
+                Point { x: 350.0, y: 75.0 },
+                Point { x: 350.0, y: 225.0 },
+                Point { x: 600.0, y: 225.0 },
+            ],
+        };
+        let layout = Layout {
+            nodes: vec![
+                geometry_at(1, 0.0, 0.0),
+                geometry_at(2, 300.0, 0.0),
+                geometry_at(3, 300.0, 100.0),
+                geometry_at(4, 0.0, 200.0),
+                geometry_at(5, 600.0, 200.0),
+            ],
+            edges: vec![
+                EdgeGeometry {
+                    id: 10,
+                    points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 300.0, y: 25.0 }],
+                },
+                EdgeGeometry {
+                    id: 11,
+                    points: vec![
+                        Point { x: 80.0, y: 25.0 },
+                        Point { x: 120.0, y: 25.0 },
+                        Point { x: 120.0, y: 125.0 },
+                        Point { x: 300.0, y: 125.0 },
+                    ],
+                },
+                unrelated.clone(),
+            ],
+            boundary_bundles: Vec::new(),
+            width: 680.0,
+            height: 250.0,
+        };
+
+        let result = apply_and_normalize(&indexed, layout, options).unwrap();
+        assert_eq!(result.boundary_bundles[0].spine.end.x, 94.0);
+        assert_eq!(
+            result.edges.iter().find(|route| route.id == 12),
+            Some(&unrelated)
+        );
+    }
+
+    #[test]
     fn vector_output_uses_one_interior_collector_after_member_convergence() {
         let graph = Graph {
             nodes: vec![
                 node(1, PortSide::East),
                 node(2, PortSide::East),
                 node(3, PortSide::West),
+                node(4, PortSide::West),
             ],
             edges: vec![
                 Edge {
@@ -1582,6 +2240,7 @@ mod tests {
                 geometry_at(1, 0.0, 0.0),
                 geometry_at(2, 0.0, 100.0),
                 geometry_at(3, 300.0, 0.0),
+                geometry_at(4, 600.0, 0.0),
             ],
             edges: vec![
                 EdgeGeometry {
@@ -1603,20 +2262,20 @@ mod tests {
             height: 150.0,
         };
 
-        let interior = apply_and_normalize(&indexed, layout, options).unwrap();
+        let interior = apply_and_normalize(&indexed, layout.clone(), options).unwrap();
         let bundle = &interior.boundary_bundles[0];
         assert_eq!(
             bundle.spine,
             BoundaryBundleSegment {
                 start: Point { x: 300.0, y: 25.0 },
-                end: Point { x: 94.0, y: 25.0 },
+                end: Point { x: 90.0, y: 25.0 },
             }
         );
         assert_eq!(
             bundle.collector,
             BoundaryBundleSegment {
-                start: Point { x: 94.0, y: 25.0 },
-                end: Point { x: 94.0, y: 125.0 },
+                start: Point { x: 90.0, y: 25.0 },
+                end: Point { x: 90.0, y: 125.0 },
             }
         );
         assert_eq!(
@@ -1624,14 +2283,23 @@ mod tests {
             vec![
                 EdgeGeometry {
                     id: 10,
-                    points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 94.0, y: 25.0 }],
+                    points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 90.0, y: 25.0 }],
                 },
                 EdgeGeometry {
                     id: 11,
-                    points: vec![Point { x: 80.0, y: 125.0 }, Point { x: 94.0, y: 125.0 }],
+                    points: vec![Point { x: 80.0, y: 125.0 }, Point { x: 90.0, y: 125.0 }],
                 },
             ]
         );
+        assert_eq!(
+            apply_and_normalize(&indexed, interior.clone(), options).unwrap(),
+            interior
+        );
+
+        let mut blocked = layout;
+        blocked.nodes[3] = geometry_at(4, 80.0, 50.0);
+        let fallback = apply_and_normalize(&indexed, blocked, options).unwrap();
+        assert_eq!(fallback.boundary_bundles[0].spine.end.x, 286.0);
     }
 
     #[test]

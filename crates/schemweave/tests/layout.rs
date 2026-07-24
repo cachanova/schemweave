@@ -2123,6 +2123,7 @@ fn wide_live_shape_bundles_reserve_distinct_boundary_corridors() {
             .all(|right_edges| right_edges[0] == right_edges[1])
     );
 
+    let mut interior_bundles = 0;
     for bundle in &result.boundary_bundles {
         let corridor_x = bundle
             .members
@@ -2140,8 +2141,18 @@ fn wide_live_shape_bundles_reserve_distinct_boundary_corridors() {
                 .to_bits()
             })
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(corridor_x.len(), bundle.width as usize);
+        let interior = (bundle.spine.end.x - bundle.spine.start.x).abs()
+            > config.layout.port_stub + config.layout.route_lane_gap;
+        if interior {
+            interior_bundles += 1;
+            assert!(bundle.members.iter().all(|member| {
+                member.tap.x == bundle.collector.start.x && member.tap.x == bundle.collector.end.x
+            }));
+        } else {
+            assert_eq!(corridor_x.len(), bundle.width as usize);
+        }
     }
+    assert!(interior_bundles > 0);
     let wide_collectors = result
         .boundary_bundles
         .iter()
@@ -2370,6 +2381,117 @@ fn direct_alias_edge_can_use_input_and_output_bundle_taps_in_any_bundle_order() 
             outputs: vec![2],
             boundary_bundles: vec![swapped_input, swapped_output],
         },
+    )
+    .unwrap();
+    assert_eq!(result.nodes, swapped.nodes);
+    assert_eq!(result.edges, swapped.edges);
+    assert_eq!(result.width, swapped.width);
+    assert_eq!(result.height, swapped.height);
+}
+
+#[test]
+fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
+    let graph = Graph {
+        nodes: vec![
+            node(1, false),
+            node(2, false),
+            node(3, false),
+            node(4, false),
+        ],
+        edges: vec![edge(10, 1, 3), edge(11, 1, 2), edge(12, 4, 3)],
+    };
+    let input = BoundaryBundleConstraint {
+        id: 3,
+        endpoint: Endpoint { node: 1, port: 1 },
+        width: 2,
+        members: vec![
+            BoundaryBundleMemberConstraint {
+                edge: 10,
+                slots: vec![0],
+            },
+            BoundaryBundleMemberConstraint {
+                edge: 11,
+                slots: vec![1],
+            },
+        ],
+    };
+    let output = BoundaryBundleConstraint {
+        id: 7,
+        endpoint: Endpoint { node: 3, port: 0 },
+        width: 2,
+        members: vec![
+            BoundaryBundleMemberConstraint {
+                edge: 10,
+                slots: vec![0],
+            },
+            BoundaryBundleMemberConstraint {
+                edge: 12,
+                slots: vec![1],
+            },
+        ],
+    };
+    let constraints = |boundary_bundles| LayoutConstraints {
+        inputs: vec![1, 4],
+        outputs: vec![2, 3],
+        boundary_bundles,
+    };
+    let result = layout_with_constraints(
+        &graph,
+        LayoutOptions::default(),
+        &constraints(vec![output.clone(), input.clone()]),
+    )
+    .unwrap();
+    let minimum_interior_depth =
+        LayoutOptions::default().port_stub + LayoutOptions::default().route_lane_gap;
+    let input_bundle = result
+        .boundary_bundles
+        .iter()
+        .find(|bundle| bundle.role == BoundaryBundleRole::Input)
+        .unwrap();
+    assert!(
+        (input_bundle.spine.end.x - input_bundle.spine.start.x).abs() > minimum_interior_depth,
+        "{input_bundle:#?}"
+    );
+    let alias = result.edges.iter().find(|route| route.id == 10).unwrap();
+    let input_tap = result
+        .boundary_bundles
+        .iter()
+        .find(|bundle| bundle.role == BoundaryBundleRole::Input)
+        .unwrap()
+        .members
+        .iter()
+        .find(|member| member.edge == 10)
+        .unwrap()
+        .tap;
+    let output_tap = result
+        .boundary_bundles
+        .iter()
+        .find(|bundle| bundle.role == BoundaryBundleRole::Output)
+        .unwrap()
+        .members
+        .iter()
+        .find(|member| member.edge == 10)
+        .unwrap()
+        .tap;
+    assert_eq!(alias.points.first(), Some(&input_tap));
+    assert_eq!(alias.points.last(), Some(&output_tap));
+
+    let reordered = layout_with_constraints(
+        &graph,
+        LayoutOptions::default(),
+        &constraints(vec![input.clone(), output.clone()]),
+    )
+    .unwrap();
+    assert_eq!(result, reordered);
+
+    let mut swapped_input = input;
+    swapped_input.id = 7;
+    let mut swapped_output = output;
+    swapped_output.id = 3;
+    let swapped = layout_with_constraints(
+        &graph,
+        LayoutOptions::default(),
+        &constraints(vec![swapped_input, swapped_output]),
     )
     .unwrap();
     assert_eq!(result.nodes, swapped.nodes);
