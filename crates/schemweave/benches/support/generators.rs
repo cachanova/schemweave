@@ -1,10 +1,6 @@
 //! Deterministic synthetic graph generators shared by the criterion benches
 //! (`benches/layout.rs`) and the guarding test (`tests/bench_fixtures.rs`).
 
-// Compiled into both the `layout` bench and the `bench_fixtures` test; each
-// target uses only a subset, so unused-in-one-target items are expected.
-#![allow(dead_code)]
-
 use schemweave::{Edge, Endpoint, Graph, Node, Port, PortSide};
 
 /// Platform-independent LCG so `layered_dag` needs no rand dependency.
