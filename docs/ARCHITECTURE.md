@@ -53,11 +53,15 @@ lifetime. Native and WASM callers execute the same core implementation.
 ## Group expansion
 
 Expansion receives a compact graph and layout, an expanded graph, the replaced
-anchor/members, and explicit boundary-trunk replacements. It preserves unrelated
-geometry, lays out the new members with the canonical engine, and accepts the
-composition only when all hard geometry and left-to-right invariants hold.
-Native callers receive `GroupExpansionError`; the WASM boundary converts selected
-safe fallbacks into a tagged full-relayout response.
+anchor/members, and explicit boundary-trunk replacements. It preserves distant
+geometry, opens a horizontal corridor for additional width, and can move the
+connected local vertical slab obstructing a taller expansion. Routes crossing
+that slab receive deterministic orthogonal jogs; the non-reflow retained
+candidate remains available when local reflow is unsafe or over budget. The
+engine lays out members canonically and accepts either composition only when
+all hard geometry and left-to-right invariants hold. Native callers receive
+`GroupExpansionError`; the WASM boundary converts selected safe fallbacks into
+a tagged full-relayout response.
 
 ## Invariants
 
