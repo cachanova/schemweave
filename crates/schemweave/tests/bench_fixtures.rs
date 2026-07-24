@@ -16,7 +16,10 @@ fn fast() -> LayoutConfig {
 #[test]
 fn generators_are_deterministic() {
     assert_eq!(generators::pipeline(10, 3), generators::pipeline(10, 3));
-    assert_eq!(generators::layered_dag(6, 8, 7), generators::layered_dag(6, 8, 7));
+    assert_eq!(
+        generators::layered_dag(6, 8, 7),
+        generators::layered_dag(6, 8, 7)
+    );
     assert_eq!(generators::bus_chain(3, 8), generators::bus_chain(3, 8));
 }
 
