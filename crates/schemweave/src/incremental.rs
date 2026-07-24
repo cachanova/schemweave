@@ -377,7 +377,7 @@ pub fn collapse_group_in_place(
     validate_compact_boundary_bundles(expanded_graph, expanded_layout, options.layout)?;
     let expanded_node_geometry = index_node_geometry(expanded_graph, expanded_layout)?;
     let expanded_edge_geometry = index_edge_geometry(expanded_graph, expanded_layout)?;
-    validate_layout_bounds(expanded_layout)?;
+    validate_layout_bounds(expanded_layout).map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
     if route_segment_count(expanded_layout) > MAX_LAYOUT_SEGMENTS {
         return Err(GroupExpansionError::TooManyCompactRouteSegments {
             actual: route_segment_count(expanded_layout),
@@ -1421,7 +1421,7 @@ fn validate_contract<'a>(
         validate_compact_boundary_bundles(compact_graph, compact_layout, options)?;
     let compact_node_geometry = index_node_geometry(compact_graph, compact_layout)?;
     let compact_edge_geometry = index_edge_geometry(compact_graph, compact_layout)?;
-    validate_layout_bounds(compact_layout)?;
+    validate_layout_bounds(compact_layout).map_err(|_| GroupExpansionError::NeedsFullRelayout)?;
     let mut hard_budget = WorkBudget::new(MAX_CANDIDATE_WORK);
     match hard_geometry_is_clean_bounded(compact_graph, compact_layout, &mut hard_budget) {
         Ok(true) => {}
@@ -5835,6 +5835,36 @@ mod tests {
         assert_eq!(
             run(&expanded_permuted, &expansion_permuted),
             Err(GroupExpansionError::NeedsFullRelayout)
+        );
+    }
+
+    #[test]
+    fn invalid_retained_layout_bounds_request_full_relayout() {
+        let (compact, expanded, expansion) = fixture();
+        let mut compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        compact_layout.width = 0.0;
+        assert_eq!(
+            expand_group_in_place(
+                &compact,
+                &compact_layout,
+                &expanded,
+                &expansion,
+                &GroupExpansionOptions::default(),
+            ),
+            Err(GroupExpansionError::NeedsFullRelayout),
+        );
+
+        let mut expanded_layout = layout(&expanded, LayoutOptions::default()).unwrap();
+        expanded_layout.height = 0.0;
+        assert_eq!(
+            collapse_group_in_place(
+                &expanded,
+                &expanded_layout,
+                &compact,
+                &expansion,
+                &GroupCollapseOptions::default(),
+            ),
+            Err(GroupExpansionError::NeedsFullRelayout),
         );
     }
 
