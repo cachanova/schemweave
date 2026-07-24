@@ -78,6 +78,7 @@ fn expand_without_a_full_relayout(captured: &CapturedExpansion) -> Layout {
             layout: config.layout,
             quality_effort: config.quality_effort,
             constraints: config.constraints,
+            protected_groups: Vec::new(),
         },
     )
     .expect("a grouped vector should preserve unrelated compact geometry");
@@ -423,6 +424,7 @@ fn focused_register_vector_keeps_its_original_grid_shape() {
             layout: config.layout,
             quality_effort: config.quality_effort,
             constraints: config.constraints,
+            protected_groups: Vec::new(),
         },
     )
     .expect("focused expansion should retain the original arrangement decision");
@@ -466,6 +468,7 @@ fn expansion_rejects_an_invalid_reference_height() {
             layout: config.layout,
             quality_effort: config.quality_effort,
             constraints: config.constraints,
+            protected_groups: Vec::new(),
         },
     )
     .expect_err("a non-positive reference height must be rejected");

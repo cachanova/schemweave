@@ -60,6 +60,7 @@ fn expansion_fixture_expands_without_full_relayout() {
                 layout: config.layout,
                 quality_effort: config.quality_effort,
                 constraints: config.constraints.clone(),
+                protected_groups: Vec::new(),
             },
         );
         let layout = result.unwrap_or_else(|error| {

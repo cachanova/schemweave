@@ -95,6 +95,7 @@ fn expand_benches(c: &mut Criterion) {
                 layout: config.layout,
                 quality_effort: config.quality_effort,
                 constraints: config.constraints.clone(),
+                protected_groups: Vec::new(),
             };
             let first =
                 expand_group_in_place(&compact, &compact_layout, &expanded, &expansion, &options)
@@ -139,6 +140,7 @@ fn collapse_benches(c: &mut Criterion) {
                 layout: config.layout,
                 quality_effort: config.quality_effort,
                 constraints: config.constraints.clone(),
+                protected_groups: Vec::new(),
             };
             let expanded_layout = expand_group_in_place(
                 &compact,

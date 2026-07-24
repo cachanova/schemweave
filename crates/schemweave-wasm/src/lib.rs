@@ -17,7 +17,7 @@ pub fn layout_json(graph_json: &str, options_json: &str) -> Result<String, JsVal
 pub fn layout_serialized(graph_json: &str, options_json: &str) -> Result<String, String> {
     let graph: Graph =
         serde_json::from_str(graph_json).map_err(|error| format!("invalid graph JSON: {error}"))?;
-    let options = if options_json.trim().is_empty() {
+    let options: LayoutConfig = if options_json.trim().is_empty() {
         LayoutConfig::default()
     } else {
         serde_json::from_str(options_json)
@@ -63,8 +63,8 @@ pub fn expand_group_serialized(
         .map_err(|error| format!("invalid expanded graph JSON: {error}"))?;
     let expansion: GroupExpansion = serde_json::from_str(expansion_json)
         .map_err(|error| format!("invalid group expansion JSON: {error}"))?;
-    let options = if options_json.trim().is_empty() {
-        LayoutConfig::default()
+    let options: GroupExpansionOptions = if options_json.trim().is_empty() {
+        GroupExpansionOptions::default()
     } else {
         serde_json::from_str(options_json)
             .map_err(|error| format!("invalid options JSON: {error}"))?
@@ -74,11 +74,7 @@ pub fn expand_group_serialized(
         &compact_layout,
         &expanded_graph,
         &expansion,
-        &GroupExpansionOptions {
-            layout: options.layout,
-            quality_effort: options.quality_effort,
-            constraints: options.constraints,
-        },
+        &options,
     ) {
         Ok(layout) => SerializedGroupExpansionResult::Layout { layout },
         Err(GroupExpansionError::NeedsFullRelayout) => {
@@ -430,6 +426,47 @@ mod tests {
         assert_eq!(
             result.edges.iter().map(|edge| edge.id).collect::<Vec<_>>(),
             vec![11, 12, 13]
+        );
+    }
+
+    #[test]
+    fn expansion_reads_protected_peer_groups_from_the_json_options() {
+        let compact = Graph {
+            nodes: vec![node(1), node(10), node(4)],
+            edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
+        };
+        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let expanded = Graph {
+            nodes: vec![node(1), node(2), node(4)],
+            edges: vec![edge(11, 1, 2, 100), edge(12, 2, 4, 200)],
+        };
+        let expansion = GroupExpansion {
+            anchor: 10,
+            members: vec![2],
+            boundary_trunks: vec![
+                BoundaryTrunk {
+                    expanded_edge: 11,
+                    compact_edge: 1,
+                },
+                BoundaryTrunk {
+                    expanded_edge: 12,
+                    compact_edge: 2,
+                },
+            ],
+        };
+
+        let error = expand_group_serialized(
+            &serde_json::to_string(&compact).unwrap(),
+            &serde_json::to_string(&compact_layout).unwrap(),
+            &serde_json::to_string(&expanded).unwrap(),
+            &serde_json::to_string(&expansion).unwrap(),
+            r#"{"protected_groups":[{"id":20,"members":[999],"frame_padding":16.0}]}"#,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("protected group 20 references non-retained node 999"),
+            "{error}"
         );
     }
 
