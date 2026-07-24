@@ -881,7 +881,7 @@ fn layout_indexed(
             &routing_plan,
             &raw_layout.nodes,
             &raw_layout.edges,
-            routing::route_quality(&indexed, &raw_layout.edges),
+            || routing::route_quality(&indexed, &raw_layout.edges),
             options,
         )
         && let Some(candidate) = prepare_owned_candidate(

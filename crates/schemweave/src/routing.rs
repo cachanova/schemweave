@@ -4146,14 +4146,14 @@ pub(crate) fn ordinary_fanout_candidate(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
     baseline: &[EdgeGeometry],
-    baseline_quality: RouteQuality,
+    baseline_quality: impl FnOnce() -> RouteQuality,
     options: LayoutOptions,
 ) -> Option<(RouteQuality, Vec<EdgeGeometry>)> {
     fanout_trunk_candidate(
         plan,
         nodes,
         baseline,
-        || baseline_quality,
+        baseline_quality,
         options,
         MIN_ORDINARY_FANOUT_EDGES,
         MAX_ORDINARY_FANOUT_EDGES,
