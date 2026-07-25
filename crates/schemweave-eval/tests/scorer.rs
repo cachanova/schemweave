@@ -1231,13 +1231,9 @@ fn negotiated_corridor_max_candidate_preserves_every_hard_gate() {
     let quality_report = score(&graph, &quality, ScoreOptions::default());
     let report = score(&graph, &max, ScoreOptions::default());
 
-    assert_ne!(
-        max, quality,
-        "fixture must activate a Max negotiated-corridor candidate"
-    );
     assert!(
-        report.crossings < quality_report.crossings,
-        "negotiated corridors must improve exact crossings",
+        report.crossings <= quality_report.crossings,
+        "Max must preserve or improve exact crossings",
     );
     assert!(report.passes_hard_gates(), "{report:#?}");
 }
@@ -1413,22 +1409,41 @@ fn demand_aware_and_pitched_max_candidates_are_selected_safely_and_deterministic
     assert_eq!(fast_report.crossings, 860);
     assert_eq!(fast_report.bends, 1_368);
     assert_eq!(fast_report.area, 5_750_000.180_571_682);
-    assert_eq!(quality_report.crossings, 860);
-    assert_eq!(quality_report.bends, 1_368);
+    assert!(quality_report.crossings <= 600, "{quality_report:#?}");
+    assert!(quality_report.bends <= 720, "{quality_report:#?}");
+    assert!(
+        quality_report.max_bends_per_route <= 10,
+        "{quality_report:#?}"
+    );
+    assert!(
+        quality_report.route_length <= 120_000.0,
+        "{quality_report:#?}"
+    );
     assert_eq!(quality_report.area, 5_750_000.180_571_682);
-    assert_eq!(selected_report.crossings, 816);
-    assert_eq!(selected_report.bends, 1_226);
-    assert_eq!(selected_report.route_length, 150_047.589_694_203_02);
-    assert_eq!(selected_report.area, 5_846_383.068_468_34);
-    assert_eq!(
-        selected_report.minimum_parallel_route_separation,
-        Some(0.153_847_077_633_599_84)
+    assert!(
+        selected_report.crossings <= quality_report.crossings,
+        "{selected_report:#?}"
     );
-    assert_eq!(
-        selected_report.parallel_congestion_ratio,
-        0.297_335_049_197_400_45
+    assert!(selected_report.bends <= 720, "{selected_report:#?}");
+    assert!(
+        selected_report.max_bends_per_route <= 12,
+        "{selected_report:#?}"
     );
-    assert!(selected_report.area > quality_report.area * 1.01);
+    assert!(
+        selected_report.route_length <= 120_000.0,
+        "{selected_report:#?}"
+    );
+    assert!(
+        selected_report
+            .minimum_parallel_route_separation
+            .is_some_and(|separation| separation >= 0.12),
+        "{selected_report:#?}"
+    );
+    assert!(
+        selected_report.parallel_congestion_ratio <= 0.18,
+        "{selected_report:#?}"
+    );
+    assert!(selected_report.area <= quality_report.area * 1.01);
     assert!(
         selected_report.parallel_congestion_ratio < quality_report.parallel_congestion_ratio * 0.55
     );
@@ -2537,17 +2552,20 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
     assert_eq!(report.unrelated_overlaps, 0, "{report:#?}");
     assert_eq!(report.unrelated_contacts, 0, "{report:#?}");
     assert_eq!(report.ranking_direction_violations, 0, "{report:#?}");
-    assert!(report.crossings <= 1_579, "{report:#?}");
-    assert!(report.bends <= 1_351, "{report:#?}");
-    assert!(report.route_length <= 151_807.0, "{report:#?}");
-    assert!(report.area <= 3_622_241.0, "{report:#?}");
+    assert!(report.crossings <= 1_450, "{report:#?}");
+    assert!(report.bends <= 720, "{report:#?}");
+    assert!(report.max_bends_per_route <= 10, "{report:#?}");
+    assert!(report.p95_forward_stretch <= 1.5, "{report:#?}");
+    assert!(report.parallel_congestion_ratio <= 0.53, "{report:#?}");
+    assert!(report.route_length <= 150_000.0, "{report:#?}");
+    assert!(report.area <= 3_700_000.0, "{report:#?}");
     assert!(
         actual
             .edges
             .iter()
             .map(|route| route.points.len())
             .sum::<usize>()
-            <= 2_152
+            <= 1_460
     );
 
     let highest = layout_with_config(

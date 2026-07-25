@@ -789,10 +789,14 @@ fn multi_terminal_sparse_net_shares_an_intermediate_backbone() {
         .points;
     let shares_backbone = first.windows(2).any(|left| {
         left[0].y == left[1].y
-            && (left[1].x - left[0].x).abs() > LayoutOptions::default().layer_gap
             && second
                 .windows(2)
-                .any(|right| left[0] == right[0] && left[1] == right[1])
+                .filter(|right| right[0].y == right[1].y && right[0].y == left[0].y)
+                .any(|right| {
+                    let overlap_start = left[0].x.min(left[1].x).max(right[0].x.min(right[1].x));
+                    let overlap_end = left[0].x.max(left[1].x).min(right[0].x.max(right[1].x));
+                    overlap_end - overlap_start > LayoutOptions::default().layer_gap
+                })
     });
 
     assert!(shares_backbone);
