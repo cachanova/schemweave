@@ -128,6 +128,11 @@ const MIN_FANOUT_AWARE_NODES: usize = 1_000;
 // sparse path payload, and the candidate is never admitted without the canonical physical score.
 const MIN_STAIRCASE_ALIGNMENT_TRANSITIONS: usize = 32;
 const MIN_STAIRCASE_ALIGNMENT_RATIO_DENOMINATOR: usize = 9;
+const MAX_STRAIGHT_RUN_ANCHORS: usize = 4_096;
+const MAX_STRAIGHT_RUN_PATH_STATES: usize = 500_000;
+const MAX_STRAIGHT_RUN_NODES: usize = 256;
+const MAX_STRAIGHT_RUN_EDGES: usize = 4_000;
+const MAX_STRAIGHT_RUN_TOTAL_WORK: usize = 4_000_000;
 const PARALLEL_CONGESTION_CUTOFF: f64 = 4.0;
 const MAX_ADAPTIVE_SPACING_LENGTH_FACTOR: f64 = 1.05;
 const MAX_ADAPTIVE_SPACING_CONGESTION_FACTOR: f64 = 0.94;
@@ -316,6 +321,16 @@ fn deduplicate_route_candidates(candidates: &mut Vec<(RouteQuality, Vec<EdgeGeom
     for candidate in pending {
         push_distinct_route_candidate(candidates, candidate);
     }
+}
+
+fn straight_run_routing_is_eligible(
+    adaptive_gap_spacing: bool,
+    node_count: usize,
+    edge_count: usize,
+) -> bool {
+    adaptive_gap_spacing
+        && node_count <= MAX_STRAIGHT_RUN_NODES
+        && edge_count <= MAX_STRAIGHT_RUN_EDGES
 }
 
 struct RouteFamily {
@@ -511,6 +526,37 @@ impl Ord for FloatKey {
 impl PartialOrd for FloatKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StraightRunCost {
+    transitions: usize,
+    movement: f64,
+    alignment: f64,
+}
+
+impl StraightRunCost {
+    fn cmp(self, other: Self) -> Ordering {
+        self.transitions
+            .cmp(&other.transitions)
+            .then(self.movement.total_cmp(&other.movement))
+            .then(self.alignment.total_cmp(&other.alignment))
+    }
+
+    fn with_transition(self, distance: f64) -> Self {
+        Self {
+            transitions: self.transitions.saturating_add(1),
+            movement: self.movement + distance,
+            alignment: self.alignment,
+        }
+    }
+
+    fn with_alignment(self, distance: f64) -> Self {
+        Self {
+            alignment: self.alignment + distance,
+            ..self
+        }
     }
 }
 
@@ -711,6 +757,27 @@ fn route_planned_candidates_with_horizontal_overrides(
     } else {
         (FULL_OUTER_LANE_ROUNDS, FULL_GAP_LANE_ROUNDS)
     };
+    let node_count = plan.nodes_by_rank.iter().map(Vec::len).sum::<usize>();
+    let straight_run_routing =
+        straight_run_routing_is_eligible(adaptive_gap_spacing, node_count, plan.edges.len());
+    let legacy = straight_run_routing.then(|| {
+        route_edges_with_lane_rounds_and_refined_global(
+            plan,
+            nodes,
+            options,
+            outer_rounds,
+            gap_rounds,
+            supplemental,
+            supplemental,
+            sparse_global,
+            large_sparse_global,
+            refined_large_sparse_global,
+            adaptive_gap_spacing,
+            deeper_crossing_repair,
+            false,
+            horizontal_overrides,
+        )
+    });
     let mut routed = route_edges_with_lane_rounds_and_refined_global(
         plan,
         nodes,
@@ -724,8 +791,32 @@ fn route_planned_candidates_with_horizontal_overrides(
         refined_large_sparse_global,
         adaptive_gap_spacing,
         deeper_crossing_repair,
+        straight_run_routing,
         horizontal_overrides,
     );
+    if let Some(legacy) = legacy {
+        let mut legacy_candidates = legacy.alternatives;
+        legacy_candidates.push((
+            legacy
+                .primary_quality
+                .unwrap_or_else(|| route_quality_for_plan(plan, &legacy.primary)),
+            legacy.primary,
+        ));
+        if let Some(candidate) = legacy.repair {
+            legacy_candidates.push(candidate);
+        }
+        for candidate in legacy_candidates {
+            let duplicates_selected = candidate.1 == routed.primary
+                || routed
+                    .repair
+                    .as_ref()
+                    .is_some_and(|(_, routes)| candidate.1 == *routes);
+            if !duplicates_selected {
+                push_distinct_route_candidate(&mut routed.alternatives, candidate);
+            }
+        }
+        deduplicate_route_candidates(&mut routed.alternatives);
+    }
     if routed.primary_quality.is_none() {
         routed.primary_quality = Some(route_quality_for_plan(plan, &routed.primary));
     }
@@ -794,6 +885,7 @@ fn route_edges_with_lane_rounds_and_global(
         false,
         false,
         false,
+        false,
         None,
     )
 }
@@ -813,6 +905,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
     deeper_crossing_repair: bool,
+    prefer_straight_runs: bool,
     horizontal_overrides: Option<&HorizontalCrossingOverrides>,
 ) -> RoutedEdges {
     let options = crate::effective_layout_options(options);
@@ -981,6 +1074,7 @@ fn route_edges_with_lane_rounds_and_refined_global(
         refined_large_sparse_global,
         adaptive_gap_spacing,
         deeper_crossing_repair,
+        prefer_straight_runs,
         horizontal_overrides,
     );
     let staircase_alternative = align_staircases
@@ -2682,6 +2776,7 @@ fn emit_routes_with_outer_lanes(
     refined_large_sparse_global: bool,
     adaptive_gap_spacing: bool,
     max_quality_effort: bool,
+    prefer_straight_runs: bool,
     horizontal_overrides: Option<&HorizontalCrossingOverrides>,
 ) -> RoutedLaneState {
     let initial_endpoint_tracks = build_endpoint_tracks(
@@ -2706,6 +2801,8 @@ fn emit_routes_with_outer_lanes(
         free_by_rank,
         &initial_endpoint_tracks,
         options.port_stub,
+        options.route_lane_gap,
+        prefer_straight_runs,
         horizontal_overrides,
     );
     let GapLaneCandidates {
@@ -3220,6 +3317,8 @@ fn repair_crossing_heavy_net(
                 free_by_rank,
                 &candidate_endpoint_tracks,
                 options.port_stub,
+                options.route_lane_gap,
+                true,
                 horizontal_overrides,
             )
         });
@@ -8615,6 +8714,53 @@ fn free_intervals(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn consume_straight_run_work(remaining: &mut usize, amount: usize) -> bool {
+    if let Some(next) = remaining.checked_sub(amount) {
+        *remaining = next;
+        true
+    } else {
+        *remaining = 0;
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preferred_crossing_path(
+    prefer_straight_runs: bool,
+    remaining_work: &mut usize,
+    layers: &[Vec<(f64, f64)>],
+    source_y: f64,
+    target_y: f64,
+    lanes: &[usize],
+    lane_counts: &[usize],
+    tie_lanes: &[usize],
+    tie_lane_count: usize,
+) -> Vec<f64> {
+    if prefer_straight_runs {
+        straight_run_crossing_path(
+            remaining_work,
+            layers,
+            source_y,
+            target_y,
+            lanes,
+            lane_counts,
+            tie_lanes,
+            tie_lane_count,
+        )
+    } else {
+        shortest_crossing_path(
+            layers,
+            source_y,
+            target_y,
+            lanes,
+            lane_counts,
+            tie_lanes,
+            tie_lane_count,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sparse_crossing_paths(
     plan: &RoutingPlan<'_>,
     nodes: &[NodeGeometry],
@@ -8625,8 +8771,11 @@ fn sparse_crossing_paths(
     free_by_rank: &[Vec<(f64, f64)>],
     endpoint_tracks: &EndpointTracks,
     port_stub: f64,
+    route_lane_gap: f64,
+    prefer_straight_runs: bool,
     horizontal_overrides: Option<&HorizontalCrossingOverrides>,
 ) -> Vec<Option<Vec<f64>>> {
+    let mut remaining_straight_run_work = MAX_STRAIGHT_RUN_TOTAL_WORK;
     let mut paths = plan
         .edges
         .iter()
@@ -8638,7 +8787,9 @@ fn sparse_crossing_paths(
             let target = port_point(&nodes[resolved.target_index], resolved.target_port);
             let source_y = endpoint_escape_y(source, edge.source, 0, endpoint_tracks, port_stub);
             let target_y = endpoint_escape_y(target, edge.target, 1, endpoint_tracks, port_stub);
-            Some(shortest_crossing_path(
+            Some(preferred_crossing_path(
+                prefer_straight_runs,
+                &mut remaining_straight_run_work,
                 &free_by_rank[source_rank + 1..target_rank],
                 source_y,
                 target_y,
@@ -8713,7 +8864,9 @@ fn sparse_crossing_paths(
                 .collect::<Vec<_>>();
             target_ys.sort_by(f64::total_cmp);
             let target_y = target_ys[target_ys.len() / 2];
-            let shared = shortest_crossing_path(
+            let shared = preferred_crossing_path(
+                prefer_straight_runs,
+                &mut remaining_straight_run_work,
                 &free_by_rank[source_rank + 1..max_target_rank],
                 source_y,
                 target_y,
@@ -8780,7 +8933,9 @@ fn sparse_crossing_paths(
             let target = port_point(&nodes[first.target_index], first.target_port);
             let target_y =
                 endpoint_escape_y(target, first.edge.target, 1, endpoint_tracks, port_stub);
-            let shared = shortest_crossing_path(
+            let shared = preferred_crossing_path(
+                prefer_straight_runs,
+                &mut remaining_straight_run_work,
                 &free_by_rank[min_source_rank + 1..target_rank],
                 source_y,
                 target_y,
@@ -8804,6 +8959,33 @@ fn sparse_crossing_paths(
         }
     }
 
+    if prefer_straight_runs {
+        let spread = spread_straight_crossing_runs(
+            plan,
+            sparse_spans,
+            free_by_rank,
+            route_lane_gap,
+            &mut remaining_straight_run_work,
+            &mut paths,
+        );
+        if !spread {
+            return sparse_crossing_paths(
+                plan,
+                nodes,
+                sparse_spans,
+                crossing_lanes,
+                crossing_tie_lanes,
+                crossing_tie_lane_count,
+                free_by_rank,
+                endpoint_tracks,
+                port_stub,
+                route_lane_gap,
+                false,
+                horizontal_overrides,
+            );
+        }
+    }
+
     if let Some(overrides) = horizontal_overrides {
         for ((resolved, span), path) in plan.edges.iter().zip(sparse_spans).zip(&mut paths) {
             let (Some((source_rank, _)), Some(path)) = (span, path) else {
@@ -8819,6 +9001,210 @@ fn sparse_crossing_paths(
         }
     }
     paths
+}
+
+fn spread_straight_crossing_runs(
+    plan: &RoutingPlan<'_>,
+    sparse_spans: &[Option<(usize, usize)>],
+    free_by_rank: &[Vec<(f64, f64)>],
+    route_lane_gap: f64,
+    remaining_work: &mut usize,
+    paths: &mut [Option<Vec<f64>>],
+) -> bool {
+    #[derive(Clone, Copy)]
+    struct Run {
+        edge_index: usize,
+        edge_id: EdgeId,
+        net: NetId,
+        source_rank: usize,
+        start: usize,
+        end: usize,
+        desired: f64,
+        low: f64,
+        high: f64,
+    }
+
+    let mut runs = Vec::new();
+    for (edge_index, ((resolved, span), path)) in plan
+        .edges
+        .iter()
+        .zip(sparse_spans)
+        .zip(paths.iter())
+        .enumerate()
+    {
+        let (Some((source_rank, _)), Some(path)) = (span, path) else {
+            continue;
+        };
+        if !consume_straight_run_work(remaining_work, path.len()) {
+            return false;
+        }
+        let mut start = 0;
+        while start < path.len() {
+            let mut end = start + 1;
+            while end < path.len() && path[end] == path[start] {
+                end += 1;
+            }
+            let desired = path[start];
+            let window =
+                (start..end).try_fold((f64::NEG_INFINITY, f64::INFINITY), |(low, high), offset| {
+                    let interval = free_interval_containing(
+                        free_by_rank.get(source_rank + offset + 1)?,
+                        desired,
+                    )?;
+                    Some((low.max(interval.0), high.min(interval.1)))
+                });
+            if let Some((low, high)) = window
+                && low <= high
+            {
+                if !consume_straight_run_work(remaining_work, 1) {
+                    return false;
+                }
+                runs.push(Run {
+                    edge_index,
+                    edge_id: resolved.edge.id,
+                    net: resolved.edge.net,
+                    source_rank: *source_rank,
+                    start,
+                    end,
+                    desired,
+                    low,
+                    high,
+                });
+            }
+            start = end;
+        }
+    }
+    runs.sort_unstable_by(|left, right| {
+        (right.end - right.start)
+            .cmp(&(left.end - left.start))
+            .then(left.net.cmp(&right.net))
+            .then(left.edge_id.cmp(&right.edge_id))
+            .then(left.start.cmp(&right.start))
+    });
+
+    let mut occupied = vec![BTreeMap::<FloatKey, BTreeSet<NetId>>::new(); free_by_rank.len()];
+    for run in runs {
+        let run_memberships = run.end - run.start;
+        if !consume_straight_run_work(remaining_work, run_memberships) {
+            return false;
+        }
+        let inset = (route_lane_gap * 0.25).min((run.high - run.low).max(0.0) / 4.0);
+        let safe_low = run.low + inset;
+        let safe_high = run.high - inset;
+        if safe_low > safe_high {
+            continue;
+        }
+        let mut blockers = BTreeSet::<FloatKey>::new();
+        let mut shared_tracks = BTreeSet::<FloatKey>::new();
+        for offset in run.start..run.end {
+            let rank = run.source_rank + offset + 1;
+            for adjacent in &occupied[rank.saturating_sub(1)..=(rank + 1).min(occupied.len() - 1)] {
+                for (&ordinate, nets) in adjacent.range(FloatKey(safe_low)..=FloatKey(safe_high)) {
+                    if !consume_straight_run_work(remaining_work, 1) {
+                        return false;
+                    }
+                    let has_other_net = nets.iter().any(|&net| net != run.net);
+                    if has_other_net {
+                        blockers.insert(ordinate);
+                    } else if nets.contains(&run.net) {
+                        shared_tracks.insert(ordinate);
+                    }
+                }
+            }
+        }
+        let desired = run.desired.clamp(safe_low, safe_high);
+        let nearest = |candidate: f64| {
+            let key = FloatKey(candidate);
+            let below = blockers
+                .range(..=key)
+                .next_back()
+                .map(|ordinate| (candidate - ordinate.0).abs());
+            let above = blockers
+                .range(key..)
+                .next()
+                .map(|ordinate| (candidate - ordinate.0).abs());
+            below
+                .into_iter()
+                .chain(above)
+                .min_by(f64::total_cmp)
+                .unwrap_or(f64::INFINITY)
+        };
+        let shared = shared_tracks
+            .iter()
+            .min_by(|left, right| {
+                (left.0 - desired)
+                    .abs()
+                    .total_cmp(&(right.0 - desired).abs())
+                    .then(left.cmp(right))
+            })
+            .map(|track| track.0);
+        let mut best = desired;
+        let mut best_separation = nearest(desired);
+        if !blockers.is_empty() {
+            let ordinates = blockers
+                .iter()
+                .map(|ordinate| ordinate.0)
+                .collect::<Vec<_>>();
+            let mut candidates = vec![
+                safe_low + (ordinates[0] - safe_low) / 2.0,
+                ordinates[ordinates.len() - 1] + (safe_high - ordinates[ordinates.len() - 1]) / 2.0,
+            ];
+            candidates.extend(
+                ordinates
+                    .windows(2)
+                    .map(|pair| pair[0] + (pair[1] - pair[0]) / 2.0),
+            );
+            if !consume_straight_run_work(remaining_work, candidates.len()) {
+                return false;
+            }
+            for candidate in candidates {
+                if blockers.contains(&FloatKey(candidate)) {
+                    continue;
+                }
+                let separation = nearest(candidate);
+                if separation.total_cmp(&best_separation).is_gt()
+                    || (separation == best_separation
+                        && (candidate - desired)
+                            .abs()
+                            .total_cmp(&(best - desired).abs())
+                            .is_lt())
+                    || (separation == best_separation
+                        && (candidate - desired).abs() == (best - desired).abs()
+                        && candidate.total_cmp(&best).is_lt())
+                {
+                    best = candidate;
+                    best_separation = separation;
+                }
+            }
+            let desired_separation = nearest(desired);
+            if desired_separation >= route_lane_gap.min(best_separation * 0.9)
+                && !blockers.contains(&FloatKey(desired))
+            {
+                best = desired;
+            }
+        }
+        if let Some(shared) = shared {
+            let shared_separation = nearest(shared);
+            if shared_separation >= route_lane_gap.min(best_separation * 0.9)
+                && !blockers.contains(&FloatKey(shared))
+            {
+                best = shared;
+            }
+        }
+        if blockers.contains(&FloatKey(best)) {
+            return false;
+        }
+        if let Some(path) = paths[run.edge_index].as_mut() {
+            path[run.start..run.end].fill(best);
+        }
+        for offset in run.start..run.end {
+            occupied[run.source_rank + offset + 1]
+                .entry(FloatKey(best))
+                .or_default()
+                .insert(run.net);
+        }
+    }
+    true
 }
 
 #[derive(Clone, Default)]
@@ -10229,6 +10615,244 @@ fn shortest_crossing_path(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
+fn straight_run_crossing_path(
+    remaining_work: &mut usize,
+    layers: &[Vec<(f64, f64)>],
+    source_y: f64,
+    target_y: f64,
+    lanes: &[usize],
+    lane_counts: &[usize],
+    tie_lanes: &[usize],
+    tie_lane_count: usize,
+) -> Vec<f64> {
+    let fallback = || {
+        shortest_crossing_path(
+            layers,
+            source_y,
+            target_y,
+            lanes,
+            lane_counts,
+            tie_lanes,
+            tie_lane_count,
+        )
+    };
+    if layers.is_empty() {
+        return Vec::new();
+    }
+    if layers.len() != lanes.len()
+        || layers.len() != lane_counts.len()
+        || layers.len() != tie_lanes.len()
+        || !source_y.is_finite()
+        || !target_y.is_finite()
+    {
+        return fallback();
+    }
+    let Some(interval_visits) = layers
+        .iter()
+        .map(Vec::len)
+        .try_fold(0usize, usize::checked_add)
+        .and_then(|visits| visits.checked_mul(3))
+    else {
+        *remaining_work = 0;
+        return fallback();
+    };
+    if !consume_straight_run_work(remaining_work, interval_visits) {
+        return fallback();
+    }
+
+    let mut anchors = vec![source_y, target_y];
+    for (((intervals, &lane), &lane_count), &tie_lane) in
+        layers.iter().zip(lanes).zip(lane_counts).zip(tie_lanes)
+    {
+        for &interval in intervals {
+            anchors.extend([interval.0, interval.1]);
+            anchors.push(crossing_track_y(
+                interval,
+                lane,
+                lane_count,
+                tie_lane,
+                tie_lane_count,
+            ));
+        }
+    }
+    for adjacent in layers.windows(2) {
+        let (left, right) = (&adjacent[0], &adjacent[1]);
+        let (mut left_index, mut right_index) = (0, 0);
+        while left_index < left.len() && right_index < right.len() {
+            let low = left[left_index].0.max(right[right_index].0);
+            let high = left[left_index].1.min(right[right_index].1);
+            if low <= high {
+                anchors.extend([low, high]);
+            }
+            match left[left_index].1.total_cmp(&right[right_index].1) {
+                Ordering::Less => left_index += 1,
+                Ordering::Greater => right_index += 1,
+                Ordering::Equal => {
+                    left_index += 1;
+                    right_index += 1;
+                }
+            }
+        }
+    }
+    anchors.retain(|anchor| anchor.is_finite());
+    anchors.sort_by(f64::total_cmp);
+    anchors.dedup_by(|left, right| left.total_cmp(right).is_eq());
+    let Some(states) = anchors.len().checked_mul(layers.len()) else {
+        *remaining_work = 0;
+        return fallback();
+    };
+    let Some(work) = states.checked_mul(6) else {
+        *remaining_work = 0;
+        return fallback();
+    };
+    if anchors.is_empty()
+        || anchors.len() > MAX_STRAIGHT_RUN_ANCHORS
+        || states > MAX_STRAIGHT_RUN_PATH_STATES
+        || !consume_straight_run_work(remaining_work, work)
+    {
+        return fallback();
+    }
+
+    let desired = layers
+        .iter()
+        .zip(lanes)
+        .zip(lane_counts)
+        .zip(tie_lanes)
+        .map(|(((intervals, &lane), &lane_count), &tie_lane)| {
+            anchors
+                .iter()
+                .map(|&anchor| {
+                    let index = intervals.partition_point(|&(_, high)| high < anchor);
+                    intervals.get(index).copied().and_then(|interval| {
+                        (interval.0 <= anchor).then(|| {
+                            crossing_track_y(interval, lane, lane_count, tie_lane, tie_lane_count)
+                        })
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    let mut costs = desired[0]
+        .iter()
+        .zip(&anchors)
+        .map(|(&desired, &anchor)| {
+            desired.map(|desired| StraightRunCost {
+                transitions: usize::from(anchor != source_y),
+                movement: (anchor - source_y).abs(),
+                alignment: (anchor - desired).abs(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if costs.iter().all(Option::is_none) {
+        return fallback();
+    }
+    let mut predecessors = Vec::with_capacity(layers.len().saturating_sub(1));
+    for layer in 1..layers.len() {
+        let transformed_cmp = |left: usize, right: usize, subtract_anchor: bool| {
+            let left_cost = costs[left].expect("prefix and suffix contain reachable anchors");
+            let right_cost = costs[right].expect("prefix and suffix contain reachable anchors");
+            left_cost
+                .transitions
+                .cmp(&right_cost.transitions)
+                .then_with(|| {
+                    let left_movement = if subtract_anchor {
+                        left_cost.movement - anchors[left]
+                    } else {
+                        left_cost.movement + anchors[left]
+                    };
+                    let right_movement = if subtract_anchor {
+                        right_cost.movement - anchors[right]
+                    } else {
+                        right_cost.movement + anchors[right]
+                    };
+                    left_movement.total_cmp(&right_movement)
+                })
+                .then(left_cost.alignment.total_cmp(&right_cost.alignment))
+                .then(left.cmp(&right))
+        };
+        let mut prefix = vec![None; anchors.len()];
+        let mut best = None;
+        for index in 0..anchors.len() {
+            if costs[index].is_some()
+                && best.is_none_or(|current| transformed_cmp(index, current, true).is_lt())
+            {
+                best = Some(index);
+            }
+            prefix[index] = best;
+        }
+        let mut suffix = vec![None; anchors.len()];
+        best = None;
+        for index in (0..anchors.len()).rev() {
+            if costs[index].is_some()
+                && best.is_none_or(|current| transformed_cmp(index, current, false).is_lt())
+            {
+                best = Some(index);
+            }
+            suffix[index] = best;
+        }
+
+        let mut next = vec![None; anchors.len()];
+        let mut layer_predecessors = vec![0; anchors.len()];
+        for (index, desired) in desired[layer].iter().copied().enumerate() {
+            let Some(desired) = desired else {
+                continue;
+            };
+            let mut selected = costs[index].map(|cost| (index, cost));
+            for predecessor in [prefix[index], suffix[index]].into_iter().flatten() {
+                let candidate = costs[predecessor]
+                    .expect("prefix and suffix contain reachable anchors")
+                    .with_transition((anchors[predecessor] - anchors[index]).abs());
+                if selected.is_none_or(|(selected_index, selected_cost)| {
+                    candidate.cmp(selected_cost).is_lt()
+                        || (candidate == selected_cost && predecessor < selected_index)
+                }) {
+                    selected = Some((predecessor, candidate));
+                }
+            }
+            if let Some((predecessor, cost)) = selected {
+                layer_predecessors[index] = predecessor;
+                next[index] = Some(cost.with_alignment((anchors[index] - desired).abs()));
+            }
+        }
+        if next.iter().all(Option::is_none) {
+            return fallback();
+        }
+        costs = next;
+        predecessors.push(layer_predecessors);
+    }
+
+    let mut selected = anchors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &anchor)| {
+            costs[index].map(|cost| {
+                (
+                    index,
+                    if anchor == target_y {
+                        cost
+                    } else {
+                        cost.with_transition((anchor - target_y).abs())
+                    },
+                )
+            })
+        })
+        .min_by(|(left_index, left), (right_index, right)| {
+            left.cmp(*right).then(left_index.cmp(right_index))
+        })
+        .map(|(index, _)| index)
+        .expect("a reachable final crossing anchor exists");
+    let mut path = vec![0.0; layers.len()];
+    for layer in (0..layers.len()).rev() {
+        path[layer] = anchors[selected];
+        if layer > 0 {
+            selected = predecessors[layer - 1][selected];
+        }
+    }
+    path
+}
+
 fn preferred_crossing_y(source: f64, target: f64, index: usize, count: usize) -> f64 {
     let progress = (index + 1) as f64 / (count + 1) as f64;
     source + (target - source) * progress
@@ -10431,9 +11055,10 @@ mod tests {
         MAX_NEGOTIATED_CORRIDOR_RELAXATIONS, MAX_NEGOTIATED_CORRIDOR_SEGMENT_VISITS,
         MAX_REGIONAL_FANOUT_ARM_RELATIONS, MAX_REGIONAL_FANOUT_ORDINATES,
         MAX_REGIONAL_FANOUT_ROUTE_POINTS, MAX_REGIONAL_FANOUT_SAFETY_VISITS,
-        MAX_REGIONAL_FANOUT_SCORE_VISITS, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL,
-        OuterLane, OuterNetAccess, OuterSide, ParallelWireSpacingError, PhysicalSegment,
-        RouteContactError, RouteQuality, RoutingPlan, SpacingRouteCandidate, SpacingRoutePlan,
+        MAX_REGIONAL_FANOUT_SCORE_VISITS, MAX_STRAIGHT_RUN_EDGES, MAX_STRAIGHT_RUN_NODES,
+        MAX_STRAIGHT_RUN_TOTAL_WORK, MIN_CROSSING_REPAIR_NET, MIN_CROSSING_REPAIR_TOTAL, OuterLane,
+        OuterNetAccess, OuterSide, ParallelWireSpacingError, PhysicalSegment, RouteContactError,
+        RouteQuality, RoutingPlan, SpacingRouteCandidate, SpacingRoutePlan,
         align_crossing_path_staircases, build_endpoint_tracks, build_regional_fanout_candidate,
         candidate_route_points_within_budget, charge_negotiated_relations, charge_negotiated_work,
         charge_regional_relation, charge_regional_work, common_free_intervals,
@@ -10468,7 +11093,8 @@ mod tests {
         route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
         route_supplemental_edges, select_crossing_repair_nets, select_gap_spacing_candidate,
         select_outer_side_repairs, selected_route_family_is_safe, shortest_crossing_path,
-        sparse_channel_route, sparse_crossing_paths, sparse_gap_x, sum_within_limit,
+        sparse_channel_route, sparse_crossing_paths, sparse_gap_x, spread_straight_crossing_runs,
+        straight_run_crossing_path, straight_run_routing_is_eligible, sum_within_limit,
         take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
     };
@@ -10713,6 +11339,8 @@ mod tests {
             &free_by_rank,
             &BTreeMap::new(),
             options.port_stub,
+            options.route_lane_gap,
+            true,
             None,
         )
     }
@@ -16938,7 +17566,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_corridor_candidate_activates_and_is_permutation_deterministic() {
+    fn negotiated_corridor_path_is_safe_and_permutation_deterministic_when_still_beneficial() {
         let options = LayoutOptions::default();
         let route = |graph: &Graph| {
             let indexed = validate_and_index(graph, options).unwrap();
@@ -16960,17 +17588,22 @@ mod tests {
                 &plan, &nodes, options, false, true, false, false, true, true,
             );
             let baseline = routed.primary_quality.expect("primary is exactly scored");
-            let candidate_quality = routed
-                .negotiated_candidate_quality
-                .expect("fixture activates negotiated corridor routing");
-            assert!(candidate_quality.crossings < baseline.crossings);
-            assert!(candidate_quality.bends <= baseline.bends);
-            let candidate = routed
-                .alternatives
-                .into_iter()
-                .find(|candidate| candidate.0 == candidate_quality)
-                .expect("activating candidate is retained")
-                .1;
+            let (candidate_quality, candidate) =
+                if let Some(candidate_quality) = routed.negotiated_candidate_quality {
+                    assert!(candidate_quality.crossings < baseline.crossings);
+                    assert!(candidate_quality.bends <= baseline.bends);
+                    (
+                        candidate_quality,
+                        routed
+                            .alternatives
+                            .into_iter()
+                            .find(|candidate| candidate.0 == candidate_quality)
+                            .expect("beneficial negotiated candidate is retained")
+                            .1,
+                    )
+                } else {
+                    (baseline, routed.primary)
+                };
             let segments = physical_route_segments(
                 plan.edges.iter().map(|resolved| resolved.edge),
                 &candidate,
@@ -18223,6 +18856,335 @@ mod tests {
         );
 
         assert!(path.iter().all(|&y| y < 10.0));
+    }
+
+    #[test]
+    fn straight_run_path_bends_only_when_the_common_corridor_ends() {
+        let open = vec![vec![(0.0, 100.0)]; 6];
+        let mut remaining_work = MAX_STRAIGHT_RUN_TOTAL_WORK;
+        let straight = straight_run_crossing_path(
+            &mut remaining_work,
+            &open,
+            20.0,
+            80.0,
+            &[0; 6],
+            &[1; 6],
+            &[0, 1, 2, 3, 4, 5],
+            6,
+        );
+        assert!(
+            straight.windows(2).all(|pair| pair[0] == pair[1]),
+            "{straight:?}"
+        );
+        let straight_with_endpoints = std::iter::once(20.0)
+            .chain(straight.iter().copied())
+            .chain(std::iter::once(80.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            straight_with_endpoints
+                .windows(2)
+                .filter(|pair| pair[0] != pair[1])
+                .count(),
+            1,
+            "{straight:?}"
+        );
+        let no_transition = straight_run_crossing_path(
+            &mut remaining_work,
+            &open,
+            20.0,
+            20.0,
+            &[0; 6],
+            &[1; 6],
+            &[0, 1, 2, 3, 4, 5],
+            6,
+        );
+        assert!(no_transition.iter().all(|&y| y == 20.0));
+        let offset_overlap = vec![
+            vec![(0.0, 9.0)],
+            vec![(8.0, 20.0)],
+            vec![(7.0, 10.0)],
+            vec![(9.0, 20.0)],
+        ];
+        let offset = straight_run_crossing_path(
+            &mut remaining_work,
+            &offset_overlap,
+            0.0,
+            20.0,
+            &[0; 4],
+            &[1; 4],
+            &[0, 1, 2, 3],
+            4,
+        );
+        let offset_with_endpoints = std::iter::once(0.0)
+            .chain(offset.iter().copied())
+            .chain(std::iter::once(20.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offset_with_endpoints
+                .windows(2)
+                .filter(|pair| pair[0] != pair[1])
+                .count(),
+            2,
+            "the shared point corridor needs only entry and exit bends: {offset:?}"
+        );
+
+        let blocked = [
+            vec![(0.0, 40.0), (60.0, 100.0)],
+            vec![(0.0, 40.0), (60.0, 100.0)],
+            vec![(60.0, 100.0)],
+            vec![(60.0, 100.0)],
+            vec![(0.0, 40.0), (60.0, 100.0)],
+            vec![(0.0, 40.0), (60.0, 100.0)],
+        ];
+        let detour = straight_run_crossing_path(
+            &mut remaining_work,
+            &blocked,
+            20.0,
+            20.0,
+            &[0; 6],
+            &[1; 6],
+            &[0, 1, 2, 3, 4, 5],
+            6,
+        );
+        let detour_with_endpoints = std::iter::once(20.0)
+            .chain(detour.iter().copied())
+            .chain(std::iter::once(20.0))
+            .collect::<Vec<_>>();
+        let transitions = detour_with_endpoints
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count();
+        assert_eq!(transitions, 2, "{detour:?}");
+        assert!(detour[2] >= 60.0 && detour[3] >= 60.0);
+
+        let nearest_boundary = straight_run_crossing_path(
+            &mut remaining_work,
+            &[vec![(10.0, 20.0)]],
+            0.0,
+            0.0,
+            &[0],
+            &[1],
+            &[0],
+            1,
+        );
+        assert_eq!(nearest_boundary, vec![10.0]);
+        let nearest_disjoint_boundaries = straight_run_crossing_path(
+            &mut remaining_work,
+            &[vec![(10.0, 20.0)], vec![(30.0, 40.0)], vec![(10.0, 20.0)]],
+            0.0,
+            0.0,
+            &[0, 0, 0],
+            &[1, 1, 1],
+            &[0, 1, 2],
+            3,
+        );
+        assert_eq!(nearest_disjoint_boundaries[1], 30.0);
+        let disjoint_with_endpoints = std::iter::once(0.0)
+            .chain(nearest_disjoint_boundaries.iter().copied())
+            .chain(std::iter::once(0.0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            disjoint_with_endpoints
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]).abs())
+                .sum::<f64>(),
+            60.0,
+            "{nearest_disjoint_boundaries:?}"
+        );
+
+        let mut exhausted = 0;
+        assert_eq!(
+            straight_run_crossing_path(
+                &mut exhausted,
+                &blocked,
+                20.0,
+                20.0,
+                &[0; 6],
+                &[1; 6],
+                &[0, 1, 2, 3, 4, 5],
+                6,
+            ),
+            shortest_crossing_path(
+                &blocked,
+                20.0,
+                20.0,
+                &[0; 6],
+                &[1; 6],
+                &[0, 1, 2, 3, 4, 5],
+                6,
+            ),
+            "exhausted straight-run work must use the deterministic legacy path"
+        );
+    }
+
+    #[test]
+    fn straight_run_routing_eligibility_has_exact_inclusive_bounds() {
+        assert!(straight_run_routing_is_eligible(
+            true,
+            MAX_STRAIGHT_RUN_NODES,
+            MAX_STRAIGHT_RUN_EDGES,
+        ));
+        assert!(!straight_run_routing_is_eligible(
+            false,
+            MAX_STRAIGHT_RUN_NODES,
+            MAX_STRAIGHT_RUN_EDGES,
+        ));
+        assert!(!straight_run_routing_is_eligible(
+            true,
+            MAX_STRAIGHT_RUN_NODES + 1,
+            MAX_STRAIGHT_RUN_EDGES,
+        ));
+        assert!(!straight_run_routing_is_eligible(
+            true,
+            MAX_STRAIGHT_RUN_NODES,
+            MAX_STRAIGHT_RUN_EDGES + 1,
+        ));
+    }
+
+    #[test]
+    fn straight_run_spreading_preserves_shared_fanout_and_fanin_around_partial_blockers() {
+        let endpoint_node = |id| Node {
+            id,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![
+                Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 5.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::East,
+                    offset: 5.0,
+                },
+            ],
+        };
+        let exercise = |edges: Vec<Edge>,
+                        ranks: Vec<usize>,
+                        sparse_spans: Vec<Option<(usize, usize)>>,
+                        mut paths: Vec<Option<Vec<f64>>>,
+                        shared_edges: (usize, usize),
+                        shared_suffix: bool| {
+            let graph = Graph {
+                nodes: (0..ranks.len() as u32).map(endpoint_node).collect(),
+                edges,
+            };
+            let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+            let plan = RoutingPlan::new(&indexed, &ranks);
+            let free_by_rank = vec![vec![(0.0, 100.0)]; ranks.len()];
+            let mut remaining_work = MAX_STRAIGHT_RUN_TOTAL_WORK;
+            assert!(spread_straight_crossing_runs(
+                &plan,
+                &sparse_spans,
+                &free_by_rank,
+                6.0,
+                &mut remaining_work,
+                &mut paths,
+            ));
+            let long = paths[shared_edges.0].as_ref().unwrap();
+            let short = paths[shared_edges.1].as_ref().unwrap();
+            let shared = if shared_suffix {
+                &long[long.len() - short.len()..]
+            } else {
+                &long[..short.len()]
+            };
+            assert_ne!(shared[0], 50.0);
+            assert_eq!(shared, short);
+        };
+        let edge = |id, source, target, net| Edge {
+            id,
+            source: Endpoint {
+                node: source,
+                port: 1,
+            },
+            target: Endpoint {
+                node: target,
+                port: 0,
+            },
+            net,
+            participates_in_ranking: true,
+        };
+
+        exercise(
+            vec![edge(10, 0, 6, 1), edge(11, 0, 2, 1), edge(20, 2, 8, 0)],
+            (0..=8).collect(),
+            vec![Some((0, 6)), Some((0, 2)), Some((2, 8))],
+            vec![
+                Some(vec![50.0; 5]),
+                Some(vec![50.0; 1]),
+                Some(vec![50.0; 5]),
+            ],
+            (0, 1),
+            false,
+        );
+        exercise(
+            vec![edge(10, 2, 10, 1), edge(11, 8, 10, 1), edge(20, 0, 10, 0)],
+            (0..=10).collect(),
+            vec![Some((2, 10)), Some((8, 10)), Some((0, 10))],
+            vec![
+                Some(vec![50.0; 7]),
+                Some(vec![50.0; 1]),
+                Some(vec![50.0; 9]),
+            ],
+            (0, 1),
+            true,
+        );
+    }
+
+    #[test]
+    fn straight_run_spreading_rejects_an_unseparable_unrelated_overlap() {
+        let node = |id| Node {
+            id,
+            width: 10.0,
+            height: 10.0,
+            cycle_breaker: false,
+            ports: vec![
+                Port {
+                    id: 0,
+                    side: PortSide::West,
+                    offset: 5.0,
+                },
+                Port {
+                    id: 1,
+                    side: PortSide::East,
+                    offset: 5.0,
+                },
+            ],
+        };
+        let edge = |id, source, target, net| Edge {
+            id,
+            source: Endpoint {
+                node: source,
+                port: 1,
+            },
+            target: Endpoint {
+                node: target,
+                port: 0,
+            },
+            net,
+            participates_in_ranking: true,
+        };
+        let graph = Graph {
+            nodes: (0..4).map(node).collect(),
+            edges: vec![edge(1, 0, 2, 10), edge(2, 1, 3, 20)],
+        };
+        let ranks = vec![0, 0, 2, 2];
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &ranks);
+        let mut paths = vec![Some(vec![50.0]), Some(vec![50.0])];
+        let mut remaining_work = MAX_STRAIGHT_RUN_TOTAL_WORK;
+        let free_by_rank = vec![vec![(50.0, 50.0)]; 4];
+
+        assert!(!spread_straight_crossing_runs(
+            &plan,
+            &[Some((0, 2)), Some((0, 2))],
+            &free_by_rank,
+            6.0,
+            &mut remaining_work,
+            &mut paths,
+        ));
     }
 
     #[test]
