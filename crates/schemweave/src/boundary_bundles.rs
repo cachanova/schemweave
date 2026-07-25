@@ -11,6 +11,7 @@ use crate::{
 pub(crate) const MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS: usize = 20_000_000;
 pub(crate) const MAX_INTERIOR_COLLECTOR_BUNDLES: usize = 32;
 pub(crate) const MAX_INTERIOR_HORIZONTAL_TAP_VISITS: usize = 2_000_000;
+const MAX_INTERIOR_PROMOTION_CANDIDATES: usize = 32;
 pub(crate) const MAX_SHARED_ROUTE_ADMISSION_VISITS: usize = 250_000;
 const BUNDLE_CLEARANCE_NET_BASE: u32 = 0x8000_0000;
 const PRESERVED_GEOMETRY_EPSILON: f64 = 1e-7;
@@ -206,6 +207,8 @@ fn apply_bundle_geometry(
         )
     });
     let mut partial_remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
+    let mut promotion_geometry_remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
+    let mut promotion_tap_remaining = MAX_INTERIOR_HORIZONTAL_TAP_VISITS;
     let mut shared_route_admission_remaining = MAX_SHARED_ROUTE_ADMISSION_VISITS;
     let mut preserved_geometry = layout
         .boundary_bundles
@@ -259,7 +262,7 @@ fn apply_bundle_geometry(
             rail_depth,
             corridor_offset,
         )?;
-        layout.boundary_bundles.push(geometry);
+        layout.boundary_bundles.push(geometry.clone());
         if planned_collector.is_some() {
             match partial_geometry_is_clean(
                 graph,
@@ -287,9 +290,102 @@ fn apply_bundle_geometry(
                         rail_depth,
                         corridor_offset,
                     )?;
-                    layout.boundary_bundles.push(geometry);
+                    layout.boundary_bundles.push(geometry.clone());
                 }
                 Err(error) => return Err(error),
+            }
+        }
+        let uses_fallback_collector =
+            (geometry.spine.end.x - geometry.spine.start.x).abs() <= rail_depth;
+        if allow_interior_collectors && uses_fallback_collector {
+            let promoted_collectors = promotion_collector_candidates(
+                &geometry_context,
+                bundle,
+                &layout.edges,
+                &mut promotion_tap_remaining,
+            );
+            if !promoted_collectors.is_empty() {
+                let fallback_geometry = geometry.clone();
+                let fallback_routes = bundle
+                    .members
+                    .iter()
+                    .map(|member| {
+                        let index = route_index[&member.edge];
+                        (index, layout.edges[index].points.clone())
+                    })
+                    .collect::<Vec<_>>();
+                let restore_work = fallback_routes
+                    .iter()
+                    .map(|(_, points)| points.len())
+                    .sum::<usize>();
+                let mut accepted = None;
+                for collector_x in promoted_collectors {
+                    let Some(next_remaining) =
+                        promotion_geometry_remaining.checked_sub(restore_work)
+                    else {
+                        break;
+                    };
+                    promotion_geometry_remaining = next_remaining;
+                    for (index, points) in &fallback_routes {
+                        layout.edges[*index].points.clone_from(points);
+                    }
+                    *layout
+                        .boundary_bundles
+                        .last_mut()
+                        .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)? =
+                        fallback_geometry.clone();
+                    let promoted =
+                        build_geometry(&geometry_context, bundle, &layout.edges, Some(collector_x));
+                    if (promoted.spine.end.x - promoted.spine.start.x).abs() <= rail_depth {
+                        continue;
+                    }
+                    match rewrite_member_routes(
+                        bundle,
+                        &promoted,
+                        &route_index,
+                        &mut layout.edges,
+                        pitch,
+                        rail_depth,
+                        corridor_offset,
+                    ) {
+                        Ok(()) => {}
+                        Err(LayoutError::BoundaryBundleGeometryUnsatisfied) => continue,
+                        Err(error) => return Err(error),
+                    }
+                    *layout
+                        .boundary_bundles
+                        .last_mut()
+                        .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)? = promoted.clone();
+                    match partial_geometry_is_clean(
+                        graph,
+                        &layout,
+                        options,
+                        bundle_index,
+                        &mut promotion_geometry_remaining,
+                    ) {
+                        Ok(()) => {
+                            accepted = Some(promoted);
+                            break;
+                        }
+                        Err(LayoutError::BoundaryBundleGeometryUnsatisfied) => {}
+                        Err(LayoutError::BoundaryBundleGeometryWorkLimitExceeded { .. })
+                        | Err(LayoutError::UnrelatedRouteContactWorkLimitExceeded { .. }) => break,
+                        Err(error) => return Err(error),
+                    }
+                }
+                if let Some(promoted) = accepted {
+                    geometry = promoted;
+                } else {
+                    for (index, points) in fallback_routes {
+                        layout.edges[index].points = points;
+                    }
+                    *layout
+                        .boundary_bundles
+                        .last_mut()
+                        .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)? =
+                        fallback_geometry.clone();
+                    geometry = fallback_geometry;
+                }
             }
         }
         let current_member_segments = bundle
@@ -989,6 +1085,26 @@ fn interior_collector_range_bounded(
     upper_bound: f64,
     horizontal_tap_visits: &mut usize,
 ) -> Option<InteriorCollectorRange> {
+    let mut range = interior_collector_bounds(context, bundle, routes, lower_bound, upper_bound)?;
+    range.desired_x = common_horizontal_collector_x(
+        context,
+        bundle,
+        routes,
+        range.minimum_x,
+        range.desired_x,
+        range.maximum_x,
+        horizontal_tap_visits,
+    )?;
+    Some(range)
+}
+
+fn interior_collector_bounds(
+    context: &BundleGeometryContext<'_, '_>,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    lower_bound: f64,
+    upper_bound: f64,
+) -> Option<InteriorCollectorRange> {
     if bundle.width <= 1 {
         return None;
     }
@@ -1033,15 +1149,6 @@ fn interior_collector_range_bounded(
         return None;
     }
     let desired_x = desired_x.max(minimum_x).min(maximum_x);
-    let desired_x = common_horizontal_collector_x(
-        context,
-        bundle,
-        routes,
-        minimum_x,
-        desired_x,
-        maximum_x,
-        horizontal_tap_visits,
-    )?;
     Some(InteriorCollectorRange {
         role: bundle.role,
         minimum_x,
@@ -1059,6 +1166,23 @@ fn common_horizontal_collector_x(
     maximum_x: f64,
     remaining: &mut usize,
 ) -> Option<f64> {
+    common_horizontal_collector_xs(
+        context, bundle, routes, minimum_x, desired_x, maximum_x, remaining,
+    )?
+    .into_iter()
+    .next()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn common_horizontal_collector_xs(
+    context: &BundleGeometryContext<'_, '_>,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    minimum_x: f64,
+    desired_x: f64,
+    maximum_x: f64,
+    remaining: &mut usize,
+) -> Option<Vec<f64>> {
     let mut candidates = vec![desired_x];
     for member in &bundle.members {
         let route = routes.get(*context.route_index.get(&member.edge)?)?;
@@ -1085,6 +1209,7 @@ fn common_horizontal_collector_x(
         BoundaryBundleRole::Output => left.total_cmp(right),
     });
     candidates.dedup_by(|left, right| left.to_bits() == right.to_bits());
+    let mut common_candidates = Vec::new();
     for candidate in candidates {
         let mut common = true;
         for member in &bundle.members {
@@ -1105,10 +1230,38 @@ fn common_horizontal_collector_x(
             }
         }
         if common {
-            return Some(candidate);
+            common_candidates.push(candidate);
         }
     }
-    None
+    Some(common_candidates)
+}
+
+fn promotion_collector_candidates(
+    context: &BundleGeometryContext<'_, '_>,
+    bundle: &IndexedBoundaryBundle,
+    routes: &[EdgeGeometry],
+    remaining: &mut usize,
+) -> Vec<f64> {
+    let Some(range) =
+        interior_collector_bounds(context, bundle, routes, f64::NEG_INFINITY, f64::INFINITY)
+    else {
+        return Vec::new();
+    };
+    let Some(candidates) = common_horizontal_collector_xs(
+        context,
+        bundle,
+        routes,
+        range.minimum_x,
+        range.desired_x,
+        range.maximum_x,
+        remaining,
+    ) else {
+        return Vec::new();
+    };
+    candidates
+        .into_iter()
+        .take(MAX_INTERIOR_PROMOTION_CANDIDATES)
+        .collect()
 }
 
 fn build_geometry(
@@ -2833,15 +2986,21 @@ mod tests {
         let mut blocked = raw;
         blocked.nodes[3] = geometry_at(4, 260.0, 50.0);
         let fallback = apply_and_normalize(&indexed, blocked, options).unwrap();
-        assert_eq!(fallback.boundary_bundles[0].spine.end.x, 94.0);
-        assert_ne!(
-            fallback.boundary_bundles[0].collector.start,
-            fallback.boundary_bundles[0].collector.end,
+        assert_eq!(
+            fallback.boundary_bundles[0].spine.end.x, 116.0,
+            "a blocked preferred collector must promote through the next clean common corridor",
+        );
+        assert!(
+            fallback.boundary_bundles[0]
+                .members
+                .iter()
+                .all(|member| member.tap.x == 116.0),
+            "all fanout members must leave the promoted shared trunk",
         );
     }
 
     #[test]
-    fn interior_collector_falls_back_from_an_unrelated_route_contact() {
+    fn interior_collector_tries_an_alternate_x_after_unrelated_route_contact() {
         let graph = Graph {
             nodes: vec![
                 node(1, PortSide::East),
@@ -2936,10 +3095,204 @@ mod tests {
         };
 
         let result = apply_and_normalize(&indexed, layout, options).unwrap();
-        assert_eq!(result.boundary_bundles[0].spine.end.x, 94.0);
+        assert_eq!(
+            result.boundary_bundles[0].spine.end.x, 116.0,
+            "the first colliding collector must not force the local comb fallback",
+        );
         assert_eq!(
             result.edges.iter().find(|route| route.id == 12),
             Some(&unrelated)
+        );
+    }
+
+    #[test]
+    fn thirty_two_source_fanin_promotes_the_local_comb_to_a_shared_trunk() {
+        let output = 100;
+        let unrelated_source = 200;
+        let unrelated_target = 201;
+        let mut nodes = (1..=32)
+            .map(|id| node(id, PortSide::East))
+            .collect::<Vec<_>>();
+        nodes.extend([
+            node(output, PortSide::West),
+            node(unrelated_source, PortSide::East),
+            node(unrelated_target, PortSide::West),
+        ]);
+        let mut edges = (0..32)
+            .map(|index| Edge {
+                id: 1_000 + index,
+                source: Endpoint {
+                    node: index + 1,
+                    port: 0,
+                },
+                target: Endpoint {
+                    node: output,
+                    port: 0,
+                },
+                net: 10_000 + index,
+                participates_in_ranking: true,
+            })
+            .collect::<Vec<_>>();
+        edges.push(Edge {
+            id: 2_000,
+            source: Endpoint {
+                node: unrelated_source,
+                port: 0,
+            },
+            target: Endpoint {
+                node: unrelated_target,
+                port: 0,
+            },
+            net: 20_000,
+            participates_in_ranking: true,
+        });
+        let graph = Graph { nodes, edges };
+        let constraints = LayoutConstraints {
+            inputs: (1..=32).chain([unrelated_source]).collect(),
+            outputs: vec![output, unrelated_target],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint {
+                    node: output,
+                    port: 0,
+                },
+                width: 32,
+                members: (0..32)
+                    .map(|index| BoundaryBundleMemberConstraint {
+                        edge: 1_000 + index,
+                        slots: vec![index],
+                    })
+                    .collect(),
+            }],
+        };
+        let options = LayoutOptions::default();
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let output_y = 475.0;
+        let mut geometries = (0..32)
+            .map(|index| {
+                let x = if index == 0 { 406.0 } else { 0.0 };
+                geometry_at(index + 1, x, index as f64 * 30.0)
+            })
+            .collect::<Vec<_>>();
+        geometries.push(geometry_at(output, 1_000.0, output_y - 25.0));
+        let mut routes = (0..32)
+            .map(|index| {
+                let start = Point {
+                    x: if index == 0 { 486.0 } else { 80.0 },
+                    y: index as f64 * 30.0 + 25.0,
+                };
+                let corridor_x = 600.0 + index as f64 * 2.0;
+                EdgeGeometry {
+                    id: 1_000 + index,
+                    points: vec![
+                        start,
+                        Point {
+                            x: corridor_x,
+                            y: start.y,
+                        },
+                        Point {
+                            x: corridor_x,
+                            y: output_y,
+                        },
+                        Point {
+                            x: 1_000.0,
+                            y: output_y,
+                        },
+                    ],
+                }
+            })
+            .collect::<Vec<_>>();
+        routes.push(EdgeGeometry {
+            id: 2_000,
+            points: vec![Point { x: 490.0, y: 40.0 }, Point { x: 510.0, y: 40.0 }],
+        });
+        let raw = Layout {
+            nodes: geometries,
+            edges: routes,
+            boundary_bundles: Vec::new(),
+            width: 1_080.0,
+            height: 980.0,
+        };
+
+        let local =
+            apply_bundle_geometry(&indexed, raw.clone(), options, false, &BTreeSet::new()).unwrap();
+        let promoted =
+            apply_bundle_geometry(&indexed, raw.clone(), options, true, &BTreeSet::new()).unwrap();
+        let local_bundle = &local.boundary_bundles[0];
+        let promoted_bundle = &promoted.boundary_bundles[0];
+
+        assert_eq!(local_bundle.spine.end.x, 986.0);
+        assert!(
+            promoted_bundle.spine.end.x > 510.0
+                && promoted_bundle.spine.end.x < local_bundle.spine.end.x,
+            "the blocked preferred X must advance to a clean shared collector",
+        );
+        assert_eq!(promoted_bundle.members.len(), 32);
+        assert!(promoted_bundle.members.iter().all(|member| {
+            promoted
+                .edges
+                .iter()
+                .find(|route| route.id == member.edge)
+                .and_then(|route| route.points.last())
+                == Some(&member.tap)
+        }));
+        let segment_count = |layout: &Layout| {
+            layout
+                .edges
+                .iter()
+                .filter(|route| route.id != 2_000)
+                .map(|route| route.points.len().saturating_sub(1))
+                .sum::<usize>()
+        };
+        assert!(
+            segment_count(&promoted) < segment_count(&local),
+            "promotion must remove the local 32-lane staircase",
+        );
+        assert!(
+            promoted
+                .edges
+                .iter()
+                .filter(|route| route.id != 2_000)
+                .all(|route| {
+                    let pair = &route.points[route.points.len() - 2..];
+                    pair[0].y == pair[1].y && pair[0].x < pair[1].x
+                })
+        );
+
+        let mut all_collectors_blocked = raw;
+        all_collectors_blocked
+            .edges
+            .last_mut()
+            .expect("unrelated route exists")
+            .points[1]
+            .x = 980.0;
+        for point in &mut all_collectors_blocked
+            .edges
+            .last_mut()
+            .expect("unrelated route exists")
+            .points
+        {
+            point.y = output_y;
+        }
+        let expected_fallback = apply_bundle_geometry(
+            &indexed,
+            all_collectors_blocked.clone(),
+            options,
+            false,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            apply_bundle_geometry(
+                &indexed,
+                all_collectors_blocked,
+                options,
+                true,
+                &BTreeSet::new(),
+            )
+            .unwrap(),
+            expected_fallback,
+            "when no common collector is clean, promotion must restore the local fallback exactly",
         );
     }
 
@@ -3054,7 +3407,10 @@ mod tests {
         let mut blocked = layout;
         blocked.nodes[3] = geometry_at(4, 80.0, 50.0);
         let fallback = apply_and_normalize(&indexed, blocked, options).unwrap();
-        assert_eq!(fallback.boundary_bundles[0].spine.end.x, 286.0);
+        assert_eq!(
+            fallback.boundary_bundles[0].spine.end.x, 254.0,
+            "output fan-in must try the next clean collector after the preferred X is blocked",
+        );
     }
 
     #[test]
