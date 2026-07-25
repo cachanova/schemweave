@@ -1277,13 +1277,13 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
         route_segments.saturating_add(replanned_bundle_members.saturating_mul(2));
     let final_verification = verification(rewritten_segments);
 
-    let interior_planning = if options.minimum_parallel_wire_spacing == 0.0
-        && bundles <= boundary_bundles::MAX_INTERIOR_COLLECTOR_BUNDLES
-    {
-        // Collector discovery has one shared hard cap across its initial and
-        // coordinated input/output searches. Reserve the complete cap because
-        // the number of rescans is topology-dependent.
-        boundary_bundles::MAX_INTERIOR_HORIZONTAL_TAP_VISITS
+    let interior_enabled = options.minimum_parallel_wire_spacing == 0.0
+        && bundles <= boundary_bundles::MAX_INTERIOR_COLLECTOR_BUNDLES;
+    let interior_planning = if interior_enabled {
+        // Initial collector discovery and post-fallback promotion each have an
+        // independent hard cap. Reserve both because the number of common-X
+        // rescans is topology-dependent.
+        boundary_bundles::MAX_INTERIOR_HORIZONTAL_TAP_VISITS.saturating_mul(2)
     } else {
         0
     };
@@ -1309,6 +1309,11 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
     let partial_verification = replanned_bundles
         .saturating_mul(partial_per_bundle)
         .min(boundary_bundles::MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS);
+    let promotion_verification = if interior_enabled {
+        boundary_bundles::MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS
+    } else {
+        0
+    };
 
     // `apply_and_normalize_preserving` first tests whether the supplied
     // geometry is already valid, then verifies the rebuilt result. Charge
@@ -1319,6 +1324,7 @@ fn boundary_bundle_replan_work_upper_bound_from_counts(
         .saturating_add(interior_planning)
         .saturating_add(shared_route_admission_planning)
         .saturating_add(partial_verification)
+        .saturating_add(promotion_verification)
         .saturating_add(structure)
         .saturating_add(rewritten_segments)
 }
@@ -8236,7 +8242,11 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(bounded_bundle_candidates.len(), 20);
+        assert_eq!(
+            bounded_bundle_candidates.len(),
+            4,
+            "fallback promotion reserves its exact worst-case verification budget",
+        );
         let bundle_replan_over_budget = ExpansionWork {
             nodes: 1_000,
             edges: 2_000,
@@ -8261,7 +8271,7 @@ mod tests {
                 0,
             ),
             Err(GroupExpansionError::ExpansionWorkLimitExceeded {
-                required: 115_924_440,
+                required: 181_924_440,
                 maximum: super::QUALITY_CANDIDATE_WORK,
             })
         );
@@ -8421,8 +8431,26 @@ mod tests {
                 ..LayoutOptions::default()
             },
         );
-        assert_eq!(without_fallback_growth, 2_252_247);
-        assert_eq!(with_fallback_growth, 2_253_007);
+        assert_eq!(without_fallback_growth, 24_252_247);
+        assert_eq!(with_fallback_growth, 24_253_007);
+        assert_eq!(
+            boundary_bundle_replan_work_upper_bound_from_counts(
+                10,
+                20,
+                30,
+                1,
+                4,
+                1,
+                4,
+                LayoutOptions {
+                    edge_node_clearance: 6.0,
+                    minimum_parallel_wire_spacing: 6.0,
+                    ..LayoutOptions::default()
+                },
+            ),
+            3_007,
+            "positive spacing disables coincident interior collectors and their promotion work",
+        );
     }
 
     #[test]
