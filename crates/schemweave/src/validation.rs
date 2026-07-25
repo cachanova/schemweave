@@ -49,6 +49,9 @@ pub(crate) fn validate_and_index(
         Err(ConstrainedLayoutError::Constraint(_)) => {
             unreachable!("empty boundary constraints cannot fail validation")
         }
+        Err(ConstrainedLayoutError::ExpandedGroup(_)) => {
+            unreachable!("graph validation does not evaluate expanded groups")
+        }
     }
 }
 

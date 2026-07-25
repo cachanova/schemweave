@@ -24,8 +24,8 @@ const QUALITY_CANDIDATE_WORK: usize = 30_000_000;
 const MAX_CANDIDATE_WORK: usize = 120_000_000;
 const SAFETY_CANDIDATES: usize = 2;
 const LOCAL_REFLOW_CANDIDATES: usize = 2;
-const EXPANSION_COMPONENT_GAP: f64 = 18.0;
-const EXPANSION_STACK_HEIGHT_FACTOR: f64 = 1.5;
+pub(crate) const EXPANSION_COMPONENT_GAP: f64 = 18.0;
+pub(crate) const EXPANSION_STACK_HEIGHT_FACTOR: f64 = 1.5;
 
 /// One expanded boundary edge and the compact route trunk it replaces.
 ///
@@ -2734,7 +2734,7 @@ fn layout_bottom(layout: &Layout) -> f64 {
         .fold(0.0, f64::max)
 }
 
-fn arrange_member_components(
+pub(crate) fn arrange_member_components(
     graph: &Graph,
     layout: &Layout,
     vertical_gap: f64,

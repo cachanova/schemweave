@@ -705,6 +705,7 @@ fn canonical_config_matches_the_explicit_layout_api() {
         },
         quality_effort: QualityEffort::Max,
         constraints: LayoutConstraints::default(),
+        expanded_groups: Vec::new(),
     };
 
     assert_eq!(
