@@ -113,14 +113,44 @@ pub(crate) fn apply_and_normalize(
     layout: Layout,
     options: LayoutOptions,
 ) -> Result<Layout, LayoutError> {
-    apply_and_normalize_preserving(graph, layout, options, &BTreeSet::new())
+    apply_and_normalize_preserving_with_crossings(graph, layout, options, &BTreeSet::new(), false)
+}
+
+pub(crate) fn refine_selected_layout(
+    graph: &IndexedGraph<'_>,
+    layout: Layout,
+    options: LayoutOptions,
+) -> Result<Layout, LayoutError> {
+    if graph.boundary_bundles.is_empty()
+        || options.minimum_parallel_wire_spacing > 0.0
+        || graph.boundary_bundles.len() > MAX_INTERIOR_COLLECTOR_BUNDLES
+    {
+        return Ok(layout);
+    }
+    apply_bundle_geometry(graph, layout, options, true, &BTreeSet::new(), true)
 }
 
 pub(crate) fn apply_and_normalize_preserving(
     graph: &IndexedGraph<'_>,
+    layout: Layout,
+    options: LayoutOptions,
+    preserved_bundle_ids: &BTreeSet<u32>,
+) -> Result<Layout, LayoutError> {
+    apply_and_normalize_preserving_with_crossings(
+        graph,
+        layout,
+        options,
+        preserved_bundle_ids,
+        !preserved_bundle_ids.is_empty(),
+    )
+}
+
+fn apply_and_normalize_preserving_with_crossings(
+    graph: &IndexedGraph<'_>,
     mut layout: Layout,
     options: LayoutOptions,
     preserved_bundle_ids: &BTreeSet<u32>,
+    allow_strict_crossings: bool,
 ) -> Result<Layout, LayoutError> {
     if graph.boundary_bundles.is_empty() {
         return Ok(layout);
@@ -137,6 +167,7 @@ pub(crate) fn apply_and_normalize_preserving(
         options,
         interior_allowed,
         preserved_bundle_ids,
+        allow_strict_crossings,
     )
 }
 
@@ -146,6 +177,7 @@ fn apply_bundle_geometry(
     options: LayoutOptions,
     allow_interior_collectors: bool,
     preserved_bundle_ids: &BTreeSet<u32>,
+    allow_strict_crossings: bool,
 ) -> Result<Layout, LayoutError> {
     let node_geometry = layout
         .nodes
@@ -189,7 +221,7 @@ fn apply_bundle_geometry(
         member_endpoint_reserve: crate::outward_obstacle_clearance_stub(options),
     };
     let interior_collectors = if allow_interior_collectors {
-        plan_interior_collectors(&geometry_context, &layout.edges)
+        plan_interior_collectors(&geometry_context, &layout.edges, allow_strict_crossings)
     } else {
         vec![None; graph.boundary_bundles.len()]
     };
@@ -270,6 +302,7 @@ fn apply_bundle_geometry(
                 options,
                 bundle_index,
                 &mut partial_remaining,
+                allow_strict_crossings,
             ) {
                 Ok(()) => {}
                 Err(LayoutError::BoundaryBundleGeometryUnsatisfied) => {
@@ -362,6 +395,7 @@ fn apply_bundle_geometry(
                         options,
                         bundle_index,
                         &mut promotion_geometry_remaining,
+                        allow_strict_crossings,
                     ) {
                         Ok(()) => {
                             accepted = Some(promoted);
@@ -451,7 +485,7 @@ fn apply_bundle_geometry(
         .boundary_bundles
         .sort_unstable_by_key(|bundle| bundle.id);
     normalize_layout(&mut layout);
-    verify_geometry(graph, &layout, options)?;
+    verify_geometry_with_crossings(graph, &layout, options, allow_strict_crossings)?;
     Ok(layout)
 }
 
@@ -747,7 +781,7 @@ fn shared_route_contacts_prior_bundles(
                 if !consume_shared_route_admission(remaining, 1) {
                     return true;
                 }
-                if !segments_have_disallowed_contact(segment, pair[0], pair[1], None) {
+                if !segments_have_disallowed_contact(segment, pair[0], pair[1], None, false) {
                     continue;
                 }
                 for member in &bundle.members {
@@ -757,6 +791,7 @@ fn shared_route_contacts_prior_bundles(
                             pair[0],
                             pair[1],
                             permitted_taps.get(&member.edge).copied(),
+                            false,
                         )
                     {
                         return true;
@@ -869,6 +904,7 @@ fn fallback_corridors_by_edge(
 fn plan_interior_collectors(
     context: &BundleGeometryContext<'_, '_>,
     routes: &[EdgeGeometry],
+    separate_same_role_collectors: bool,
 ) -> Vec<Option<f64>> {
     let mut horizontal_tap_visits = MAX_INTERIOR_HORIZONTAL_TAP_VISITS;
     let ranges = context
@@ -1017,7 +1053,52 @@ fn plan_interior_collectors(
             .map(|range| range.desired_x);
         }
     }
+    if separate_same_role_collectors {
+        let mut used_inputs = Vec::<f64>::new();
+        let mut used_outputs = Vec::<f64>::new();
+        for (bundle_index, planned_x) in planned.iter_mut().enumerate() {
+            let Some(current_x) = *planned_x else {
+                continue;
+            };
+            let range = ranges[bundle_index].expect("planned collectors have a feasible range");
+            let used = match range.role {
+                BoundaryBundleRole::Input => &mut used_inputs,
+                BoundaryBundleRole::Output => &mut used_outputs,
+            };
+            if used
+                .iter()
+                .any(|used_x| preserved_point_coordinate_matches(*used_x, current_x))
+            {
+                let direction = match range.role {
+                    BoundaryBundleRole::Input => -1.0,
+                    BoundaryBundleRole::Output => 1.0,
+                };
+                let desired = (current_x + direction * context.pitch / 2.0)
+                    .clamp(range.minimum_x, range.maximum_x);
+                let (minimum_x, maximum_x) = match range.role {
+                    BoundaryBundleRole::Input => (range.minimum_x, desired),
+                    BoundaryBundleRole::Output => (desired, range.maximum_x),
+                };
+                *planned_x = common_horizontal_collector_x(
+                    context,
+                    &context.graph.boundary_bundles[bundle_index],
+                    routes,
+                    minimum_x,
+                    desired,
+                    maximum_x,
+                    &mut horizontal_tap_visits,
+                );
+            }
+            if let Some(x) = *planned_x {
+                used.push(x);
+            }
+        }
+    }
     planned
+}
+
+fn preserved_point_coordinate_matches(left: f64, right: f64) -> bool {
+    (left - right).abs() <= PRESERVED_GEOMETRY_EPSILON
 }
 
 fn required_output_collector_x(
@@ -1105,7 +1186,7 @@ fn interior_collector_bounds(
     lower_bound: f64,
     upper_bound: f64,
 ) -> Option<InteriorCollectorRange> {
-    if bundle.width <= 1 {
+    if bundle.width <= 1 || bundle.members.len() <= 1 {
         return None;
     }
     let node = &context.nodes[context.node_geometry[&bundle.endpoint.node]];
@@ -1247,7 +1328,7 @@ fn promotion_collector_candidates(
     else {
         return Vec::new();
     };
-    let Some(candidates) = common_horizontal_collector_xs(
+    let Some(mut candidates) = common_horizontal_collector_xs(
         context,
         bundle,
         routes,
@@ -1258,6 +1339,29 @@ fn promotion_collector_candidates(
     ) else {
         return Vec::new();
     };
+    let between_lanes = match bundle.role {
+        BoundaryBundleRole::Input => range.desired_x - context.pitch / 2.0,
+        BoundaryBundleRole::Output => range.desired_x + context.pitch / 2.0,
+    };
+    if between_lanes >= range.minimum_x
+        && between_lanes <= range.maximum_x
+        && let Some(offset_candidates) = common_horizontal_collector_xs(
+            context,
+            bundle,
+            routes,
+            range.minimum_x,
+            between_lanes,
+            range.maximum_x,
+            remaining,
+        )
+    {
+        candidates.extend(offset_candidates);
+        candidates.sort_by(|left, right| match bundle.role {
+            BoundaryBundleRole::Input => right.total_cmp(left),
+            BoundaryBundleRole::Output => left.total_cmp(right),
+        });
+        candidates.dedup_by(|left, right| left.to_bits() == right.to_bits());
+    }
     candidates
         .into_iter()
         .take(MAX_INTERIOR_PROMOTION_CANDIDATES)
@@ -1692,10 +1796,24 @@ pub(crate) fn verify_geometry(
     layout: &Layout,
     options: LayoutOptions,
 ) -> Result<(), LayoutError> {
+    verify_geometry_with_crossings(graph, layout, options, true)
+}
+
+fn verify_geometry_with_crossings(
+    graph: &IndexedGraph<'_>,
+    layout: &Layout,
+    options: LayoutOptions,
+    allow_strict_crossings: bool,
+) -> Result<(), LayoutError> {
     verify_preserved_geometry_structure(graph, layout, options)?;
     verify_bundle_node_clearance(layout, options)?;
     verify_rewritten_route_node_interiors(graph, layout)?;
-    verify_bundle_route_contacts(graph, layout, options.minimum_parallel_wire_spacing)
+    verify_bundle_route_contacts(
+        graph,
+        layout,
+        options.minimum_parallel_wire_spacing,
+        allow_strict_crossings,
+    )
 }
 
 fn partial_geometry_is_clean(
@@ -1704,6 +1822,7 @@ fn partial_geometry_is_clean(
     options: LayoutOptions,
     bundle: usize,
     remaining: &mut usize,
+    allow_strict_crossings: bool,
 ) -> Result<(), LayoutError> {
     let layout_bundle = layout
         .boundary_bundles
@@ -1722,6 +1841,7 @@ fn partial_geometry_is_clean(
             .collect(),
         options.minimum_parallel_wire_spacing,
         remaining,
+        allow_strict_crossings,
     )?;
     verify_rewritten_route_contacts(graph, layout, options, remaining)
 }
@@ -2128,6 +2248,7 @@ fn verify_new_bundle_route_contacts(
     changed_routes: BTreeSet<u32>,
     minimum_spacing: f64,
     remaining: &mut usize,
+    allow_strict_crossings: bool,
 ) -> Result<(), LayoutError> {
     let geometry = layout
         .boundary_bundles
@@ -2143,16 +2264,20 @@ fn verify_new_bundle_route_contacts(
             let permitted_tap = permitted_taps.get(&route.id).copied();
             for pair in route.points.windows(2) {
                 consume_geometry_visit(remaining)?;
-                if segments_have_disallowed_contact(segment, pair[0], pair[1], permitted_tap)
-                    || parallel_segments_are_too_close(
-                        segment,
-                        BoundaryBundleSegment {
-                            start: pair[0],
-                            end: pair[1],
-                        },
-                        minimum_spacing,
-                    )
-                {
+                if segments_have_disallowed_contact(
+                    segment,
+                    pair[0],
+                    pair[1],
+                    permitted_tap,
+                    allow_strict_crossings,
+                ) || parallel_segments_are_too_close(
+                    segment,
+                    BoundaryBundleSegment {
+                        start: pair[0],
+                        end: pair[1],
+                    },
+                    minimum_spacing,
+                ) {
                     return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
                 }
             }
@@ -2173,16 +2298,20 @@ fn verify_new_bundle_route_contacts(
                 let permitted_tap = prior_taps.get(&route.id).copied();
                 for pair in route.points.windows(2) {
                     consume_geometry_visit(remaining)?;
-                    if segments_have_disallowed_contact(segment, pair[0], pair[1], permitted_tap)
-                        || parallel_segments_are_too_close(
-                            segment,
-                            BoundaryBundleSegment {
-                                start: pair[0],
-                                end: pair[1],
-                            },
-                            minimum_spacing,
-                        )
-                    {
+                    if segments_have_disallowed_contact(
+                        segment,
+                        pair[0],
+                        pair[1],
+                        permitted_tap,
+                        allow_strict_crossings,
+                    ) || parallel_segments_are_too_close(
+                        segment,
+                        BoundaryBundleSegment {
+                            start: pair[0],
+                            end: pair[1],
+                        },
+                        minimum_spacing,
+                    ) {
                         return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
                     }
                 }
@@ -2196,6 +2325,7 @@ fn verify_new_bundle_route_contacts(
                     prior_segment.start,
                     prior_segment.end,
                     None,
+                    allow_strict_crossings,
                 ) || parallel_segments_are_too_close(new_segment, prior_segment, minimum_spacing)
                 {
                     return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
@@ -2252,6 +2382,7 @@ fn verify_bundle_route_contacts(
     graph: &IndexedGraph<'_>,
     layout: &Layout,
     minimum_spacing: f64,
+    allow_strict_crossings: bool,
 ) -> Result<(), LayoutError> {
     let route_index = layout
         .edges
@@ -2274,7 +2405,13 @@ fn verify_bundle_route_contacts(
                             maximum: MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS,
                         },
                     )?;
-                    if segments_have_disallowed_contact(segment, pair[0], pair[1], permitted_tap) {
+                    if segments_have_disallowed_contact(
+                        segment,
+                        pair[0],
+                        pair[1],
+                        permitted_tap,
+                        allow_strict_crossings,
+                    ) {
                         return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
                     }
                     if parallel_segments_are_too_close(
@@ -2312,6 +2449,7 @@ fn verify_bundle_route_contacts(
                 bundle_segments[right].1.start,
                 bundle_segments[right].1.end,
                 None,
+                allow_strict_crossings,
             ) || parallel_segments_are_too_close(
                 bundle_segments[left].1,
                 bundle_segments[right].1,
@@ -2361,12 +2499,14 @@ fn segments_have_disallowed_contact(
     route_start: Point,
     route_end: Point,
     permitted_tap: Option<Point>,
+    allow_strict_crossings: bool,
 ) -> bool {
     if route_start == route_end {
         return false;
     }
     let bus_horizontal = bus.start.y == bus.end.y;
     let route_horizontal = route_start.y == route_end.y;
+    let perpendicular = bus_horizontal != route_horizontal;
     if !bus_horizontal && bus.start.x != bus.end.x
         || !route_horizontal && route_start.x != route_end.x
     {
@@ -2433,6 +2573,15 @@ fn segments_have_disallowed_contact(
             })
     };
     contact.is_some_and(|point| {
+        if allow_strict_crossings
+            && perpendicular
+            && !preserved_point_matches(bus.start, point)
+            && !preserved_point_matches(bus.end, point)
+            && !preserved_point_matches(route_start, point)
+            && !preserved_point_matches(route_end, point)
+        {
+            return false;
+        }
         !permitted_tap.is_some_and(|tap| preserved_point_matches(tap, point))
             || (!preserved_point_matches(route_start, point)
                 && !preserved_point_matches(route_end, point))
@@ -2756,12 +2905,14 @@ mod tests {
             Point { x: 5.0, y: 0.0 },
             Point { x: 15.0, y: 0.0 },
             Some(Point { x: 5.0, y: 0.0 }),
+            false,
         ));
         assert!(!segments_have_disallowed_contact(
             bus,
             Point { x: 10.0, y: 0.0 },
             Point { x: 15.0, y: 0.0 },
             Some(Point { x: 10.0, y: 0.0 }),
+            false,
         ));
     }
 
@@ -2782,6 +2933,7 @@ mod tests {
                 y: 7.000_000_000_000_004,
             },
             Some(Point { x: 10.0, y: 7.0 }),
+            false,
         ));
     }
 
@@ -3000,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn interior_collector_tries_an_alternate_x_after_unrelated_route_contact() {
+    fn interior_collector_accepts_a_strict_unrelated_route_crossing() {
         let graph = Graph {
             nodes: vec![
                 node(1, PortSide::East),
@@ -3094,14 +3246,123 @@ mod tests {
             height: 250.0,
         };
 
-        let result = apply_and_normalize(&indexed, layout, options).unwrap();
+        let result = refine_selected_layout(&indexed, layout, options).unwrap();
         assert_eq!(
-            result.boundary_bundles[0].spine.end.x, 116.0,
-            "the first colliding collector must not force the local comb fallback",
+            result.boundary_bundles[0].spine.end.x, 290.0,
+            "an ordinary interior crossing must not reject the preferred collector",
         );
         assert_eq!(
             result.edges.iter().find(|route| route.id == 12),
             Some(&unrelated)
+        );
+    }
+
+    #[test]
+    fn input_collector_steps_off_overlap_and_crosses_an_unrelated_wire_cleanly() {
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::West),
+                node(4, PortSide::East),
+                node(5, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 12,
+                    source: Endpoint { node: 4, port: 0 },
+                    target: Endpoint { node: 5, port: 0 },
+                    net: 12,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1, 4],
+            outputs: vec![2, 3, 5],
+            boundary_bundles: vec![BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 1, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            }],
+        };
+        let options = LayoutOptions {
+            route_lane_gap: 6.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let unrelated = EdgeGeometry {
+            id: 12,
+            points: vec![
+                Point { x: 290.0, y: 0.0 },
+                Point { x: 290.0, y: 75.0 },
+                Point { x: 200.0, y: 75.0 },
+                Point { x: 200.0, y: 225.0 },
+                Point { x: 600.0, y: 225.0 },
+            ],
+        };
+        let layout = Layout {
+            nodes: vec![
+                geometry_at(1, 0.0, 0.0),
+                geometry_at(2, 300.0, 0.0),
+                geometry_at(3, 300.0, 100.0),
+                geometry_at(4, 0.0, 200.0),
+                geometry_at(5, 600.0, 200.0),
+            ],
+            edges: vec![
+                EdgeGeometry {
+                    id: 10,
+                    points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 300.0, y: 25.0 }],
+                },
+                EdgeGeometry {
+                    id: 11,
+                    points: vec![
+                        Point { x: 80.0, y: 25.0 },
+                        Point { x: 120.0, y: 25.0 },
+                        Point { x: 120.0, y: 125.0 },
+                        Point { x: 300.0, y: 125.0 },
+                    ],
+                },
+                unrelated.clone(),
+            ],
+            boundary_bundles: Vec::new(),
+            width: 680.0,
+            height: 250.0,
+        };
+
+        let result = refine_selected_layout(&indexed, layout, options).unwrap();
+        assert_eq!(
+            result.boundary_bundles[0].spine.end.x, 287.0,
+            "the colliding preferred X must step between lanes instead of restoring the comb",
+        );
+        assert_eq!(
+            result.edges.iter().find(|route| route.id == 12),
+            Some(&unrelated),
+            "admitting a strict crossing must not rewrite unrelated geometry",
         );
     }
 
@@ -3214,18 +3475,25 @@ mod tests {
             height: 980.0,
         };
 
-        let local =
-            apply_bundle_geometry(&indexed, raw.clone(), options, false, &BTreeSet::new()).unwrap();
+        let local = apply_bundle_geometry(
+            &indexed,
+            raw.clone(),
+            options,
+            false,
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
         let promoted =
-            apply_bundle_geometry(&indexed, raw.clone(), options, true, &BTreeSet::new()).unwrap();
+            apply_bundle_geometry(&indexed, raw.clone(), options, true, &BTreeSet::new(), true)
+                .unwrap();
         let local_bundle = &local.boundary_bundles[0];
         let promoted_bundle = &promoted.boundary_bundles[0];
 
         assert_eq!(local_bundle.spine.end.x, 986.0);
         assert!(
-            promoted_bundle.spine.end.x > 510.0
-                && promoted_bundle.spine.end.x < local_bundle.spine.end.x,
-            "the blocked preferred X must advance to a clean shared collector",
+            promoted_bundle.spine.end.x < local_bundle.spine.end.x,
+            "a strict crossing must retain a shared interior collector",
         );
         assert_eq!(promoted_bundle.members.len(), 32);
         assert!(promoted_bundle.members.iter().all(|member| {
@@ -3280,6 +3548,7 @@ mod tests {
             options,
             false,
             &BTreeSet::new(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3289,6 +3558,7 @@ mod tests {
                 options,
                 true,
                 &BTreeSet::new(),
+                true,
             )
             .unwrap(),
             expected_fallback,
