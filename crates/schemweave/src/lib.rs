@@ -1034,6 +1034,23 @@ fn layout_indexed(
         raw_layout = baseline.raw_layout;
         layout = baseline.layout;
     }
+    if quality_effort != QualityEffort::Fast
+        && let Ok(candidate) =
+            boundary_bundles::refine_selected_layout(&indexed, raw_layout.clone(), options)
+    {
+        let candidate_quality = boundary_bundles::route_quality(&indexed, &candidate);
+        let current_area = layout.width * layout.height;
+        let candidate_area = candidate.width * candidate.height;
+        if candidate_area <= current_area * 1.05
+            && candidate_quality.crossings <= quality.crossings
+            && candidate_quality.bends < quality.bends
+            && candidate_quality.route_length
+                <= quality.route_length * options.max_quality_route_length_factor
+        {
+            quality = candidate_quality;
+            layout = candidate;
+        }
+    }
     let selected = AdmittedCandidate {
         selection_quality,
         quality,

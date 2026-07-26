@@ -1611,13 +1611,33 @@ fn highest_quality_routes_captured_reg_mux_boundary_bundles_with_positive_cleara
     let strict = layout_with_config(&graph, &config).unwrap();
     assert_eq!(strict.boundary_bundles.len(), 3);
     assert_edge_node_clearance(&graph, &strict, config.layout.edge_node_clearance);
-    let input_corridors = strict
-        .edges
-        .iter()
-        .filter(|route| (5..=8).contains(&route.id))
-        .map(|route| route.points[1].x.to_bits())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(input_corridors.len(), 4);
+    let input_corridor = |bundle_id| {
+        strict
+            .boundary_bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("captured input bundle exists")
+            .members
+            .iter()
+            .map(|member| member.tap.x.to_bits())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let first_input = input_corridor(0);
+    let second_input = input_corridor(1);
+    assert_eq!(
+        first_input.len(),
+        1,
+        "each captured vector input should share one trunk before diverging",
+    );
+    assert_eq!(
+        second_input.len(),
+        1,
+        "each captured vector input should share one trunk before diverging",
+    );
+    assert_ne!(
+        first_input, second_input,
+        "unrelated vector inputs must not share an electrically ambiguous trunk",
+    );
 
     let permuted_graph = Graph {
         nodes: graph.nodes.iter().cloned().rev().collect(),
