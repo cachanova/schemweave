@@ -20,6 +20,10 @@ const MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS: usize = 100_000;
 const MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS: usize = 20_000_000;
 const MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS: usize = 100_000;
 const MAX_LAYOUT_ROUTE_CONTACT_VISITS: usize = 20_000_000;
+const MIN_VERTICAL_TRACK_SPACING_CONGESTION: f64 = 0.10;
+const MIN_VERTICAL_TRACK_SPACING_PITCH: f64 = 8.0;
+const MAX_VERTICAL_TRACK_SPACING_CONGESTION_FACTOR: f64 = 0.75;
+const MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR: f64 = 1.10;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -1051,6 +1055,43 @@ fn layout_indexed(
             layout = candidate;
         }
     }
+    if quality_effort == QualityEffort::Max
+        && let Some(candidate) = routing::selected_layout_vertical_track_spacing_candidate(
+            &routing_plan,
+            &layout,
+            options.route_lane_gap.max(MIN_VERTICAL_TRACK_SPACING_PITCH),
+        )
+    {
+        let candidate_quality = exact_layout_route_quality(&indexed, &candidate);
+        let current_area = layout.width * layout.height;
+        let candidate_area = candidate.width * candidate.height;
+        if routing::route_parallel_congestion(&routing_plan, &layout.edges)
+            .zip(routing::route_parallel_congestion(
+                &routing_plan,
+                &candidate.edges,
+            ))
+            .is_some_and(|(baseline_congestion, candidate_congestion)| {
+                vertical_track_spacing_quality_is_admissible(
+                    baseline_congestion,
+                    candidate_congestion,
+                    quality,
+                    current_area,
+                    candidate_quality,
+                    candidate_area,
+                    options,
+                )
+            })
+            && candidate_satisfies_hard_geometry_contract(
+                &indexed,
+                &candidate,
+                options,
+                &mut admission_state,
+            )
+        {
+            quality = candidate_quality;
+            layout = candidate;
+        }
+    }
     let selected = AdmittedCandidate {
         selection_quality,
         quality,
@@ -1074,6 +1115,24 @@ fn layout_indexed(
         );
     }
     Ok(selected.layout)
+}
+
+fn vertical_track_spacing_quality_is_admissible(
+    baseline_congestion: f64,
+    candidate_congestion: f64,
+    baseline: routing::RouteQuality,
+    baseline_area: f64,
+    candidate: routing::RouteQuality,
+    candidate_area: f64,
+    options: LayoutOptions,
+) -> bool {
+    baseline_congestion >= MIN_VERTICAL_TRACK_SPACING_CONGESTION
+        && candidate_congestion
+            <= baseline_congestion * MAX_VERTICAL_TRACK_SPACING_CONGESTION_FACTOR
+        && candidate_area <= baseline_area * MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR
+        && candidate.crossings == baseline.crossings
+        && candidate.bends == baseline.bends
+        && candidate.route_length <= baseline.route_length * options.max_quality_route_length_factor
 }
 
 fn composite_pitched_quality_is_admissible(
@@ -1725,6 +1784,7 @@ mod tests {
         retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
         routing::RouteQuality, straight_chain_cost_is_bounded,
         straight_chain_large_gain_is_significant, topology, validation,
+        vertical_track_spacing_quality_is_admissible,
     };
 
     mod active_fanout_fixture {
@@ -3783,6 +3843,68 @@ mod tests {
         ] {
             assert!(!composite_pitched_quality_is_admissible(
                 baseline, 100.0, candidate, area, options,
+            ));
+        }
+    }
+
+    #[test]
+    fn vertical_track_spacing_admission_has_exact_inclusive_boundaries() {
+        let baseline = RouteQuality {
+            crossings: 10,
+            bends: 20,
+            route_length: 100.0,
+        };
+        let options = LayoutOptions {
+            max_quality_route_length_factor: 1.25,
+            ..LayoutOptions::default()
+        };
+        let boundary = RouteQuality {
+            route_length: 125.0,
+            ..baseline
+        };
+        assert!(vertical_track_spacing_quality_is_admissible(
+            0.10, 0.075, baseline, 100.0, boundary, 110.0, options,
+        ));
+        for (baseline_congestion, candidate_congestion, candidate, candidate_area) in [
+            (0.099_999, 0.01, boundary, 110.0),
+            (0.10, 0.075_001, boundary, 110.0),
+            (
+                0.10,
+                0.075,
+                RouteQuality {
+                    crossings: 11,
+                    ..boundary
+                },
+                110.0,
+            ),
+            (
+                0.10,
+                0.075,
+                RouteQuality {
+                    bends: 21,
+                    ..boundary
+                },
+                110.0,
+            ),
+            (
+                0.10,
+                0.075,
+                RouteQuality {
+                    route_length: 125.000_001,
+                    ..boundary
+                },
+                110.0,
+            ),
+            (0.10, 0.075, boundary, 110.000_001),
+        ] {
+            assert!(!vertical_track_spacing_quality_is_admissible(
+                baseline_congestion,
+                candidate_congestion,
+                baseline,
+                100.0,
+                candidate,
+                candidate_area,
+                options,
             ));
         }
     }

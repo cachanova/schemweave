@@ -2600,6 +2600,23 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
         "{highest_report:#?}"
     );
     assert_eq!(highest_report.unrelated_contacts, 0, "{highest_report:#?}");
+    assert!(
+        highest_report.parallel_congestion_ratio <= 0.08,
+        "{highest_report:#?}"
+    );
+    assert!(
+        highest_report.parallel_pair_overlap_length <= 22_000.0,
+        "{highest_report:#?}"
+    );
+    assert!(
+        highest_report.peak_parallel_close_neighbors <= 8,
+        "{highest_report:#?}"
+    );
+    assert!(
+        highest_report.route_length <= 147_000.0,
+        "{highest_report:#?}"
+    );
+    assert!(highest_report.area <= 5_100_000.0, "{highest_report:#?}");
 
     let mut permuted_graph = graph.clone();
     permuted_graph.nodes.reverse();
@@ -2624,6 +2641,17 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
             options,
             QualityEffort::Quality,
             &permuted_constraints,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        highest,
+        layout_with_config(
+            &permuted_graph,
+            &LayoutConfig {
+                constraints: permuted_constraints,
+                ..LayoutConfig::highest_quality()
+            },
         )
         .unwrap()
     );
