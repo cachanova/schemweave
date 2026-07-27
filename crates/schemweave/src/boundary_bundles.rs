@@ -242,8 +242,6 @@ fn apply_bundle_geometry(
     let mut promotion_geometry_remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
     let mut promotion_tap_remaining = MAX_INTERIOR_HORIZONTAL_TAP_VISITS;
     let mut shared_route_admission_remaining = MAX_SHARED_ROUTE_ADMISSION_VISITS;
-    let mut used_input_collectors = Vec::<f64>::new();
-    let mut used_output_collectors = Vec::<f64>::new();
     let mut preserved_geometry = layout
         .boundary_bundles
         .iter()
@@ -253,24 +251,45 @@ fn apply_bundle_geometry(
     if preserved_geometry.len() != preserved_bundle_ids.len() {
         return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
     }
+    let mut used_input_collectors = allow_interior_collectors.then(Vec::<f64>::new);
+    let mut used_output_collectors = allow_interior_collectors.then(Vec::<f64>::new);
+    if allow_interior_collectors {
+        for bundle in &graph.boundary_bundles {
+            let Some(geometry) = preserved_geometry.get(&bundle.id) else {
+                continue;
+            };
+            match bundle.role {
+                BoundaryBundleRole::Input => used_input_collectors
+                    .as_mut()
+                    .expect("interior collector tracking is enabled")
+                    .push(geometry.spine.end.x),
+                BoundaryBundleRole::Output => used_output_collectors
+                    .as_mut()
+                    .expect("interior collector tracking is enabled")
+                    .push(geometry.spine.end.x),
+            }
+        }
+    }
     layout.boundary_bundles.clear();
     for bundle_index in processing_order {
         let bundle = &graph.boundary_bundles[bundle_index];
         let used_collectors = match bundle.role {
-            BoundaryBundleRole::Input => &mut used_input_collectors,
-            BoundaryBundleRole::Output => &mut used_output_collectors,
+            BoundaryBundleRole::Input => used_input_collectors.as_mut(),
+            BoundaryBundleRole::Output => used_output_collectors.as_mut(),
         };
         if preserved_bundle_ids.contains(&bundle.id) {
             let geometry = preserved_geometry
                 .remove(&bundle.id)
                 .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
-            used_collectors.push(geometry.spine.end.x);
             layout.boundary_bundles.push(geometry);
             continue;
         }
         let corridor_offset = corridor_offsets[bundle_index];
-        let planned_collector = interior_collectors[bundle_index]
-            .filter(|candidate| collector_has_lane_separation(*candidate, used_collectors, pitch));
+        let planned_collector = interior_collectors[bundle_index].filter(|candidate| {
+            used_collectors
+                .as_deref()
+                .is_none_or(|used| collector_has_lane_separation(*candidate, used, pitch))
+        });
         let previous_member_segments = bundle
             .members
             .iter()
@@ -361,7 +380,9 @@ fn apply_bundle_geometry(
                     .sum::<usize>();
                 let mut accepted = None;
                 for collector_x in promoted_collectors.into_iter().filter(|candidate| {
-                    collector_has_lane_separation(*candidate, used_collectors, pitch)
+                    used_collectors
+                        .as_deref()
+                        .is_none_or(|used| collector_has_lane_separation(*candidate, used, pitch))
                 }) {
                     let Some(next_remaining) =
                         promotion_geometry_remaining.checked_sub(restore_work)
@@ -482,15 +503,17 @@ fn apply_bundle_geometry(
                 .saturating_sub(current_member_segments)
                 .saturating_add(shared.candidate_route_segments);
         }
-        used_collectors.push(
-            layout
-                .boundary_bundles
-                .last()
-                .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?
-                .spine
-                .end
-                .x,
-        );
+        if let Some(used_collectors) = used_collectors {
+            used_collectors.push(
+                layout
+                    .boundary_bundles
+                    .last()
+                    .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?
+                    .spine
+                    .end
+                    .x,
+            );
+        }
     }
     debug_assert_eq!(
         route_segments,
@@ -2783,6 +2806,183 @@ mod tests {
             None
         );
         assert_eq!(exhausted_budget, 0);
+    }
+
+    #[test]
+    fn replanned_collector_reserves_a_later_preserved_collector_lane() {
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::West),
+                node(4, PortSide::East),
+                node(5, PortSide::West),
+                node(6, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 20,
+                    source: Endpoint { node: 4, port: 0 },
+                    target: Endpoint { node: 5, port: 0 },
+                    net: 20,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 21,
+                    source: Endpoint { node: 4, port: 0 },
+                    target: Endpoint { node: 6, port: 0 },
+                    net: 21,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1, 4],
+            outputs: vec![2, 3, 5, 6],
+            boundary_bundles: vec![
+                BoundaryBundleConstraint {
+                    id: 1,
+                    endpoint: Endpoint { node: 1, port: 0 },
+                    width: 2,
+                    members: vec![
+                        BoundaryBundleMemberConstraint {
+                            edge: 10,
+                            slots: vec![0],
+                        },
+                        BoundaryBundleMemberConstraint {
+                            edge: 11,
+                            slots: vec![1],
+                        },
+                    ],
+                },
+                BoundaryBundleConstraint {
+                    id: 2,
+                    endpoint: Endpoint { node: 4, port: 0 },
+                    width: 2,
+                    members: vec![
+                        BoundaryBundleMemberConstraint {
+                            edge: 20,
+                            slots: vec![0],
+                        },
+                        BoundaryBundleMemberConstraint {
+                            edge: 21,
+                            slots: vec![1],
+                        },
+                    ],
+                },
+            ],
+        };
+        let options = LayoutOptions {
+            route_lane_gap: 6.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let raw = Layout {
+            nodes: vec![
+                geometry_at(1, 0.0, 0.0),
+                geometry_at(2, 300.0, 0.0),
+                geometry_at(3, 300.0, 100.0),
+                geometry_at(4, 0.0, 200.0),
+                geometry_at(5, 300.0, 200.0),
+                geometry_at(6, 300.0, 300.0),
+            ],
+            edges: vec![
+                EdgeGeometry {
+                    id: 10,
+                    points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 300.0, y: 25.0 }],
+                },
+                EdgeGeometry {
+                    id: 11,
+                    points: vec![
+                        Point { x: 80.0, y: 25.0 },
+                        Point { x: 120.0, y: 25.0 },
+                        Point { x: 120.0, y: 125.0 },
+                        Point { x: 300.0, y: 125.0 },
+                    ],
+                },
+                EdgeGeometry {
+                    id: 20,
+                    points: vec![Point { x: 80.0, y: 225.0 }, Point { x: 300.0, y: 225.0 }],
+                },
+                EdgeGeometry {
+                    id: 21,
+                    points: vec![
+                        Point { x: 80.0, y: 225.0 },
+                        Point { x: 120.0, y: 225.0 },
+                        Point { x: 120.0, y: 325.0 },
+                        Point { x: 300.0, y: 325.0 },
+                    ],
+                },
+            ],
+            boundary_bundles: Vec::new(),
+            width: 380.0,
+            height: 350.0,
+        };
+        let baseline = refine_selected_layout(&indexed, raw, options).unwrap();
+        assert_eq!(baseline.boundary_bundles[0].spine.end.x, 290.0);
+        assert_eq!(baseline.boundary_bundles[1].spine.end.x, 284.0);
+
+        let mut candidate = baseline;
+        candidate.boundary_bundles.retain(|bundle| bundle.id == 2);
+        for node_id in [2, 3] {
+            candidate
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .expect("replanned target exists")
+                .x = 294.0;
+        }
+        candidate
+            .edges
+            .iter_mut()
+            .find(|edge| edge.id == 10)
+            .expect("first replanned route exists")
+            .points = vec![Point { x: 80.0, y: 25.0 }, Point { x: 294.0, y: 25.0 }];
+        candidate
+            .edges
+            .iter_mut()
+            .find(|edge| edge.id == 11)
+            .expect("second replanned route exists")
+            .points = vec![
+            Point { x: 80.0, y: 25.0 },
+            Point { x: 120.0, y: 25.0 },
+            Point { x: 120.0, y: 125.0 },
+            Point { x: 294.0, y: 125.0 },
+        ];
+
+        let preserved = candidate.boundary_bundles[0].clone();
+        let result =
+            apply_and_normalize_preserving(&indexed, candidate, options, &BTreeSet::from([2]))
+                .unwrap();
+        assert_eq!(
+            result.boundary_bundles.iter().find(|bundle| bundle.id == 2),
+            Some(&preserved),
+            "the reserved collector must remain byte-identical",
+        );
+        assert!(
+            (result.boundary_bundles[0].spine.end.x - result.boundary_bundles[1].spine.end.x).abs()
+                >= options.route_lane_gap,
+            "replanned collector reused the later preserved collector lane: {:?}",
+            result
+                .boundary_bundles
+                .iter()
+                .map(|bundle| (bundle.id, bundle.spine.end.x))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
