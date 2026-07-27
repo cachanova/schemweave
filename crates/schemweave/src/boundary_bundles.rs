@@ -251,9 +251,32 @@ fn apply_bundle_geometry(
     if preserved_geometry.len() != preserved_bundle_ids.len() {
         return Err(LayoutError::BoundaryBundleGeometryUnsatisfied);
     }
+    let mut used_input_collectors = allow_interior_collectors.then(Vec::<f64>::new);
+    let mut used_output_collectors = allow_interior_collectors.then(Vec::<f64>::new);
+    if allow_interior_collectors {
+        for bundle in &graph.boundary_bundles {
+            let Some(geometry) = preserved_geometry.get(&bundle.id) else {
+                continue;
+            };
+            match bundle.role {
+                BoundaryBundleRole::Input => used_input_collectors
+                    .as_mut()
+                    .expect("interior collector tracking is enabled")
+                    .push(geometry.spine.end.x),
+                BoundaryBundleRole::Output => used_output_collectors
+                    .as_mut()
+                    .expect("interior collector tracking is enabled")
+                    .push(geometry.spine.end.x),
+            }
+        }
+    }
     layout.boundary_bundles.clear();
     for bundle_index in processing_order {
         let bundle = &graph.boundary_bundles[bundle_index];
+        let used_collectors = match bundle.role {
+            BoundaryBundleRole::Input => used_input_collectors.as_mut(),
+            BoundaryBundleRole::Output => used_output_collectors.as_mut(),
+        };
         if preserved_bundle_ids.contains(&bundle.id) {
             let geometry = preserved_geometry
                 .remove(&bundle.id)
@@ -262,7 +285,11 @@ fn apply_bundle_geometry(
             continue;
         }
         let corridor_offset = corridor_offsets[bundle_index];
-        let planned_collector = interior_collectors[bundle_index];
+        let planned_collector = interior_collectors[bundle_index].filter(|candidate| {
+            used_collectors
+                .as_deref()
+                .is_none_or(|used| collector_has_lane_separation(*candidate, used, pitch))
+        });
         let previous_member_segments = bundle
             .members
             .iter()
@@ -352,7 +379,11 @@ fn apply_bundle_geometry(
                     .map(|(_, points)| points.len())
                     .sum::<usize>();
                 let mut accepted = None;
-                for collector_x in promoted_collectors {
+                for collector_x in promoted_collectors.into_iter().filter(|candidate| {
+                    used_collectors
+                        .as_deref()
+                        .is_none_or(|used| collector_has_lane_separation(*candidate, used, pitch))
+                }) {
                     let Some(next_remaining) =
                         promotion_geometry_remaining.checked_sub(restore_work)
                     else {
@@ -471,6 +502,17 @@ fn apply_bundle_geometry(
             route_segments = route_segments
                 .saturating_sub(current_member_segments)
                 .saturating_add(shared.candidate_route_segments);
+        }
+        if let Some(used_collectors) = used_collectors {
+            used_collectors.push(
+                layout
+                    .boundary_bundles
+                    .last()
+                    .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?
+                    .spine
+                    .end
+                    .x,
+            );
         }
     }
     debug_assert_eq!(
@@ -1065,16 +1107,18 @@ fn plan_interior_collectors(
                 BoundaryBundleRole::Input => &mut used_inputs,
                 BoundaryBundleRole::Output => &mut used_outputs,
             };
-            if used
-                .iter()
-                .any(|used_x| preserved_point_coordinate_matches(*used_x, current_x))
-            {
-                let direction = match range.role {
-                    BoundaryBundleRole::Input => -1.0,
-                    BoundaryBundleRole::Output => 1.0,
-                };
-                let desired = (current_x + direction * context.pitch / 2.0)
-                    .clamp(range.minimum_x, range.maximum_x);
+            if used.iter().any(|used_x| {
+                (*used_x - current_x).abs() < context.pitch - PRESERVED_GEOMETRY_EPSILON
+            }) {
+                let desired = match range.role {
+                    BoundaryBundleRole::Input => {
+                        used.iter().copied().fold(current_x, f64::min) - context.pitch
+                    }
+                    BoundaryBundleRole::Output => {
+                        used.iter().copied().fold(current_x, f64::max) + context.pitch
+                    }
+                }
+                .clamp(range.minimum_x, range.maximum_x);
                 let (minimum_x, maximum_x) = match range.role {
                     BoundaryBundleRole::Input => (range.minimum_x, desired),
                     BoundaryBundleRole::Output => (desired, range.maximum_x),
@@ -1087,7 +1131,8 @@ fn plan_interior_collectors(
                     desired,
                     maximum_x,
                     &mut horizontal_tap_visits,
-                );
+                )
+                .filter(|candidate| collector_has_lane_separation(*candidate, used, context.pitch));
             }
             if let Some(x) = *planned_x {
                 used.push(x);
@@ -1097,8 +1142,9 @@ fn plan_interior_collectors(
     planned
 }
 
-fn preserved_point_coordinate_matches(left: f64, right: f64) -> bool {
-    (left - right).abs() <= PRESERVED_GEOMETRY_EPSILON
+fn collector_has_lane_separation(candidate: f64, used: &[f64], pitch: f64) -> bool {
+    used.iter()
+        .all(|used_x| (*used_x - candidate).abs() >= pitch - PRESERVED_GEOMETRY_EPSILON)
 }
 
 fn required_output_collector_x(
@@ -1339,18 +1385,18 @@ fn promotion_collector_candidates(
     ) else {
         return Vec::new();
     };
-    let between_lanes = match bundle.role {
-        BoundaryBundleRole::Input => range.desired_x - context.pitch / 2.0,
-        BoundaryBundleRole::Output => range.desired_x + context.pitch / 2.0,
+    let adjacent_lane = match bundle.role {
+        BoundaryBundleRole::Input => range.desired_x - context.pitch,
+        BoundaryBundleRole::Output => range.desired_x + context.pitch,
     };
-    if between_lanes >= range.minimum_x
-        && between_lanes <= range.maximum_x
+    if adjacent_lane >= range.minimum_x
+        && adjacent_lane <= range.maximum_x
         && let Some(offset_candidates) = common_horizontal_collector_xs(
             context,
             bundle,
             routes,
             range.minimum_x,
-            between_lanes,
+            adjacent_lane,
             range.maximum_x,
             remaining,
         )
@@ -2763,6 +2809,183 @@ mod tests {
     }
 
     #[test]
+    fn replanned_collector_reserves_a_later_preserved_collector_lane() {
+        let graph = Graph {
+            nodes: vec![
+                node(1, PortSide::East),
+                node(2, PortSide::West),
+                node(3, PortSide::West),
+                node(4, PortSide::East),
+                node(5, PortSide::West),
+                node(6, PortSide::West),
+            ],
+            edges: vec![
+                Edge {
+                    id: 10,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 2, port: 0 },
+                    net: 10,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 11,
+                    source: Endpoint { node: 1, port: 0 },
+                    target: Endpoint { node: 3, port: 0 },
+                    net: 11,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 20,
+                    source: Endpoint { node: 4, port: 0 },
+                    target: Endpoint { node: 5, port: 0 },
+                    net: 20,
+                    participates_in_ranking: true,
+                },
+                Edge {
+                    id: 21,
+                    source: Endpoint { node: 4, port: 0 },
+                    target: Endpoint { node: 6, port: 0 },
+                    net: 21,
+                    participates_in_ranking: true,
+                },
+            ],
+        };
+        let constraints = LayoutConstraints {
+            inputs: vec![1, 4],
+            outputs: vec![2, 3, 5, 6],
+            boundary_bundles: vec![
+                BoundaryBundleConstraint {
+                    id: 1,
+                    endpoint: Endpoint { node: 1, port: 0 },
+                    width: 2,
+                    members: vec![
+                        BoundaryBundleMemberConstraint {
+                            edge: 10,
+                            slots: vec![0],
+                        },
+                        BoundaryBundleMemberConstraint {
+                            edge: 11,
+                            slots: vec![1],
+                        },
+                    ],
+                },
+                BoundaryBundleConstraint {
+                    id: 2,
+                    endpoint: Endpoint { node: 4, port: 0 },
+                    width: 2,
+                    members: vec![
+                        BoundaryBundleMemberConstraint {
+                            edge: 20,
+                            slots: vec![0],
+                        },
+                        BoundaryBundleMemberConstraint {
+                            edge: 21,
+                            slots: vec![1],
+                        },
+                    ],
+                },
+            ],
+        };
+        let options = LayoutOptions {
+            route_lane_gap: 6.0,
+            ..LayoutOptions::default()
+        };
+        let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
+        let raw = Layout {
+            nodes: vec![
+                geometry_at(1, 0.0, 0.0),
+                geometry_at(2, 300.0, 0.0),
+                geometry_at(3, 300.0, 100.0),
+                geometry_at(4, 0.0, 200.0),
+                geometry_at(5, 300.0, 200.0),
+                geometry_at(6, 300.0, 300.0),
+            ],
+            edges: vec![
+                EdgeGeometry {
+                    id: 10,
+                    points: vec![Point { x: 80.0, y: 25.0 }, Point { x: 300.0, y: 25.0 }],
+                },
+                EdgeGeometry {
+                    id: 11,
+                    points: vec![
+                        Point { x: 80.0, y: 25.0 },
+                        Point { x: 120.0, y: 25.0 },
+                        Point { x: 120.0, y: 125.0 },
+                        Point { x: 300.0, y: 125.0 },
+                    ],
+                },
+                EdgeGeometry {
+                    id: 20,
+                    points: vec![Point { x: 80.0, y: 225.0 }, Point { x: 300.0, y: 225.0 }],
+                },
+                EdgeGeometry {
+                    id: 21,
+                    points: vec![
+                        Point { x: 80.0, y: 225.0 },
+                        Point { x: 120.0, y: 225.0 },
+                        Point { x: 120.0, y: 325.0 },
+                        Point { x: 300.0, y: 325.0 },
+                    ],
+                },
+            ],
+            boundary_bundles: Vec::new(),
+            width: 380.0,
+            height: 350.0,
+        };
+        let baseline = refine_selected_layout(&indexed, raw, options).unwrap();
+        assert_eq!(baseline.boundary_bundles[0].spine.end.x, 290.0);
+        assert_eq!(baseline.boundary_bundles[1].spine.end.x, 284.0);
+
+        let mut candidate = baseline;
+        candidate.boundary_bundles.retain(|bundle| bundle.id == 2);
+        for node_id in [2, 3] {
+            candidate
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .expect("replanned target exists")
+                .x = 294.0;
+        }
+        candidate
+            .edges
+            .iter_mut()
+            .find(|edge| edge.id == 10)
+            .expect("first replanned route exists")
+            .points = vec![Point { x: 80.0, y: 25.0 }, Point { x: 294.0, y: 25.0 }];
+        candidate
+            .edges
+            .iter_mut()
+            .find(|edge| edge.id == 11)
+            .expect("second replanned route exists")
+            .points = vec![
+            Point { x: 80.0, y: 25.0 },
+            Point { x: 120.0, y: 25.0 },
+            Point { x: 120.0, y: 125.0 },
+            Point { x: 294.0, y: 125.0 },
+        ];
+
+        let preserved = candidate.boundary_bundles[0].clone();
+        let result =
+            apply_and_normalize_preserving(&indexed, candidate, options, &BTreeSet::from([2]))
+                .unwrap();
+        assert_eq!(
+            result.boundary_bundles.iter().find(|bundle| bundle.id == 2),
+            Some(&preserved),
+            "the reserved collector must remain byte-identical",
+        );
+        assert!(
+            (result.boundary_bundles[0].spine.end.x - result.boundary_bundles[1].spine.end.x).abs()
+                >= options.route_lane_gap,
+            "replanned collector reused the later preserved collector lane: {:?}",
+            result
+                .boundary_bundles
+                .iter()
+                .map(|bundle| (bundle.id, bundle.spine.end.x))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn rewritten_contact_verification_charges_only_indexed_candidates() {
         let edge_count = 600u32;
         let graph = Graph {
@@ -3356,8 +3579,8 @@ mod tests {
 
         let result = refine_selected_layout(&indexed, layout, options).unwrap();
         assert_eq!(
-            result.boundary_bundles[0].spine.end.x, 287.0,
-            "the colliding preferred X must step between lanes instead of restoring the comb",
+            result.boundary_bundles[0].spine.end.x, 284.0,
+            "the colliding preferred X must step by one lane instead of restoring the comb",
         );
         assert_eq!(
             result.edges.iter().find(|route| route.id == 12),

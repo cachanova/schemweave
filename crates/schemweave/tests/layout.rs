@@ -1638,6 +1638,23 @@ fn highest_quality_routes_captured_reg_mux_boundary_bundles_with_positive_cleara
         first_input, second_input,
         "unrelated vector inputs must not share an electrically ambiguous trunk",
     );
+    let input_trunk_x = |bundle_id| {
+        strict
+            .boundary_bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("captured input bundle exists")
+            .members[0]
+            .tap
+            .x
+    };
+    let first_input_x = input_trunk_x(0);
+    let second_input_x = input_trunk_x(1);
+    assert!(
+        (first_input_x - second_input_x).abs() >= config.layout.route_lane_gap,
+        "unrelated vector input trunks must be separated by at least one routing lane: \
+         {first_input_x} vs {second_input_x}",
+    );
 
     let permuted_graph = Graph {
         nodes: graph.nodes.iter().cloned().rev().collect(),
@@ -1656,6 +1673,92 @@ fn highest_quality_routes_captured_reg_mux_boundary_bundles_with_positive_cleara
     assert_eq!(
         layout_with_config(&permuted_graph, &permuted_config).unwrap(),
         strict
+    );
+}
+
+#[test]
+fn highest_quality_separates_unrelated_output_bundle_trunks() {
+    let graph = Graph {
+        nodes: (1..=6).map(|id| node(id, false)).collect(),
+        edges: vec![
+            edge(10, 1, 3),
+            edge(11, 2, 3),
+            edge(20, 4, 6),
+            edge(21, 5, 6),
+        ],
+    };
+    let mut config = LayoutConfig::highest_quality();
+    config.constraints = LayoutConstraints {
+        inputs: vec![1, 2, 4, 5],
+        outputs: vec![3, 6],
+        boundary_bundles: vec![
+            BoundaryBundleConstraint {
+                id: 1,
+                endpoint: Endpoint { node: 3, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 10,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 11,
+                        slots: vec![1],
+                    },
+                ],
+            },
+            BoundaryBundleConstraint {
+                id: 2,
+                endpoint: Endpoint { node: 6, port: 0 },
+                width: 2,
+                members: vec![
+                    BoundaryBundleMemberConstraint {
+                        edge: 20,
+                        slots: vec![0],
+                    },
+                    BoundaryBundleMemberConstraint {
+                        edge: 21,
+                        slots: vec![1],
+                    },
+                ],
+            },
+        ],
+    };
+
+    let result = layout_with_config(&graph, &config).unwrap();
+    let trunk_x = |bundle_id| {
+        let bundle = result
+            .boundary_bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("output bundle exists");
+        assert!(
+            bundle
+                .members
+                .iter()
+                .all(|member| member.tap.x == bundle.members[0].tap.x),
+            "each output bundle must use one shared trunk",
+        );
+        bundle.members[0].tap.x
+    };
+    assert!(
+        (trunk_x(1) - trunk_x(2)).abs() >= config.layout.route_lane_gap,
+        "unrelated output trunks must be separated by at least one routing lane",
+    );
+
+    let mut permuted_graph = graph.clone();
+    permuted_graph.nodes.reverse();
+    permuted_graph.edges.reverse();
+    let mut permuted_config = config.clone();
+    permuted_config.constraints.inputs.reverse();
+    permuted_config.constraints.outputs.reverse();
+    permuted_config.constraints.boundary_bundles.reverse();
+    for bundle in &mut permuted_config.constraints.boundary_bundles {
+        bundle.members.reverse();
+    }
+    assert_eq!(
+        layout_with_config(&permuted_graph, &permuted_config).unwrap(),
+        result,
     );
 }
 
