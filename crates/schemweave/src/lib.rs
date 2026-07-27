@@ -1129,7 +1129,9 @@ fn vertical_track_spacing_quality_is_admissible(
     baseline_congestion >= MIN_VERTICAL_TRACK_SPACING_CONGESTION
         && candidate_congestion
             <= baseline_congestion * MAX_VERTICAL_TRACK_SPACING_CONGESTION_FACTOR
-        && candidate_area <= baseline_area * MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR
+        && candidate_area
+            <= baseline_area
+                * MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR.min(options.max_quality_area_factor)
         && candidate.crossings == baseline.crossings
         && candidate.bends == baseline.bends
         && candidate.route_length <= baseline.route_length * options.max_quality_route_length_factor
@@ -3864,6 +3866,18 @@ mod tests {
         };
         assert!(vertical_track_spacing_quality_is_admissible(
             0.10, 0.075, baseline, 20.0, boundary, 23.0, options,
+        ));
+        assert!(!vertical_track_spacing_quality_is_admissible(
+            0.10,
+            0.075,
+            baseline,
+            20.0,
+            boundary,
+            23.0,
+            LayoutOptions {
+                max_quality_area_factor: 1.10,
+                ..options
+            },
         ));
         for (baseline_congestion, candidate_congestion, candidate, candidate_area) in [
             (0.099_999, 0.01, boundary, 23.0),
