@@ -5770,12 +5770,10 @@ fn selected_layout_vertical_track_spacing_candidate_with_limits(
     if !pitch.is_finite() || pitch <= 0.0 || baseline.edges.len() != plan.edges.len() {
         return None;
     }
-    let route_segments = baseline.edges.iter().try_fold(0usize, |count, edge| {
-        count.checked_add(edge.points.len().saturating_sub(1))
+    baseline.edges.iter().try_fold(0usize, |count, edge| {
+        let count = count.checked_add(edge.points.len().saturating_sub(1))?;
+        (count <= max_segments).then_some(count)
     })?;
-    if route_segments > max_segments {
-        return None;
-    }
     let segments = physical_route_segments(
         plan.edges.iter().map(|resolved| resolved.edge),
         &baseline.edges,
