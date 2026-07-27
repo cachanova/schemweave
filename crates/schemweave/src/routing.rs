@@ -13301,33 +13301,33 @@ mod tests {
         };
 
         let candidate =
-            selected_layout_vertical_track_spacing_candidate(&plan, &baseline, 8.0).unwrap();
+            selected_layout_vertical_track_spacing_candidate(&plan, &baseline, 12.0).unwrap();
 
         assert_eq!(candidate.edges[0].points[0].y, 0.0);
-        assert_eq!(candidate.edges[1].points[0].y, 8.0);
-        assert!(candidate.nodes.iter().all(|node| node.y == 15.0));
-        assert_eq!(candidate.height, 35.0);
+        assert_eq!(candidate.edges[1].points[0].y, 12.0);
+        assert!(candidate.nodes.iter().all(|node| node.y == 19.0));
+        assert_eq!(candidate.height, 39.0);
         assert!(
             selected_layout_vertical_track_spacing_candidate_with_limits(
-                &plan, &baseline, 8.0, 2, 1, 4,
+                &plan, &baseline, 12.0, 2, 1, 4,
             )
             .is_some()
         );
         assert!(
             selected_layout_vertical_track_spacing_candidate_with_limits(
-                &plan, &baseline, 8.0, 1, 1, 4,
+                &plan, &baseline, 12.0, 1, 1, 4,
             )
             .is_none()
         );
         assert!(
             selected_layout_vertical_track_spacing_candidate_with_limits(
-                &plan, &baseline, 8.0, 2, 0, 4,
+                &plan, &baseline, 12.0, 2, 0, 4,
             )
             .is_none()
         );
         assert!(
             selected_layout_vertical_track_spacing_candidate_with_limits(
-                &plan, &baseline, 8.0, 2, 1, 3,
+                &plan, &baseline, 12.0, 2, 1, 3,
             )
             .is_none()
         );
@@ -13338,20 +13338,20 @@ mod tests {
             validate_and_index(&same_net_graph, LayoutOptions::default()).unwrap();
         let same_net_plan = RoutingPlan::new(&same_net_indexed, &[0, 0, 1, 1]);
         assert!(
-            selected_layout_vertical_track_spacing_candidate(&same_net_plan, &baseline, 8.0)
+            selected_layout_vertical_track_spacing_candidate(&same_net_plan, &baseline, 12.0)
                 .is_none()
         );
 
         let mut blocked = baseline.clone();
         blocked.nodes[0].y = 1.0;
         blocked.nodes[0].height = 1.0;
-        assert!(selected_layout_vertical_track_spacing_candidate(&plan, &blocked, 8.0).is_none());
+        assert!(selected_layout_vertical_track_spacing_candidate(&plan, &blocked, 12.0).is_none());
 
         let mut bottom_edge_blocked = baseline.clone();
         bottom_edge_blocked.nodes[0].y = 0.5;
         bottom_edge_blocked.nodes[0].height = 1.0;
         assert!(
-            selected_layout_vertical_track_spacing_candidate(&plan, &bottom_edge_blocked, 8.0)
+            selected_layout_vertical_track_spacing_candidate(&plan, &bottom_edge_blocked, 12.0)
                 .is_none()
         );
 
@@ -13405,15 +13405,15 @@ mod tests {
             height: baseline.height,
         };
         let attached_candidate =
-            selected_layout_vertical_track_spacing_candidate(&plan, &attached, 8.0).unwrap();
+            selected_layout_vertical_track_spacing_candidate(&plan, &attached, 12.0).unwrap();
         for edge in &attached_candidate.edges {
-            assert_eq!(edge.points.first().unwrap().y, 25.0);
-            assert_eq!(edge.points.last().unwrap().y, 25.0);
+            assert_eq!(edge.points.first().unwrap().y, 29.0);
+            assert_eq!(edge.points.last().unwrap().y, 29.0);
         }
         let bundle = &attached_candidate.boundary_bundles[0];
-        assert_eq!(bundle.collector.start.y, 25.0);
-        assert_eq!(bundle.collector.end.y, 25.0);
-        assert_eq!(bundle.spine.start.y, 25.0);
+        assert_eq!(bundle.collector.start.y, 29.0);
+        assert_eq!(bundle.collector.end.y, 29.0);
+        assert_eq!(bundle.spine.start.y, 29.0);
         assert_eq!(bundle.spine.end.y, 0.0);
         assert_eq!(bundle.members[0].tap.y, 0.0);
     }

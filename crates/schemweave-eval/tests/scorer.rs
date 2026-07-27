@@ -2576,6 +2576,21 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
         },
     )
     .unwrap();
+    let track = |edge_id| {
+        let route = highest
+            .edges
+            .iter()
+            .find(|route| route.id == edge_id)
+            .unwrap();
+        let start = route.points[2];
+        let end = route.points[3];
+        assert_eq!(start.y, end.y);
+        (start.y, start.x.min(end.x), start.x.max(end.x))
+    };
+    let first_track = track(111);
+    let second_track = track(219);
+    assert!(first_track.1.max(second_track.1) < first_track.2.min(second_track.2));
+    assert!((first_track.0 - second_track.0).abs() >= 12.0);
     for role in [BoundaryBundleRole::Input, BoundaryBundleRole::Output] {
         assert!(
             highest.boundary_bundles.iter().any(|bundle| {
@@ -2613,10 +2628,10 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
         "{highest_report:#?}"
     );
     assert!(
-        highest_report.route_length <= 147_000.0,
+        highest_report.route_length <= 148_000.0,
         "{highest_report:#?}"
     );
-    assert!(highest_report.area <= 5_100_000.0, "{highest_report:#?}");
+    assert!(highest_report.area <= 5_300_000.0, "{highest_report:#?}");
 
     let mut permuted_graph = graph.clone();
     permuted_graph.nodes.reverse();
