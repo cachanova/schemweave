@@ -242,6 +242,8 @@ fn apply_bundle_geometry(
     let mut promotion_geometry_remaining = MAX_BOUNDARY_BUNDLE_GEOMETRY_VISITS;
     let mut promotion_tap_remaining = MAX_INTERIOR_HORIZONTAL_TAP_VISITS;
     let mut shared_route_admission_remaining = MAX_SHARED_ROUTE_ADMISSION_VISITS;
+    let mut used_input_collectors = Vec::<f64>::new();
+    let mut used_output_collectors = Vec::<f64>::new();
     let mut preserved_geometry = layout
         .boundary_bundles
         .iter()
@@ -254,15 +256,21 @@ fn apply_bundle_geometry(
     layout.boundary_bundles.clear();
     for bundle_index in processing_order {
         let bundle = &graph.boundary_bundles[bundle_index];
+        let used_collectors = match bundle.role {
+            BoundaryBundleRole::Input => &mut used_input_collectors,
+            BoundaryBundleRole::Output => &mut used_output_collectors,
+        };
         if preserved_bundle_ids.contains(&bundle.id) {
             let geometry = preserved_geometry
                 .remove(&bundle.id)
                 .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?;
+            used_collectors.push(geometry.spine.end.x);
             layout.boundary_bundles.push(geometry);
             continue;
         }
         let corridor_offset = corridor_offsets[bundle_index];
-        let planned_collector = interior_collectors[bundle_index];
+        let planned_collector = interior_collectors[bundle_index]
+            .filter(|candidate| collector_has_lane_separation(*candidate, used_collectors, pitch));
         let previous_member_segments = bundle
             .members
             .iter()
@@ -352,7 +360,9 @@ fn apply_bundle_geometry(
                     .map(|(_, points)| points.len())
                     .sum::<usize>();
                 let mut accepted = None;
-                for collector_x in promoted_collectors {
+                for collector_x in promoted_collectors.into_iter().filter(|candidate| {
+                    collector_has_lane_separation(*candidate, used_collectors, pitch)
+                }) {
                     let Some(next_remaining) =
                         promotion_geometry_remaining.checked_sub(restore_work)
                     else {
@@ -472,6 +482,15 @@ fn apply_bundle_geometry(
                 .saturating_sub(current_member_segments)
                 .saturating_add(shared.candidate_route_segments);
         }
+        used_collectors.push(
+            layout
+                .boundary_bundles
+                .last()
+                .ok_or(LayoutError::BoundaryBundleGeometryUnsatisfied)?
+                .spine
+                .end
+                .x,
+        );
     }
     debug_assert_eq!(
         route_segments,
@@ -1065,16 +1084,18 @@ fn plan_interior_collectors(
                 BoundaryBundleRole::Input => &mut used_inputs,
                 BoundaryBundleRole::Output => &mut used_outputs,
             };
-            if used
-                .iter()
-                .any(|used_x| preserved_point_coordinate_matches(*used_x, current_x))
-            {
-                let direction = match range.role {
-                    BoundaryBundleRole::Input => -1.0,
-                    BoundaryBundleRole::Output => 1.0,
-                };
-                let desired = (current_x + direction * context.pitch / 2.0)
-                    .clamp(range.minimum_x, range.maximum_x);
+            if used.iter().any(|used_x| {
+                (*used_x - current_x).abs() < context.pitch - PRESERVED_GEOMETRY_EPSILON
+            }) {
+                let desired = match range.role {
+                    BoundaryBundleRole::Input => {
+                        used.iter().copied().fold(current_x, f64::min) - context.pitch
+                    }
+                    BoundaryBundleRole::Output => {
+                        used.iter().copied().fold(current_x, f64::max) + context.pitch
+                    }
+                }
+                .clamp(range.minimum_x, range.maximum_x);
                 let (minimum_x, maximum_x) = match range.role {
                     BoundaryBundleRole::Input => (range.minimum_x, desired),
                     BoundaryBundleRole::Output => (desired, range.maximum_x),
@@ -1087,7 +1108,8 @@ fn plan_interior_collectors(
                     desired,
                     maximum_x,
                     &mut horizontal_tap_visits,
-                );
+                )
+                .filter(|candidate| collector_has_lane_separation(*candidate, used, context.pitch));
             }
             if let Some(x) = *planned_x {
                 used.push(x);
@@ -1097,8 +1119,9 @@ fn plan_interior_collectors(
     planned
 }
 
-fn preserved_point_coordinate_matches(left: f64, right: f64) -> bool {
-    (left - right).abs() <= PRESERVED_GEOMETRY_EPSILON
+fn collector_has_lane_separation(candidate: f64, used: &[f64], pitch: f64) -> bool {
+    used.iter()
+        .all(|used_x| (*used_x - candidate).abs() >= pitch - PRESERVED_GEOMETRY_EPSILON)
 }
 
 fn required_output_collector_x(
@@ -1339,18 +1362,18 @@ fn promotion_collector_candidates(
     ) else {
         return Vec::new();
     };
-    let between_lanes = match bundle.role {
-        BoundaryBundleRole::Input => range.desired_x - context.pitch / 2.0,
-        BoundaryBundleRole::Output => range.desired_x + context.pitch / 2.0,
+    let adjacent_lane = match bundle.role {
+        BoundaryBundleRole::Input => range.desired_x - context.pitch,
+        BoundaryBundleRole::Output => range.desired_x + context.pitch,
     };
-    if between_lanes >= range.minimum_x
-        && between_lanes <= range.maximum_x
+    if adjacent_lane >= range.minimum_x
+        && adjacent_lane <= range.maximum_x
         && let Some(offset_candidates) = common_horizontal_collector_xs(
             context,
             bundle,
             routes,
             range.minimum_x,
-            between_lanes,
+            adjacent_lane,
             range.maximum_x,
             remaining,
         )
@@ -3356,8 +3379,8 @@ mod tests {
 
         let result = refine_selected_layout(&indexed, layout, options).unwrap();
         assert_eq!(
-            result.boundary_bundles[0].spine.end.x, 287.0,
-            "the colliding preferred X must step between lanes instead of restoring the comb",
+            result.boundary_bundles[0].spine.end.x, 284.0,
+            "the colliding preferred X must step by one lane instead of restoring the comb",
         );
         assert_eq!(
             result.edges.iter().find(|route| route.id == 12),

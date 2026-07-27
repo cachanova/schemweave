@@ -1638,6 +1638,23 @@ fn highest_quality_routes_captured_reg_mux_boundary_bundles_with_positive_cleara
         first_input, second_input,
         "unrelated vector inputs must not share an electrically ambiguous trunk",
     );
+    let input_trunk_x = |bundle_id| {
+        strict
+            .boundary_bundles
+            .iter()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("captured input bundle exists")
+            .members[0]
+            .tap
+            .x
+    };
+    let first_input_x = input_trunk_x(0);
+    let second_input_x = input_trunk_x(1);
+    assert!(
+        (first_input_x - second_input_x).abs() >= config.layout.route_lane_gap,
+        "unrelated vector input trunks must be separated by at least one routing lane: \
+         {first_input_x} vs {second_input_x}",
+    );
 
     let permuted_graph = Graph {
         nodes: graph.nodes.iter().cloned().rev().collect(),
