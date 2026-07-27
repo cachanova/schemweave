@@ -21,9 +21,9 @@ const MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS: usize = 20_000_000;
 const MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS: usize = 100_000;
 const MAX_LAYOUT_ROUTE_CONTACT_VISITS: usize = 20_000_000;
 const MIN_VERTICAL_TRACK_SPACING_CONGESTION: f64 = 0.10;
-const MIN_VERTICAL_TRACK_SPACING_PITCH: f64 = 8.0;
+const MIN_VERTICAL_TRACK_SPACING_PITCH: f64 = 12.0;
 const MAX_VERTICAL_TRACK_SPACING_CONGESTION_FACTOR: f64 = 0.75;
-const MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR: f64 = 1.10;
+const MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR: f64 = 1.15;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -3863,11 +3863,11 @@ mod tests {
             ..baseline
         };
         assert!(vertical_track_spacing_quality_is_admissible(
-            0.10, 0.075, baseline, 100.0, boundary, 110.0, options,
+            0.10, 0.075, baseline, 20.0, boundary, 23.0, options,
         ));
         for (baseline_congestion, candidate_congestion, candidate, candidate_area) in [
-            (0.099_999, 0.01, boundary, 110.0),
-            (0.10, 0.075_001, boundary, 110.0),
+            (0.099_999, 0.01, boundary, 23.0),
+            (0.10, 0.075_001, boundary, 23.0),
             (
                 0.10,
                 0.075,
@@ -3875,7 +3875,7 @@ mod tests {
                     crossings: 11,
                     ..boundary
                 },
-                110.0,
+                23.0,
             ),
             (
                 0.10,
@@ -3884,7 +3884,7 @@ mod tests {
                     bends: 21,
                     ..boundary
                 },
-                110.0,
+                23.0,
             ),
             (
                 0.10,
@@ -3893,15 +3893,15 @@ mod tests {
                     route_length: 125.000_001,
                     ..boundary
                 },
-                110.0,
+                23.0,
             ),
-            (0.10, 0.075, boundary, 110.000_001),
+            (0.10, 0.075, boundary, 23.000_001),
         ] {
             assert!(!vertical_track_spacing_quality_is_admissible(
                 baseline_congestion,
                 candidate_congestion,
                 baseline,
-                100.0,
+                20.0,
                 candidate,
                 candidate_area,
                 options,
