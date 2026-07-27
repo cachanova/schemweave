@@ -26,6 +26,7 @@ const MAX_REGIONAL_FANOUT_ROUTE_POINTS: usize = 100_000;
 const MAX_REGIONAL_FANOUT_ORDINATES: usize = 32_768;
 const MAX_VERTICAL_TRACK_SPACING_SEGMENTS: usize = 4_096;
 const MAX_VERTICAL_TRACK_SPACING_PAIR_VISITS: usize = 2_000_000;
+const MAX_VERTICAL_TRACK_SPACING_NODE_VISITS: usize = 2_000_000;
 
 fn requires_exact_candidate_admission(options: LayoutOptions) -> bool {
     options.edge_node_clearance > 0.0 || options.minimum_parallel_wire_spacing > 0.0
@@ -5748,7 +5749,31 @@ pub(crate) fn selected_layout_vertical_track_spacing_candidate(
     baseline: &Layout,
     pitch: f64,
 ) -> Option<Layout> {
+    selected_layout_vertical_track_spacing_candidate_with_limits(
+        plan,
+        baseline,
+        pitch,
+        MAX_VERTICAL_TRACK_SPACING_SEGMENTS,
+        MAX_VERTICAL_TRACK_SPACING_PAIR_VISITS,
+        MAX_VERTICAL_TRACK_SPACING_NODE_VISITS,
+    )
+}
+
+fn selected_layout_vertical_track_spacing_candidate_with_limits(
+    plan: &RoutingPlan<'_>,
+    baseline: &Layout,
+    pitch: f64,
+    max_segments: usize,
+    max_pair_visits: usize,
+    max_node_visits: usize,
+) -> Option<Layout> {
     if !pitch.is_finite() || pitch <= 0.0 || baseline.edges.len() != plan.edges.len() {
+        return None;
+    }
+    let route_segments = baseline.edges.iter().try_fold(0usize, |count, edge| {
+        count.checked_add(edge.points.len().saturating_sub(1))
+    })?;
+    if route_segments > max_segments {
         return None;
     }
     let segments = physical_route_segments(
@@ -5760,7 +5785,7 @@ pub(crate) fn selected_layout_vertical_track_spacing_candidate(
         .into_iter()
         .filter(|segment| segment.horizontal)
         .collect::<Vec<_>>();
-    if horizontal.len() < 2 || horizontal.len() > MAX_VERTICAL_TRACK_SPACING_SEGMENTS {
+    if horizontal.len() < 2 {
         return None;
     }
     let mut tracks = BTreeMap::<FloatKey, Vec<PhysicalSegment>>::new();
@@ -5779,6 +5804,7 @@ pub(crate) fn selected_layout_vertical_track_spacing_candidate(
     }
     let tracks = tracks.into_iter().collect::<Vec<_>>();
     let mut pair_visits = 0usize;
+    let mut node_visits = 0usize;
     let mut cumulative = 0.0;
     let mut cuts = Vec::<(f64, f64)>::new();
     for pair in tracks.windows(2) {
@@ -5792,7 +5818,7 @@ pub(crate) fn selected_layout_vertical_track_spacing_candidate(
         'segments: for left in &pair[0].1 {
             for right in &pair[1].1 {
                 pair_visits = pair_visits.checked_add(1)?;
-                if pair_visits > MAX_VERTICAL_TRACK_SPACING_PAIR_VISITS {
+                if pair_visits > max_pair_visits {
                     return None;
                 }
                 if left.net != right.net && left.start.max(right.start) < left.end.min(right.end) {
@@ -5805,11 +5831,18 @@ pub(crate) fn selected_layout_vertical_track_spacing_candidate(
             continue;
         }
         let cut = lower + separation / 2.0;
-        if baseline
-            .nodes
-            .iter()
-            .any(|node| node.y < cut && cut < node.y + node.height)
-        {
+        let mut blocked = false;
+        for node in &baseline.nodes {
+            node_visits = node_visits.checked_add(1)?;
+            if node_visits > max_node_visits {
+                return None;
+            }
+            if node.y < cut && cut <= node.y + node.height {
+                blocked = true;
+                break;
+            }
+        }
+        if blocked {
             continue;
         }
         cumulative += pitch - separation;
@@ -11156,8 +11189,10 @@ mod tests {
     };
 
     use crate::{
-        Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutConfig, LayoutOptions, Node,
-        NodeGeometry, Point, Port, PortSide, QualityEffort, validation::validate_and_index,
+        BoundaryBundleGeometry, BoundaryBundleMemberGeometry, BoundaryBundleRole,
+        BoundaryBundleSegment, Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutConfig,
+        LayoutOptions, Node, NodeGeometry, Point, Port, PortSide, QualityEffort,
+        validation::validate_and_index,
     };
 
     use super::{
@@ -11207,6 +11242,7 @@ mod tests {
         route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
         route_supplemental_edges, select_crossing_repair_nets, select_gap_spacing_candidate,
         select_outer_side_repairs, selected_layout_vertical_track_spacing_candidate,
+        selected_layout_vertical_track_spacing_candidate_with_limits,
         selected_route_family_is_safe, shortest_crossing_path, sparse_channel_route,
         sparse_crossing_paths, sparse_gap_x, spread_straight_crossing_runs,
         straight_run_crossing_path, straight_run_routing_is_eligible, sum_within_limit,
@@ -13267,12 +13303,36 @@ mod tests {
         };
 
         let candidate =
-            selected_layout_vertical_track_spacing_candidate(&plan, &baseline, 6.0).unwrap();
+            selected_layout_vertical_track_spacing_candidate(&plan, &baseline, 8.0).unwrap();
 
         assert_eq!(candidate.edges[0].points[0].y, 0.0);
-        assert_eq!(candidate.edges[1].points[0].y, 6.0);
-        assert!(candidate.nodes.iter().all(|node| node.y == 13.0));
-        assert_eq!(candidate.height, 33.0);
+        assert_eq!(candidate.edges[1].points[0].y, 8.0);
+        assert!(candidate.nodes.iter().all(|node| node.y == 15.0));
+        assert_eq!(candidate.height, 35.0);
+        assert!(
+            selected_layout_vertical_track_spacing_candidate_with_limits(
+                &plan, &baseline, 8.0, 2, 1, 4,
+            )
+            .is_some()
+        );
+        assert!(
+            selected_layout_vertical_track_spacing_candidate_with_limits(
+                &plan, &baseline, 8.0, 1, 1, 4,
+            )
+            .is_none()
+        );
+        assert!(
+            selected_layout_vertical_track_spacing_candidate_with_limits(
+                &plan, &baseline, 8.0, 2, 0, 4,
+            )
+            .is_none()
+        );
+        assert!(
+            selected_layout_vertical_track_spacing_candidate_with_limits(
+                &plan, &baseline, 8.0, 2, 1, 3,
+            )
+            .is_none()
+        );
 
         let mut same_net_graph = graph.clone();
         same_net_graph.edges[1].net = same_net_graph.edges[0].net;
@@ -13280,14 +13340,84 @@ mod tests {
             validate_and_index(&same_net_graph, LayoutOptions::default()).unwrap();
         let same_net_plan = RoutingPlan::new(&same_net_indexed, &[0, 0, 1, 1]);
         assert!(
-            selected_layout_vertical_track_spacing_candidate(&same_net_plan, &baseline, 6.0)
+            selected_layout_vertical_track_spacing_candidate(&same_net_plan, &baseline, 8.0)
                 .is_none()
         );
 
-        let mut blocked = baseline;
+        let mut blocked = baseline.clone();
         blocked.nodes[0].y = 1.0;
         blocked.nodes[0].height = 1.0;
-        assert!(selected_layout_vertical_track_spacing_candidate(&plan, &blocked, 6.0).is_none());
+        assert!(selected_layout_vertical_track_spacing_candidate(&plan, &blocked, 8.0).is_none());
+
+        let mut bottom_edge_blocked = baseline.clone();
+        bottom_edge_blocked.nodes[0].y = 0.5;
+        bottom_edge_blocked.nodes[0].height = 1.0;
+        assert!(
+            selected_layout_vertical_track_spacing_candidate(&plan, &bottom_edge_blocked, 8.0)
+                .is_none()
+        );
+
+        let attached_edges = vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![
+                    Point { x: 20.0, y: 20.0 },
+                    Point { x: 30.0, y: 20.0 },
+                    Point { x: 30.0, y: 0.0 },
+                    Point { x: 90.0, y: 0.0 },
+                    Point { x: 90.0, y: 20.0 },
+                    Point { x: 100.0, y: 20.0 },
+                ],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![
+                    Point { x: 20.0, y: 20.0 },
+                    Point { x: 35.0, y: 20.0 },
+                    Point { x: 35.0, y: 3.0 },
+                    Point { x: 85.0, y: 3.0 },
+                    Point { x: 85.0, y: 20.0 },
+                    Point { x: 100.0, y: 20.0 },
+                ],
+            },
+        ];
+        let attached = Layout {
+            nodes: baseline.nodes.clone(),
+            edges: attached_edges,
+            boundary_bundles: vec![BoundaryBundleGeometry {
+                id: 0,
+                endpoint: Endpoint { node: 0, port: 0 },
+                role: BoundaryBundleRole::Input,
+                width: 1,
+                collector: BoundaryBundleSegment {
+                    start: Point { x: 20.0, y: 20.0 },
+                    end: Point { x: 30.0, y: 20.0 },
+                },
+                spine: BoundaryBundleSegment {
+                    start: Point { x: 30.0, y: 20.0 },
+                    end: Point { x: 30.0, y: 0.0 },
+                },
+                members: vec![BoundaryBundleMemberGeometry {
+                    edge: 0,
+                    slots: vec![0],
+                    tap: Point { x: 30.0, y: 0.0 },
+                }],
+            }],
+            width: baseline.width,
+            height: baseline.height,
+        };
+        let attached_candidate =
+            selected_layout_vertical_track_spacing_candidate(&plan, &attached, 8.0).unwrap();
+        for edge in &attached_candidate.edges {
+            assert_eq!(edge.points.first().unwrap().y, 25.0);
+            assert_eq!(edge.points.last().unwrap().y, 25.0);
+        }
+        let bundle = &attached_candidate.boundary_bundles[0];
+        assert_eq!(bundle.collector.start.y, 25.0);
+        assert_eq!(bundle.collector.end.y, 25.0);
+        assert_eq!(bundle.spine.start.y, 25.0);
+        assert_eq!(bundle.spine.end.y, 0.0);
+        assert_eq!(bundle.members[0].tap.y, 0.0);
     }
 
     #[test]

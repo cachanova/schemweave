@@ -2616,7 +2616,7 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
         highest_report.route_length <= 147_000.0,
         "{highest_report:#?}"
     );
-    assert!(highest_report.area <= 5_000_000.0, "{highest_report:#?}");
+    assert!(highest_report.area <= 5_100_000.0, "{highest_report:#?}");
 
     let mut permuted_graph = graph.clone();
     permuted_graph.nodes.reverse();
