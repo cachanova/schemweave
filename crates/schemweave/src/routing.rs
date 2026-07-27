@@ -9,7 +9,7 @@ use std::cell::Cell;
 
 use crate::{
     Edge, EdgeGeometry, EdgeId, EdgeNodeClearance, EdgeNodeClearanceError, EdgeNodeSegment,
-    Endpoint, LayoutOptions, NetId, NetNodeRelation, NodeGeometry, ParallelSegment,
+    Endpoint, Layout, LayoutOptions, NetId, NetNodeRelation, NodeGeometry, ParallelSegment,
     ParallelSeparationError, Point, Port, PortSide, measure_edge_node_clearance_bounded,
     measure_parallel_congestion_profile_bounded, measure_parallel_separation_bounded,
     validation::IndexedGraph,
@@ -24,6 +24,8 @@ const MAX_REGIONAL_FANOUT_NODES: usize = 1_000;
 const MAX_REGIONAL_FANOUT_GRAPH_EDGES: usize = 2_000;
 const MAX_REGIONAL_FANOUT_ROUTE_POINTS: usize = 100_000;
 const MAX_REGIONAL_FANOUT_ORDINATES: usize = 32_768;
+const MAX_VERTICAL_TRACK_SPACING_SEGMENTS: usize = 4_096;
+const MAX_VERTICAL_TRACK_SPACING_PAIR_VISITS: usize = 2_000_000;
 
 fn requires_exact_candidate_admission(options: LayoutOptions) -> bool {
     options.edge_node_clearance > 0.0 || options.minimum_parallel_wire_spacing > 0.0
@@ -5735,6 +5737,118 @@ pub(crate) fn route_parallel_congestion(
     parallel_congestion_ratio(&segments)
 }
 
+/// Insert global vertical whitespace between close, overlapping horizontal tracks.
+///
+/// A cut is eligible only when it crosses no node interior. Moving every node, route point, and
+/// boundary-bundle point below that cut by the same amount preserves ports, orthogonality, route
+/// topology, and existing keep-out geometry. The caller still applies the exact final geometry and
+/// quality gates before selecting this bounded Max-quality refinement.
+pub(crate) fn selected_layout_vertical_track_spacing_candidate(
+    plan: &RoutingPlan<'_>,
+    baseline: &Layout,
+    pitch: f64,
+) -> Option<Layout> {
+    if !pitch.is_finite() || pitch <= 0.0 || baseline.edges.len() != plan.edges.len() {
+        return None;
+    }
+    let segments = physical_route_segments(
+        plan.edges.iter().map(|resolved| resolved.edge),
+        &baseline.edges,
+    )
+    .0;
+    let horizontal = segments
+        .into_iter()
+        .filter(|segment| segment.horizontal)
+        .collect::<Vec<_>>();
+    if horizontal.len() < 2 || horizontal.len() > MAX_VERTICAL_TRACK_SPACING_SEGMENTS {
+        return None;
+    }
+    let mut tracks = BTreeMap::<FloatKey, Vec<PhysicalSegment>>::new();
+    for segment in horizontal {
+        if !segment.fixed.is_finite()
+            || !segment.start.is_finite()
+            || !segment.end.is_finite()
+            || segment.start >= segment.end
+        {
+            return None;
+        }
+        tracks
+            .entry(FloatKey(segment.fixed))
+            .or_default()
+            .push(segment);
+    }
+    let tracks = tracks.into_iter().collect::<Vec<_>>();
+    let mut pair_visits = 0usize;
+    let mut cumulative = 0.0;
+    let mut cuts = Vec::<(f64, f64)>::new();
+    for pair in tracks.windows(2) {
+        let lower = pair[0].0.0;
+        let upper = pair[1].0.0;
+        let separation = upper - lower;
+        if !separation.is_finite() || separation <= 0.0 || separation >= pitch {
+            continue;
+        }
+        let mut close = false;
+        'segments: for left in &pair[0].1 {
+            for right in &pair[1].1 {
+                pair_visits = pair_visits.checked_add(1)?;
+                if pair_visits > MAX_VERTICAL_TRACK_SPACING_PAIR_VISITS {
+                    return None;
+                }
+                if left.net != right.net && left.start.max(right.start) < left.end.min(right.end) {
+                    close = true;
+                    break 'segments;
+                }
+            }
+        }
+        if !close {
+            continue;
+        }
+        let cut = lower + separation / 2.0;
+        if baseline
+            .nodes
+            .iter()
+            .any(|node| node.y < cut && cut < node.y + node.height)
+        {
+            continue;
+        }
+        cumulative += pitch - separation;
+        if !cut.is_finite() || !cumulative.is_finite() {
+            return None;
+        }
+        cuts.push((cut, cumulative));
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let shift = |ordinate: f64| {
+        let count = cuts.partition_point(|&(cut, _)| cut <= ordinate);
+        ordinate + count.checked_sub(1).map_or(0.0, |index| cuts[index].1)
+    };
+    let mut candidate = baseline.clone();
+    for node in &mut candidate.nodes {
+        node.y = shift(node.y);
+    }
+    for point in candidate
+        .edges
+        .iter_mut()
+        .flat_map(|edge| edge.points.iter_mut())
+    {
+        point.y = shift(point.y);
+    }
+    for bundle in &mut candidate.boundary_bundles {
+        bundle.collector.start.y = shift(bundle.collector.start.y);
+        bundle.collector.end.y = shift(bundle.collector.end.y);
+        bundle.spine.start.y = shift(bundle.spine.start.y);
+        bundle.spine.end.y = shift(bundle.spine.end.y);
+        for member in &mut bundle.members {
+            member.tap.y = shift(member.tap.y);
+        }
+    }
+    candidate.height = shift(baseline.height);
+    candidate.height.is_finite().then_some(candidate)
+}
+
 fn charge_horizontal_pitch_work(visits: &mut usize, amount: usize) -> Option<()> {
     *visits = visits.checked_add(amount)?;
     (*visits <= MAX_HORIZONTAL_PITCH_RANK_VISITS).then_some(())
@@ -11042,8 +11156,8 @@ mod tests {
     };
 
     use crate::{
-        Edge, EdgeGeometry, Endpoint, Graph, LayoutConfig, LayoutOptions, Node, NodeGeometry,
-        Point, Port, PortSide, QualityEffort, validation::validate_and_index,
+        Edge, EdgeGeometry, Endpoint, Graph, Layout, LayoutConfig, LayoutOptions, Node,
+        NodeGeometry, Point, Port, PortSide, QualityEffort, validation::validate_and_index,
     };
 
     use super::{
@@ -11092,8 +11206,9 @@ mod tests {
         route_planned_candidates_with_quality_options, route_planned_candidates_with_sparse_global,
         route_planned_edges, route_quality, route_quality_cmp, route_quality_for_plan,
         route_supplemental_edges, select_crossing_repair_nets, select_gap_spacing_candidate,
-        select_outer_side_repairs, selected_route_family_is_safe, shortest_crossing_path,
-        sparse_channel_route, sparse_crossing_paths, sparse_gap_x, spread_straight_crossing_runs,
+        select_outer_side_repairs, selected_layout_vertical_track_spacing_candidate,
+        selected_route_family_is_safe, shortest_crossing_path, sparse_channel_route,
+        sparse_crossing_paths, sparse_gap_x, spread_straight_crossing_runs,
         straight_run_crossing_path, straight_run_routing_is_eligible, sum_within_limit,
         take_horizontal_crossing_profile_calls, take_routing_reuse_counts,
         vertical_horizontal_crossings,
@@ -13114,6 +13229,65 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn vertical_track_spacing_inserts_only_safe_different_net_whitespace() {
+        let graph = two_sparse_net_graph();
+        let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
+        let plan = RoutingPlan::new(&indexed, &[0, 0, 1, 1]);
+        let nodes = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| NodeGeometry {
+                id: node.id,
+                x: if index < 2 { 0.0 } else { 100.0 },
+                y: 10.0,
+                width: node.width,
+                height: node.height,
+            })
+            .collect::<Vec<_>>();
+        let edges = vec![
+            EdgeGeometry {
+                id: 0,
+                points: vec![Point { x: 20.0, y: 0.0 }, Point { x: 100.0, y: 0.0 }],
+            },
+            EdgeGeometry {
+                id: 1,
+                points: vec![Point { x: 20.0, y: 3.0 }, Point { x: 100.0, y: 3.0 }],
+            },
+        ];
+        let baseline = Layout {
+            nodes,
+            edges,
+            boundary_bundles: Vec::new(),
+            width: 120.0,
+            height: 30.0,
+        };
+
+        let candidate =
+            selected_layout_vertical_track_spacing_candidate(&plan, &baseline, 6.0).unwrap();
+
+        assert_eq!(candidate.edges[0].points[0].y, 0.0);
+        assert_eq!(candidate.edges[1].points[0].y, 6.0);
+        assert!(candidate.nodes.iter().all(|node| node.y == 13.0));
+        assert_eq!(candidate.height, 33.0);
+
+        let mut same_net_graph = graph.clone();
+        same_net_graph.edges[1].net = same_net_graph.edges[0].net;
+        let same_net_indexed =
+            validate_and_index(&same_net_graph, LayoutOptions::default()).unwrap();
+        let same_net_plan = RoutingPlan::new(&same_net_indexed, &[0, 0, 1, 1]);
+        assert!(
+            selected_layout_vertical_track_spacing_candidate(&same_net_plan, &baseline, 6.0)
+                .is_none()
+        );
+
+        let mut blocked = baseline;
+        blocked.nodes[0].y = 1.0;
+        blocked.nodes[0].height = 1.0;
+        assert!(selected_layout_vertical_track_spacing_candidate(&plan, &blocked, 6.0).is_none());
     }
 
     #[test]

@@ -20,6 +20,9 @@ const MAX_LAYOUT_PARALLEL_WIRE_SPACING_SEGMENTS: usize = 100_000;
 const MAX_LAYOUT_PARALLEL_WIRE_SPACING_VISITS: usize = 20_000_000;
 const MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS: usize = 100_000;
 const MAX_LAYOUT_ROUTE_CONTACT_VISITS: usize = 20_000_000;
+const MIN_VERTICAL_TRACK_SPACING_CONGESTION: f64 = 0.10;
+const MAX_VERTICAL_TRACK_SPACING_CONGESTION_FACTOR: f64 = 0.75;
+const MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR: f64 = 1.10;
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -1046,6 +1049,41 @@ fn layout_indexed(
             && candidate_quality.bends < quality.bends
             && candidate_quality.route_length
                 <= quality.route_length * options.max_quality_route_length_factor
+        {
+            quality = candidate_quality;
+            layout = candidate;
+        }
+    }
+    if quality_effort == QualityEffort::Max
+        && let Some(candidate) = routing::selected_layout_vertical_track_spacing_candidate(
+            &routing_plan,
+            &layout,
+            options.route_lane_gap,
+        )
+    {
+        let candidate_quality = exact_layout_route_quality(&indexed, &candidate);
+        let current_area = layout.width * layout.height;
+        let candidate_area = candidate.width * candidate.height;
+        if routing::route_parallel_congestion(&routing_plan, &layout.edges)
+            .zip(routing::route_parallel_congestion(
+                &routing_plan,
+                &candidate.edges,
+            ))
+            .is_some_and(|(baseline, candidate)| {
+                baseline >= MIN_VERTICAL_TRACK_SPACING_CONGESTION
+                    && candidate <= baseline * MAX_VERTICAL_TRACK_SPACING_CONGESTION_FACTOR
+            })
+            && candidate_area <= current_area * MAX_VERTICAL_TRACK_SPACING_AREA_FACTOR
+            && candidate_quality.crossings == quality.crossings
+            && candidate_quality.bends == quality.bends
+            && candidate_quality.route_length
+                <= quality.route_length * options.max_quality_route_length_factor
+            && candidate_satisfies_hard_geometry_contract(
+                &indexed,
+                &candidate,
+                options,
+                &mut admission_state,
+            )
         {
             quality = candidate_quality;
             layout = candidate;
