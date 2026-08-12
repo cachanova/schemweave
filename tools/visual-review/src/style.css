@@ -4,13 +4,11 @@
   background: #090b0f;
   color: #edf2f8;
   --panel: #11151c;
-  --panel-soft: #151a23;
   --line: #293241;
   --muted: #91a0b5;
   --elk: #66a7ff;
   --schemweave: #39d6a0;
   --warning: #f7c75c;
-  --danger: #ff7c87;
 }
 
 * { box-sizing: border-box; }

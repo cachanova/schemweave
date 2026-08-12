@@ -1,9 +1,10 @@
 # Benchmarks
 
-`crates/schemweave/benches/layout.rs` measures `layout_with_config` and
-`expand_group_in_place` over deterministic synthetic fixtures
-(`benches/support/generators.rs`), across shapes (pipeline, fanout, fanin,
-layered DAG, bus chain), sizes, and all three `QualityEffort` levels.
+`crates/schemweave/benches/layout.rs` measures `layout_with_config`,
+`expand_group_in_place`, and `collapse_group_in_place` over deterministic
+synthetic fixtures (`benches/support/generators.rs`), across shapes (pipeline,
+fanout, fanin, layered DAG, bus chain, expansion, and collapse), sizes, and all
+three `QualityEffort` levels.
 `tests/bench_fixtures.rs` guards generator determinism and fixture validity
 in the normal test suite.
 
@@ -12,6 +13,7 @@ in the normal test suite.
 ```bash
 cargo bench --locked -p schemweave                              # full matrix
 cargo bench --locked -p schemweave --bench layout -- 'layout/dag' # one group
+cargo bench --locked -p schemweave --bench layout -- 'collapse/chain' # collapse group
 cargo bench --locked -p schemweave --bench layout -- --test     # smoke: each bench once
 ```
 

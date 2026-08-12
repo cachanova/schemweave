@@ -3952,7 +3952,9 @@ mod tests {
         };
         let options = LayoutOptions::default();
         let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
-        let layout = crate::layout_with_constraints(&graph, options, &constraints).unwrap();
+        let layout =
+            crate::layout_with_policy(&graph, options, crate::QualityEffort::Quality, &constraints)
+                .unwrap();
 
         let mut permuted = layout.clone();
         permuted.boundary_bundles[0].members.reverse();
@@ -4010,7 +4012,9 @@ mod tests {
         };
         let options = LayoutOptions::default();
         let indexed = validate_and_index_with_constraints(&graph, options, &constraints).unwrap();
-        let layout = crate::layout_with_constraints(&graph, options, &constraints).unwrap();
+        let layout =
+            crate::layout_with_policy(&graph, options, crate::QualityEffort::Quality, &constraints)
+                .unwrap();
         assert_eq!(layout.edges[0].points, layout.edges[1].points);
         assert_eq!(
             verify_preserved_geometry_structure(&indexed, &layout, options),
@@ -4050,9 +4054,13 @@ mod tests {
         let cohort_indexed =
             validate_and_index_with_constraints(&cohort_graph, cohort_options, &cohort_constraints)
                 .unwrap();
-        let cohort_layout =
-            crate::layout_with_constraints(&cohort_graph, cohort_options, &cohort_constraints)
-                .unwrap();
+        let cohort_layout = crate::layout_with_policy(
+            &cohort_graph,
+            cohort_options,
+            crate::QualityEffort::Quality,
+            &cohort_constraints,
+        )
+        .unwrap();
         assert_eq!(
             verify_preserved_geometry_structure(&cohort_indexed, &cohort_layout, cohort_options,),
             Ok(()),

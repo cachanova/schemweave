@@ -27,6 +27,10 @@ the workspace directly or pin a reviewed Git revision:
 schemweave = { git = "https://github.com/cachanova/schemweave", rev = "<commit>" }
 ```
 
+SchemWeave is pre-release software and does not yet guarantee source-compatible
+Rust or WASM APIs between revisions. `LayoutConfig` and `layout_with_config` are
+the canonical native layout entry points.
+
 ```rust
 use schemweave::{
     Edge, Endpoint, Graph, LayoutConfig, Node, Port, PortSide, layout_with_config,
@@ -99,11 +103,19 @@ caching, request supersession, and rendering.
 `expand_group_json` accepts compact graph/layout JSON, expanded graph JSON, and
 expansion metadata. Expansion options may include `protected_groups`, each with
 a stable `id`, retained `members`, and nonnegative `frame_padding`; later local
-reflow treats those active peer groups as atomic keep-out regions. A successful
-call returns either `status: "layout"` or `status: "needs_full_relayout"` with
-`geometry`, `work_limit`, or `preserved_geometry_too_large` as its reason;
-request a normal layout for the latter. Malformed input and other contract
-failures reject with an error.
+reflow treats those active peer groups as atomic keep-out regions.
+
+`collapse_group_json` accepts the expanded graph/layout JSON, the compact graph
+JSON, and the same expansion metadata. It restores the compact anchor and trunk
+identities while preserving unrelated geometry; the space vacated by expanded
+members remains available until a later explicit compaction. Native callers can
+use the corresponding `expand_group_in_place` and `collapse_group_in_place`
+APIs.
+
+Both WASM operations return either `status: "layout"` or
+`status: "needs_full_relayout"` with `geometry`, `work_limit`, or
+`preserved_geometry_too_large` as its reason; request a normal layout for the
+latter. Malformed input and other contract failures reject with an error.
 
 The model is optimized for directed, port-based data-flow. See
 [Architecture](ARCHITECTURE.md) and [Evaluation](EVALUATION.md).

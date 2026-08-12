@@ -52,10 +52,9 @@ export class StagedLayoutRequests {
     this.dispatch(submission)
   }
 
-  supersedeActiveLarge(): boolean {
-    if (!this.active?.large) return false
+  supersedeActiveLarge(): void {
+    if (!this.active?.large) return
     this.cancelActiveLargeRequest()
-    return true
   }
 
   receive(response: WorkerResponse): void {
@@ -96,10 +95,6 @@ export class StagedLayoutRequests {
 
   get hasPending(): boolean {
     return this.pending != null
-  }
-
-  get refining(): boolean {
-    return this.active?.stage === 'waiting-to-refine' || this.active?.stage === 'refining'
   }
 
   private dispatch(submission: LayoutSubmission): void {

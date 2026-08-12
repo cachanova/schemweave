@@ -804,18 +804,6 @@ fn isotonic_projection(targets: &[f64], weights: &[f64]) -> Vec<f64> {
     projected
 }
 
-#[allow(dead_code)]
-pub(crate) fn normalize(nodes: &mut [NodeGeometry], edges: &mut [EdgeGeometry]) -> Layout {
-    let (width, height) = normalize_in_place(nodes, edges);
-    Layout {
-        nodes: nodes.to_vec(),
-        edges: edges.to_vec(),
-        boundary_bundles: Vec::new(),
-        width,
-        height,
-    }
-}
-
 pub(crate) fn normalize_owned(
     mut nodes: Vec<NodeGeometry>,
     mut edges: Vec<EdgeGeometry>,
@@ -882,15 +870,15 @@ pub fn place(
 #[cfg(test)]
 mod tests {
     use super::{
-        Alignment, align_layer, demand_aware_layer_gaps, isotonic_projection, normalize,
-        normalize_owned, place_straight_chain_nodes, preferred_alignment_can_be_significant,
+        Alignment, align_layer, demand_aware_layer_gaps, isotonic_projection,
+        place_straight_chain_nodes, preferred_alignment_can_be_significant,
         preferred_alignment_is_significant, preferred_chain_targets, preferred_edges,
         reserve_boundary_bundle_corridors, reserve_boundary_bundle_vertical_envelopes,
         straight_chain_scale_is_eligible,
     };
     use crate::{
-        BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, EdgeGeometry, Endpoint,
-        Graph, LayoutConstraints, LayoutOptions, Node, NodeGeometry, Point, Port, PortSide, place,
+        BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, Endpoint, Graph,
+        LayoutConstraints, LayoutOptions, Node, NodeGeometry, Port, PortSide, place,
         topology::assign_ranks,
         validation::{validate_and_index, validate_and_index_with_constraints},
     };
@@ -1072,28 +1060,6 @@ mod tests {
         assert_eq!(
             demand_aware_layer_gaps(&indexed, &[0, 2], 3, options),
             vec![72.0, 72.0],
-        );
-    }
-
-    #[test]
-    fn owned_normalization_matches_the_borrowed_api_exactly() {
-        let nodes = vec![NodeGeometry {
-            id: 7,
-            x: -4.0,
-            y: 3.0,
-            width: 20.0,
-            height: 10.0,
-        }];
-        let edges = vec![EdgeGeometry {
-            id: 11,
-            points: vec![Point { x: -8.0, y: -6.0 }, Point { x: 5.0, y: -6.0 }],
-        }];
-        let mut borrowed_nodes = nodes.clone();
-        let mut borrowed_edges = edges.clone();
-
-        assert_eq!(
-            normalize_owned(nodes, edges),
-            normalize(&mut borrowed_nodes, &mut borrowed_edges)
         );
     }
 

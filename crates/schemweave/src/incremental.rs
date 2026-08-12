@@ -9,8 +9,7 @@ use crate::{
     BoundaryBundleMemberConstraint, BoundaryBundleRole, BoundaryBundleSegment,
     ConstrainedLayoutError, Edge, EdgeGeometry, EdgeId, Endpoint, Graph, Layout, LayoutConstraints,
     LayoutError, LayoutOptions, NetId, Node, NodeGeometry, NodeId, Point, Port, PortSide,
-    QualityEffort, boundary_bundles, layout_with_quality_effort_and_constraints, routing,
-    validation,
+    QualityEffort, boundary_bundles, layout_with_policy, routing, validation,
 };
 
 const MAX_EXPANSION_MEMBERS: usize = 4_096;
@@ -636,7 +635,7 @@ pub fn expand_group_in_place_with_reference_height(
             .collect(),
         boundary_bundles: Vec::new(),
     };
-    let member_layout = layout_with_quality_effort_and_constraints(
+    let member_layout = layout_with_policy(
         &member_graph,
         options.layout,
         options.quality_effort,
@@ -5244,10 +5243,30 @@ mod tests {
         obstacle_safe_bridge, path_is_clear, protected_group_plan,
     };
     use crate::{
-        BoundaryBundleConstraint, BoundaryBundleMemberConstraint, Edge, EdgeGeometry, Endpoint,
-        Graph, Layout, LayoutConstraints, LayoutError, LayoutOptions, Node, NodeGeometry, Point,
-        Port, PortSide, QualityEffort, layout, layout_with_constraints,
+        BoundaryBundleConstraint, BoundaryBundleMemberConstraint, ConstrainedLayoutError, Edge,
+        EdgeGeometry, Endpoint, Graph, Layout, LayoutConstraints, LayoutError, LayoutOptions, Node,
+        NodeGeometry, Point, Port, PortSide, QualityEffort, layout_with_policy,
     };
+
+    fn layout_graph(
+        graph: &Graph,
+        options: LayoutOptions,
+    ) -> Result<Layout, ConstrainedLayoutError> {
+        layout_with_policy(
+            graph,
+            options,
+            QualityEffort::Quality,
+            &LayoutConstraints::default(),
+        )
+    }
+
+    fn layout_graph_with_constraints(
+        graph: &Graph,
+        options: LayoutOptions,
+        constraints: &LayoutConstraints,
+    ) -> Result<Layout, ConstrainedLayoutError> {
+        layout_with_policy(graph, options, QualityEffort::Quality, constraints)
+    }
 
     fn node(id: u32) -> Node {
         Node {
@@ -5592,7 +5611,7 @@ mod tests {
     #[test]
     fn protected_group_contract_rejects_ambiguous_or_non_retained_members() {
         let (compact, expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let run = |protected_groups| {
             expand_group_in_place(
                 &compact,
@@ -5729,7 +5748,7 @@ mod tests {
     #[test]
     fn protected_group_member_order_does_not_change_expansion_geometry() {
         let (compact, expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let expected = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -5817,7 +5836,7 @@ mod tests {
                 },
             ],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let run = |expanded: &Graph, expansion: &GroupExpansion| {
             expand_group_in_place(
                 &compact,
@@ -5847,7 +5866,7 @@ mod tests {
     #[test]
     fn invalid_retained_layout_bounds_request_full_relayout() {
         let (compact, expanded, expansion) = fixture();
-        let mut compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let mut compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         compact_layout.width = 0.0;
         assert_eq!(
             expand_group_in_place(
@@ -5860,7 +5879,7 @@ mod tests {
             Err(GroupExpansionError::NeedsFullRelayout),
         );
 
-        let mut expanded_layout = layout(&expanded, LayoutOptions::default()).unwrap();
+        let mut expanded_layout = layout_graph(&expanded, LayoutOptions::default()).unwrap();
         expanded_layout.height = 0.0;
         assert_eq!(
             collapse_group_in_place(
@@ -5877,7 +5896,7 @@ mod tests {
     #[test]
     fn expansion_preserves_retained_geometry_and_reuses_trunks() {
         let (compact, expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let result = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -5947,7 +5966,7 @@ mod tests {
     #[test]
     fn collapse_restores_anchor_without_moving_retained_geometry() {
         let (compact, expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let expanded_layout = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -5998,7 +6017,7 @@ mod tests {
     #[test]
     fn collapse_is_deterministic_across_graph_and_contract_permutations() {
         let (compact, expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let expanded_layout = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -6132,7 +6151,7 @@ mod tests {
             quality_effort: QualityEffort::Max,
             ..GroupExpansionOptions::default()
         };
-        let base_layout = layout(&base, LayoutOptions::default()).unwrap();
+        let base_layout = layout_graph(&base, LayoutOptions::default()).unwrap();
         let layout_a =
             expand_group_in_place(&base, &base_layout, &expanded_a, &group_a, &options).unwrap();
         let layout_both =
@@ -6189,7 +6208,7 @@ mod tests {
                 edge(14, 3, 5, 201),
             ],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let compact_anchor = compact_layout
             .nodes
             .iter()
@@ -6279,7 +6298,7 @@ mod tests {
                 edge(4, 30, 40, 400),
             ],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let compact_nodes = compact_layout
             .nodes
             .iter()
@@ -6409,7 +6428,7 @@ mod tests {
                 edge(4, 30, 40, 400),
             ],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let result = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -6489,7 +6508,7 @@ mod tests {
             edge_node_clearance: 20.0,
             ..LayoutOptions::default()
         };
-        let compact_layout = layout(&compact, options).unwrap();
+        let compact_layout = layout_graph(&compact, options).unwrap();
         let result = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -6516,7 +6535,7 @@ mod tests {
             minimum_parallel_wire_spacing: 6.0,
             ..LayoutOptions::default()
         };
-        let compact_layout = layout(&compact, options).unwrap();
+        let compact_layout = layout_graph(&compact, options).unwrap();
         let result = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -6576,7 +6595,7 @@ mod tests {
             ..LayoutOptions::default()
         };
         let compact_layout =
-            layout_with_constraints(&compact, options, &compact_constraints).unwrap();
+            layout_graph_with_constraints(&compact, options, &compact_constraints).unwrap();
         let result = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -6669,7 +6688,7 @@ mod tests {
         };
         let options = LayoutOptions::default();
         let mut compact_layout =
-            layout_with_constraints(&compact, options, &compact_constraints).unwrap();
+            layout_graph_with_constraints(&compact, options, &compact_constraints).unwrap();
         compact_layout.boundary_bundles[0].members[0].tap.x += 1.0;
         compact_layout
             .edges
@@ -6741,7 +6760,7 @@ mod tests {
         };
         let options = LayoutOptions::default();
         let compact_layout =
-            layout_with_constraints(&compact, options, &compact_constraints).unwrap();
+            layout_graph_with_constraints(&compact, options, &compact_constraints).unwrap();
         let expansion = GroupExpansion {
             anchor: 10,
             members: vec![2, 3],
@@ -6891,7 +6910,7 @@ mod tests {
             ..LayoutOptions::default()
         };
         let compact_layout =
-            layout_with_constraints(&compact, options, &compact_constraints).unwrap();
+            layout_graph_with_constraints(&compact, options, &compact_constraints).unwrap();
         let compact_layout: Layout =
             serde_json::from_str(&serde_json::to_string(&compact_layout).unwrap()).unwrap();
         let result = expand_group_in_place(
@@ -6999,7 +7018,7 @@ mod tests {
             ..LayoutOptions::default()
         };
         let compact_layout =
-            layout_with_constraints(&compact, options, &compact_constraints).unwrap();
+            layout_graph_with_constraints(&compact, options, &compact_constraints).unwrap();
         let result = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -7109,7 +7128,7 @@ mod tests {
         };
         let options = LayoutOptions::default();
         let compact_layout =
-            layout_with_constraints(&compact, options, &compact_constraints).unwrap();
+            layout_graph_with_constraints(&compact, options, &compact_constraints).unwrap();
         let expansion = GroupExpansion {
             anchor: 10,
             members: vec![2, 3],
@@ -7228,7 +7247,7 @@ mod tests {
             minimum_parallel_wire_spacing: 6.0,
             ..LayoutOptions::default()
         };
-        let compact_layout = layout_with_constraints(
+        let compact_layout = layout_graph_with_constraints(
             &compact,
             options,
             &LayoutConstraints {
@@ -7286,7 +7305,7 @@ mod tests {
     #[test]
     fn expansion_is_deterministic_across_graph_and_member_permutations() {
         let (compact, expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let expected = expand_group_in_place(
             &compact,
             &compact_layout,
@@ -7334,7 +7353,7 @@ mod tests {
     #[test]
     fn expansion_rejects_changed_retained_semantics() {
         let (compact, mut expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         expanded
             .nodes
             .iter_mut()
@@ -7385,7 +7404,7 @@ mod tests {
             nodes: vec![node(1), node(2), node(3)],
             edges: vec![edge(11, 1, 2, 100), edge(12, 1, 3, 100)],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let expansion = GroupExpansion {
             anchor: 10,
             members: vec![2, 3],
@@ -7420,7 +7439,7 @@ mod tests {
         expansion
             .boundary_trunks
             .retain(|mapping| mapping.expanded_edge != 13);
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
 
         assert_eq!(
             expand_group_in_place(
@@ -7448,7 +7467,7 @@ mod tests {
                 edge(13, 3, 4, 200),
             ],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let compact_output = compact_layout
             .nodes
             .iter()
@@ -7552,7 +7571,7 @@ mod tests {
             nodes: vec![node(1), node(2), node(3), node(9)],
             edges: vec![edge(11, 1, 2, 101), edge(12, 1, 3, 102), edge(3, 1, 9, 300)],
         };
-        let compact_layout = layout_with_constraints(
+        let compact_layout = layout_graph_with_constraints(
             &compact,
             LayoutOptions::default(),
             &crate::LayoutConstraints {
@@ -7613,7 +7632,7 @@ mod tests {
             nodes: vec![node(1), node(2), node(3), node(9)],
             edges: vec![edge(11, 2, 9, 101), edge(12, 3, 9, 102), edge(3, 1, 9, 300)],
         };
-        let compact_layout = layout_with_constraints(
+        let compact_layout = layout_graph_with_constraints(
             &compact,
             LayoutOptions::default(),
             &crate::LayoutConstraints {
@@ -7678,7 +7697,7 @@ mod tests {
                 edge(3, 8, 9, 300),
             ],
         };
-        let mut compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let mut compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let retained_x = compact_layout.width + 100.0;
         let retained_non_output = compact_layout
             .nodes
@@ -7807,7 +7826,7 @@ mod tests {
     #[test]
     fn invalid_expansion_constraints_surface_before_layout() {
         let (compact, expanded, expansion) = fixture();
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
 
         assert_eq!(
             expand_group_in_place(
@@ -7838,7 +7857,7 @@ mod tests {
     #[test]
     fn compact_routes_must_leave_and_enter_ports_outward() {
         let (compact, expanded, expansion) = fixture();
-        let mut compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let mut compact_layout = layout_graph(&compact, LayoutOptions::default()).unwrap();
         let route = compact_layout
             .edges
             .iter_mut()
@@ -7961,7 +7980,7 @@ mod tests {
             nodes: (1..=64).map(node).collect(),
             edges: Vec::new(),
         };
-        let ordinary = layout(&graph, LayoutOptions::default()).unwrap();
+        let ordinary = layout_graph(&graph, LayoutOptions::default()).unwrap();
         let packed = arrange_member_components(
             &graph,
             &ordinary,
@@ -7987,7 +8006,7 @@ mod tests {
 
         let mut permuted = graph.clone();
         permuted.nodes.reverse();
-        let permuted_layout = layout(&permuted, LayoutOptions::default()).unwrap();
+        let permuted_layout = layout_graph(&permuted, LayoutOptions::default()).unwrap();
         assert_eq!(
             arrange_member_components(
                 &permuted,

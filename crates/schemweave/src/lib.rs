@@ -524,32 +524,7 @@ pub enum ConstrainedLayoutError {
     ExpandedGroup(#[from] ExpandedGroupLayoutError),
 }
 
-/// Lay out a graph. Output ordering depends only on stable identifiers, not input order.
-pub fn layout(graph: &Graph, options: LayoutOptions) -> Result<Layout, LayoutError> {
-    layout_with_quality_effort(graph, options, QualityEffort::Quality)
-}
-
-/// Lay out a graph with explicit primary boundary constraints.
-pub fn layout_with_constraints(
-    graph: &Graph,
-    options: LayoutOptions,
-    constraints: &LayoutConstraints,
-) -> Result<Layout, ConstrainedLayoutError> {
-    layout_with_quality_effort_and_constraints(graph, options, QualityEffort::Quality, constraints)
-}
-
-/// Lay out a graph with an explicit quality-versus-latency policy.
-pub fn layout_with_quality_effort(
-    graph: &Graph,
-    options: LayoutOptions,
-    quality_effort: QualityEffort,
-) -> Result<Layout, LayoutError> {
-    let indexed = validation::validate_and_index(graph, options)?;
-    layout_indexed(graph, options, quality_effort, indexed)
-}
-
-/// Lay out a graph with explicit boundary constraints and quality policy.
-pub fn layout_with_quality_effort_and_constraints(
+pub(crate) fn layout_with_policy(
     graph: &Graph,
     options: LayoutOptions,
     quality_effort: QualityEffort,
@@ -564,7 +539,7 @@ pub fn layout_with_config(
     graph: &Graph,
     config: &LayoutConfig,
 ) -> Result<Layout, ConstrainedLayoutError> {
-    let layout = layout_with_quality_effort_and_constraints(
+    let layout = layout_with_policy(
         graph,
         config.layout,
         config.quality_effort,
@@ -1774,20 +1749,54 @@ fn candidate_bend_concentration(layout: &Layout) -> BendConcentration {
 mod tests {
     use super::{
         AdmittedCandidate, BoundaryBundleConstraint, BoundaryBundleMemberConstraint,
-        CandidateAdmissionState, CandidateRouting, Edge, EdgeGeometry, EdgeId, Endpoint, Graph,
-        Layout, LayoutConstraints, LayoutError, LayoutOptions, MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS,
-        MAX_LAYOUT_ROUTE_CONTACT_VISITS, Node, NodeGeometry, Point, Port, PortSide, QualityEffort,
-        boundary_bundle_rail_depth, candidate_quality_cmp,
+        CandidateAdmissionState, CandidateRouting, ConstrainedLayoutError, Edge, EdgeGeometry,
+        EdgeId, Endpoint, Graph, Layout, LayoutConstraints, LayoutError, LayoutOptions,
+        MAX_LAYOUT_ROUTE_CONTACT_SEGMENTS, MAX_LAYOUT_ROUTE_CONTACT_VISITS, Node, NodeGeometry,
+        Point, Port, PortSide, QualityEffort, boundary_bundle_rail_depth, candidate_quality_cmp,
         candidate_satisfies_edge_node_clearance_bounded, composite_pitched_quality_is_admissible,
         demand_aware_quality_is_better, demand_aware_scale_is_eligible, effective_layout_options,
         effective_ranking_edges, evaluate_candidate, full_family_pitched_spacing_enabled,
-        hard_geometry_failure, layout, outward_obstacle_clearance_stub, placement,
+        hard_geometry_failure, layout_with_policy, outward_obstacle_clearance_stub, placement,
         record_boundary_bundle_application_error, retain_better_admitted_candidate,
         retain_better_candidate, retain_owned_candidate, retain_owned_candidate_unchecked, routing,
         routing::RouteQuality, straight_chain_cost_is_bounded,
         straight_chain_large_gain_is_significant, topology, validation,
         vertical_track_spacing_quality_is_admissible,
     };
+
+    fn layout_graph(
+        graph: &Graph,
+        options: LayoutOptions,
+    ) -> Result<Layout, ConstrainedLayoutError> {
+        layout_with_policy(
+            graph,
+            options,
+            QualityEffort::Quality,
+            &LayoutConstraints::default(),
+        )
+    }
+
+    fn layout_graph_with_effort(
+        graph: &Graph,
+        options: LayoutOptions,
+        quality_effort: QualityEffort,
+    ) -> Result<Layout, ConstrainedLayoutError> {
+        layout_with_policy(
+            graph,
+            options,
+            quality_effort,
+            &LayoutConstraints::default(),
+        )
+    }
+
+    fn layout_graph_with_effort_and_constraints(
+        graph: &Graph,
+        options: LayoutOptions,
+        quality_effort: QualityEffort,
+        constraints: &LayoutConstraints,
+    ) -> Result<Layout, ConstrainedLayoutError> {
+        layout_with_policy(graph, options, quality_effort, constraints)
+    }
 
     mod active_fanout_fixture {
         use crate as schemweave;
@@ -2959,16 +2968,16 @@ mod tests {
         assert_eq!(routed.alternatives.len(), 1);
         let (candidate_quality, candidate_edges) = &routed.alternatives[0];
         assert!(candidate_quality.crossings < routed.primary_quality.unwrap().crossings);
-        let mut candidate_nodes = ordinary;
-        let mut candidate_edges = candidate_edges.clone();
-        let candidate_layout = placement::normalize(&mut candidate_nodes, &mut candidate_edges);
+        let candidate_nodes = ordinary;
+        let candidate_edges = candidate_edges.clone();
+        let candidate_layout = placement::normalize_owned(candidate_nodes, candidate_edges);
 
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         assert_eq!(selected, candidate_layout);
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
     }
 
     #[test]
@@ -2980,20 +2989,20 @@ mod tests {
         let (candidate_quality, candidate_edges) = &routed.alternatives[0];
         let primary_quality = routed.primary_quality.unwrap();
         assert!(candidate_quality.crossings > primary_quality.crossings);
-        let mut primary_nodes = ordinary.clone();
-        let mut primary_edges = routed.primary;
-        let primary_layout = placement::normalize(&mut primary_nodes, &mut primary_edges);
-        let mut candidate_nodes = ordinary;
-        let mut candidate_edges = candidate_edges.clone();
-        let candidate_layout = placement::normalize(&mut candidate_nodes, &mut candidate_edges);
+        let primary_nodes = ordinary.clone();
+        let primary_edges = routed.primary;
+        let primary_layout = placement::normalize_owned(primary_nodes, primary_edges);
+        let candidate_nodes = ordinary;
+        let candidate_edges = candidate_edges.clone();
+        let candidate_layout = placement::normalize_owned(candidate_nodes, candidate_edges);
 
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         assert_eq!(selected, primary_layout);
         assert_ne!(selected, candidate_layout);
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
     }
 
     fn net_representative_graph() -> Graph {
@@ -3287,14 +3296,13 @@ mod tests {
             "ordinary={ordinary_alignment} preferred={preferred_alignment}"
         );
         let evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool| {
-            let mut edges = if supplemental {
+            let edges = if supplemental {
                 routing::route_supplemental_edges(&indexed, &nodes, &ranks, options)
             } else {
                 routing::route_edges(&indexed, &nodes, &ranks, options)
             };
             let quality = routing::route_quality(&indexed, &edges);
-            let mut nodes = nodes;
-            let layout = placement::normalize(&mut nodes, &mut edges);
+            let layout = placement::normalize_owned(nodes, edges);
             (quality, layout)
         };
         let ordinary = evaluate(ordinary, false);
@@ -3323,12 +3331,12 @@ mod tests {
         );
         assert!(straight_routes(&straight_chain.1) > straight_routes(&preferred.1));
 
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         assert_eq!(selected, straight_chain.1);
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
     }
 
     #[test]
@@ -3369,14 +3377,14 @@ mod tests {
 
         assert!(admission.contact_satisfied);
         assert!(admission.clearance_satisfied);
-        assert_eq!(layout(&graph, requested).unwrap(), expected);
+        assert_eq!(layout_graph(&graph, requested).unwrap(), expected);
         let mut permuted = graph;
         permuted.nodes.reverse();
         for node in &mut permuted.nodes {
             node.ports.reverse();
         }
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, requested).unwrap(), expected);
+        assert_eq!(layout_graph(&permuted, requested).unwrap(), expected);
     }
 
     #[test]
@@ -3575,7 +3583,7 @@ mod tests {
             retain_owned_candidate_unchecked(&mut best_chain, quality, chain.clone(), edges);
         }
         let best_chain = best_chain.unwrap();
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         let selected_quality = routing::route_quality(&indexed, &selected.edges);
 
         assert!(
@@ -3586,7 +3594,7 @@ mod tests {
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
     }
 
     #[test]
@@ -3612,17 +3620,14 @@ mod tests {
         assert!(routed.fanout_trace.evaluated, "{:#?}", routed.fanout_trace);
         assert!(routed.fanout_trace.selected, "{:#?}", routed.fanout_trace);
         let mut adaptive_layouts = Vec::new();
-        let mut candidate_nodes = preferred.clone();
-        let mut candidate_edges = routed.primary;
-        adaptive_layouts.push(placement::normalize(
-            &mut candidate_nodes,
-            &mut candidate_edges,
-        ));
-        if let Some((_, mut repair)) = routed.repair {
-            let mut candidate_nodes = preferred.clone();
-            adaptive_layouts.push(placement::normalize(&mut candidate_nodes, &mut repair));
+        let candidate_nodes = preferred.clone();
+        let candidate_edges = routed.primary;
+        adaptive_layouts.push(placement::normalize_owned(candidate_nodes, candidate_edges));
+        if let Some((_, repair)) = routed.repair {
+            let candidate_nodes = preferred.clone();
+            adaptive_layouts.push(placement::normalize_owned(candidate_nodes, repair));
         }
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         assert!(
             adaptive_layouts.contains(&selected),
             "public layout did not retain the active adaptive family"
@@ -3656,18 +3661,18 @@ mod tests {
         assert!(baseline_crossings - alternative_crossings >= baseline_crossings.div_ceil(100));
 
         let evaluate = |ranks: &[usize], layers: &[Vec<usize>], baseline| {
-            let mut nodes = if baseline {
+            let nodes = if baseline {
                 placement::place_baseline_nodes(&indexed, ranks, layers, options)
             } else {
                 placement::place_nodes(&indexed, ranks, layers, options)
             };
             let plan = routing::RoutingPlan::new(&indexed, ranks);
-            let mut edges = routing::route_planned_candidates_with_quality_options(
+            let edges = routing::route_planned_candidates_with_quality_options(
                 &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
             let quality = routing::route_quality(&indexed, &edges);
-            let layout = placement::normalize(&mut nodes, &mut edges);
+            let layout = placement::normalize_owned(nodes, edges);
             (quality, layout)
         };
         let baseline = evaluate(&ranks, &forward.layers, true);
@@ -3689,10 +3694,9 @@ mod tests {
             .is_lt()
         );
 
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         assert_eq!(selected, alternative.1);
-        let max_selected =
-            super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+        let max_selected = layout_graph_with_effort(&graph, options, QualityEffort::Max).unwrap();
         assert_eq!(
             max_selected, alternative.1,
             "Max must retain the winning alternative-rank plan without a primary-rank post-pass",
@@ -3702,14 +3706,20 @@ mod tests {
             ordering_sweeps: 0,
             ..options
         };
-        let zero_sweep_selected = layout(&graph, zero_sweeps).unwrap();
-        assert_eq!(layout(&graph, zero_sweeps).unwrap(), zero_sweep_selected);
+        let zero_sweep_selected = layout_graph(&graph, zero_sweeps).unwrap();
+        assert_eq!(
+            layout_graph(&graph, zero_sweeps).unwrap(),
+            zero_sweep_selected
+        );
 
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, options).unwrap(), selected);
-        assert_eq!(layout(&permuted, zero_sweeps).unwrap(), zero_sweep_selected);
+        assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
+        assert_eq!(
+            layout_graph(&permuted, zero_sweeps).unwrap(),
+            zero_sweep_selected
+        );
     }
 
     #[test]
@@ -3746,14 +3756,14 @@ mod tests {
         let alternative = alternative.unwrap();
         assert!(alternative.crossings < forward.crossings.min(reverse.crossings));
 
-        let evaluate = |mut nodes: Vec<NodeGeometry>| {
+        let evaluate = |nodes: Vec<NodeGeometry>| {
             let plan = routing::RoutingPlan::new(&indexed, &ranks);
-            let mut edges = routing::route_planned_candidates_with_quality_options(
+            let edges = routing::route_planned_candidates_with_quality_options(
                 &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
             let quality = routing::route_quality(&indexed, &edges);
-            let layout = placement::normalize(&mut nodes, &mut edges);
+            let layout = placement::normalize_owned(nodes, edges);
             (quality, layout)
         };
         let baseline = evaluate(placement::place_baseline_nodes(
@@ -3790,13 +3800,13 @@ mod tests {
             .is_lt()
         );
 
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         assert_eq!(selected, alternative.1);
 
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
     }
 
     #[test]
@@ -4010,14 +4020,14 @@ mod tests {
         let net_representative = net_representative.unwrap();
         assert_ne!(net_representative.layers, *quality_layers);
 
-        let evaluate = |mut nodes: Vec<NodeGeometry>| {
+        let evaluate = |nodes: Vec<NodeGeometry>| {
             let plan = routing::RoutingPlan::new(&indexed, &ranks);
-            let mut edges = routing::route_planned_candidates_with_quality_options(
+            let edges = routing::route_planned_candidates_with_quality_options(
                 &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
             let quality = routing::route_quality(&indexed, &edges);
-            let layout = placement::normalize(&mut nodes, &mut edges);
+            let layout = placement::normalize_owned(nodes, edges);
             (quality, layout)
         };
         let baseline = evaluate(placement::place_baseline_nodes(
@@ -4054,24 +4064,23 @@ mod tests {
             .is_lt()
         );
 
-        let selected = layout(&graph, options).unwrap();
+        let selected = layout_graph(&graph, options).unwrap();
         assert_eq!(selected, net_representative.1);
 
         let mut permuted = graph;
         permuted.nodes.reverse();
         permuted.edges.reverse();
-        assert_eq!(layout(&permuted, options).unwrap(), selected);
+        assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
     }
 
     #[test]
     fn quality_effort_controls_the_admitted_public_layout_deterministically() {
         let graph = net_representative_graph_with_padding(600, 81);
         let options = LayoutOptions::default();
-        let fast = super::layout_with_quality_effort(&graph, options, QualityEffort::Fast).unwrap();
-        let quality =
-            super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
-        let max = super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
-        assert_eq!(layout(&graph, options).unwrap(), quality);
+        let fast = layout_graph_with_effort(&graph, options, QualityEffort::Fast).unwrap();
+        let quality = layout_graph_with_effort(&graph, options, QualityEffort::Quality).unwrap();
+        let max = layout_graph_with_effort(&graph, options, QualityEffort::Max).unwrap();
+        assert_eq!(layout_graph(&graph, options).unwrap(), quality);
         let indexed = validation::validate_and_index(&graph, options).unwrap();
         let fast_quality = routing::route_quality(&indexed, &fast.edges);
         let quality_quality = routing::route_quality(&indexed, &quality.edges);
@@ -4085,15 +4094,15 @@ mod tests {
         permuted.nodes.reverse();
         permuted.edges.reverse();
         assert_eq!(
-            super::layout_with_quality_effort(&permuted, options, QualityEffort::Fast).unwrap(),
+            layout_graph_with_effort(&permuted, options, QualityEffort::Fast).unwrap(),
             fast
         );
         assert_eq!(
-            super::layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
+            layout_graph_with_effort(&permuted, options, QualityEffort::Quality).unwrap(),
             quality
         );
         assert_eq!(
-            super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
+            layout_graph_with_effort(&permuted, options, QualityEffort::Max).unwrap(),
             max
         );
     }
@@ -4127,9 +4136,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [22_315, 21_959, 22_044]
         );
-        let quality =
-            super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
-        let max = super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+        let quality = layout_graph_with_effort(&graph, options, QualityEffort::Quality).unwrap();
+        let max = layout_graph_with_effort(&graph, options, QualityEffort::Max).unwrap();
 
         assert_eq!(
             routing::route_quality(&indexed, &quality.edges).crossings,
@@ -4144,7 +4152,7 @@ mod tests {
         permuted.nodes.reverse();
         permuted.edges.reverse();
         assert_eq!(
-            super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
+            layout_graph_with_effort(&permuted, options, QualityEffort::Max).unwrap(),
             max
         );
     }
@@ -4203,9 +4211,8 @@ mod tests {
         }
         let graph = Graph { nodes, edges };
         let options = LayoutOptions::default();
-        let quality =
-            super::layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
-        let max = super::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+        let quality = layout_graph_with_effort(&graph, options, QualityEffort::Quality).unwrap();
+        let max = layout_graph_with_effort(&graph, options, QualityEffort::Max).unwrap();
         let indexed = validation::validate_and_index(&graph, options).unwrap();
         let quality_score = routing::route_quality(&indexed, &quality.edges);
         let max_score = routing::route_quality(&indexed, &max.edges);
@@ -4218,7 +4225,7 @@ mod tests {
         permuted.nodes.reverse();
         permuted.edges.reverse();
         assert_eq!(
-            super::layout_with_quality_effort(&permuted, options, QualityEffort::Max).unwrap(),
+            layout_graph_with_effort(&permuted, options, QualityEffort::Max).unwrap(),
             max
         );
     }
@@ -4288,14 +4295,14 @@ mod tests {
                 }],
             }],
         };
-        let quality = super::layout_with_quality_effort_and_constraints(
+        let quality = layout_graph_with_effort_and_constraints(
             &graph,
             options,
             QualityEffort::Quality,
             &constraints,
         )
         .unwrap();
-        let max = super::layout_with_quality_effort_and_constraints(
+        let max = layout_graph_with_effort_and_constraints(
             &graph,
             options,
             QualityEffort::Max,

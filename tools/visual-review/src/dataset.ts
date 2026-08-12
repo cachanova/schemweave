@@ -2,7 +2,6 @@ import { buildGraph } from './graph'
 import type { Corpus, ElkRows, Fixture, SchemWeaveGraph } from './types'
 
 export interface PreparedDataset {
-  corpus: Corpus
   fixtures: Fixture[]
   elkByName: Map<string, ElkRows['rows'][number]>
   graphByName: Map<string, SchemWeaveGraph>
@@ -32,7 +31,6 @@ export function prepareDataset(corpus: Corpus, elk: ElkRows): PreparedDataset {
   }
 
   return {
-    corpus,
     fixtures: corpus.fixtures,
     elkByName,
     graphByName,

@@ -20,7 +20,7 @@ it('returns Fast first, then requests only the selected Quality refinement after
 
   harness.requests.receive(result(initial, 'fast', 'fast', false))
   expect(harness.results.map((response) => response.phase)).toEqual(['fast'])
-  expect(harness.requests.refining).toBe(true)
+  expect(harness.sent).toEqual([initial])
 
   vi.advanceTimersByTime(REFINE_QUIESCENCE_MS - 1)
   expect(harness.sent).toHaveLength(1)
