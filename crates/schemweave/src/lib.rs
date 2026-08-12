@@ -3296,7 +3296,7 @@ mod tests {
             "ordinary={ordinary_alignment} preferred={preferred_alignment}"
         );
         let evaluate = |nodes: Vec<NodeGeometry>, supplemental: bool| {
-            let mut edges = if supplemental {
+            let edges = if supplemental {
                 routing::route_supplemental_edges(&indexed, &nodes, &ranks, options)
             } else {
                 routing::route_edges(&indexed, &nodes, &ranks, options)
@@ -3661,13 +3661,13 @@ mod tests {
         assert!(baseline_crossings - alternative_crossings >= baseline_crossings.div_ceil(100));
 
         let evaluate = |ranks: &[usize], layers: &[Vec<usize>], baseline| {
-            let mut nodes = if baseline {
+            let nodes = if baseline {
                 placement::place_baseline_nodes(&indexed, ranks, layers, options)
             } else {
                 placement::place_nodes(&indexed, ranks, layers, options)
             };
             let plan = routing::RoutingPlan::new(&indexed, ranks);
-            let mut edges = routing::route_planned_candidates_with_quality_options(
+            let edges = routing::route_planned_candidates_with_quality_options(
                 &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
@@ -3756,9 +3756,9 @@ mod tests {
         let alternative = alternative.unwrap();
         assert!(alternative.crossings < forward.crossings.min(reverse.crossings));
 
-        let evaluate = |mut nodes: Vec<NodeGeometry>| {
+        let evaluate = |nodes: Vec<NodeGeometry>| {
             let plan = routing::RoutingPlan::new(&indexed, &ranks);
-            let mut edges = routing::route_planned_candidates_with_quality_options(
+            let edges = routing::route_planned_candidates_with_quality_options(
                 &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
@@ -4020,9 +4020,9 @@ mod tests {
         let net_representative = net_representative.unwrap();
         assert_ne!(net_representative.layers, *quality_layers);
 
-        let evaluate = |mut nodes: Vec<NodeGeometry>| {
+        let evaluate = |nodes: Vec<NodeGeometry>| {
             let plan = routing::RoutingPlan::new(&indexed, &ranks);
-            let mut edges = routing::route_planned_candidates_with_quality_options(
+            let edges = routing::route_planned_candidates_with_quality_options(
                 &plan, &nodes, options, false, false, false, false, true, false,
             )
             .primary;
