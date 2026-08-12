@@ -2,10 +2,55 @@ use schemweave::{
     BoundaryBundleConstraint, BoundaryBundleGeometry, BoundaryBundleMemberConstraint,
     BoundaryBundleRole, BoundaryBundleSegment, BoundaryTrunk, Edge, EdgeGeometry, Endpoint, Graph,
     GroupExpansion, GroupExpansionOptions, Layout, LayoutConfig, LayoutConstraints, LayoutOptions,
-    Node, NodeGeometry, Point, Port, PortSide, QualityEffort, expand_group_in_place, layout,
-    layout_with_config, layout_with_quality_effort, layout_with_quality_effort_and_constraints,
+    Node, NodeGeometry, Point, Port, PortSide, QualityEffort, expand_group_in_place,
+    layout_with_config,
 };
 use schemweave_eval::{QualityReport, ScoreOptions, ViolationKind, score};
+
+fn layout_graph(
+    graph: &Graph,
+    options: LayoutOptions,
+) -> Result<Layout, schemweave::ConstrainedLayoutError> {
+    layout_with_config(
+        graph,
+        &LayoutConfig {
+            layout: options,
+            ..LayoutConfig::default()
+        },
+    )
+}
+
+fn layout_graph_with_effort(
+    graph: &Graph,
+    options: LayoutOptions,
+    quality_effort: QualityEffort,
+) -> Result<Layout, schemweave::ConstrainedLayoutError> {
+    layout_with_config(
+        graph,
+        &LayoutConfig {
+            layout: options,
+            quality_effort,
+            ..LayoutConfig::default()
+        },
+    )
+}
+
+fn layout_graph_with_effort_and_constraints(
+    graph: &Graph,
+    options: LayoutOptions,
+    quality_effort: QualityEffort,
+    constraints: &LayoutConstraints,
+) -> Result<Layout, schemweave::ConstrainedLayoutError> {
+    layout_with_config(
+        graph,
+        &LayoutConfig {
+            layout: options,
+            quality_effort,
+            constraints: constraints.clone(),
+            ..LayoutConfig::default()
+        },
+    )
+}
 
 mod active_fanout_fixture {
     include!(concat!(
@@ -277,7 +322,7 @@ fn incremental_group_expansion_preserves_every_hard_gate() {
         edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
     };
     let options = LayoutOptions::default();
-    let compact_layout = layout(&compact, options).unwrap();
+    let compact_layout = layout_graph(&compact, options).unwrap();
     let members = (1_000..1_032).collect::<Vec<_>>();
     let mut nodes = vec![node(1), node(4)];
     nodes.extend(members.iter().copied().map(node));
@@ -721,9 +766,9 @@ fn quality_effort_selects_the_exact_scored_adaptive_gap_tracks() {
         ],
     };
     let options = LayoutOptions::default();
-    let fast = layout_with_quality_effort(&graph, options, QualityEffort::Fast).unwrap();
-    let quality = layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
-    let max = layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+    let fast = layout_graph_with_effort(&graph, options, QualityEffort::Fast).unwrap();
+    let quality = layout_graph_with_effort(&graph, options, QualityEffort::Quality).unwrap();
+    let max = layout_graph_with_effort(&graph, options, QualityEffort::Max).unwrap();
     let fast_report = score(&graph, &fast, ScoreOptions::default());
     let quality_report = score(&graph, &quality, ScoreOptions::default());
 
@@ -752,7 +797,7 @@ fn quality_effort_selects_the_exact_scored_adaptive_gap_tracks() {
     permuted.nodes.reverse();
     permuted.edges.reverse();
     assert_eq!(
-        layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
+        layout_graph_with_effort(&permuted, options, QualityEffort::Quality).unwrap(),
         quality
     );
 }
@@ -800,8 +845,8 @@ fn quality_spreads_a_dense_small_gap_across_the_full_safe_channel() {
             .collect(),
     };
     let options = LayoutOptions::default();
-    let fast = layout_with_quality_effort(&graph, options, QualityEffort::Fast).unwrap();
-    let quality = layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
+    let fast = layout_graph_with_effort(&graph, options, QualityEffort::Fast).unwrap();
+    let quality = layout_graph_with_effort(&graph, options, QualityEffort::Quality).unwrap();
     let fast_report = score(&graph, &fast, ScoreOptions::default());
     let quality_report = score(&graph, &quality, ScoreOptions::default());
     assert!(fast_report.passes_hard_gates(), "{fast_report:#?}");
@@ -828,9 +873,8 @@ fn quality_spreads_a_dense_small_gap_across_the_full_safe_channel() {
         cycle_breaker: false,
         ports: Vec::new(),
     }));
-    let bounded =
-        layout_with_quality_effort(&large_graph, options, QualityEffort::Quality).unwrap();
-    let maximum = layout_with_quality_effort(&large_graph, options, QualityEffort::Max).unwrap();
+    let bounded = layout_graph_with_effort(&large_graph, options, QualityEffort::Quality).unwrap();
+    let maximum = layout_graph_with_effort(&large_graph, options, QualityEffort::Max).unwrap();
     let bounded_report = score(&large_graph, &bounded, ScoreOptions::default());
     let maximum_report = score(&large_graph, &maximum, ScoreOptions::default());
     assert!(bounded_report.passes_hard_gates(), "{bounded_report:#?}");
@@ -866,14 +910,14 @@ fn quality_spreads_a_dense_small_gap_across_the_full_safe_channel() {
         net: port_count,
         participates_in_ranking: false,
     });
-    let mixed = layout_with_quality_effort(&mixed_graph, options, QualityEffort::Quality).unwrap();
+    let mixed = layout_graph_with_effort(&mixed_graph, options, QualityEffort::Quality).unwrap();
     let mixed_report = score(&mixed_graph, &mixed, ScoreOptions::default());
     assert!(mixed_report.passes_hard_gates(), "{mixed_report:#?}");
     let mut mixed_permuted = mixed_graph.clone();
     mixed_permuted.nodes.reverse();
     mixed_permuted.edges.reverse();
     assert_eq!(
-        layout_with_quality_effort(&mixed_permuted, options, QualityEffort::Quality).unwrap(),
+        layout_graph_with_effort(&mixed_permuted, options, QualityEffort::Quality).unwrap(),
         mixed
     );
 
@@ -881,7 +925,7 @@ fn quality_spreads_a_dense_small_gap_across_the_full_safe_channel() {
     permuted.nodes.reverse();
     permuted.edges.reverse();
     assert_eq!(
-        layout_with_quality_effort(&permuted, options, QualityEffort::Quality).unwrap(),
+        layout_graph_with_effort(&permuted, options, QualityEffort::Quality).unwrap(),
         quality
     );
 }
@@ -889,7 +933,7 @@ fn quality_spreads_a_dense_small_gap_across_the_full_safe_channel() {
 #[test]
 fn accepts_the_current_exact_port_baseline() {
     let graph = graph();
-    let layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let report = score(&graph, &layout, ScoreOptions::default());
     assert!(report.passes_hard_gates(), "{report:#?}");
     assert_eq!(report.semantic_violations, 0);
@@ -918,7 +962,7 @@ fn fanout_candidate_layout_preserves_all_hard_gates() {
         ordering_sweeps: 0,
         ..LayoutOptions::default()
     };
-    let layout = layout(&graph, options).unwrap();
+    let layout = layout_graph(&graph, options).unwrap();
     let report = score(&graph, &layout, ScoreOptions::default());
 
     assert!(report.passes_hard_gates(), "{report:#?}");
@@ -1226,8 +1270,8 @@ fn rounded_staircase_fanout_highest_quality_is_deterministic_and_hard_safe() {
 fn negotiated_corridor_max_candidate_preserves_every_hard_gate() {
     let graph = negotiated_corridor_graph();
     let options = LayoutOptions::default();
-    let quality = layout_with_quality_effort(&graph, options, QualityEffort::Quality).unwrap();
-    let max = layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+    let quality = layout_graph_with_effort(&graph, options, QualityEffort::Quality).unwrap();
+    let max = layout_graph_with_effort(&graph, options, QualityEffort::Max).unwrap();
     let quality_report = score(&graph, &quality, ScoreOptions::default());
     let report = score(&graph, &max, ScoreOptions::default());
 
@@ -1241,7 +1285,7 @@ fn negotiated_corridor_max_candidate_preserves_every_hard_gate() {
 #[test]
 fn positive_clearance_covers_negotiated_corridor_candidates() {
     let graph = negotiated_corridor_graph();
-    let layout = layout_with_quality_effort(
+    let layout = layout_graph_with_effort(
         &graph,
         LayoutOptions {
             edge_node_clearance: 20.0,
@@ -1264,20 +1308,16 @@ fn regional_fanout_max_candidate_preserves_every_hard_gate() {
         outputs: (492..500).collect(),
         boundary_bundles: Vec::new(),
     };
-    let quality = layout_with_quality_effort_and_constraints(
+    let quality = layout_graph_with_effort_and_constraints(
         &graph,
         options,
         QualityEffort::Quality,
         &constraints,
     )
     .unwrap();
-    let max = layout_with_quality_effort_and_constraints(
-        &graph,
-        options,
-        QualityEffort::Max,
-        &constraints,
-    )
-    .unwrap();
+    let max =
+        layout_graph_with_effort_and_constraints(&graph, options, QualityEffort::Max, &constraints)
+            .unwrap();
     let quality_report = score(&graph, &quality, ScoreOptions::default());
     let report = score(&graph, &max, ScoreOptions::default());
     let top = max
@@ -1342,7 +1382,7 @@ fn positive_clearance_covers_regional_fanout_and_boundary_constraints() {
         outputs: (492..500).collect(),
         boundary_bundles: Vec::new(),
     };
-    let layout = layout_with_quality_effort_and_constraints(
+    let layout = layout_graph_with_effort_and_constraints(
         &graph,
         LayoutOptions {
             edge_node_clearance: 20.0,
@@ -1380,23 +1420,19 @@ fn demand_aware_and_pitched_max_candidates_are_selected_safely_and_deterministic
         edge_node_clearance: 20.0,
         ..LayoutOptions::default()
     };
-    let quality = layout_with_quality_effort_and_constraints(
+    let quality = layout_graph_with_effort_and_constraints(
         &graph,
         options,
         QualityEffort::Quality,
         &constraints,
     )
     .unwrap();
-    let selected = layout_with_quality_effort_and_constraints(
-        &graph,
-        options,
-        QualityEffort::Max,
-        &constraints,
-    )
-    .unwrap();
+    let selected =
+        layout_graph_with_effort_and_constraints(&graph, options, QualityEffort::Max, &constraints)
+            .unwrap();
     let quality_report = score(&graph, &quality, ScoreOptions::default());
     let selected_report = score(&graph, &selected, ScoreOptions::default());
-    let fast = layout_with_quality_effort_and_constraints(
+    let fast = layout_graph_with_effort_and_constraints(
         &graph,
         options,
         QualityEffort::Fast,
@@ -1471,7 +1507,7 @@ fn demand_aware_and_pitched_max_candidates_are_selected_safely_and_deterministic
     permuted_constraints.inputs.reverse();
     permuted_constraints.outputs.reverse();
     assert_eq!(
-        layout_with_quality_effort_and_constraints(
+        layout_graph_with_effort_and_constraints(
             &permuted,
             options,
             QualityEffort::Max,
@@ -1485,7 +1521,7 @@ fn demand_aware_and_pitched_max_candidates_are_selected_safely_and_deterministic
 #[test]
 fn viewport_fit_uses_configured_dimensions_and_rejects_invalid_dimensions() {
     let graph = graph();
-    let layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let options = ScoreOptions {
         viewport_width: layout.width * 2.0,
         viewport_height: layout.height * 4.0,
@@ -1518,7 +1554,7 @@ fn viewport_fit_uses_configured_dimensions_and_rejects_invalid_dimensions() {
 #[test]
 fn measures_westward_detours_on_forward_routes() {
     let graph = graph();
-    let mut layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let mut layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let route = &mut layout.edges[0];
     let source = route.points[0];
     let target = route.points[route.points.len() - 1];
@@ -2030,7 +2066,7 @@ fn detects_a_feedback_net_split_across_outer_bands() {
 #[test]
 fn detects_overlapping_nodes() {
     let graph = graph();
-    let mut layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let mut layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     layout.nodes[1].x = layout.nodes[0].x;
     layout.nodes[1].y = layout.nodes[0].y;
     let report = score(&graph, &layout, ScoreOptions::default());
@@ -2102,7 +2138,7 @@ fn quality_regression_graph(seed: u64) -> Graph {
 #[test]
 fn candidate_selection_never_increases_canonical_crossings_over_baseline() {
     let graph = quality_regression_graph(172);
-    let selected = layout(&graph, LayoutOptions::default()).unwrap();
+    let selected = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let report = score(&graph, &selected, ScoreOptions::default());
 
     assert!(report.passes_hard_gates(), "{report:#?}");
@@ -2112,7 +2148,7 @@ fn candidate_selection_never_increases_canonical_crossings_over_baseline() {
 #[test]
 fn rejects_a_diagonal_and_wrong_fixed_endpoint() {
     let graph = graph();
-    let mut layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let mut layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     layout.edges[0].points[0].x += 3.0;
     layout.edges[0].points[1].y += 2.0;
     let report = score(&graph, &layout, ScoreOptions::default());
@@ -2134,7 +2170,7 @@ fn rejects_a_diagonal_and_wrong_fixed_endpoint() {
 #[test]
 fn detects_a_route_through_a_node_interior() {
     let graph = graph();
-    let mut layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let mut layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let source = layout.nodes.iter().find(|node| node.id == 1).unwrap();
     let target = layout.nodes.iter().find(|node| node.id == 2).unwrap();
     layout.edges[0].points = vec![
@@ -2224,7 +2260,7 @@ fn boundary_rounding_does_not_count_as_a_node_intersection() {
 #[test]
 fn caps_examples_without_hiding_violation_counts() {
     let graph = graph();
-    let mut layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let mut layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     layout.width = -1.0;
     let report = score(
         &graph,
@@ -2281,7 +2317,7 @@ fn scores_the_full_consumer_bound() {
             })
             .collect(),
     };
-    let layout = layout(&graph, LayoutOptions::default()).unwrap();
+    let layout = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let report = score(&graph, &layout, ScoreOptions::default());
     assert_eq!(report.semantic_violations, 0);
     assert_eq!(report.node_overlaps, 0);
@@ -2512,14 +2548,14 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
     );
 
     let options = LayoutOptions::default();
-    let actual = layout_with_quality_effort_and_constraints(
+    let actual = layout_graph_with_effort_and_constraints(
         &graph,
         options,
         QualityEffort::Quality,
         &constraints,
     )
     .unwrap();
-    let repeated = layout_with_quality_effort_and_constraints(
+    let repeated = layout_graph_with_effort_and_constraints(
         &graph,
         options,
         QualityEffort::Quality,
@@ -2651,7 +2687,7 @@ fn captured_synth_priority_encoder_uses_safe_interior_vector_trunks_deterministi
     }
     assert_eq!(
         actual,
-        layout_with_quality_effort_and_constraints(
+        layout_graph_with_effort_and_constraints(
             &permuted_graph,
             options,
             QualityEffort::Quality,
@@ -2757,7 +2793,7 @@ fn boundary_bundle_geometry_and_tap_endpoints_participate_in_scoring() {
             },
         ],
     };
-    let layout = layout_with_quality_effort_and_constraints(
+    let layout = layout_graph_with_effort_and_constraints(
         &graph,
         LayoutOptions::default(),
         QualityEffort::Quality,

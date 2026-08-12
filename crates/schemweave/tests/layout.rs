@@ -2,9 +2,65 @@ use schemweave::{
     BoundaryBundleConstraint, BoundaryBundleMemberConstraint, BoundaryBundleRole,
     ConstrainedLayoutError, Edge, EdgeNodeSegment, Endpoint, Graph, Layout, LayoutConfig,
     LayoutConstraintError, LayoutConstraints, LayoutError, LayoutOptions, NetNodeRelation, Node,
-    Port, PortSide, QualityEffort, layout, layout_with_config, layout_with_constraints,
-    measure_edge_node_clearance_bounded, place,
+    Port, PortSide, QualityEffort, layout_with_config, measure_edge_node_clearance_bounded, place,
 };
+
+fn layout_graph(graph: &Graph, options: LayoutOptions) -> Result<Layout, ConstrainedLayoutError> {
+    layout_with_config(
+        graph,
+        &LayoutConfig {
+            layout: options,
+            ..LayoutConfig::default()
+        },
+    )
+}
+
+fn layout_graph_with_constraints(
+    graph: &Graph,
+    options: LayoutOptions,
+    constraints: &LayoutConstraints,
+) -> Result<Layout, ConstrainedLayoutError> {
+    layout_with_config(
+        graph,
+        &LayoutConfig {
+            layout: options,
+            constraints: constraints.clone(),
+            ..LayoutConfig::default()
+        },
+    )
+}
+
+fn layout_graph_with_effort(
+    graph: &Graph,
+    options: LayoutOptions,
+    quality_effort: QualityEffort,
+) -> Result<Layout, ConstrainedLayoutError> {
+    layout_with_config(
+        graph,
+        &LayoutConfig {
+            layout: options,
+            quality_effort,
+            ..LayoutConfig::default()
+        },
+    )
+}
+
+fn layout_graph_with_effort_and_constraints(
+    graph: &Graph,
+    options: LayoutOptions,
+    quality_effort: QualityEffort,
+    constraints: &LayoutConstraints,
+) -> Result<Layout, ConstrainedLayoutError> {
+    layout_with_config(
+        graph,
+        &LayoutConfig {
+            layout: options,
+            quality_effort,
+            constraints: constraints.clone(),
+            ..LayoutConfig::default()
+        },
+    )
+}
 
 fn node(id: u32, cycle_breaker: bool) -> Node {
     Node {
@@ -185,7 +241,7 @@ fn edge_node_clearance_defaults_to_disabled_and_rejects_invalid_values() {
         1_000_000.0 + f64::EPSILON * 1_000_000.0,
         f64::MAX,
     ] {
-        let error = layout(
+        let error = layout_graph(
             &graph,
             LayoutOptions {
                 edge_node_clearance: value,
@@ -195,14 +251,14 @@ fn edge_node_clearance_defaults_to_disabled_and_rejects_invalid_values() {
         .unwrap_err();
         assert!(matches!(
             error,
-            LayoutError::InvalidOption {
+            ConstrainedLayoutError::Layout(LayoutError::InvalidOption {
                 field: "edge_node_clearance",
                 value: invalid,
-            } if (value.is_nan() && invalid.is_nan()) || value == invalid
+            }) if (value.is_nan() && invalid.is_nan()) || value == invalid
         ));
     }
     assert!(
-        layout(
+        layout_graph(
             &graph,
             LayoutOptions {
                 edge_node_clearance: 1_000_000.0,
@@ -228,7 +284,7 @@ fn parallel_wire_spacing_defaults_to_disabled_and_rejects_invalid_values() {
         1_000_000.0 + f64::EPSILON * 1_000_000.0,
         f64::MAX,
     ] {
-        let error = layout(
+        let error = layout_graph(
             &graph,
             LayoutOptions {
                 minimum_parallel_wire_spacing: value,
@@ -238,14 +294,14 @@ fn parallel_wire_spacing_defaults_to_disabled_and_rejects_invalid_values() {
         .unwrap_err();
         assert!(matches!(
             error,
-            LayoutError::InvalidOption {
+            ConstrainedLayoutError::Layout(LayoutError::InvalidOption {
                 field: "minimum_parallel_wire_spacing",
                 value: invalid,
-            } if (value.is_nan() && invalid.is_nan()) || value == invalid
+            }) if (value.is_nan() && invalid.is_nan()) || value == invalid
         ));
     }
     assert!(
-        layout(
+        layout_graph(
             &graph,
             LayoutOptions {
                 minimum_parallel_wire_spacing: 1_000_000.0,
@@ -282,11 +338,11 @@ fn quality_budget_factors_have_stable_defaults_and_validate_their_lower_bound() 
         ),
     ] {
         assert!(matches!(
-            layout(&graph, options),
-            Err(LayoutError::InvalidOption {
+            layout_graph(&graph, options),
+            Err(ConstrainedLayoutError::Layout(LayoutError::InvalidOption {
                 field: invalid,
                 value: 0.99,
-            }) if invalid == field
+            })) if invalid == field
         ));
     }
 }
@@ -314,7 +370,7 @@ fn positive_edge_node_clearance_is_exact_and_permutation_deterministic() {
         edge_node_clearance: 20.0,
         ..LayoutOptions::default()
     };
-    let selected = layout(&graph, options).unwrap();
+    let selected = layout_graph(&graph, options).unwrap();
     assert_edge_node_clearance(&graph, &selected, 20.0);
     let highest = layout_with_config(&graph, &LayoutConfig::highest_quality()).unwrap();
     assert_edge_node_clearance(&graph, &highest, 20.0);
@@ -323,7 +379,7 @@ fn positive_edge_node_clearance_is_exact_and_permutation_deterministic() {
         nodes: graph.nodes.iter().cloned().rev().collect(),
         edges: graph.edges.iter().cloned().rev().collect(),
     };
-    assert_eq!(layout(&permuted, options).unwrap(), selected);
+    assert_eq!(layout_graph(&permuted, options).unwrap(), selected);
 }
 
 #[test]
@@ -343,7 +399,7 @@ fn positive_clearance_preserves_aligned_input_and_output_boundaries() {
         edge_node_clearance: 20.0,
         ..LayoutOptions::default()
     };
-    let result = layout_with_constraints(&graph, options, &constraints).unwrap();
+    let result = layout_graph_with_constraints(&graph, options, &constraints).unwrap();
     assert_edge_node_clearance(&graph, &result, 20.0);
     let input = result.nodes.iter().find(|node| node.id == 1).unwrap();
     assert!(result.nodes.iter().all(|node| node.x >= input.x));
@@ -454,7 +510,7 @@ fn configurable_clearance_expands_ordinary_same_rank_gaps() {
         edge_node_clearance: 40.0,
         ..LayoutOptions::default()
     };
-    let result = layout(&graph, options).unwrap();
+    let result = layout_graph(&graph, options).unwrap();
     assert_edge_node_clearance(&graph, &result, 40.0);
 }
 
@@ -536,11 +592,15 @@ fn coincident_distinct_corner_ports_fail_with_typed_contact_error() {
         edge_node_clearance: 40.0,
         ..LayoutOptions::default()
     };
-    let result = std::panic::catch_unwind(|| {
-        schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max)
-    })
-    .expect("positive-clearance layout must not panic");
-    assert_eq!(result, Err(LayoutError::UnrelatedRouteContactUnsatisfied));
+    let result =
+        std::panic::catch_unwind(|| layout_graph_with_effort(&graph, options, QualityEffort::Max))
+            .expect("positive-clearance layout must not panic");
+    assert_eq!(
+        result,
+        Err(ConstrainedLayoutError::Layout(
+            LayoutError::UnrelatedRouteContactUnsatisfied
+        ))
+    );
 }
 
 #[test]
@@ -585,8 +645,7 @@ fn positive_clearance_self_loop_exempts_only_its_endpoint_node() {
         edge_node_clearance: 20.0,
         ..LayoutOptions::default()
     };
-    let result =
-        schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max).unwrap();
+    let result = layout_graph_with_effort(&graph, options, QualityEffort::Max).unwrap();
 
     assert_edge_node_clearance(&graph, &result, 20.0);
     assert_eq!(result.edges.len(), 1);
@@ -685,8 +744,13 @@ fn mixed_side_corner_port_contacts_fail_with_typed_error_deterministically() {
             edge_node_clearance: 20.0,
             ..LayoutOptions::default()
         };
-        let result = schemweave::layout_with_quality_effort(&graph, options, QualityEffort::Max);
-        assert_eq!(result, Err(LayoutError::UnrelatedRouteContactUnsatisfied));
+        let result = layout_graph_with_effort(&graph, options, QualityEffort::Max);
+        assert_eq!(
+            result,
+            Err(ConstrainedLayoutError::Layout(
+                LayoutError::UnrelatedRouteContactUnsatisfied
+            ))
+        );
     }
 }
 
@@ -710,7 +774,7 @@ fn canonical_config_matches_the_explicit_layout_api() {
 
     assert_eq!(
         layout_with_config(&graph, &config).unwrap(),
-        schemweave::layout_with_quality_effort_and_constraints(
+        layout_graph_with_effort_and_constraints(
             &graph,
             config.layout,
             config.quality_effort,
@@ -731,8 +795,8 @@ fn is_deterministic_across_input_permutations() {
         edges: forward.edges.iter().cloned().rev().collect(),
     };
     assert_eq!(
-        layout(&forward, LayoutOptions::default()).unwrap(),
-        layout(&reversed, LayoutOptions::default()).unwrap()
+        layout_graph(&forward, LayoutOptions::default()).unwrap(),
+        layout_graph(&reversed, LayoutOptions::default()).unwrap()
     );
 }
 
@@ -769,12 +833,15 @@ fn multi_terminal_sparse_net_shares_an_intermediate_backbone() {
         ],
     };
 
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let reversed = Graph {
         nodes: graph.nodes.iter().cloned().rev().collect(),
         edges: graph.edges.iter().cloned().rev().collect(),
     };
-    assert_eq!(result, layout(&reversed, LayoutOptions::default()).unwrap());
+    assert_eq!(
+        result,
+        layout_graph(&reversed, LayoutOptions::default()).unwrap()
+    );
     let first = &result
         .edges
         .iter()
@@ -808,7 +875,7 @@ fn returns_exact_orthogonal_port_routes_and_nonnegative_bounds() {
         nodes: vec![node(1, false), node(2, false)],
         edges: vec![edge(10, 1, 2)],
     };
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let source = result.nodes.iter().find(|node| node.id == 1).unwrap();
     let target = result.nodes.iter().find(|node| node.id == 2).unwrap();
     let route = &result.edges[0].points;
@@ -879,7 +946,7 @@ fn handles_all_port_sides_without_diagonal_segments() {
             },
         ],
     };
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     assert!(result.edges.iter().all(|edge| {
         edge.points
             .windows(2)
@@ -903,7 +970,7 @@ fn outer_lane_baseline_avoids_intermediate_nodes() {
             edge(8, 7, 1),
         ],
     };
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     assert_routes_avoid_node_interiors(&result);
 }
 
@@ -918,7 +985,7 @@ fn adjacent_layers_align_ports_and_route_straight_through_their_channel() {
         edges: vec![edge(10, 1, 2)],
     };
 
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let source = result.nodes.iter().find(|node| node.id == 1).unwrap();
     let target = result.nodes.iter().find(|node| node.id == 2).unwrap();
     let route = &result.edges[0].points;
@@ -946,7 +1013,7 @@ fn uncontended_adjacent_route_stays_straight() {
         edges: vec![edge(10, 1, 2)],
     };
 
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     assert_eq!(result.edges[0].points.len(), 2);
 }
 
@@ -969,7 +1036,7 @@ fn large_multi_terminal_nets_keep_a_shared_outer_trunk() {
             .collect(),
     };
 
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let source = result.nodes.iter().find(|node| node.id == 0).unwrap();
     let target_left = result
         .nodes
@@ -1010,7 +1077,7 @@ fn long_forward_routes_weave_through_free_layer_space() {
         ],
     };
 
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let route = &result
         .edges
         .iter()
@@ -1042,7 +1109,7 @@ fn cycle_breakers_keep_feedback_from_flattening_the_dataflow() {
         nodes: vec![node(1, true), node(2, false), node(3, false)],
         edges: vec![edge(10, 1, 2), edge(11, 2, 3), edge(12, 3, 1)],
     };
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let x = |id| result.nodes.iter().find(|node| node.id == id).unwrap().x;
     assert!(x(1) < x(2));
     assert!(x(2) < x(3));
@@ -1055,7 +1122,7 @@ fn root_inputs_rank_cycle_breakers_without_reopening_feedback() {
         edges: vec![edge(10, 1, 2), edge(11, 2, 3), edge(12, 3, 2)],
     };
 
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     let x = |id| result.nodes.iter().find(|node| node.id == id).unwrap().x;
 
     assert!(x(1) < x(2));
@@ -1071,7 +1138,7 @@ fn pure_cycles_are_supported_without_recursion() {
             .map(|id| edge(id, id, (id + 1) % count))
             .collect(),
     };
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     assert_eq!(result.nodes.len(), count as usize);
     assert_eq!(result.edges.len(), count as usize);
 }
@@ -1106,7 +1173,7 @@ fn handles_the_full_consumer_graph_bound() {
             })
             .collect(),
     };
-    let result = layout(&graph, LayoutOptions::default()).unwrap();
+    let result = layout_graph(&graph, LayoutOptions::default()).unwrap();
     assert_eq!(result.nodes.len(), node_count as usize);
     assert_eq!(result.edges.len(), 10_000);
     assert!(result.edges.iter().all(|edge| edge.points.len() <= 32));
@@ -1119,12 +1186,14 @@ fn rejects_invalid_graphs_before_layout() {
         edges: vec![edge(10, 1, 9)],
     };
     assert_eq!(
-        layout(&graph, LayoutOptions::default()),
-        Err(LayoutError::UnknownEndpointNode {
-            edge: 10,
-            role: "target",
-            node: 9
-        })
+        layout_graph(&graph, LayoutOptions::default()),
+        Err(ConstrainedLayoutError::Layout(
+            LayoutError::UnknownEndpointNode {
+                edge: 10,
+                role: "target",
+                node: 9
+            }
+        ))
     );
 }
 
@@ -1181,7 +1250,8 @@ fn boundary_constraints_preserve_acyclic_register_dataflow() {
         boundary_bundles: Vec::new(),
     };
 
-    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let result =
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
     let geometry = |id| result.nodes.iter().find(|node| node.id == id).unwrap();
     assert_eq!(geometry(1).x, geometry(2).x);
     assert_eq!(geometry(2).x, geometry(3).x);
@@ -1225,7 +1295,8 @@ fn constrained_outputs_align_right_edges_across_widths_and_depths() {
         boundary_bundles: Vec::new(),
     };
 
-    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let result =
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
     let geometry = |id| result.nodes.iter().find(|node| node.id == id).unwrap();
     assert_eq!(
         geometry(30).x + geometry(30).width,
@@ -1274,8 +1345,8 @@ fn constrained_layout_is_deterministic_across_node_port_edge_and_role_permutatio
     };
 
     assert_eq!(
-        layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap(),
-        layout_with_constraints(&permuted, LayoutOptions::default(), &permuted_constraints)
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap(),
+        layout_graph_with_constraints(&permuted, LayoutOptions::default(), &permuted_constraints)
             .unwrap()
     );
 }
@@ -1297,14 +1368,15 @@ fn constrained_internal_sources_do_not_share_the_input_rank() {
         boundary_bundles: Vec::new(),
     };
 
-    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let result =
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
     let geometry = |id| result.nodes.iter().find(|node| node.id == id).unwrap();
     assert!(geometry(2).x > geometry(1).x);
 }
 
 #[test]
 fn boundary_constraints_handle_empty_and_one_sided_graphs() {
-    let empty = layout_with_constraints(
+    let empty = layout_graph_with_constraints(
         &Graph {
             nodes: vec![],
             edges: vec![],
@@ -1316,7 +1388,7 @@ fn boundary_constraints_handle_empty_and_one_sided_graphs() {
     assert_eq!(empty.width, 0.0);
     assert_eq!(empty.height, 0.0);
 
-    let inputs = layout_with_constraints(
+    let inputs = layout_graph_with_constraints(
         &Graph {
             nodes: vec![node(1, false), node(2, false)],
             edges: vec![],
@@ -1335,7 +1407,7 @@ fn boundary_constraints_handle_empty_and_one_sided_graphs() {
     narrow.width = 35.0;
     let mut wide = node(2, false);
     wide.width = 125.0;
-    let outputs = layout_with_constraints(
+    let outputs = layout_graph_with_constraints(
         &Graph {
             nodes: vec![narrow, wide],
             edges: vec![],
@@ -1363,7 +1435,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
     let options = LayoutOptions::default();
 
     assert_eq!(
-        layout_with_constraints(
+        layout_graph_with_constraints(
             &graph,
             options,
             &LayoutConstraints {
@@ -1380,7 +1452,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
         ))
     );
     assert_eq!(
-        layout_with_constraints(
+        layout_graph_with_constraints(
             &graph,
             options,
             &LayoutConstraints {
@@ -1397,7 +1469,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
         ))
     );
     assert_eq!(
-        layout_with_constraints(
+        layout_graph_with_constraints(
             &graph,
             options,
             &LayoutConstraints {
@@ -1411,7 +1483,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
         ))
     );
     assert_eq!(
-        layout_with_constraints(
+        layout_graph_with_constraints(
             &graph,
             options,
             &LayoutConstraints {
@@ -1425,7 +1497,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
         ))
     );
     assert_eq!(
-        layout_with_constraints(
+        layout_graph_with_constraints(
             &graph,
             options,
             &LayoutConstraints {
@@ -1447,8 +1519,8 @@ fn empty_constraints_are_byte_identical_to_the_existing_api() {
         edges: vec![edge(1, 1, 2), edge(2, 2, 3)],
     };
     assert_eq!(
-        layout(&graph, LayoutOptions::default()).unwrap(),
-        layout_with_constraints(
+        layout_graph(&graph, LayoutOptions::default()).unwrap(),
+        layout_graph_with_constraints(
             &graph,
             LayoutOptions::default(),
             &LayoutConstraints::default()
@@ -1965,7 +2037,8 @@ fn input_boundary_bundle_advances_one_collector_to_the_first_interior_divergence
         }],
     };
 
-    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let result =
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
     let bundle = &result.boundary_bundles[0];
     assert_eq!(bundle.id, 7);
     assert_eq!(bundle.role, BoundaryBundleRole::Input);
@@ -2019,7 +2092,7 @@ fn input_boundary_bundle_advances_one_collector_to_the_first_interior_divergence
     }
     assert_eq!(
         result,
-        layout_with_constraints(
+        layout_graph_with_constraints(
             &permuted_graph,
             LayoutOptions::default(),
             &permuted_constraints,
@@ -2027,7 +2100,7 @@ fn input_boundary_bundle_advances_one_collector_to_the_first_interior_divergence
         .unwrap()
     );
 
-    let wider_pitch = layout_with_constraints(
+    let wider_pitch = layout_graph_with_constraints(
         &graph,
         LayoutOptions {
             route_lane_gap: 6.0,
@@ -2048,7 +2121,8 @@ fn input_boundary_bundle_advances_one_collector_to_the_first_interior_divergence
     let mut sparse_declared_width = constraints.clone();
     sparse_declared_width.boundary_bundles[0].width = 1_000_000;
     let sparse =
-        layout_with_constraints(&graph, LayoutOptions::default(), &sparse_declared_width).unwrap();
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &sparse_declared_width)
+            .unwrap();
     assert_eq!(sparse.nodes, result.nodes);
     assert_eq!(sparse.edges, result.edges);
     assert_eq!(sparse.width, result.width);
@@ -2094,7 +2168,8 @@ fn output_boundary_bundle_routes_members_horizontally_into_unique_taps() {
         }],
     };
 
-    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let result =
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
     let bundle = &result.boundary_bundles[0];
     assert_eq!(bundle.role, BoundaryBundleRole::Output);
     for member in &bundle.members {
@@ -2528,7 +2603,8 @@ fn same_net_fanout_can_branch_at_multiple_declared_interior_taps_deterministical
             ],
         }],
     };
-    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let result =
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
     let bundle = &result.boundary_bundles[0];
     let tap = |edge| {
         bundle
@@ -2581,7 +2657,7 @@ fn same_net_fanout_can_branch_at_multiple_declared_interior_taps_deterministical
     }
     assert_eq!(
         result,
-        layout_with_constraints(
+        layout_graph_with_constraints(
             &permuted_graph,
             LayoutOptions::default(),
             &permuted_constraints,
@@ -2619,7 +2695,8 @@ fn direct_alias_edge_can_use_input_and_output_bundle_taps_in_any_bundle_order() 
         outputs: vec![2],
         boundary_bundles: vec![output.clone(), input.clone()],
     };
-    let result = layout_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
+    let result =
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints).unwrap();
     let route = &result.edges[0];
     let input_tap = result
         .boundary_bundles
@@ -2640,7 +2717,7 @@ fn direct_alias_edge_can_use_input_and_output_bundle_taps_in_any_bundle_order() 
     assert!(route.points[1].x > input_tap.x);
     assert!(route.points[route.points.len() - 2].x < output_tap.x);
 
-    let reordered = layout_with_constraints(
+    let reordered = layout_graph_with_constraints(
         &graph,
         LayoutOptions::default(),
         &LayoutConstraints {
@@ -2656,7 +2733,7 @@ fn direct_alias_edge_can_use_input_and_output_bundle_taps_in_any_bundle_order() 
     swapped_input.id = 7;
     let mut swapped_output = output;
     swapped_output.id = 3;
-    let swapped = layout_with_constraints(
+    let swapped = layout_graph_with_constraints(
         &graph,
         LayoutOptions::default(),
         &LayoutConstraints {
@@ -2722,7 +2799,7 @@ fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
         layer_gap: 160.0,
         ..LayoutOptions::default()
     };
-    let result = layout_with_constraints(
+    let result = layout_graph_with_constraints(
         &graph,
         options,
         &constraints(vec![output.clone(), input.clone()]),
@@ -2775,7 +2852,7 @@ fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
     assert_eq!(alias.points.first(), Some(&input_tap));
     assert_eq!(alias.points.last(), Some(&output_tap));
 
-    let reordered = layout_with_constraints(
+    let reordered = layout_graph_with_constraints(
         &graph,
         options,
         &constraints(vec![input.clone(), output.clone()]),
@@ -2787,7 +2864,7 @@ fn vector_alias_edge_plans_two_eligible_bundle_ends_independently_of_ids() {
     swapped_input.id = 7;
     let mut swapped_output = output;
     swapped_output.id = 3;
-    let swapped = layout_with_constraints(
+    let swapped = layout_graph_with_constraints(
         &graph,
         options,
         &constraints(vec![swapped_input, swapped_output]),
@@ -2834,7 +2911,7 @@ fn invalid_boundary_bundle_contracts_return_typed_deterministic_errors() {
         }],
     };
     assert_eq!(
-        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints),
         Err(ConstrainedLayoutError::Constraint(
             LayoutConstraintError::BoundaryBundleSlotConflict {
                 bundle: 4,
@@ -2851,7 +2928,7 @@ fn invalid_boundary_bundle_contracts_return_typed_deterministic_errors() {
     constraints.boundary_bundles[0].members[0].slots = vec![0, 1];
     constraints.boundary_bundles[0].members[1].slots = vec![1, 2];
     assert_eq!(
-        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints),
         Err(ConstrainedLayoutError::Constraint(
             LayoutConstraintError::BoundaryBundleSlotConflict {
                 bundle: 4,
@@ -2866,7 +2943,7 @@ fn invalid_boundary_bundle_contracts_return_typed_deterministic_errors() {
     constraints.boundary_bundles[0].members[0].slots = vec![0];
     constraints.boundary_bundles[0].members[1].slots = vec![2];
     assert_eq!(
-        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints),
         Err(ConstrainedLayoutError::Constraint(
             LayoutConstraintError::BoundaryBundleSlotOutOfRange {
                 bundle: 4,
@@ -2879,7 +2956,7 @@ fn invalid_boundary_bundle_contracts_return_typed_deterministic_errors() {
 
     constraints.boundary_bundles[0].width = 1_000_001;
     assert_eq!(
-        layout_with_constraints(&graph, LayoutOptions::default(), &constraints),
+        layout_graph_with_constraints(&graph, LayoutOptions::default(), &constraints),
         Err(ConstrainedLayoutError::Constraint(
             LayoutConstraintError::InvalidBoundaryBundleWidth {
                 bundle: 4,
