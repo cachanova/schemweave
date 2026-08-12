@@ -9370,10 +9370,6 @@ struct GapLaneCandidates {
 type GapPairCosts = BTreeMap<(u32, u32), usize>;
 type GapLaneOrder = (BTreeMap<u32, usize>, usize);
 
-#[cfg(test)]
-static USE_BTREE_GAP_PAIR_COSTS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 struct DenseGapPairCosts<'a> {
     accesses: Vec<&'a GapNetAccess>,
     values: Vec<Option<usize>>,
@@ -9920,16 +9916,7 @@ fn crossing_aware_gap_lane_indices_with_rounds(
     ordered.sort_unstable();
     let seed: Vec<_> = ordered.into_iter().map(|(_, net)| net).collect();
     let mut ordered = seed;
-    let use_dense = ordered.len() <= MAX_GLOBAL_GAP_LANES && {
-        #[cfg(test)]
-        {
-            !USE_BTREE_GAP_PAIR_COSTS.load(std::sync::atomic::Ordering::Relaxed)
-        }
-        #[cfg(not(test))]
-        {
-            true
-        }
-    };
+    let use_dense = ordered.len() <= MAX_GLOBAL_GAP_LANES;
     if use_dense {
         let mut costs = DenseGapPairCosts::new(&ordered, accesses);
         let mut dense_order = (0..ordered.len()).collect::<Vec<_>>();
@@ -19816,133 +19803,5 @@ mod tests {
         assert_eq!(planned.crossings, quality.crossings);
         assert_eq!(planned.bends, quality.bends);
         assert_eq!(planned.route_length, quality.route_length);
-    }
-
-    #[test]
-    #[ignore = "manual release-mode end-to-end benchmark"]
-    fn benchmark_dense_gap_end_to_end() {
-        use std::{hint::black_box, sync::atomic::Ordering as AtomicOrdering, time::Instant};
-
-        fn fixture(node_count: u32, layers: u32, width: u32) -> Graph {
-            let nodes = (0..node_count)
-                .map(|id| Node {
-                    id,
-                    width: 80.0,
-                    height: 60.0,
-                    cycle_breaker: false,
-                    ports: std::iter::once(Port {
-                        id: 0,
-                        side: PortSide::East,
-                        offset: 30.0,
-                    })
-                    .chain((0..5).map(|branch| Port {
-                        id: branch + 1,
-                        side: PortSide::West,
-                        offset: 10.0 * f64::from(branch + 1),
-                    }))
-                    .collect(),
-                })
-                .collect();
-            let mut edges = Vec::new();
-            for layer in 0..layers - 1 {
-                for source in 0..width {
-                    for branch in 0..5 {
-                        edges.push(Edge {
-                            id: edges.len() as u32,
-                            source: Endpoint {
-                                node: layer * width + source,
-                                port: 0,
-                            },
-                            target: Endpoint {
-                                node: (layer + 1) * width
-                                    + (source * 7 + branch * 11 + layer * 13) % width,
-                                port: branch + 1,
-                            },
-                            net: layer * width + source,
-                            participates_in_ranking: true,
-                        });
-                    }
-                }
-            }
-            Graph { nodes, edges }
-        }
-
-        fn checksum(bytes: &[u8]) -> u64 {
-            bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-            })
-        }
-
-        for (node_count, layers) in [(600, 18), (1_000, 31), (2_000, 62)] {
-            let graph = fixture(node_count, layers, 32);
-            for effort in [
-                crate::QualityEffort::Fast,
-                crate::QualityEffort::Quality,
-                crate::QualityEffort::Max,
-            ] {
-                super::USE_BTREE_GAP_PAIR_COSTS.store(false, AtomicOrdering::Relaxed);
-                let expected = crate::layout_with_quality_effort(
-                    black_box(&graph),
-                    LayoutOptions::default(),
-                    effort,
-                )
-                .unwrap();
-                let indexed = validate_and_index(&graph, LayoutOptions::default()).unwrap();
-                let quality = route_quality(&indexed, &expected.edges);
-                let bytes = serde_json::to_vec(&expected).unwrap();
-                let measure = |use_btree| {
-                    super::USE_BTREE_GAP_PAIR_COSTS.store(use_btree, AtomicOrdering::Relaxed);
-                    let start = Instant::now();
-                    let actual = crate::layout_with_quality_effort(
-                        black_box(&graph),
-                        LayoutOptions::default(),
-                        effort,
-                    )
-                    .unwrap();
-                    let elapsed = start.elapsed().as_micros();
-                    assert_eq!(actual, expected);
-                    elapsed
-                };
-                let mut btree_samples = Vec::new();
-                let mut dense_samples = Vec::new();
-                for iteration in 0..5 {
-                    if iteration % 2 == 0 {
-                        btree_samples.push(measure(true));
-                        dense_samples.push(measure(false));
-                    } else {
-                        dense_samples.push(measure(false));
-                        btree_samples.push(measure(true));
-                    }
-                }
-                super::USE_BTREE_GAP_PAIR_COSTS.store(false, AtomicOrdering::Relaxed);
-                let mut permuted = graph.clone();
-                permuted.nodes.reverse();
-                permuted.edges.reverse();
-                assert_eq!(
-                    crate::layout_with_quality_effort(&permuted, LayoutOptions::default(), effort,)
-                        .unwrap(),
-                    expected
-                );
-                btree_samples.sort_unstable();
-                dense_samples.sort_unstable();
-                let btree_median = btree_samples[btree_samples.len() / 2];
-                let dense_median = dense_samples[dense_samples.len() / 2];
-                eprintln!(
-                    "nodes={} effort={effort:?} btree_median_us={} btree_tail_us={} dense_median_us={} dense_tail_us={} speedup={:.2}x bytes={} checksum={:016x} quality=({},{},{:016x})",
-                    graph.nodes.len(),
-                    btree_median,
-                    btree_samples[btree_samples.len() - 1],
-                    dense_median,
-                    dense_samples[dense_samples.len() - 1],
-                    btree_median as f64 / dense_median as f64,
-                    bytes.len(),
-                    checksum(&bytes),
-                    quality.crossings,
-                    quality.bends,
-                    quality.route_length.to_bits(),
-                );
-            }
-        }
-        super::USE_BTREE_GAP_PAIR_COSTS.store(false, AtomicOrdering::Relaxed);
     }
 }
