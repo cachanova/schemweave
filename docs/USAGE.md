@@ -27,6 +27,10 @@ the workspace directly or pin a reviewed Git revision:
 schemweave = { git = "https://github.com/cachanova/schemweave", rev = "<commit>" }
 ```
 
+SchemWeave is pre-release software and does not yet guarantee source-compatible
+Rust or WASM APIs between revisions. `LayoutConfig` and `layout_with_config` are
+the canonical native layout entry points.
+
 ```rust
 use schemweave::{
     Edge, Endpoint, Graph, LayoutConfig, Node, Port, PortSide, layout_with_config,
