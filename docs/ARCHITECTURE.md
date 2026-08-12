@@ -20,7 +20,7 @@ Graph + LayoutConfig
 
 | Component | Responsibility |
 | --- | --- |
-| `schemweave` | Validation, layout, routing, deterministic selection, group expansion. |
+| `schemweave` | Validation, layout, routing, deterministic selection, group expansion and collapse. |
 | `schemweave-wasm` | JSON/WASM boundary over the same core. |
 | `schemweave-eval` | Development-only correctness and readability scoring. |
 | `tools/visual-review` | Corpus conversion, worker orchestration, ELK comparison, rendering. |
@@ -50,7 +50,7 @@ lifetime. Native and WASM callers execute the same core implementation.
    `Max` may add deeper ordering/routing repair, demand-aware spacing, and
    lane-pitch refinements, subject to configured area and route-length budgets.
 
-## Group expansion
+## Group expansion and collapse
 
 Expansion receives a compact graph and layout, an expanded graph, the replaced
 anchor/members, and explicit boundary-trunk replacements. It preserves distant
@@ -65,6 +65,14 @@ The engine lays out members canonically and accepts either composition only
 when all hard geometry and left-to-right invariants hold. Native callers
 receive `GroupExpansionError`; the WASM boundary converts selected safe
 fallbacks into a tagged full-relayout response.
+
+Collapse receives the expanded graph and layout, the target compact graph, the
+same anchor/member and boundary-trunk mapping, and collapse options. It replaces
+the expanded members with the compact anchor, restores compact trunk identities,
+and keeps unrelated geometry fixed. The vacated member frame is intentionally
+left open so a responsive visibility toggle does not move unrelated nodes; a
+later explicit compaction may reclaim it. Collapse uses the same deterministic
+validation and full-relayout fallback contract as expansion.
 
 ## Invariants
 

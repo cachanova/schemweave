@@ -48,7 +48,7 @@ pub fn expand_group_json(
 }
 
 /// Execute incremental group expansion without converting errors to JavaScript values.
-pub fn expand_group_serialized(
+fn expand_group_serialized(
     compact_graph_json: &str,
     compact_layout_json: &str,
     expanded_graph_json: &str,
@@ -69,31 +69,13 @@ pub fn expand_group_serialized(
         serde_json::from_str(options_json)
             .map_err(|error| format!("invalid options JSON: {error}"))?
     };
-    let result = match schemweave::expand_group_in_place(
+    let result = map_group_mutation_result(schemweave::expand_group_in_place(
         &compact_graph,
         &compact_layout,
         &expanded_graph,
         &expansion,
         &options,
-    ) {
-        Ok(layout) => SerializedGroupExpansionResult::Layout { layout },
-        Err(GroupExpansionError::NeedsFullRelayout) => {
-            SerializedGroupExpansionResult::NeedsFullRelayout {
-                reason: FullRelayoutReason::Geometry,
-            }
-        }
-        Err(GroupExpansionError::ExpansionWorkLimitExceeded { .. }) => {
-            SerializedGroupExpansionResult::NeedsFullRelayout {
-                reason: FullRelayoutReason::WorkLimit,
-            }
-        }
-        Err(GroupExpansionError::PreservedGeometryTooLarge { .. }) => {
-            SerializedGroupExpansionResult::NeedsFullRelayout {
-                reason: FullRelayoutReason::PreservedGeometryTooLarge,
-            }
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    ))?;
     serde_json::to_string(&result)
         .map_err(|error| format!("failed to encode expanded layout: {error}"))
 }
@@ -118,7 +100,7 @@ pub fn collapse_group_json(
 }
 
 /// Execute incremental group collapse without converting errors to JavaScript values.
-pub fn collapse_group_serialized(
+fn collapse_group_serialized(
     expanded_graph_json: &str,
     expanded_layout_json: &str,
     compact_graph_json: &str,
@@ -139,7 +121,7 @@ pub fn collapse_group_serialized(
         serde_json::from_str(options_json)
             .map_err(|error| format!("invalid options JSON: {error}"))?
     };
-    let result = match schemweave::collapse_group_in_place(
+    let result = map_group_mutation_result(schemweave::collapse_group_in_place(
         &expanded_graph,
         &expanded_layout,
         &compact_graph,
@@ -148,32 +130,38 @@ pub fn collapse_group_serialized(
             layout: options.layout,
             constraints: options.constraints,
         },
-    ) {
-        Ok(layout) => SerializedGroupExpansionResult::Layout { layout },
-        Err(GroupExpansionError::NeedsFullRelayout) => {
-            SerializedGroupExpansionResult::NeedsFullRelayout {
-                reason: FullRelayoutReason::Geometry,
-            }
-        }
-        Err(GroupExpansionError::ExpansionWorkLimitExceeded { .. }) => {
-            SerializedGroupExpansionResult::NeedsFullRelayout {
-                reason: FullRelayoutReason::WorkLimit,
-            }
-        }
-        Err(GroupExpansionError::PreservedGeometryTooLarge { .. }) => {
-            SerializedGroupExpansionResult::NeedsFullRelayout {
-                reason: FullRelayoutReason::PreservedGeometryTooLarge,
-            }
-        }
-        Err(error) => return Err(error.to_string()),
-    };
+    ))?;
     serde_json::to_string(&result)
         .map_err(|error| format!("failed to encode collapsed layout: {error}"))
 }
 
+fn map_group_mutation_result(
+    result: Result<Layout, GroupExpansionError>,
+) -> Result<SerializedGroupMutationResult, String> {
+    match result {
+        Ok(layout) => Ok(SerializedGroupMutationResult::Layout { layout }),
+        Err(GroupExpansionError::NeedsFullRelayout) => {
+            Ok(SerializedGroupMutationResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::Geometry,
+            })
+        }
+        Err(GroupExpansionError::ExpansionWorkLimitExceeded { .. }) => {
+            Ok(SerializedGroupMutationResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::WorkLimit,
+            })
+        }
+        Err(GroupExpansionError::PreservedGeometryTooLarge { .. }) => {
+            Ok(SerializedGroupMutationResult::NeedsFullRelayout {
+                reason: FullRelayoutReason::PreservedGeometryTooLarge,
+            })
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 #[derive(Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum SerializedGroupExpansionResult {
+enum SerializedGroupMutationResult {
     Layout { layout: Layout },
     NeedsFullRelayout { reason: FullRelayoutReason },
 }
@@ -197,14 +185,18 @@ mod tests {
     };
     use schemweave::{
         BoundaryTrunk, Edge, Endpoint, Graph, GroupExpansion, GroupExpansionOptions, Layout,
-        LayoutOptions, Node, Port, PortSide, ProtectedGroup, expand_group_in_place, layout,
-        layout_with_constraints,
+        LayoutConfig, LayoutConstraints, Node, Port, PortSide, ProtectedGroup,
+        expand_group_in_place, layout_with_config,
     };
 
     fn decode_expanded_layout(response: String) -> Layout {
         let value: serde_json::Value = serde_json::from_str(&response).unwrap();
         assert_eq!(value["status"], "layout");
         serde_json::from_value(value["layout"].clone()).unwrap()
+    }
+
+    fn layout_for_test(graph: &Graph) -> Layout {
+        layout_with_config(graph, &LayoutConfig::default()).unwrap()
     }
 
     fn activating_graph_json() -> String {
@@ -387,7 +379,7 @@ mod tests {
             nodes: vec![node(1), anchor, node(4)],
             edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_for_test(&compact);
         let expanded = Graph {
             nodes: vec![node(1), node(2), node(3), node(4)],
             edges: vec![
@@ -436,7 +428,7 @@ mod tests {
             nodes: vec![node(1), node(10), node(4)],
             edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_for_test(&compact);
         let expanded = Graph {
             nodes: vec![node(1), node(2), node(4)],
             edges: vec![edge(11, 1, 2, 100), edge(12, 2, 4, 200)],
@@ -501,7 +493,7 @@ mod tests {
             nodes: vec![node(1), anchor, node(4)],
             edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_for_test(&compact);
         let expanded = Graph {
             nodes: vec![node(1), node(2), node(3), node(4)],
             edges: vec![
@@ -569,13 +561,15 @@ mod tests {
             nodes: vec![node(1), node(10), node(9)],
             edges: vec![edge(1, 1, 10, 100), edge(3, 1, 9, 300)],
         };
-        let compact_layout = layout_with_constraints(
+        let compact_layout = layout_with_config(
             &compact,
-            LayoutOptions::default(),
-            &schemweave::LayoutConstraints {
-                inputs: vec![1],
-                outputs: vec![9, 10],
-                boundary_bundles: Vec::new(),
+            &LayoutConfig {
+                constraints: LayoutConstraints {
+                    inputs: vec![1],
+                    outputs: vec![9, 10],
+                    ..LayoutConstraints::default()
+                },
+                ..LayoutConfig::default()
             },
         )
         .unwrap();
@@ -621,7 +615,7 @@ mod tests {
             nodes: vec![node(10)],
             edges: Vec::new(),
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_for_test(&compact);
         let expanded = Graph {
             nodes: vec![node(1), node(2), node(3)],
             edges: Vec::new(),
@@ -665,7 +659,7 @@ mod tests {
             nodes: vec![node(1), node(10), node(4)],
             edges: vec![edge(1, 1, 10, 100), edge(2, 10, 4, 200)],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_for_test(&compact);
         let expanded = Graph {
             nodes: vec![node(1), node(2), node(3), node(4)],
             edges: vec![
@@ -727,7 +721,7 @@ mod tests {
             nodes: vec![node(1), node(10)],
             edges: vec![edge(1, 1, 10, 100)],
         };
-        let compact_layout = layout(&compact, LayoutOptions::default()).unwrap();
+        let compact_layout = layout_for_test(&compact);
         let members = (1_000..2_000).collect::<Vec<_>>();
         let edges = (0..4_000)
             .map(|index| edge(index + 100, 1, members[index as usize % members.len()], 100))
