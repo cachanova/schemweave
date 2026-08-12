@@ -755,7 +755,7 @@ fn mixed_side_corner_port_contacts_fail_with_typed_error_deterministically() {
 }
 
 #[test]
-fn canonical_config_matches_the_explicit_layout_api() {
+fn canonical_config_matches_the_internal_layout_policy() {
     let graph = Graph {
         nodes: vec![node(1, false), node(2, false), node(3, false)],
         edges: vec![edge(10, 1, 2), edge(11, 1, 3), edge(12, 2, 3)],
@@ -1513,7 +1513,7 @@ fn invalid_boundary_constraints_are_rejected_deterministically() {
 }
 
 #[test]
-fn empty_constraints_are_byte_identical_to_the_existing_api() {
+fn empty_constraints_match_the_default_config_byte_for_byte() {
     let graph = Graph {
         nodes: vec![node(1, false), node(2, false), node(3, false)],
         edges: vec![edge(1, 1, 2), edge(2, 2, 3)],
