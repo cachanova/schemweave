@@ -1,8 +1,6 @@
-# SchemWeave Repository Rules
+# SchemWeave
 
-These workspace-level rules apply to every SchemWeave worktree. Start agent
-sessions from `/home/leela/code/schemweave`. A worktree-local `AGENTS.md` is
-only a bootstrap back to this parent workspace policy.
+Shared rules live in `~/agents`. This file holds only SchemWeave facts.
 
 ## Product and contracts
 
@@ -27,39 +25,6 @@ Preserve stable-ID determinism, fixed boundary ports, axis-aligned routes,
 obstacle avoidance, and explicit electrical-net identity. Proxy costs may select
 bounded candidates, but a complete candidate must pass exact geometry scoring
 before it replaces the current best layout.
-
-## Workspace
-
-The workspace root is a container, not a checkout:
-
-```text
-/home/leela/code/schemweave/
-  repo.git/       canonical bare repository
-  main/           main branch and persistent .agents checkout
-  <worktree>/     feature branches
-```
-
-Shared agent policy is pinned as the `main/.agents` submodule. Project-specific
-policy is tracked separately at `main/.agent/Repo.md`. The parent `AGENTS.md`,
-`CLAUDE.md`, and shared `.agent/` entries are symlinks into `main`; the parent
-`.agent/Repo.md` symlink targets the project file instead of the submodule.
-
-- Only `main` maintains a persistent `.agents` checkout. Leave it uninitialized
-  in feature worktrees, except temporarily in a dedicated policy-update
-  worktree.
-- After a policy gitlink changes on `main`, run
-  `git -C /home/leela/code/schemweave/main submodule update --init --checkout .agents`.
-- For `claude_start`, use `main/.agents` as `policy_root`, the workspace parent
-  as `workspace_root`, and `main/.agent/Repo.md` as `repo_policy_file`.
-- Run bare-repository commands with
-  `git --git-dir=/home/leela/code/schemweave/repo.git ...`.
-- Run normal git commands with `git -C <worktree> ...`.
-- Keep `main/` on `main`. Never use it for feature work.
-- Fetch with prune and fast-forward `main` before creating new worktrees.
-- Continue an existing task branch when it has a worktree; otherwise create a
-  branch and same-named worktree from updated `main`.
-- Merge pull requests with squash and remove merged feature worktrees after
-  completion is verified.
 
 ## Quality and performance
 
